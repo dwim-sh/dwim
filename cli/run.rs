@@ -359,6 +359,11 @@ impl App {
         }
         self.lines.push(Line::new());
 
+        if let Some(command) = message.strip_prefix('/') {
+            self.command(command);
+            return;
+        }
+
         self.reply.clear();
         self.segment = Segment::Text;
         self.reply_width = columns.saturating_sub(2);
@@ -500,13 +505,14 @@ impl App {
         }
     }
 
-    /// The working directory, with the home directory as `~`.
-    fn cwd_label(&self) -> String {
-        match dirs::home_dir().and_then(|home| self.cwd.strip_prefix(home).ok()) {
-            Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-            Some(rest) => format!("~/{}", rest.display()),
-            None => self.cwd.display().to_string(),
-        }
+    /// Runs a slash command, printing what it has to say.
+    fn command(&mut self, command: &str) {
+        let (columns, _) = self.screen.size();
+        let lines = match command.trim() {
+            "models" => models_listing(&self.model),
+            other => vec![vec![span(format!("● Unknown command /{other}"))]],
+        };
+        self.lines.extend(lines.iter().map(|line| tui::truncate(line, columns)));
     }
 
     fn draw(&mut self) -> Result<(), Box<dyn Error>> {
@@ -609,7 +615,7 @@ impl App {
 
     /// What's running and how full the context is, with the keys to know.
     fn footer(&self, columns: usize) -> Line {
-        let mut left = format!("  {} · {}", self.cwd_label(), self.model);
+        let mut left = format!("  {} · {}", tilde(&self.cwd), self.model);
         if let Some(device) = &self.device {
             left.push_str(&format!(" · {device}"));
         }
@@ -648,6 +654,43 @@ fn download_details(progress: Progress, elapsed: Duration) -> String {
         details.push_str(&format!(" · {left} left"));
     }
     details
+}
+
+/// A path, with the home directory as `~`.
+fn tilde(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The models hack knows, where their weights are kept, and how much of
+/// each is there, for the `/models` command. The one running is marked.
+fn models_listing(running: &str) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for (i, model) in models::MODELS.iter().enumerate() {
+        let bullet = if i == 0 { "● " } else { "  " };
+        let mut line = vec![span(bullet), span(model.name).bold(), span(format!("  {}", model.repo))];
+        if model.name == running {
+            line.push(span("  running").dark_grey());
+        }
+        lines.push(line);
+        let location = match model.dir() {
+            Some(dir) => {
+                let (files, bytes) = fetch::on_disk(model, &dir);
+                let status = match files {
+                    0 => "not fetched".to_string(),
+                    n if n == model.files.len() => fetch::size(bytes),
+                    n => format!("{n}/{} files, {}", model.files.len(), fetch::size(bytes)),
+                };
+                format!("{} · {status}", tilde(&dir))
+            }
+            None => "no cache directory".to_string(),
+        };
+        lines.push(vec![span(format!("  {location}")).dark_grey()]);
+    }
+    lines
 }
 
 /// A line of a part of the reply, the first one marked with a bullet. A
