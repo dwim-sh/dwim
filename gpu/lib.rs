@@ -1,13 +1,28 @@
 //! Devices a model runs on: the operations a transformer's forward pass is
 //! built from, and their implementations. [`Cpu`] is the reference; the
-//! [`vulkan`] device runs the same operations on a GPU with hand-written
-//! compute kernels.
+//! `metal` and [`vulkan`] devices run the same operations on a GPU with
+//! hand-written compute kernels.
+
+#[cfg(test)]
+#[macro_use]
+mod tests;
 
 pub mod cpu;
+#[cfg(target_vendor = "apple")]
+pub mod metal;
 pub mod vulkan;
 
 pub use cpu::Cpu;
+#[cfg(target_vendor = "apple")]
+pub use metal::Metal;
 pub use vulkan::Vulkan;
+
+/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
+#[cfg(target_vendor = "apple")]
+pub type Gpu = Metal;
+/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
+#[cfg(not(target_vendor = "apple"))]
+pub type Gpu = Vulkan;
 
 /// A bf16 tensor on the host: its shape, and its values as raw bf16 bits.
 pub struct Tensor {

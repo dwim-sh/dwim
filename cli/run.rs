@@ -20,7 +20,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use hack_gpu::{Cpu, Vulkan};
+use hack_gpu::{Cpu, Gpu};
 use hack_harness::{self as harness, Harness};
 use hack_models::{Chat, Sampler, Tokenizer, qwen3::Model};
 
@@ -127,7 +127,7 @@ fn work(
             serve(dir, Cpu, requests, replies, stop)
         }
         Device::Gpu => {
-            let gpu = Vulkan::new()?;
+            let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let name = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
             let _ = replies.send(Reply::Device(name));
