@@ -5,9 +5,17 @@
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
 //! them as they happen. The one tool is `bash`, which runs a shell command,
 //! and the system prompt pushes the model to use it rather than answer from
-//! memory or ask the user for a command.
+//! memory or ask the user for a command. It also tells the model about the
+//! project it works in, since a small model won't go looking on its own.
 
-use std::{error::Error, ops::ControlFlow, process::Command};
+use std::{
+    error::Error,
+    fs,
+    ops::ControlFlow,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use hack_models::{Chat, Chunk, Device, ToolCall};
 
@@ -15,14 +23,19 @@ use hack_models::{Chat, Chunk, Device, ToolCall};
 /// command can't fill the context window.
 const MAX_OUTPUT: usize = 2000;
 
+/// Most of a project's `AGENTS.md` that goes into the system prompt.
+const MAX_INSTRUCTIONS: usize = 4000;
+
+/// Most of the files in the working directory the system prompt lists.
+const MAX_FILES: usize = 50;
+
 /// What the model gets back when it makes the same call twice in a row,
 /// instead of running it again: nothing ran in between to change its output,
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
-/// The system prompt declaring the tools, in the form Qwen3's chat template
-/// puts them.
-pub const SYSTEM: &str = r#"You are hack, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
+/// How the agent should behave: the start of the system prompt.
+const INSTRUCTIONS: &str = r#"You are hack, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
 - Never say you can't access files or run commands, and never ask the user which command to run: pick one yourself.
@@ -31,9 +44,11 @@ pub const SYSTEM: &str = r#"You are hack, a coding agent working in the user's p
 - If a command fails, read the error and try another way.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
-For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`.
+For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
 
-# Tools
+/// The tools, declared in the form Qwen3's chat template puts them: the end
+/// of the system prompt.
+const TOOLS: &str = r#"# Tools
 
 You may call one or more functions to assist with the user query.
 
@@ -46,6 +61,100 @@ For each function call, return a json object with function name and arguments wi
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"#;
+
+/// The system prompt for an agent working in `dir`: how to behave, where it
+/// is and what the project looks like, the project's own instructions from
+/// its `AGENTS.md` if it has one, and the tools.
+pub fn system_prompt(dir: &Path) -> String {
+    let mut prompt = format!("{INSTRUCTIONS}\n\n{}", environment(dir));
+    if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
+        let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
+        prompt.push_str(&format!("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"));
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(TOOLS);
+    prompt
+}
+
+/// Where the agent is: the working directory and the files in it, whether
+/// it is a git repository, the platform, and the date.
+fn environment(dir: &Path) -> String {
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let git = match branch {
+        Some(branch) if !branch.is_empty() => format!("yes, on branch {branch}"),
+        Some(_) => "yes".to_string(),
+        None => "no".to_string(),
+    };
+    let platform = match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        os => os,
+    };
+    let days = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() / 86400);
+    format!(
+        "# Environment\n\nWorking directory: {}\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
+        dir.display(),
+        files(dir),
+        date(days as i64),
+    )
+}
+
+/// The files and directories in `dir`, directories with a trailing slash,
+/// leaving out hidden ones.
+fn files(dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            match entry.file_type().ok()? {
+                _ if name.starts_with('.') => None,
+                kind if kind.is_dir() => Some(format!("{name}/")),
+                _ => Some(name),
+            }
+        })
+        .collect();
+    names.sort();
+    if names.len() > MAX_FILES {
+        names.truncate(MAX_FILES);
+        names.push("…".to_string());
+    }
+    names.join(" ")
+}
+
+/// The date `days` after 1970-01-01, as year-month-day.
+fn date(days: i64) -> String {
+    // Howard Hinnant's civil_from_days: count in 400-year eras of 146097
+    // days, from a year that starts in March so that leap days come last.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let day_of_era = z.rem_euclid(146097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Cuts `text` down to at most `max` bytes, on a character boundary, marking
+/// the cut with an ellipsis.
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let end = (0..=max).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+    format!("{}…", &text[..end])
+}
 
 /// What happens during a turn, as it happens.
 pub enum Event<'a> {
@@ -155,15 +264,11 @@ fn run(call: &ToolCall) -> String {
     if !output.status.success() {
         text.push_str(&format!("({})\n", output.status));
     }
-    if text.len() > MAX_OUTPUT {
-        let end = (0..=MAX_OUTPUT).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-        text.truncate(end);
-        text.push_str("…\n");
-    }
+    let text = truncate(text.trim_end(), MAX_OUTPUT);
     if text.is_empty() {
-        text.push_str("(no output)");
+        return "(no output)".to_string();
     }
-    text.trim_end().to_string()
+    text
 }
 
 #[cfg(test)]
@@ -196,6 +301,26 @@ mod tests {
         assert!(run(&call(r#"{"name": "rm", "arguments": {}}"#)).starts_with("error: unknown tool"));
         assert!(run(&call(r#"{"name": "bash", "arguments": {}}"#)).starts_with("error: bash needs"));
         assert!(ToolCall::parse("not json").is_err());
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(11016), "2000-02-29");
+        assert_eq!(date(19782), "2024-02-29");
+        assert_eq!(date(20711), "2026-09-15");
+    }
+
+    #[test]
+    fn describes_the_project() {
+        let prompt = system_prompt(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap());
+        assert!(prompt.starts_with(INSTRUCTIONS));
+        assert!(prompt.ends_with(TOOLS));
+        let files = prompt.lines().find_map(|line| line.strip_prefix("Files: ")).unwrap();
+        assert!(files.split(' ').any(|file| file == "Cargo.toml"));
+        assert!(files.split(' ').any(|file| file == "harness/"));
+        assert!(!files.contains(".git"));
+        assert!(prompt.contains("From AGENTS.md:\n\n# Hack"));
     }
 
     #[test]

@@ -154,7 +154,8 @@ fn serve<D: hack_gpu::Device>(
     // Qwen3's recommended sampling settings for replies with thinking.
     let sampler = Sampler::new(0.6, 20, 0.95, seed());
     let mut chat = Chat::new(model, tokenizer, sampler, MAX_LEN)?;
-    chat.system(harness::SYSTEM, |read, total| {
+    let cwd = env::current_dir()?;
+    chat.system(&harness::system_prompt(&cwd), |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
     let mut harness = Harness::new(chat);
