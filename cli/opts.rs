@@ -12,6 +12,10 @@ pub struct Opts {
     /// device to run the model on: gpu (default), or cpu
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
+
+    /// message to send the model first, as the words after the options
+    #[argh(positional, greedy)]
+    pub prompt: Vec<String>,
 }
 
 /// Where to run the model.
