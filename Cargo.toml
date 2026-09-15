@@ -1,0 +1,11 @@
+[workspace]
+members = ["cli", "gpu", "harness", "models"]
+resolver = "3"
+
+# The forward pass is unusably slow unoptimized on the CPU, so optimize the
+# model and the CPU device even in debug builds.
+[profile.dev.package.hack-models]
+opt-level = 3
+
+[profile.dev.package.hack-gpu]
+opt-level = 3

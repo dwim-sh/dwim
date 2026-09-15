@@ -1,0 +1,18 @@
+[package]
+name = "hack-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hack"
+path = "main.rs"
+
+[dependencies]
+argh = "0.1.19"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+hack-gpu = { version = "0.1.0", path = "../gpu" }
+hack-harness = { version = "0.1.0", path = "../harness" }
+hack-models = { version = "0.1.0", path = "../models" }
+unicode-width = "0.2.2"
+ureq = "3.4.1"

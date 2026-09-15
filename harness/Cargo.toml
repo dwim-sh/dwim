@@ -1,0 +1,10 @@
+[package]
+name = "hack-harness"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+hack-models = { version = "0.1.0", path = "../models" }
