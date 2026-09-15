@@ -15,6 +15,11 @@ use hack_models::{Chat, Chunk, Device, ToolCall};
 /// command can't fill the context window.
 const MAX_OUTPUT: usize = 2000;
 
+/// What the model gets back when it makes the same call twice in a row,
+/// instead of running it again: nothing ran in between to change its output,
+/// and small models otherwise tend to repeat a call over and over.
+const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
+
 /// The system prompt declaring the tools, in the form Qwen3's chat template
 /// puts them.
 pub const SYSTEM: &str = r#"You are hack, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
@@ -79,6 +84,8 @@ impl<D: Device> Harness<D> {
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
         let mut calls = self.chat.send(message, |chunk| on_event(event(chunk)))?;
+        // The last call run, as its name and arguments.
+        let mut last = None;
         while !calls.is_empty() {
             let mut outputs = Vec::new();
             for call in &calls {
@@ -93,7 +100,13 @@ impl<D: Device> Harness<D> {
                         {
                             return Ok(());
                         }
-                        run(&call)
+                        let this = Some((call.name.clone(), call.arguments.to_string()));
+                        if this == last {
+                            REPEATED.to_string()
+                        } else {
+                            last = this;
+                            run(&call)
+                        }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
