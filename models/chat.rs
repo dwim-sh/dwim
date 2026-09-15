@@ -27,7 +27,11 @@ use crate::{Device, Result, Sampler, Tokenizer, qwen3::{BATCH, Model, State}};
 /// caller.
 ///
 /// The whole conversation stays in the key/value cache, so each turn only
-/// runs the model over its new tokens.
+/// runs the model over its new tokens. The exception is the model's
+/// thoughts: as in Qwen3's chat template, the model sees the thoughts of the
+/// answer it is working on, but not those of earlier answers, so when the
+/// user sends a message, the answer to the last one is run again without
+/// them.
 pub struct Chat<D: Device> {
     model: Model<D>,
     state: State<D>,
@@ -35,6 +39,12 @@ pub struct Chat<D: Device> {
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
     len: usize,
+    /// Where the answer to the user's last message starts: the model's
+    /// replies to it, and the tool responses between them.
+    answer_start: usize,
+    /// The answer to the user's last message as later turns see it: without
+    /// the model's thoughts.
+    answer: Vec<u32>,
     im_start: u32,
     im_end: u32,
     end_of_text: u32,
@@ -82,6 +92,8 @@ impl<D: Device> Chat<D> {
             tokenizer,
             sampler,
             len: 0,
+            answer_start: 0,
+            answer: Vec::new(),
         })
     }
 
@@ -100,6 +112,7 @@ impl<D: Device> Chat<D> {
             self.feed(batch)?;
             on_progress(i * BATCH + batch.len(), turn.len());
         }
+        self.answer_start = self.len;
         Ok(())
     }
 
@@ -113,9 +126,11 @@ impl<D: Device> Chat<D> {
     /// model wrote them. The reply ends early if `on_chunk` breaks, and then
     /// makes no calls.
     pub fn send(&mut self, message: &str, on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
+        self.forget_thoughts()?;
         let content = self.tokenizer.encode(message)?;
         let turn = self.turn("user", content)?;
         self.feed(&turn)?;
+        self.answer_start = self.len;
         self.generate(on_chunk)
     }
 
@@ -129,7 +144,19 @@ impl<D: Device> Chat<D> {
         let content = self.tokenizer.encode_with_special(&responses.join("\n"))?;
         let turn = self.turn("user", content)?;
         self.feed(&turn)?;
+        self.answer.extend(turn);
         self.generate(on_chunk)
+    }
+
+    /// Runs the answer to the user's last message through the model again
+    /// without the thoughts in it, if it had any.
+    fn forget_thoughts(&mut self) -> Result<()> {
+        let answer = std::mem::take(&mut self.answer);
+        if self.len != self.answer_start + answer.len() {
+            self.len = self.answer_start;
+            self.feed(&answer)?;
+        }
+        Ok(())
     }
 
     /// Encodes a turn of the conversation around its content's tokens.
@@ -148,18 +175,50 @@ impl<D: Device> Chat<D> {
         prompt.extend(self.tokenizer.encode("assistant\n")?);
 
         let mut logits = self.feed(&prompt)?;
+        self.answer.extend(prompt);
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
         // Whether the model is inside its <think> block.
         let mut thinking = false;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;
+        // Whether the model's thought just ended, and blank lines after it
+        // are left out of the answer with it.
+        let mut after_thought = false;
+        // Whether the reply has shown any text, or called a tool.
+        let mut replied = false;
+        // Whether the model tried to end the reply without doing either, and
+        // must write out its answer before it may end.
+        let mut answering = false;
         let mut interrupted = false;
         loop {
-            let token = self.sampler.sample(&logits);
-            if token == self.im_end || token == self.end_of_text {
-                break;
+            if answering && !replied {
+                for token in [self.im_end, self.end_of_text, self.tool_call] {
+                    logits[token as usize] = f32::NEG_INFINITY;
+                }
             }
+            let mut token = self.sampler.sample(&logits);
+            if token == self.im_end || token == self.end_of_text {
+                if thinking {
+                    // The model sometimes ends its reply while still
+                    // thinking, which leaves nothing to show for it: close
+                    // the thought instead, so that it goes on to reply.
+                    token = self.think_end;
+                } else if replied {
+                    break;
+                } else {
+                    // The model sometimes ends its reply having answered only
+                    // in its thought: make it write the answer out, as text
+                    // rather than another tool call.
+                    answering = true;
+                    continue;
+                }
+            }
+            let blank = self.tokenizer.decode(token).iter().all(|&b| b == b'\n');
+            if !(thinking || token == self.think || (after_thought && blank)) {
+                self.answer.push(token);
+            }
+            after_thought = token == self.think_end || (after_thought && blank);
             let flow = if token == self.think {
                 thinking = true;
                 ControlFlow::Continue(())
@@ -167,6 +226,7 @@ impl<D: Device> Chat<D> {
                 thinking = false;
                 ControlFlow::Continue(())
             } else if token == self.tool_call {
+                replied = true;
                 call = Some(String::new());
                 ControlFlow::Continue(())
             } else if token == self.tool_call_end {
@@ -181,7 +241,10 @@ impl<D: Device> Chat<D> {
                     }
                     None if chunk.is_empty() => ControlFlow::Continue(()),
                     None if thinking => on_chunk(Chunk::Thought(&chunk)),
-                    None => on_chunk(Chunk::Text(&chunk)),
+                    None => {
+                        replied |= !chunk.trim().is_empty();
+                        on_chunk(Chunk::Text(&chunk))
+                    }
                 }
             };
             // Feed the token even if the reply ends here, so that the model
@@ -198,6 +261,7 @@ impl<D: Device> Chat<D> {
         let mut end = vec![self.im_end];
         end.extend(self.tokenizer.encode("\n")?);
         self.feed(&end)?;
+        self.answer.extend(end);
         Ok(if interrupted { Vec::new() } else { calls })
     }
 
