@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use hack_models::{Chat, Chunk, Device, ToolCall};
+use hack_models::{Chat, Chunk, LanguageModel, ToolCall};
 
 /// Most of a tool's output that goes back to the model, so that a chatty
 /// command can't fill the context window.
@@ -34,6 +34,17 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
+/// How a model writes tool calls: the form its chat template trained it
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// A JSON object in `<tool_call>` tags, as Qwen3 writes them.
+    Json,
+    /// A `<function=...>` block of `<parameter=...>` values in `<tool_call>`
+    /// tags, as Qwen3-Coder writes them.
+    Xml,
+}
+
 /// How the agent should behave: the start of the system prompt.
 const INSTRUCTIONS: &str = r#"You are hack, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
 
@@ -48,7 +59,7 @@ For example, for "review commit abc123", run `git show abc123` and point out bug
 
 /// The tools, declared in the form Qwen3's chat template puts them: the end
 /// of the system prompt.
-const TOOLS: &str = r#"# Tools
+const TOOLS_JSON: &str = r#"# Tools
 
 You may call one or more functions to assist with the user query.
 
@@ -62,17 +73,64 @@ For each function call, return a json object with function name and arguments wi
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"#;
 
+/// The tools, declared in the form Qwen3-Coder's chat template puts them:
+/// the end of the system prompt.
+const TOOLS_XML: &str = r#"# Tools
+
+You have access to the following functions:
+
+<tools>
+<function>
+<name>bash</name>
+<description>Run a shell command and return its output.</description>
+<parameters>
+<parameter>
+<name>command</name>
+<type>string</type>
+<description>The command to run.</description>
+</parameter>
+<required>["command"]</required>
+</parameters>
+</function>
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>"#;
+
 /// The system prompt for an agent working in `dir`: how to behave, where it
 /// is and what the project looks like, the project's own instructions from
-/// its `AGENTS.md` if it has one, and the tools.
-pub fn system_prompt(dir: &Path) -> String {
+/// its `AGENTS.md` if it has one, and the tools, declared in the given form.
+pub fn system_prompt(dir: &Path, tools: ToolFormat) -> String {
     let mut prompt = format!("{INSTRUCTIONS}\n\n{}", environment(dir));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str(&format!("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"));
     }
     prompt.push_str("\n\n");
-    prompt.push_str(TOOLS);
+    prompt.push_str(match tools {
+        ToolFormat::Json => TOOLS_JSON,
+        ToolFormat::Xml => TOOLS_XML,
+    });
     prompt
 }
 
@@ -170,12 +228,12 @@ pub enum Event<'a> {
 
 /// The loop around a [`Chat`] that runs the tools the model calls and feeds
 /// the results back, until the model replies with text alone.
-pub struct Harness<D: Device> {
-    chat: Chat<D>,
+pub struct Harness<M: LanguageModel> {
+    chat: Chat<M>,
 }
 
-impl<D: Device> Harness<D> {
-    pub fn new(chat: Chat<D>) -> Self {
+impl<M: LanguageModel> Harness<M> {
+    pub fn new(chat: Chat<M>) -> Self {
         Self { chat }
     }
 
@@ -313,14 +371,25 @@ mod tests {
 
     #[test]
     fn describes_the_project() {
-        let prompt = system_prompt(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let prompt = system_prompt(dir, ToolFormat::Json);
         assert!(prompt.starts_with(INSTRUCTIONS));
-        assert!(prompt.ends_with(TOOLS));
+        assert!(prompt.ends_with(TOOLS_JSON));
+        assert!(system_prompt(dir, ToolFormat::Xml).ends_with(TOOLS_XML));
         let files = prompt.lines().find_map(|line| line.strip_prefix("Files: ")).unwrap();
         assert!(files.split(' ').any(|file| file == "Cargo.toml"));
         assert!(files.split(' ').any(|file| file == "harness/"));
         assert!(!files.contains(".git"));
         assert!(prompt.contains("From AGENTS.md:\n\n# Hack"));
+    }
+
+    #[test]
+    fn parses_coder_calls() {
+        let ls = call("<function=bash>\n<parameter=command>\nls -l\n</parameter>\n</function>");
+        assert_eq!(ls.name, "bash");
+        assert_eq!(describe(&ls), "ls -l");
+        assert_eq!(run(&call("<function=bash>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>")), "a\nb");
+        assert!(ToolCall::parse("<function=bash>\n<parameter=command>\nls").is_err());
     }
 
     #[test]
