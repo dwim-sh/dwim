@@ -52,6 +52,16 @@ impl Weights {
         self.entries.contains_key(name)
     }
 
+    /// Names of every tensor in the file.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Shape of a tensor.
+    pub fn shape(&self, name: &str) -> Result<&[usize]> {
+        Ok(&self.entries.get(name).ok_or_else(|| format!("missing tensor '{name}'"))?.shape)
+    }
+
     /// Reads a bf16 tensor.
     pub fn read(&mut self, name: &str) -> Result<Tensor> {
         let entry = self

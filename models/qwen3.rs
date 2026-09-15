@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 
 use serde::Deserialize;
 
-use crate::{Device, Result, Weights};
+use crate::{Device, LanguageModel, Result, Weights, rope_table};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -36,7 +36,7 @@ impl Config {
     }
 }
 
-/// The model, with its weights on a device.
+/// The model, with its weights on a device, and the state of a sequence.
 pub struct Model<D: Device> {
     pub config: Config,
     pub device: D,
@@ -45,6 +45,7 @@ pub struct Model<D: Device> {
     norm: D::Weight,
     /// Output projection, or `None` when it shares the embedding table.
     lm_head: Option<D::Weight>,
+    state: Option<State<D>>,
 }
 
 struct Layer<D: Device> {
@@ -63,9 +64,10 @@ struct Layer<D: Device> {
 
 impl<D: Device> Model<D> {
     /// Loads a model from a directory holding a Hugging Face `config.json` and
-    /// `model.safetensors`, uploading its weights to `device`, and reporting
-    /// how many of its tensors are loaded, out of how many, as it goes.
-    pub fn load(dir: &Path, device: D, mut on_progress: impl FnMut(usize, usize)) -> Result<Self> {
+    /// `model.safetensors`, uploading its weights to `device`, with state for
+    /// sequences of up to `max_len` tokens, and reporting how many of its
+    /// tensors are loaded, out of how many, as it goes.
+    pub fn load(dir: &Path, device: D, max_len: usize, mut on_progress: impl FnMut(usize, usize)) -> Result<Self> {
         let config = Config::load(&dir.join("config.json"))?;
         let mut weights = Weights::open(&dir.join("model.safetensors"))?;
         let w = &mut weights;
@@ -103,28 +105,17 @@ impl<D: Device> Model<D> {
         };
         let embed = load("model.embed_tokens.weight")?;
         let norm = load("model.norm.weight")?;
-        Ok(Self {
+        let mut model = Self {
             embed,
             layers,
             norm,
             lm_head,
             config,
             device,
-        })
-    }
-
-    /// Runs `tokens`, the first at position `pos`, through the model, adding
-    /// their keys and values to the cache in `state`, and returns the logits
-    /// for the token that follows the last of them. Tokens run through the
-    /// model in batches of up to [`BATCH`].
-    pub fn forward(&self, state: &mut State<D>, tokens: &[u32], pos: usize) -> Vec<f32> {
-        assert!(!tokens.is_empty(), "no tokens to run");
-        assert!(pos + tokens.len() <= state.max_len, "tokens past the end of the cache");
-        let mut logits = Vec::new();
-        for (i, batch) in tokens.chunks(BATCH).enumerate() {
-            logits = self.forward_batch(state, batch, pos + i * BATCH);
-        }
-        logits
+            state: None,
+        };
+        model.state = Some(State::new(&model, max_len));
+        Ok(model)
     }
 
     fn forward_batch(&self, state: &mut State<D>, tokens: &[u32], pos: usize) -> Vec<f32> {
@@ -181,11 +172,31 @@ impl<D: Device> Model<D> {
     }
 }
 
+impl<D: Device> LanguageModel for Model<D> {
+    /// Adds the tokens' keys and values to the cache. Tokens run through the
+    /// model in batches of up to [`BATCH`].
+    fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        assert!(!tokens.is_empty(), "no tokens to run");
+        let mut state = self.state.take().expect("state");
+        assert!(pos + tokens.len() <= state.max_len, "tokens past the end of the cache");
+        let mut logits = Vec::new();
+        for (i, batch) in tokens.chunks(BATCH).enumerate() {
+            logits = self.forward_batch(&mut state, batch, pos + i * BATCH);
+        }
+        self.state = Some(state);
+        logits
+    }
+
+    fn max_len(&self) -> usize {
+        self.state.as_ref().expect("state").max_len
+    }
+}
+
 /// Buffers the forward pass computes in, with room for a batch of
 /// [`BATCH`] tokens, the key/value cache holding every position seen so far
 /// in half precision, and the rotary position embedding table for every
 /// position there is room for.
-pub struct State<D: Device> {
+struct State<D: Device> {
     /// Activations per token of each buffer, in the order of the fields.
     widths: [usize; 8],
     x: D::Buffer,
@@ -205,7 +216,7 @@ pub struct State<D: Device> {
 
 impl<D: Device> State<D> {
     /// Allocates state for sequences of up to `max_len` tokens.
-    pub fn new(model: &Model<D>, max_len: usize) -> Self {
+    fn new(model: &Model<D>, max_len: usize) -> Self {
         let c = &model.config;
         let d = &model.device;
         let q_dim = c.num_attention_heads * c.head_dim;
@@ -242,10 +253,6 @@ impl<D: Device> State<D> {
         }
     }
 
-    pub fn max_len(&self) -> usize {
-        self.max_len
-    }
-
     /// Sizes the buffers for a batch of `n` tokens.
     fn batch(&mut self, device: &D, n: usize) {
         assert!(n <= BATCH, "a batch of {n} tokens is more than {BATCH}");
@@ -263,20 +270,4 @@ impl<D: Device> State<D> {
             device.resize(buffer, n * width);
         }
     }
-}
-
-/// The cosines and sines of the angles rotary position embeddings rotate
-/// by, laid out as [`Device::rope`] expects, for positions up to `max_len`.
-/// Each of a head's pairs of elements rotates at its own frequency.
-pub fn rope_table(max_len: usize, head_dim: usize, theta: f32) -> Vec<f32> {
-    let half = head_dim / 2;
-    let mut table = Vec::with_capacity(max_len * head_dim);
-    for pos in 0..max_len {
-        for i in 0..half {
-            let freq = 1.0 / theta.powf((2 * i) as f32 / head_dim as f32);
-            let (sin, cos) = (pos as f32 * freq).sin_cos();
-            table.extend([cos, sin]);
-        }
-    }
-    table
 }

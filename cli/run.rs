@@ -13,7 +13,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -22,17 +22,15 @@ use crossterm::{
 };
 use hack_gpu::{Cpu, Gpu};
 use hack_harness::{self as harness, Harness};
-use hack_models::{Chat, Sampler, Tokenizer, qwen3::Model};
+use hack_models::{Chat, Tokenizer};
 
 use crate::{
+    convert,
     fetch::{self, Progress},
     models,
     opts::Device,
     tui::{self, Input, Line, Screen, span},
 };
-
-/// Longest conversation, in tokens, the key/value cache has room for.
-pub const MAX_LEN: usize = 4096;
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
@@ -88,6 +86,8 @@ pub fn run(name: &str, device: Device) -> Result<(), Box<dyn Error>> {
 enum Reply {
     /// Part of one of the model's files has been downloaded.
     Downloading(Progress),
+    /// The model's shards are being converted into a pack.
+    Converting(convert::Progress),
     /// Which device the model is being loaded onto.
     Device(String),
     /// How many of the model's tensors are loaded, out of how many.
@@ -121,38 +121,42 @@ fn work(
     fetch::fetch(model, dir, |progress| {
         let _ = replies.send(Reply::Downloading(progress));
     })?;
+    if model.sharded {
+        convert::ensure_pack(model, dir, |progress| {
+            let _ = replies.send(Reply::Converting(progress));
+        })?;
+    }
     match device {
         Device::Cpu => {
             let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(dir, Cpu, requests, replies, stop)
+            serve(dir, Cpu, model.tools, requests, replies, stop)
         }
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let name = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
             let _ = replies.send(Reply::Device(name));
-            serve(dir, gpu, requests, replies, stop)
+            serve(dir, gpu, model.tools, requests, replies, stop)
         }
     }
 }
 
 /// Loads the model and answers messages until the UI hangs up.
-fn serve<D: hack_gpu::Device>(
+fn serve<D: hack_gpu::Device + 'static>(
     dir: &Path,
     device: D,
+    tools: harness::ToolFormat,
     requests: Receiver<String>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let model = Model::load(dir, device, |done, total| {
+    let model = models::load(dir, device, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"))?;
-    // Qwen3's recommended sampling settings for replies with thinking.
-    let sampler = Sampler::new(0.6, 20, 0.95, seed());
-    let mut chat = Chat::new(model, tokenizer, sampler, MAX_LEN)?;
+    let mut chat = Chat::new(model, tokenizer, models::sampler(dir))?;
     let cwd = env::current_dir()?;
-    chat.system(&harness::system_prompt(&cwd), |read, total| {
+    chat.system(&harness::system_prompt(&cwd, tools), |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
     let mut harness = Harness::new(chat);
@@ -181,18 +185,12 @@ fn serve<D: hack_gpu::Device>(
     Ok(())
 }
 
-/// Seed for sampling, different on every run.
-pub fn seed() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or(1)
-}
-
 /// What the model is doing.
 enum Status {
     /// Downloading one of the model's files, since when.
     Downloading { since: Instant, progress: Progress },
+    /// Converting the model's shards, since when.
+    Converting { since: Instant, progress: convert::Progress },
     /// Loading the weights, since when: how many tensors so far, out of how
     /// many.
     Loading { since: Instant, done: usize, total: usize },
@@ -384,6 +382,13 @@ impl App {
                     _ => Instant::now(),
                 };
                 self.status = Status::Downloading { since, progress };
+            }
+            Reply::Converting(progress) => {
+                let since = match &self.status {
+                    Status::Converting { since, progress: last } if same_shard(*last, progress) => *since,
+                    _ => Instant::now(),
+                };
+                self.status = Status::Converting { since, progress };
             }
             Reply::Device(device) => self.device = Some(device),
             Reply::Loading { done, total } => {
@@ -583,6 +588,23 @@ impl App {
                 since,
                 download_details(progress, since.elapsed()),
             ),
+            Status::Converting { since, progress } => {
+                let (verb, details) = match progress {
+                    convert::Progress::Planning => ("Planning conversion…".to_string(), String::new()),
+                    convert::Progress::Downloading { shard, total, download } => (
+                        format!("Downloading shard {shard}/{total}…"),
+                        match download {
+                            Some(download) => download_details(download, since.elapsed()),
+                            None => "waiting for another download".to_string(),
+                        },
+                    ),
+                    convert::Progress::Converting { shard, total, done, tensors } => (
+                        format!("Converting shard {shard}/{total}…"),
+                        format!("{done}/{tensors} tensors · {}s", since.elapsed().as_secs()),
+                    ),
+                };
+                (verb, since, details)
+            }
             Status::Loading { since, done, total } => (
                 format!("Loading {}…", self.model),
                 since,
@@ -620,12 +642,24 @@ impl App {
         if let Some(device) = &self.device {
             left.push_str(&format!(" · {device}"));
         }
-        left.push_str(&format!(" · {}/{MAX_LEN} tokens", self.context));
+        left.push_str(&format!(" · {}/{} tokens", self.context, models::MAX_LEN));
         if let Some(speed) = self.speed {
             left.push_str(&format!(" · {speed:.1} tok/s"));
         }
         let right = "shift+enter for newline · ctrl+c to quit  ";
         tui::spread(vec![span(left).dark_grey()], vec![span(right).dark_grey()], columns)
+    }
+}
+
+/// Whether two conversion reports are about the same shard and stage, so
+/// that the time since it started carries over.
+fn same_shard(a: convert::Progress, b: convert::Progress) -> bool {
+    use convert::Progress::*;
+    match (a, b) {
+        (Planning, Planning) => true,
+        (Downloading { shard: x, .. }, Downloading { shard: y, .. }) => x == y,
+        (Converting { shard: x, .. }, Converting { shard: y, .. }) => x == y,
+        _ => false,
     }
 }
 

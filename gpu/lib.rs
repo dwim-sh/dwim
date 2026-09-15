@@ -121,6 +121,10 @@ pub trait Device {
     fn silu_mul(&self, gate: &mut Self::Buffer, up: &Self::Buffer);
 }
 
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// Converts bf16 bits to f32: bf16 is the top half of an f32.
 pub fn bf16(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)

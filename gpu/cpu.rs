@@ -3,7 +3,7 @@
 
 use rayon::prelude::*;
 
-use crate::{Device, Tensor, bf16, from_f16, to_f16};
+use crate::{Device, Tensor, bf16, from_f16, sigmoid, to_f16};
 
 pub struct Cpu;
 
@@ -160,7 +160,7 @@ impl Device for Cpu {
 
     fn silu_mul(&self, gate: &mut Vec<f32>, up: &Vec<f32>) {
         for (g, &u) in gate.iter_mut().zip(up) {
-            *g = *g / (1.0 + (-*g).exp()) * u;
+            *g = *g * sigmoid(*g) * u;
         }
     }
 }

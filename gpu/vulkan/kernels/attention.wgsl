@@ -23,7 +23,7 @@ var<immediate> p: Params;
 var<workgroup> scores: array<f32, MAX_LEN>;
 var<workgroup> partial: array<f32, 16>;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_index) lid: u32,
@@ -43,7 +43,7 @@ fn main(
 
     // Scores, and their maximum for a stable softmax.
     var m = -1e30;
-    for (var pos = lid; pos < len; pos += 128u) {
+    for (var pos = lid; pos < len; pos += 256u) {
         var s = 0.0;
         let kbase = (pos * kv_dim + kv) / 2u;
         for (var d = 0u; d < quads; d++) {
@@ -65,7 +65,7 @@ fn main(
     workgroupBarrier();
 
     var sum = 0.0;
-    for (var pos = lid; pos < len; pos += 128u) {
+    for (var pos = lid; pos < len; pos += 256u) {
         let e = exp(scores[pos] - m);
         scores[pos] = e;
         sum += e;
