@@ -15,6 +15,7 @@ macro_rules! check_against_cpu {
             rmsnorm_matches_cpu,
             rope_matches_cpu,
             attention_matches_cpu,
+            store_rounds_like_cpu,
             elementwise_match_cpu,
             resize_keeps_capacity
         );
@@ -72,6 +73,18 @@ fn buffer<D: Device>(gpu: &D, data: &[f32]) -> D::Buffer {
     let mut buf = gpu.alloc(data.len());
     gpu.write(&mut buf, data);
     buf
+}
+
+/// A cache holding `data`, stored in two parts split at `split`, as the
+/// prompt and then the tokens after it are.
+fn cache<D: Device>(gpu: &D, data: &[f32], split: usize) -> D::Cache {
+    let mut cache = gpu.alloc_cache(data.len());
+    for (offset, part) in [(0, &data[..split]), (split, &data[split..])] {
+        if !part.is_empty() {
+            gpu.store(&mut cache, offset, &buffer(gpu, part));
+        }
+    }
+    cache
 }
 
 pub fn write_and_read_round_trip<D: Device>(gpu: &D) {
@@ -153,12 +166,43 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         let k_cache = rng.floats((pos + n) * kv_dim);
         let v_cache = rng.floats((pos + n) * kv_dim);
         let mut want = vec![0.0; q.len()];
-        Cpu.attention(&mut want, &q, &k_cache, &v_cache, pos, n_heads, head_dim, n_kv_heads);
-        let (q, k, v) = (buffer(gpu, &q), buffer(gpu, &k_cache), buffer(gpu, &v_cache));
+        let (cpu_k, cpu_v) = (cache(&Cpu, &k_cache, pos * kv_dim), cache(&Cpu, &v_cache, pos * kv_dim));
+        Cpu.attention(&mut want, &q, &cpu_k, &cpu_v, pos, n_heads, head_dim, n_kv_heads);
+        let q = buffer(gpu, &q);
+        let (k, v) = (cache(gpu, &k_cache, pos * kv_dim), cache(gpu, &v_cache, pos * kv_dim));
         let mut out = gpu.alloc(want.len());
         gpu.attention(&mut out, &q, &k, &v, pos, n_heads, head_dim, n_kv_heads);
         close(&gpu.read(&out), &want, 1e-4);
     }
+}
+
+pub fn store_rounds_like_cpu<D: Device>(gpu: &D) {
+    // Attention over a single position weighs its value by exactly one, so
+    // it reads back what the value cache holds.
+    let head_dim = 128;
+    let mut v = Rng(9).floats(head_dim);
+    let edges = [
+        1e6,
+        -1e6,
+        65504.0,
+        65520.0,
+        1.0 + 2.0f32.powi(-11),
+        1.0 + 3.0 * 2.0f32.powi(-11),
+        0.1,
+        1e-9,
+        -3e-7,
+        2.0f32.powi(-14) * 0.99999,
+        -0.0,
+    ];
+    v[..edges.len()].copy_from_slice(&edges);
+    let q = vec![0.0; head_dim];
+    let mut want = vec![0.0; head_dim];
+    let cpu_v = cache(&Cpu, &v, 0);
+    Cpu.attention(&mut want, &q, &cpu_v, &cpu_v, 0, 1, head_dim, 1);
+    let gpu_v = cache(gpu, &v, 0);
+    let mut out = gpu.alloc(head_dim);
+    gpu.attention(&mut out, &buffer(gpu, &q), &gpu_v, &gpu_v, 0, 1, head_dim, 1);
+    assert_eq!(gpu.read(&out), want);
 }
 
 pub fn elementwise_match_cpu<D: Device>(gpu: &D) {

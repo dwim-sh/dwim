@@ -43,6 +43,12 @@ pub struct Buffer {
     cap: usize,
 }
 
+/// A cache of f16 activations in memory shared with the GPU.
+pub struct Cache {
+    buf: Object<dyn MTLBuffer>,
+    len: usize,
+}
+
 /// A bf16 weight tensor in memory shared with the GPU.
 pub struct Weight {
     buf: Object<dyn MTLBuffer>,
@@ -58,6 +64,7 @@ struct Kernels {
     attention: Object<dyn MTLComputePipelineState>,
     silu_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
+    store: Object<dyn MTLComputePipelineState>,
 }
 
 /// A command buffer with commands encoded but not yet committed.
@@ -116,6 +123,7 @@ impl Metal {
             attention: msl!("attention"),
             silu_mul: msl!("silu_mul"),
             copy: msl!("copy"),
+            store: msl!("store"),
         };
         let matmul_rows = THREADS / kernels.matmul.threadExecutionWidth();
         let tokens = device
@@ -255,6 +263,13 @@ struct CopyParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StoreParams {
+    offset: u32,
+    len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LenParams {
     len: u32,
 }
@@ -262,6 +277,7 @@ struct LenParams {
 impl Device for Metal {
     type Buffer = Buffer;
     type Weight = Weight;
+    type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
         assert!(tensor.data.len().is_multiple_of(8), "weights must come in multiples of eight");
@@ -282,6 +298,13 @@ impl Device for Metal {
             buf: self.buffer(len * 4),
             len,
             cap: len,
+        }
+    }
+
+    fn alloc_cache(&self, len: usize) -> Cache {
+        Cache {
+            buf: self.buffer(len * 2),
+            len,
         }
     }
 
@@ -311,6 +334,16 @@ impl Device for Metal {
         };
         let groups = len.div_ceil(THREADS);
         self.dispatch(&self.kernels.copy, &[&dst.buf, &src.buf], &params, groups, THREADS);
+    }
+
+    fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
+        assert!(offset + src.len <= cache.len);
+        let params = StoreParams {
+            offset: offset as u32,
+            len: src.len as u32,
+        };
+        let groups = src.len.div_ceil(THREADS);
+        self.dispatch(&self.kernels.store, &[&cache.buf, &src.buf], &params, groups, THREADS);
     }
 
     fn embed(&self, out: &mut Buffer, table: &Weight, tokens: &[u32]) {
@@ -374,8 +407,8 @@ impl Device for Metal {
         &self,
         out: &mut Buffer,
         q: &Buffer,
-        k_cache: &Buffer,
-        v_cache: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
         pos: usize,
         n_heads: usize,
         head_dim: usize,

@@ -1,7 +1,8 @@
-// Causal attention: one workgroup per (token, head). The threads first score
-// the positions the token attends to, strided, into workgroup memory; then
-// softmax the scores; then each thread sums one element of the head over the
-// values, reading them coalesced.
+// Causal attention over f16 caches, two half-precision floats to a word:
+// one workgroup per (token, head). The threads first score the positions the
+// token attends to, strided, into workgroup memory; then softmax the scores;
+// then each thread sums one element of the head over the values, reading
+// them coalesced.
 
 struct Params {
     n_heads: u32,
@@ -16,8 +17,8 @@ var<immediate> p: Params;
 
 @group(0) @binding(0) var<storage, read_write> out: array<f32>;
 @group(0) @binding(1) var<storage, read> q: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> k_cache: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> v_cache: array<f32>;
+@group(0) @binding(2) var<storage, read> k_cache: array<u32>;
+@group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 
 var<workgroup> scores: array<f32, MAX_LEN>;
 var<workgroup> partial: array<f32, 16>;
@@ -44,9 +45,10 @@ fn main(
     var m = -1e30;
     for (var pos = lid; pos < len; pos += 128u) {
         var s = 0.0;
-        let kbase = (pos * kv_dim + kv) / 4u;
+        let kbase = (pos * kv_dim + kv) / 2u;
         for (var d = 0u; d < quads; d++) {
-            s += dot(q[qbase / 4u + d], k_cache[kbase + d]);
+            let k = vec4(unpack2x16float(k_cache[kbase + 2u * d]), unpack2x16float(k_cache[kbase + 2u * d + 1u]));
+            s += dot(q[qbase / 4u + d], k);
         }
         s *= scale;
         scores[pos] = s;
@@ -82,7 +84,8 @@ fn main(
     if lid < p.head_dim {
         var o = 0.0;
         for (var pos = 0u; pos < len; pos++) {
-            o += scores[pos] * v_cache[pos * kv_dim + kv + lid];
+            let e = pos * kv_dim + kv + lid;
+            o += scores[pos] * unpack2x16float(v_cache[e / 2u])[e % 2u];
         }
         out[qbase + lid] = o / total;
     }
