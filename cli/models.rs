@@ -13,8 +13,9 @@ use hack_models::{LanguageModel, Sampler, pack::Pack, qwen3, qwen3_moe};
 /// Model used when none is named on the command line.
 pub const DEFAULT: &str = "qwen3-0.6b";
 
-/// Longest conversation, in tokens, a model's state has room for.
-pub const MAX_LEN: usize = 4096;
+/// Tokens of conversation a model has room for unless the command line says
+/// otherwise.
+pub const DEFAULT_CONTEXT: usize = 32768;
 
 /// Models hack knows how to fetch.
 pub const MODELS: &[Model] = &[
@@ -82,15 +83,26 @@ impl Model {
 }
 
 /// Loads the model in `dir`, of whichever architecture its `config.json`
-/// names, onto `device`, reporting how many of its tensors are loaded, out
-/// of how many, as it goes.
-pub fn load<D: Device + 'static>(dir: &Path, device: D, mut on_progress: impl FnMut(usize, usize)) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
+/// names, onto `device`, with room for `context` tokens of conversation,
+/// reporting how many of its tensors are loaded, out of how many, as it
+/// goes.
+pub fn load<D: Device + 'static>(
+    dir: &Path,
+    device: D,
+    context: usize,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
     let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
+    // Past the positions the model was trained on, its attention degrades.
+    let trained = config["max_position_embeddings"].as_u64().unwrap_or(u64::MAX) as usize;
+    if context == 0 || context > trained {
+        return Err(format!("a context of {context} tokens is outside the 1 to {trained} the model was trained for").into());
+    }
     Ok(match config["model_type"].as_str().unwrap_or("") {
-        "qwen3" => Box::new(qwen3::Model::load(dir, device, MAX_LEN, on_progress)?),
+        "qwen3" => Box::new(qwen3::Model::load(dir, device, context, on_progress)?),
         "qwen3_moe" => {
             let pack = Arc::new(Pack::open(&dir.join("model.hack"))?);
-            Box::new(qwen3_moe::Model::load(dir, pack, device, MAX_LEN, &mut on_progress)?)
+            Box::new(qwen3_moe::Model::load(dir, pack, device, context, &mut on_progress)?)
         }
         other => return Err(format!("unsupported model type '{other}'").into()),
     })

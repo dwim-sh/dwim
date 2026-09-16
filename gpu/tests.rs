@@ -160,7 +160,10 @@ pub fn rope_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
-    for (n_heads, head_dim, n_kv_heads, n, pos) in [(4, 8, 2, 3, 5), (16, 128, 8, 2, 300), (2, 128, 1, 1, 0)] {
+    // The last attends over more positions than one dispatch has scores
+    // for, all its tokens at once.
+    let cases = [(4, 8, 2, 3, 5), (16, 128, 8, 2, 300), (2, 128, 1, 1, 0), (16, 128, 4, 64, 32704)];
+    for (n_heads, head_dim, n_kv_heads, n, pos) in cases {
         let kv_dim = n_kv_heads * head_dim;
         let q = rng.floats(n * n_heads * head_dim);
         let k_cache = rng.floats((pos + n) * kv_dim);
