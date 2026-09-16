@@ -19,8 +19,10 @@ const STAGING: usize = 64 << 20;
 /// Most tokens one embedding lookup can take: the size of the tokens buffer.
 const MAX_TOKENS: usize = 1024;
 
-/// Most positions the attention kernel's workgroup memory has room for.
-pub const MAX_LEN: usize = 4096;
+/// Most attention scores one dispatch of the attention kernel computes, one
+/// per head of each token for each position it attends to: the size of the
+/// scores buffer. Longer batches are dispatched a few tokens at a time.
+const SCORES: usize = 16 << 20;
 
 /// A vector of f32 activations in device memory.
 pub struct Buffer {
@@ -88,6 +90,7 @@ pub struct Vulkan {
     memory_types: vk::PhysicalDeviceMemoryProperties,
     staging: Mapped,
     tokens: Mapped,
+    scores: vk::Buffer,
     max_groups: u32,
     name: String,
     /// Every buffer and its memory, freed when the device is dropped.
@@ -247,6 +250,7 @@ impl Vulkan {
                     buf: vk::Buffer::null(),
                     ptr: std::ptr::null_mut(),
                 },
+                scores: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
                 name,
                 allocations: Mutex::new(Vec::new()),
@@ -255,6 +259,7 @@ impl Vulkan {
             };
             gpu.staging = gpu.map(STAGING)?;
             gpu.tokens = gpu.map(MAX_TOKENS * 4)?;
+            gpu.scores = gpu.buffer(SCORES * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
             Ok(gpu)
         }
     }
@@ -511,6 +516,8 @@ struct AttentionParams {
     head_dim: u32,
     n_kv_heads: u32,
     pos: u32,
+    first: u32,
+    stride: u32,
 }
 
 #[repr(C)]
@@ -678,20 +685,28 @@ impl Device for Vulkan {
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
         assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
-        assert!(pos + n <= MAX_LEN, "attention over more than {MAX_LEN} positions");
-        let params = AttentionParams {
-            n_heads: n_heads as u32,
-            head_dim: head_dim as u32,
-            n_kv_heads: n_kv_heads as u32,
-            pos: pos as u32,
-        };
-        let groups = self.groups(n * n_heads, 1);
-        self.dispatch(
-            self.kernels.attention,
-            &[out.buf, q.buf, k_cache.buf, v_cache.buf],
-            &params,
-            groups,
-        );
+        // Every token's heads get a row of scores as long as the last token
+        // attends over, as many tokens to a dispatch as the scores fit.
+        let stride = pos + n;
+        assert!(n_heads * stride <= SCORES, "attention over {stride} positions needs more scores than {SCORES}");
+        let per_dispatch = SCORES / (n_heads * stride);
+        for first in (0..n).step_by(per_dispatch) {
+            let params = AttentionParams {
+                n_heads: n_heads as u32,
+                head_dim: head_dim as u32,
+                n_kv_heads: n_kv_heads as u32,
+                pos: pos as u32,
+                first: first as u32,
+                stride: stride as u32,
+            };
+            let groups = self.groups(per_dispatch.min(n - first) * n_heads, 1);
+            self.dispatch(
+                self.kernels.attention,
+                &[out.buf, q.buf, k_cache.buf, v_cache.buf, self.scores],
+                &params,
+                groups,
+            );
+        }
     }
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {

@@ -25,6 +25,12 @@ OPTIONS
        --device <device>
               Device to run the model on: gpu (default), or cpu.
 
+       --context <tokens>
+              Maximum conversation length in tokens (default: 32768).
+              Cannot exceed the model's supported context length.
+              Larger values reserve more memory on the selected device
+              at startup.
+
        --help Display usage information.
 
 INTERACTIVE SHELL

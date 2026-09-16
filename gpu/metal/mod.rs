@@ -24,8 +24,10 @@ use crate::{Device, Tensor};
 /// Most tokens one embedding lookup can take: the size of the tokens buffer.
 const MAX_TOKENS: usize = 1024;
 
-/// Most positions the attention kernel's threadgroup memory has room for.
-pub const MAX_LEN: usize = 4096;
+/// Most attention scores one dispatch of the attention kernel computes, one
+/// per head of each token for each position it attends to: the size of the
+/// scores buffer. Longer batches are dispatched a few tokens at a time.
+const SCORES: usize = 16 << 20;
 
 /// Threads in a threadgroup of every kernel but attention's.
 const THREADS: usize = 256;
@@ -78,6 +80,7 @@ pub struct Metal {
     queue: Object<dyn MTLCommandQueue>,
     kernels: Kernels,
     tokens: Object<dyn MTLBuffer>,
+    scores: Object<dyn MTLBuffer>,
     /// Rows of the weights each matmul threadgroup takes: one per SIMD group.
     matmul_rows: usize,
     name: String,
@@ -129,11 +132,15 @@ impl Metal {
         let tokens = device
             .newBufferWithLength_options(MAX_TOKENS * 4, MTLResourceOptions::StorageModeShared)
             .ok_or("out of GPU memory")?;
+        let scores = device
+            .newBufferWithLength_options(SCORES * 4, MTLResourceOptions::StorageModePrivate)
+            .ok_or("out of GPU memory")?;
         Ok(Self {
             device,
             queue,
             kernels,
             tokens,
+            scores,
             matmul_rows,
             name,
             pending: RefCell::new(None),
@@ -251,6 +258,8 @@ struct AttentionParams {
     head_dim: u32,
     n_kv_heads: u32,
     pos: u32,
+    first: u32,
+    stride: u32,
 }
 
 #[repr(C)]
@@ -418,20 +427,28 @@ impl Device for Metal {
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
         assert!(head_dim.is_multiple_of(4) && head_dim <= ATTENTION_THREADS);
-        assert!(pos + n <= MAX_LEN, "attention over more than {MAX_LEN} positions");
-        let params = AttentionParams {
-            n_heads: n_heads as u32,
-            head_dim: head_dim as u32,
-            n_kv_heads: n_kv_heads as u32,
-            pos: pos as u32,
-        };
-        self.dispatch(
-            &self.kernels.attention,
-            &[&out.buf, &q.buf, &k_cache.buf, &v_cache.buf],
-            &params,
-            n * n_heads,
-            ATTENTION_THREADS,
-        );
+        // Every token's heads get a row of scores as long as the last token
+        // attends over, as many tokens to a dispatch as the scores fit.
+        let stride = pos + n;
+        assert!(n_heads * stride <= SCORES, "attention over {stride} positions needs more scores than {SCORES}");
+        let per_dispatch = SCORES / (n_heads * stride);
+        for first in (0..n).step_by(per_dispatch) {
+            let params = AttentionParams {
+                n_heads: n_heads as u32,
+                head_dim: head_dim as u32,
+                n_kv_heads: n_kv_heads as u32,
+                pos: pos as u32,
+                first: first as u32,
+                stride: stride as u32,
+            };
+            self.dispatch(
+                &self.kernels.attention,
+                &[&out.buf, &q.buf, &k_cache.buf, &v_cache.buf, &self.scores],
+                &params,
+                per_dispatch.min(n - first) * n_heads,
+                ATTENTION_THREADS,
+            );
+        }
     }
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {

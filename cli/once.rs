@@ -21,7 +21,7 @@ use crate::{convert, fetch, models, opts::Device};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone.
-pub fn once(name: &str, device: Device, prompt: &str) -> Result<(), Box<dyn Error>> {
+pub fn once(name: &str, device: Device, context: usize, prompt: &str) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
     let mut progress = Progress::new();
     fetch::fetch(model, &dir, |file| {
@@ -43,28 +43,30 @@ pub fn once(name: &str, device: Device, prompt: &str) -> Result<(), Box<dyn Erro
         })?;
     }
     match device {
-        Device::Cpu => answer(&dir, Cpu, name, "the CPU", model.tools, prompt),
+        Device::Cpu => answer(&dir, Cpu, name, "the CPU", context, model.tools, prompt),
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let device = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
-            answer(&dir, gpu, name, &device, model.tools, prompt)
+            answer(&dir, gpu, name, &device, context, model.tools, prompt)
         }
     }
 }
 
-/// Loads `name` onto `device` and answers `prompt` with it, declaring the
-/// tools in the form the model writes calls in.
+/// Loads `name` onto `device`, with room for `context` tokens, and answers
+/// `prompt` with it, declaring the tools in the form the model writes calls
+/// in.
 fn answer<D: hack_gpu::Device + 'static>(
     dir: &Path,
     device: D,
     name: &str,
     on: &str,
+    context: usize,
     tools: harness::ToolFormat,
     prompt: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mut progress = Progress::new();
-    let model = models::load(dir, device, |done, total| {
+    let model = models::load(dir, device, context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
     let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"))?;

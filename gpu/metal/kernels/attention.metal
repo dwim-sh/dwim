@@ -1,7 +1,9 @@
 // Causal attention over f16 caches: one threadgroup per (token, head). The
-// threads first score the positions the token attends to, strided, into
-// threadgroup memory; then softmax the scores; then each thread sums one
-// element of the head over the values, reading them coalesced.
+// threads first score the positions the token attends to, strided, into the
+// threadgroup's row of the scores buffer; then softmax the scores; then each
+// thread sums one element of the head over the values, reading them
+// coalesced. A dispatch covers the tokens from `first` on, and each
+// threadgroup's row of scores is `stride` long.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -11,16 +13,17 @@ struct Params {
     uint head_dim;
     uint n_kv_heads;
     uint pos;
+    uint first;
+    uint stride;
 };
-
-constant uint MAX_LEN = 4096;
 
 kernel void attention(
     device float* out [[buffer(0)]],
     const device float4* q [[buffer(1)]],
     const device half4* k_cache [[buffer(2)]],
     const device half* v_cache [[buffer(3)]],
-    constant Params& p [[buffer(4)]],
+    device float* scores [[buffer(4)]],
+    constant Params& p [[buffer(5)]],
     uint group [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -28,17 +31,18 @@ kernel void attention(
     uint nsg [[simdgroups_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float scores[MAX_LEN];
     threadgroup float partial[32];
 
-    uint t = group / p.n_heads;
-    uint h = group % p.n_heads;
+    uint head = p.first * p.n_heads + group;
+    uint t = head / p.n_heads;
+    uint h = head % p.n_heads;
     uint kv = (h / (p.n_heads / p.n_kv_heads)) * p.head_dim;
     uint kv_dim = p.n_kv_heads * p.head_dim;
     uint len = p.pos + t + 1;
     float scale = rsqrt(float(p.head_dim));
     uint quads = p.head_dim / 4;
-    const device float4* qh = q + group * quads;
+    const device float4* qh = q + head * quads;
+    device float* row = scores + group * p.stride;
 
     // Scores, and their maximum for a stable softmax.
     float m = -FLT_MAX;
@@ -49,7 +53,7 @@ kernel void attention(
             s += dot(qh[d], float4(k[d]));
         }
         s *= scale;
-        scores[pos] = s;
+        row[pos] = s;
         m = max(m, s);
     }
     m = simd_max(m);
@@ -64,8 +68,8 @@ kernel void attention(
 
     float sum = 0.0f;
     for (uint pos = lid; pos < len; pos += threads) {
-        float e = exp(scores[pos] - m);
-        scores[pos] = e;
+        float e = exp(row[pos] - m);
+        row[pos] = e;
         sum += e;
     }
     sum = simd_sum(sum);
@@ -82,8 +86,8 @@ kernel void attention(
     if (lid < p.head_dim) {
         float o = 0.0f;
         for (uint pos = 0; pos < len; pos++) {
-            o += scores[pos] * v_cache[pos * kv_dim + kv + lid];
+            o += row[pos] * v_cache[pos * kv_dim + kv + lid];
         }
-        out[group * p.head_dim + lid] = o / total;
+        out[head * p.head_dim + lid] = o / total;
     }
 }
