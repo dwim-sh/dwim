@@ -31,11 +31,13 @@ INTERACTIVE SHELL
        The shell reads one message at a time. Anything you type is sent
        to the agent. Lines starting with a slash are commands:
 
-       /help  List the available commands.
+       /model List the models hack knows, where their weights are kept
+              and how much of each has been fetched, marking the one
+              running.
 
-       /clear Start a new conversation, discarding the current context.
-
-       /quit  Exit hack. Ctrl-D and Ctrl-C twice do the same.
+       Ctrl-C or Esc interrupts the agent while it works. Ctrl-C or
+       Ctrl-D on an empty line exits hack, and Ctrl-C on a line with
+       text clears it.
 
 FILES
        AGENTS.md
