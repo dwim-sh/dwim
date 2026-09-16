@@ -13,7 +13,7 @@ pub struct Opts {
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
 
-    /// message to send the model first, as the words after the options
+    /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,
 }

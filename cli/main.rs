@@ -1,5 +1,6 @@
 mod fetch;
 mod models;
+mod once;
 mod opts;
 mod run;
 mod tui;
@@ -9,8 +10,14 @@ use opts::Opts;
 fn main() {
     let opts: Opts = argh::from_env();
 
+    // A prompt on the command line is a one-off: answer it and exit, with
+    // nothing on standard output but the reply. Without one, open the shell.
     let prompt = opts.prompt.join(" ");
-    if let Err(e) = run::run(&opts.model, opts.device, &prompt) {
+    let result = match prompt.trim() {
+        "" => run::run(&opts.model, opts.device),
+        prompt => once::once(&opts.model, opts.device, prompt),
+    };
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

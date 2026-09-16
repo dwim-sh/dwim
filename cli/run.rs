@@ -32,15 +32,14 @@ use crate::{
 };
 
 /// Longest conversation, in tokens, the key/value cache has room for.
-const MAX_LEN: usize = 4096;
+pub const MAX_LEN: usize = 4096;
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
 
-/// Runs the shell until the user quits. The prompt, if there is one, sits
-/// in the input box while the model loads and is sent once it is ready.
-pub fn run(name: &str, device: Device, prompt: &str) -> Result<(), Box<dyn Error>> {
+/// Runs the shell until the user quits.
+pub fn run(name: &str, device: Device) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
     let (requests, requests_rx) = mpsc::channel();
@@ -62,7 +61,6 @@ pub fn run(name: &str, device: Device, prompt: &str) -> Result<(), Box<dyn Error
         device: None,
         cwd: env::current_dir().unwrap_or_default(),
         input: Input::default(),
-        prompted: !prompt.trim().is_empty(),
         history: Vec::new(),
         recalled: None,
         status: Status::Loading { since: Instant::now(), done: 0, total: 0 },
@@ -78,7 +76,6 @@ pub fn run(name: &str, device: Device, prompt: &str) -> Result<(), Box<dyn Error
         replies,
         stop,
     };
-    app.input.set(prompt.trim().to_string());
     let result = app.run();
     // Leave the conversation on screen, but not the input box, with a blank
     // line between it and whatever the shell prints next.
@@ -185,7 +182,7 @@ fn serve<D: hack_gpu::Device>(
 }
 
 /// Seed for sampling, different on every run.
-fn seed() -> u64 {
+pub fn seed() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as u64)
@@ -224,9 +221,6 @@ struct App {
     device: Option<String>,
     cwd: PathBuf,
     input: Input,
-    /// Whether a prompt from the command line is waiting in the input box
-    /// to be sent when the model is ready.
-    prompted: bool,
     /// Messages sent so far, and which one is recalled into the input.
     history: Vec<String>,
     recalled: Option<usize>,
@@ -409,9 +403,6 @@ impl App {
             Reply::Ready { tokens } => {
                 self.context = tokens;
                 self.status = Status::Idle;
-                if std::mem::take(&mut self.prompted) {
-                    self.submit();
-                }
             }
             Reply::Thought(text) => self.generated(Segment::Thought, &text),
             Reply::Text(text) => self.generated(Segment::Text, &text),

@@ -13,8 +13,10 @@ DESCRIPTION
        an interactive shell.
 
        With no arguments, hack starts an interactive session in the
-       current directory. If PROMPT is given, it is sent as the first
-       message of the session.
+       current directory. If PROMPT is given, hack answers it without
+       the shell and exits: the reply goes to standard output and
+       nothing else does, while progress, the model's thinking, the
+       commands it runs, and their output go to standard error.
 
 OPTIONS
        --model <model>
