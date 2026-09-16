@@ -519,7 +519,7 @@ impl App {
     fn command(&mut self, command: &str) {
         let (columns, _) = self.screen.size();
         let lines = match command.trim() {
-            "models" => models_listing(&self.model),
+            "model" => models_listing(&self.model),
             other => vec![vec![span(format!("● Unknown command /{other}"))]],
         };
         self.lines.extend(lines.iter().map(|line| tui::truncate(line, columns)));
@@ -676,7 +676,7 @@ fn tilde(path: &Path) -> String {
 }
 
 /// The models hack knows, where their weights are kept, and how much of
-/// each is there, for the `/models` command. The one running is marked.
+/// each is there, for the `/model` command. The one running is marked.
 fn models_listing(running: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
