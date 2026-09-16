@@ -3,13 +3,14 @@
 
 use rayon::prelude::*;
 
-use crate::{Device, Tensor, bf16};
+use crate::{Device, Tensor, bf16, from_f16, to_f16};
 
 pub struct Cpu;
 
 impl Device for Cpu {
     type Buffer = Vec<f32>;
     type Weight = Tensor;
+    type Cache = Vec<u16>;
 
     fn upload(&self, tensor: Tensor) -> Tensor {
         tensor
@@ -17,6 +18,10 @@ impl Device for Cpu {
 
     fn alloc(&self, len: usize) -> Vec<f32> {
         vec![0.0; len]
+    }
+
+    fn alloc_cache(&self, len: usize) -> Vec<u16> {
+        vec![0; len]
     }
 
     fn resize(&self, buf: &mut Vec<f32>, len: usize) {
@@ -34,6 +39,12 @@ impl Device for Cpu {
 
     fn copy(&self, dst: &mut Vec<f32>, dst_offset: usize, src: &Vec<f32>, src_offset: usize, len: usize) {
         dst[dst_offset..][..len].copy_from_slice(&src[src_offset..][..len]);
+    }
+
+    fn store(&self, cache: &mut Vec<u16>, offset: usize, src: &Vec<f32>) {
+        for (c, &x) in cache[offset..][..src.len()].iter_mut().zip(src) {
+            *c = to_f16(x);
+        }
     }
 
     fn embed(&self, out: &mut Vec<f32>, table: &Tensor, tokens: &[u32]) {
@@ -115,8 +126,8 @@ impl Device for Cpu {
         &self,
         out: &mut Vec<f32>,
         q: &Vec<f32>,
-        k_cache: &Vec<f32>,
-        v_cache: &Vec<f32>,
+        k_cache: &Vec<u16>,
+        v_cache: &Vec<u16>,
         pos: usize,
         n_heads: usize,
         head_dim: usize,
@@ -136,15 +147,13 @@ impl Device for Cpu {
                 let len = pos + token + 1;
                 let kv = head / group * head_dim;
                 let mut scores: Vec<f32> = (0..len)
-                    .map(|t| scale * dot_f32(q, &k_cache[t * kv_dim + kv..][..head_dim]))
+                    .map(|t| scale * dot_f16(q, &k_cache[t * kv_dim + kv..][..head_dim]))
                     .collect();
                 softmax(&mut scores);
                 out.fill(0.0);
                 for (t, &score) in scores.iter().enumerate() {
                     let v = &v_cache[t * kv_dim + kv..][..head_dim];
-                    for (o, &v) in out.iter_mut().zip(v) {
-                        *o += score * v;
-                    }
+                    add_scaled_f16(out, score, v);
                 }
             });
     }
@@ -172,8 +181,55 @@ fn dot(w: &[u16], x: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + rest
 }
 
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(a, b)| a * b).sum()
+/// Dot product of f32 activations with f16 ones, in eight independent sums
+/// like [`dot`].
+fn dot_f16(a: &[f32], b: &[u16]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for (a, b) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        let b = from_f16_8(b.try_into().unwrap());
+        for i in 0..8 {
+            acc[i] += a[i] * b[i];
+        }
+    }
+    let done = a.len() / 8 * 8;
+    let rest: f32 = a[done..].iter().zip(&b[done..]).map(|(a, &b)| a * from_f16(b)).sum();
+    acc.iter().sum::<f32>() + rest
+}
+
+/// `out += scale * x` for f16 activations `x`.
+fn add_scaled_f16(out: &mut [f32], scale: f32, x: &[u16]) {
+    for (out, x) in out.chunks_exact_mut(8).zip(x.chunks_exact(8)) {
+        let x = from_f16_8(x.try_into().unwrap());
+        for i in 0..8 {
+            out[i] += scale * x[i];
+        }
+    }
+    let done = out.len() / 8 * 8;
+    for (o, &x) in out[done..].iter_mut().zip(&x[done..]) {
+        *o += scale * from_f16(x);
+    }
+}
+
+/// Converts eight f16 activations to f32 with NEON, whose conversion is many
+/// times faster than one that goes a value at a time.
+#[cfg(all(target_arch = "aarch64", target_feature = "fp16"))]
+fn from_f16_8(bits: &[u16; 8]) -> [f32; 8] {
+    use std::arch::aarch64::{float16x4_t, uint16x4_t, vcvt_f32_f16, vld1_u16, vst1q_f32};
+
+    let mut out = [0.0; 8];
+    for i in [0, 4] {
+        unsafe {
+            let half = std::mem::transmute::<uint16x4_t, float16x4_t>(vld1_u16(bits[i..].as_ptr()));
+            vst1q_f32(out[i..].as_mut_ptr(), vcvt_f32_f16(half));
+        }
+    }
+    out
+}
+
+/// Converts eight f16 activations to f32.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "fp16")))]
+fn from_f16_8(bits: &[u16; 8]) -> [f32; 8] {
+    bits.map(from_f16)
 }
 
 fn softmax(x: &mut [f32]) {
@@ -185,5 +241,44 @@ fn softmax(x: &mut [f32]) {
     }
     for v in x.iter_mut() {
         *v /= sum;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::from_f16_8;
+    use crate::{F16_MAX, from_f16, to_f16};
+
+    #[test]
+    fn f16_round_trips_what_it_can_represent() {
+        for x in [0.0, -0.0, 1.0, -2.5, 0.333_251_95, 65504.0, -65504.0, 1e-5, -3e-7, 2.0f32.powi(-14)] {
+            let bits = to_f16(x);
+            let back = from_f16(bits);
+            assert_eq!(to_f16(back), bits, "{x}");
+        }
+        for bits in 0..=u16::MAX {
+            if bits & 0x7c00 != 0x7c00 {
+                assert_eq!(to_f16(from_f16(bits)), bits, "{bits:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn f16_converts_the_same_eight_at_a_time() {
+        let finite: Vec<u16> = (0..=u16::MAX).filter(|bits| bits & 0x7c00 != 0x7c00).collect();
+        for bits in finite.chunks_exact(8) {
+            let bits: &[u16; 8] = bits.try_into().unwrap();
+            assert_eq!(from_f16_8(bits).map(f32::to_bits), bits.map(|b| from_f16(b).to_bits()));
+        }
+    }
+
+    #[test]
+    fn f16_rounds_to_nearest_and_clamps() {
+        assert_eq!(from_f16(to_f16(1.0 + 2.0f32.powi(-11))), 1.0, "a tie rounds to even");
+        assert_eq!(from_f16(to_f16(1.0 + 3.0 * 2.0f32.powi(-11))), 1.0 + 2.0f32.powi(-9));
+        assert_eq!(from_f16(to_f16(0.1)), 0.099975586);
+        assert_eq!(from_f16(to_f16(1e6)), F16_MAX);
+        assert_eq!(from_f16(to_f16(-1e6)), -F16_MAX);
+        assert_eq!(from_f16(to_f16(1e-9)), 0.0);
     }
 }

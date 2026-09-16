@@ -29,6 +29,12 @@ pub struct Buffer {
     cap: usize,
 }
 
+/// A cache of f16 activations in device memory, two to a 32-bit word.
+pub struct Cache {
+    buf: vk::Buffer,
+    len: usize,
+}
+
 /// A bf16 weight tensor in device memory.
 pub struct Weight {
     buf: vk::Buffer,
@@ -43,6 +49,7 @@ struct Kernels {
     rope: vk::Pipeline,
     attention: vk::Pipeline,
     silu_mul: vk::Pipeline,
+    store: vk::Pipeline,
 }
 
 /// A host-visible buffer, mapped for as long as the device lives.
@@ -199,6 +206,7 @@ impl Vulkan {
                 rope: spv!("rope"),
                 attention: spv!("attention"),
                 silu_mul: spv!("silu_mul"),
+                store: spv!("store"),
             };
 
             let mut gpu = Self {
@@ -414,7 +422,7 @@ impl Drop for Vulkan {
         unsafe {
             let _ = self.device.device_wait_idle();
             let k = &self.kernels;
-            for pipeline in [k.embed, k.matmul, k.add, k.rmsnorm, k.rope, k.attention, k.silu_mul] {
+            for pipeline in [k.embed, k.matmul, k.add, k.rmsnorm, k.rope, k.attention, k.silu_mul, k.store] {
                 self.device.destroy_pipeline(pipeline, None);
             }
             self.device.destroy_pipeline_layout(self.layout, None);
@@ -474,6 +482,13 @@ struct AttentionParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StoreParams {
+    offset: u32,
+    len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LenParams {
     len: u32,
 }
@@ -481,6 +496,7 @@ struct LenParams {
 impl Device for Vulkan {
     type Buffer = Buffer;
     type Weight = Weight;
+    type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
         assert!(tensor.data.len().is_multiple_of(8), "weights must come in multiples of eight");
@@ -501,6 +517,14 @@ impl Device for Vulkan {
         unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
         self.barrier(cmd);
         Buffer { buf, len, cap: len }
+    }
+
+    fn alloc_cache(&self, len: usize) -> Cache {
+        let buf = self.device_buffer(len.div_ceil(2) * 4);
+        let cmd = self.cmd();
+        unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
+        self.barrier(cmd);
+        Cache { buf, len }
     }
 
     fn resize(&self, buf: &mut Buffer, len: usize) {
@@ -530,6 +554,18 @@ impl Device for Vulkan {
             .size((len * 4) as u64);
         unsafe { self.device.cmd_copy_buffer(cmd, src.buf, dst.buf, &[region]) };
         self.barrier(cmd);
+    }
+
+    fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
+        assert!(offset + src.len <= cache.len);
+        // The kernel packs whole words of two activations.
+        assert!(offset.is_multiple_of(2) && src.len.is_multiple_of(2));
+        let params = StoreParams {
+            offset: offset as u32,
+            len: src.len as u32,
+        };
+        let groups = self.groups(src.len / 2, 256);
+        self.dispatch(self.kernels.store, &[cache.buf, src.buf], &params, groups);
     }
 
     fn embed(&self, out: &mut Buffer, table: &Weight, tokens: &[u32]) {
@@ -598,8 +634,8 @@ impl Device for Vulkan {
         &self,
         out: &mut Buffer,
         q: &Buffer,
-        k_cache: &Buffer,
-        v_cache: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
         pos: usize,
         n_heads: usize,
         head_dim: usize,

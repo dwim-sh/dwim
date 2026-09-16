@@ -148,8 +148,8 @@ impl<D: Device> Model<D> {
             d.rmsnorm(&mut s.k, &layer.k_norm, eps);
             d.rope(&mut s.q, &s.rope, pos, c.num_attention_heads, c.head_dim);
             d.rope(&mut s.k, &s.rope, pos, c.num_key_value_heads, c.head_dim);
-            d.copy(&mut s.k_cache[i], pos * kv_dim, &s.k, 0, n * kv_dim);
-            d.copy(&mut s.v_cache[i], pos * kv_dim, &s.v, 0, n * kv_dim);
+            d.store(&mut s.k_cache[i], pos * kv_dim, &s.k);
+            d.store(&mut s.v_cache[i], pos * kv_dim, &s.v);
             d.attention(
                 &mut s.att,
                 &s.q,
@@ -182,9 +182,9 @@ impl<D: Device> Model<D> {
 }
 
 /// Buffers the forward pass computes in, with room for a batch of
-/// [`BATCH`] tokens, the key/value cache holding every position seen so far,
-/// and the rotary position embedding table for every position there is room
-/// for.
+/// [`BATCH`] tokens, the key/value cache holding every position seen so far
+/// in half precision, and the rotary position embedding table for every
+/// position there is room for.
 pub struct State<D: Device> {
     /// Activations per token of each buffer, in the order of the fields.
     widths: [usize; 8],
@@ -197,8 +197,8 @@ pub struct State<D: Device> {
     gate: D::Buffer,
     up: D::Buffer,
     logits: D::Buffer,
-    k_cache: Vec<D::Buffer>,
-    v_cache: Vec<D::Buffer>,
+    k_cache: Vec<D::Cache>,
+    v_cache: Vec<D::Cache>,
     rope: D::Buffer,
     max_len: usize,
 }
@@ -235,8 +235,8 @@ impl<D: Device> State<D> {
             gate,
             up,
             logits: d.alloc(c.vocab_size),
-            k_cache: (0..c.num_hidden_layers).map(|_| d.alloc(max_len * kv_dim)).collect(),
-            v_cache: (0..c.num_hidden_layers).map(|_| d.alloc(max_len * kv_dim)).collect(),
+            k_cache: (0..c.num_hidden_layers).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
+            v_cache: (0..c.num_hidden_layers).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
             rope,
             max_len,
         }

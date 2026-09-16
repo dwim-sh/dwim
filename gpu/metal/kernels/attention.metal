@@ -1,7 +1,7 @@
-// Causal attention: one threadgroup per (token, head). The threads first
-// score the positions the token attends to, strided, into threadgroup
-// memory; then softmax the scores; then each thread sums one element of the
-// head over the values, reading them coalesced.
+// Causal attention over f16 caches: one threadgroup per (token, head). The
+// threads first score the positions the token attends to, strided, into
+// threadgroup memory; then softmax the scores; then each thread sums one
+// element of the head over the values, reading them coalesced.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -18,8 +18,8 @@ constant uint MAX_LEN = 4096;
 kernel void attention(
     device float* out [[buffer(0)]],
     const device float4* q [[buffer(1)]],
-    const device float4* k_cache [[buffer(2)]],
-    const device float* v_cache [[buffer(3)]],
+    const device half4* k_cache [[buffer(2)]],
+    const device half* v_cache [[buffer(3)]],
     constant Params& p [[buffer(4)]],
     uint group [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
@@ -43,10 +43,10 @@ kernel void attention(
     // Scores, and their maximum for a stable softmax.
     float m = -FLT_MAX;
     for (uint pos = lid; pos < len; pos += threads) {
-        const device float4* k = k_cache + (pos * kv_dim + kv) / 4;
+        const device half4* k = k_cache + (pos * kv_dim + kv) / 4;
         float s = 0.0f;
         for (uint d = 0; d < quads; d++) {
-            s += dot(qh[d], k[d]);
+            s += dot(qh[d], float4(k[d]));
         }
         s *= scale;
         scores[pos] = s;
