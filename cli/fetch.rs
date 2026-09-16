@@ -79,7 +79,7 @@ fn remove_stale(dir: &Path) -> io::Result<()> {
 /// name is unique to this process, so that runs started at the same time
 /// don't write over each other: whichever finishes first puts the file in
 /// place, and the others replace it with their identical copies.
-fn download(
+pub fn download(
     model: &Model,
     file: &'static str,
     path: &Path,

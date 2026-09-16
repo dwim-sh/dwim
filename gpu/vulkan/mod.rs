@@ -52,6 +52,21 @@ struct Kernels {
     store: vk::Pipeline,
 }
 
+impl Kernels {
+    fn all(&self) -> [vk::Pipeline; 8] {
+        [
+            self.embed,
+            self.matmul,
+            self.add,
+            self.rmsnorm,
+            self.rope,
+            self.attention,
+            self.silu_mul,
+            self.store,
+        ]
+    }
+}
+
 /// A host-visible buffer, mapped for as long as the device lives.
 struct Mapped {
     buf: vk::Buffer,
@@ -79,6 +94,8 @@ pub struct Vulkan {
     allocations: Mutex<Vec<(vk::Buffer, vk::DeviceMemory)>>,
     /// Whether the command buffer is open with commands not yet submitted.
     recording: Mutex<bool>,
+    /// Whether a pending command still reads from staging.
+    staging_busy: Mutex<bool>,
 }
 
 // The mapped pointers are only used from whichever thread owns the device.
@@ -149,9 +166,9 @@ impl Vulkan {
             )?[0];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-            // Every kernel binds up to four storage buffers, pushed with each
+            // Every kernel binds up to eight storage buffers, pushed with each
             // dispatch, and takes its sizes as push constants.
-            let bindings: Vec<_> = (0..4)
+            let bindings: Vec<_> = (0..8)
                 .map(|i| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(i)
@@ -234,6 +251,7 @@ impl Vulkan {
                 name,
                 allocations: Mutex::new(Vec::new()),
                 recording: Mutex::new(false),
+                staging_busy: Mutex::new(false),
             };
             gpu.staging = gpu.map(STAGING)?;
             gpu.tokens = gpu.map(MAX_TOKENS * 4)?;
@@ -344,6 +362,7 @@ impl Vulkan {
             self.device.reset_fences(&[self.fence]).unwrap();
         }
         *recording = false;
+        *self.staging_busy.lock().unwrap() = false;
     }
 
     /// Records a kernel over `groups` workgroups, bound to `buffers` in
@@ -383,9 +402,19 @@ impl Vulkan {
     }
 
     /// Copies bytes from the host into a device buffer, through staging.
+    ///
+    /// The copy is recorded behind whatever is pending and left there: it
+    /// runs with the next submission, and staging is not written again until
+    /// it has. Data larger than staging goes in chunks, each submitted.
     fn upload_bytes(&self, dst: vk::Buffer, offset: usize, data: &[u8]) {
+        let chunks = data.chunks(STAGING).count();
         for (i, chunk) in data.chunks(STAGING).enumerate() {
-            self.flush();
+            let mut busy = self.staging_busy.lock().unwrap();
+            if *busy {
+                drop(busy);
+                self.flush();
+                busy = self.staging_busy.lock().unwrap();
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging.ptr, chunk.len());
                 let cmd = self.cmd();
@@ -393,16 +422,21 @@ impl Vulkan {
                     .dst_offset((offset + i * STAGING) as u64)
                     .size(chunk.len() as u64);
                 self.device.cmd_copy_buffer(cmd, self.staging.buf, dst, &[region]);
+                self.barrier(cmd);
             }
-            self.barrier(self.cmd);
-            self.flush();
+            *busy = true;
+            drop(busy);
+            if chunks > 1 {
+                self.flush();
+            }
         }
     }
 
-    /// Copies bytes from a device buffer to the host, through staging.
+    /// Copies bytes from a device buffer to the host, through staging: the
+    /// copy is recorded behind whatever is pending, and everything is
+    /// submitted together.
     fn download_bytes(&self, src: vk::Buffer, data: &mut [u8]) {
         for (i, chunk) in data.chunks_mut(STAGING).enumerate() {
-            self.flush();
             unsafe {
                 let cmd = self.cmd();
                 let region = vk::BufferCopy::default()
@@ -421,8 +455,7 @@ impl Drop for Vulkan {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            let k = &self.kernels;
-            for pipeline in [k.embed, k.matmul, k.add, k.rmsnorm, k.rope, k.attention, k.silu_mul, k.store] {
+            for pipeline in self.kernels.all() {
                 self.device.destroy_pipeline(pipeline, None);
             }
             self.device.destroy_pipeline_layout(self.layout, None);
@@ -644,7 +677,7 @@ impl Device for Vulkan {
         let n = q.len / (n_heads * head_dim);
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(4) && head_dim <= 128);
+        assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
         assert!(pos + n <= MAX_LEN, "attention over more than {MAX_LEN} positions");
         let params = AttentionParams {
             n_heads: n_heads as u32,

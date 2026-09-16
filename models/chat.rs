@@ -3,7 +3,11 @@ use std::ops::ControlFlow;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{Device, Result, Sampler, Tokenizer, qwen3::{BATCH, Model, State}};
+use crate::{LanguageModel, Result, Sampler, Tokenizer};
+
+/// Most tokens fed to the model at once while it reads a prompt, between
+/// progress reports.
+const BATCH: usize = 64;
 
 /// A conversation with an instruction-tuned model, in the ChatML format that
 /// Qwen models are trained on:
@@ -26,15 +30,14 @@ use crate::{Device, Result, Sampler, Tokenizer, qwen3::{BATCH, Model, State}};
 /// only speaks the format: what the tools are and running them is up to the
 /// caller.
 ///
-/// The whole conversation stays in the key/value cache, so each turn only
+/// The whole conversation stays in the model's state, so each turn only
 /// runs the model over its new tokens. The exception is the model's
 /// thoughts: as in Qwen3's chat template, the model sees the thoughts of the
 /// answer it is working on, but not those of earlier answers, so when the
 /// user sends a message, the answer to the last one is run again without
 /// them.
-pub struct Chat<D: Device> {
-    model: Model<D>,
-    state: State<D>,
+pub struct Chat<M: LanguageModel> {
+    model: M,
     tokenizer: Tokenizer,
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
@@ -70,17 +73,46 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    /// Parses the body of a `<tool_call>` block.
+    /// Parses the body of a `<tool_call>` block: either a JSON object with
+    /// the name and the arguments, as Qwen3 writes it, or a `<function=name>`
+    /// block of `<parameter=name>` values, as Qwen3-Coder writes it, whose
+    /// values are all strings.
     pub fn parse(text: &str) -> Result<Self> {
-        Ok(serde_json::from_str(text.trim())?)
+        let text = text.trim();
+        if text.starts_with('{') {
+            return Ok(serde_json::from_str(text)?);
+        }
+        let rest = text.strip_prefix("<function=").ok_or("a tool call is a JSON object or a <function=...> block")?;
+        let (name, mut rest) = rest.split_once('>').ok_or("unterminated function name")?;
+        let mut arguments = serde_json::Map::new();
+        loop {
+            rest = rest.trim_start();
+            if let Some(after) = rest.strip_prefix("</function>") {
+                if !after.trim().is_empty() {
+                    return Err("text after </function>".into());
+                }
+                break;
+            }
+            let param = rest.strip_prefix("<parameter=").ok_or("expected <parameter=...> or </function>")?;
+            let (key, rest_of_param) = param.split_once('>').ok_or("unterminated parameter name")?;
+            let (value, after) = rest_of_param.split_once("</parameter>").ok_or("unterminated parameter")?;
+            // The value sits on its own lines between the tags.
+            let value = value.strip_prefix('\n').unwrap_or(value);
+            let value = value.strip_suffix('\n').unwrap_or(value);
+            arguments.insert(key.to_string(), Value::String(value.to_string()));
+            rest = after;
+        }
+        Ok(Self {
+            name: name.to_string(),
+            arguments: Value::Object(arguments),
+        })
     }
 }
 
-impl<D: Device> Chat<D> {
-    /// Starts a conversation with room for `max_len` tokens.
-    pub fn new(model: Model<D>, tokenizer: Tokenizer, sampler: Sampler, max_len: usize) -> Result<Self> {
+impl<M: LanguageModel> Chat<M> {
+    /// Starts a conversation.
+    pub fn new(model: M, tokenizer: Tokenizer, sampler: Sampler) -> Result<Self> {
         Ok(Self {
-            state: State::new(&model, max_len),
             model,
             im_start: tokenizer.special("<|im_start|>")?,
             im_end: tokenizer.special("<|im_end|>")?,
@@ -267,10 +299,10 @@ impl<D: Device> Chat<D> {
 
     /// Runs tokens through the model, returning the logits after the last one.
     fn feed(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
-        if self.len + tokens.len() > self.state.max_len() {
+        if self.len + tokens.len() > self.model.max_len() {
             return Err("the conversation no longer fits in the context window".into());
         }
-        let logits = self.model.forward(&mut self.state, tokens, self.len);
+        let logits = self.model.forward(tokens, self.len);
         self.len += tokens.len();
         Ok(logits)
     }
