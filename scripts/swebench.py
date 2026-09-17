@@ -15,8 +15,8 @@ untrusted repository, as you. Run this in a container or a virtual machine.
 """
 import argparse, glob, json, os, pathlib, shutil, subprocess, sys, urllib.request
 
-DATASET = "princeton-nlp/SWE-bench_Lite"
-ROWS = "https://datasets-server.huggingface.co/rows?dataset=princeton-nlp%2FSWE-bench_Lite&config=default&split=test"
+DATASET = "SWE-bench/SWE-bench_Lite"
+ROWS = "https://datasets-server.huggingface.co/rows?dataset=SWE-bench%2FSWE-bench_Lite&config=default&split=test"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
