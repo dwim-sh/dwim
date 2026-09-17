@@ -14,7 +14,7 @@ A coding agent harness in Rust.
 ## Models
 
 * `qwen3-0.6b` (default) is one safetensors file, run entirely on the device in bf16.
-* `qwen3-coder-30b-a3b` is 30B parameters in 16 shards (61 GB bf16). `cli/convert.rs` streams the shards one at a time into `~/.cache/hack/models/qwen3-coder-30b-a3b/model.hack`, quantizing the routed experts to four bits (about 16 GB) and keeping the dense layers bf16, deleting each shard once converted; it resumes where it left off. At run time the dense layers live on the GPU and the experts stay in the pack's memory mapping, run on the CPU; each layer's router output is read back to pick them. The experts want to stay in the page cache. The model is not offered on Apple platforms, where the CPU experts have no fast path.
+* `qwen3-coder-30b-a3b` is 30B parameters in 16 shards (61 GB bf16). `cli/convert.rs` streams the shards one at a time into `~/.cache/hack/models/qwen3-coder-30b-a3b/model.hack`, quantizing the routed experts to four bits (about 16 GB) and keeping the dense layers bf16, deleting each shard once converted; it resumes where it left off. At run time the dense layers live on the GPU and the experts stay in the pack's memory mapping, run on the CPU; each layer's activations are read back for the router and the experts it picks, both on the CPU. The experts want to stay in the page cache. The model is not offered on Apple platforms, where the CPU experts have no fast path.
 
 ## Building
 

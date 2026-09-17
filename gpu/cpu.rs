@@ -169,7 +169,7 @@ impl Device for Cpu {
 ///
 /// Accumulating into eight independent sums lets the compiler vectorize the
 /// loop, which a single running sum would not allow.
-fn dot(w: &[u16], x: &[f32]) -> f32 {
+pub fn dot(w: &[u16], x: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     for (w, x) in w.chunks_exact(8).zip(x.chunks_exact(8)) {
         for i in 0..8 {
