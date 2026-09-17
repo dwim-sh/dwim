@@ -37,7 +37,7 @@ use crate::{
 const TICK: Duration = Duration::from_millis(80);
 
 /// Runs the shell until the user quits.
-pub fn run(name: &str, device: Device) -> Result<(), Box<dyn Error>> {
+pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
     let (requests, requests_rx) = mpsc::channel();
@@ -47,7 +47,7 @@ pub fn run(name: &str, device: Device) -> Result<(), Box<dyn Error>> {
         let dir = dir.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            if let Err(e) = work(model, &dir, device, requests_rx, &replies_tx, &stop) {
+            if let Err(e) = work(model, &dir, device, context, requests_rx, &replies_tx, &stop) {
                 let _ = replies_tx.send(Reply::Failed(e.to_string()));
             }
         });
@@ -68,6 +68,7 @@ pub fn run(name: &str, device: Device) -> Result<(), Box<dyn Error>> {
         committed: 0,
         interrupted: false,
         context: 0,
+        max_context: context,
         speed: None,
         lines: Vec::new(),
         requests,
@@ -114,6 +115,7 @@ fn work(
     model: &'static models::Model,
     dir: &Path,
     device: Device,
+    context: usize,
     requests: Receiver<String>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -129,14 +131,14 @@ fn work(
     match device {
         Device::Cpu => {
             let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(dir, Cpu, model.tools, requests, replies, stop)
+            serve(dir, Cpu, context, model.tools, requests, replies, stop)
         }
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let name = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
             let _ = replies.send(Reply::Device(name));
-            serve(dir, gpu, model.tools, requests, replies, stop)
+            serve(dir, gpu, context, model.tools, requests, replies, stop)
         }
     }
 }
@@ -145,12 +147,13 @@ fn work(
 fn serve<D: hack_gpu::Device + 'static>(
     dir: &Path,
     device: D,
+    context: usize,
     tools: harness::ToolFormat,
     requests: Receiver<String>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let model = models::load(dir, device, |done, total| {
+    let model = models::load(dir, device, context, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"))?;
@@ -230,8 +233,9 @@ struct App {
     reply_width: usize,
     committed: usize,
     interrupted: bool,
-    /// Tokens in the conversation so far.
+    /// Tokens in the conversation so far, and how many it has room for.
     context: usize,
+    max_context: usize,
     /// Tokens per second of the last reply.
     speed: Option<f32>,
     /// Lines waiting to be printed above the live region.
@@ -642,7 +646,7 @@ impl App {
         if let Some(device) = &self.device {
             left.push_str(&format!(" · {device}"));
         }
-        left.push_str(&format!(" · {}/{} tokens", self.context, models::MAX_LEN));
+        left.push_str(&format!(" · {}/{} tokens", self.context, self.max_context));
         if let Some(speed) = self.speed {
             left.push_str(&format!(" · {speed:.1} tok/s"));
         }
