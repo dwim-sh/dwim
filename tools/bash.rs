@@ -9,9 +9,12 @@
 use std::{
     collections::VecDeque,
     env,
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -47,6 +50,12 @@ const RETAINED: u64 = 4 << 20;
 /// without dropping it, as the shell does while the model is busy, leaves
 /// the directory behind, and the next to start removes what earlier
 /// processes that are no longer running left.
+///
+/// The temporary directory is shared with the machine's other users, and
+/// the name is predictable, so what is found at it is never trusted: the
+/// tool takes a name nothing is at, makes the directory itself, keeps it
+/// only if it is a directory of this user's, and never writes through a
+/// file that is already there.
 pub struct Bash {
     dir: PathBuf,
     /// Commands run so far; the next one's files are named by the count.
@@ -68,12 +77,16 @@ impl Bash {
     pub fn new() -> Self {
         let tmp = env::temp_dir();
         sweep(&tmp);
-        let n = OUTPUT_DIRS.fetch_add(1, Ordering::Relaxed);
-        Self {
-            dir: tmp.join(format!("dwim-{}-{n}", process::id())),
-            calls: 0,
-            retain: RETAINED,
-        }
+        let dir = loop {
+            let n = OUTPUT_DIRS.fetch_add(1, Ordering::Relaxed);
+            let dir = tmp.join(format!("dwim-{}-{n}", process::id()));
+            // Whatever is at the name, another user's or left by an earlier
+            // process that had this process's id, is left alone.
+            if fs::symlink_metadata(&dir).is_err() {
+                break dir;
+            }
+        };
+        Self { dir, calls: 0, retain: RETAINED }
     }
 
     /// The file for the `stream` of the command being run.
@@ -116,7 +129,9 @@ impl Bash {
 
 impl Drop for Bash {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if own(&self.dir) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -136,10 +151,18 @@ fn sweep(tmp: &Path) {
         if let Some(pid) = pid
             && pid != process::id()
             && !alive(pid)
+            && own(&entry.path())
         {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Whether `path` is a directory, not a symbolic link to one, that this
+/// user owns: one this program made, and not something another user put
+/// at the name.
+fn own(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && meta.uid() == unsafe { libc::geteuid() })
 }
 
 /// Whether a process with `pid` is running. Signal 0 checks without
@@ -227,10 +250,22 @@ impl Stream {
     /// Writes what the file lacks of the stream up to the retention cap,
     /// opening it with the head of the stream if it is not open yet. The
     /// stream was `before` bytes long before `bytes`.
+    ///
+    /// The directory is made here, not merely found: `mkdir` does not
+    /// follow a symbolic link at the name, and one already there is used
+    /// only if it is this user's, as the other stream of the same command
+    /// may have just made it. The file must be new, so that a link planted
+    /// where it goes is not written through.
     fn keep(&mut self, before: u64, bytes: &[u8]) -> io::Result<()> {
         if self.file.is_none() {
-            DirBuilder::new().mode(0o700).recursive(true).create(&self.dir)?;
-            let mut file = File::create(&self.path)?;
+            match DirBuilder::new().mode(0o700).create(&self.dir) {
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+                Err(_) if !own(&self.dir) => {
+                    return Err(io::Error::other(format!("{} is not this user's directory", self.dir.display())));
+                }
+                _ => {}
+            }
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&self.path)?;
             let kept = self.head.len().min(self.retain as usize);
             file.write_all(&self.head[..kept])?;
             self.kept = kept as u64;
@@ -548,11 +583,44 @@ mod tests {
         for dir in [&stale, &mine, &other] {
             fs::create_dir_all(dir).unwrap();
         }
+        // A link at a dead process's name is not a directory of this
+        // program's making, so neither it nor what it points to goes.
+        let link = tmp.join("dwim-4000001-0");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&other, &link).unwrap();
         sweep(&tmp);
         assert!(!stale.exists());
         assert!(mine.exists() && other.exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        fs::remove_file(link).unwrap();
         fs::remove_dir_all(mine).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn does_not_write_through_what_another_planted() {
+        // Someone else on the machine can put a symlink at the output
+        // directory's predictable name before this process makes it, and a
+        // file inside the target named like the stream's file, pointing at
+        // something of this user's: the output must not go there.
+        let scratch = env::temp_dir().join(format!("dwim-{}-planted", process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        let precious = scratch.join("precious");
+        fs::write(&precious, "keep me").unwrap();
+        let theirs = scratch.join("theirs");
+        fs::create_dir(&theirs).unwrap();
+        std::os::unix::fs::symlink(&precious, theirs.join("1.stdout")).unwrap();
+        let mut bash = Bash::new();
+        bash.dir = scratch.join("link");
+        std::os::unix::fs::symlink(&theirs, &bash.dir).unwrap();
+        let output = sh("seq 1 2000", &mut bash);
+        assert_eq!(fs::read_to_string(&precious).unwrap(), "keep me");
+        assert!(output.contains("could not keep the rest: "), "{output}");
+        assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
+        drop(bash);
+        assert_eq!(fs::read_to_string(&precious).unwrap(), "keep me");
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
