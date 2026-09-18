@@ -39,8 +39,8 @@ const BATCH: usize = 64;
 /// runs the model over its new tokens. The exception is the model's
 /// thoughts: the model sees the thoughts of the answer it is working on,
 /// but not those of earlier answers, whose `<think>` blocks it sees empty,
-/// so when the user sends a message, the answer to the last one is run
-/// again without them.
+/// so when the user sends a message, the model's state is put back to
+/// where the last answer began, and the answer is run again without them.
 pub struct Chat<M: LanguageModel> {
     model: M,
     tokenizer: Tokenizer,
@@ -48,7 +48,8 @@ pub struct Chat<M: LanguageModel> {
     /// Number of tokens in the conversation so far.
     len: usize,
     /// Where the answer to the user's last message starts: the model's
-    /// replies to it, and the tool responses between them.
+    /// replies to it, and the tool responses between them. The model's
+    /// state is saved there.
     answer_start: usize,
     /// The answer to the user's last message as later turns see it: without
     /// the model's thoughts.
@@ -155,7 +156,7 @@ impl<M: LanguageModel> Chat<M> {
             self.feed(batch)?;
             on_progress(i * BATCH + batch.len(), turn.len());
         }
-        self.answer_start = self.len;
+        self.begin_answer();
         Ok(())
     }
 
@@ -173,7 +174,7 @@ impl<M: LanguageModel> Chat<M> {
         let content = self.tokenizer.encode(message)?;
         let turn = self.turn("user", content)?;
         self.feed(&turn)?;
-        self.answer_start = self.len;
+        self.begin_answer();
         self.generate(on_chunk)
     }
 
@@ -197,11 +198,20 @@ impl<M: LanguageModel> Chat<M> {
         self.generate(on_chunk)
     }
 
+    /// Marks where an answer begins: the point the conversation is rewound
+    /// to when the answer's thoughts are forgotten.
+    fn begin_answer(&mut self) {
+        self.answer_start = self.len;
+        self.model.save();
+    }
+
     /// Runs the answer to the user's last message through the model again
-    /// without the thoughts in it, if it had any.
+    /// without the thoughts in it, if it had any, from the state the model
+    /// was in when the answer began.
     fn forget_thoughts(&mut self) -> Result<()> {
         let answer = std::mem::take(&mut self.answer);
         if self.len != self.answer_start + answer.len() {
+            self.model.restore();
             self.len = self.answer_start;
             self.feed(&answer)?;
         }
@@ -374,6 +384,10 @@ mod tests {
     /// the next of its scripts, then ends the reply.
     struct Scripted {
         fed: Vec<u32>,
+        /// Positions saved at, and the sequence as saved.
+        saved: Vec<(usize, Vec<u32>)>,
+        /// The sequence as of each restore, before and after it.
+        restored: Vec<(Vec<u32>, Vec<u32>)>,
         scripts: VecDeque<Vec<u32>>,
         /// What is left of the reply being said.
         saying: VecDeque<u32>,
@@ -385,7 +399,9 @@ mod tests {
 
     impl LanguageModel for Scripted {
         fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-            self.fed.truncate(pos);
+            // A recurrent model cannot go back on its own: the caller
+            // restores before running at an earlier position.
+            assert_eq!(pos, self.fed.len(), "ran at position {pos} with {} tokens in the state", self.fed.len());
             self.fed.extend(tokens);
             // The reply's prompt ends with `<think>\n`; a sampled token
             // comes alone.
@@ -403,6 +419,15 @@ mod tests {
         fn max_len(&self) -> usize {
             1 << 16
         }
+
+        fn save(&mut self) {
+            self.saved.push((self.fed.len(), self.fed.clone()));
+        }
+
+        fn restore(&mut self) {
+            let (_, saved) = self.saved.last().expect("nothing saved").clone();
+            self.restored.push((std::mem::replace(&mut self.fed, saved.clone()), saved));
+        }
     }
 
     /// A chat with a scripted model over the tiny vocabulary, its scripts
@@ -411,6 +436,8 @@ mod tests {
         let tokenizer = Tokenizer::tiny();
         let model = Scripted {
             fed: Vec::new(),
+            saved: Vec::new(),
+            restored: Vec::new(),
             scripts: scripts.iter().map(|script| tokenizer.encode_with_special(script).unwrap()).collect(),
             saying: VecDeque::new(),
             vocab: tokenizer.vocab_size(),
@@ -509,5 +536,37 @@ mod tests {
         // And what was said is there byte for byte.
         let bytes: Vec<u8> = fed.iter().flat_map(|&t| tokenizer.decode(t).to_vec()).collect();
         assert!(String::from_utf8_lossy(&bytes).contains(hostile));
+    }
+
+    #[test]
+    fn forgets_thoughts_from_the_saved_state() {
+        let mut chat = chat(&["I wonder.</think>\n\nOne.", "Hm.</think>\n\nTwo."]);
+        let system_end = chat.model.fed.len();
+        assert_eq!(chat.model.saved.len(), 1, "saved after the system prompt");
+        assert_eq!(chat.model.saved[0].0, system_end);
+
+        chat.send("first", |_| ControlFlow::Continue(())).unwrap();
+        assert!(chat.model.restored.is_empty(), "nothing to forget yet");
+        assert_eq!(chat.model.saved.len(), 2, "saved after the user's turn");
+        let (start, at_start) = chat.model.saved[1].clone();
+        assert!(start > system_end);
+        assert_eq!(at_start.len(), start);
+        let with_thoughts = chat.model.fed.clone();
+        let think = chat.think;
+        assert!(with_thoughts[start..].contains(&think));
+
+        chat.send("second", |_| ControlFlow::Continue(())).unwrap();
+        // The state went back to where the answer began, and the answer
+        // was run again without its thought, before the second message.
+        assert_eq!(chat.model.restored.len(), 1);
+        let (before, after) = &chat.model.restored[0];
+        assert_eq!(before, &with_thoughts);
+        assert_eq!(after, &at_start);
+        let replayed = &chat.model.fed[start..];
+        let thought = chat.tokenizer.encode("I wonder.").unwrap();
+        assert!(!replayed.windows(thought.len()).any(|w| w == thought), "the thought is gone");
+        let answer = chat.tokenizer.encode("One.").unwrap();
+        assert!(replayed.windows(answer.len()).any(|w| w == answer), "the answer stays");
+        assert_eq!(chat.model.saved.len(), 3, "saved again after the second turn");
     }
 }

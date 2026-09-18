@@ -17,6 +17,13 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.
+///
+/// The sequence can be rewound to an earlier position and continued
+/// differently from there, by running new tokens at that position. What
+/// the model keeps by position, such as key/value caches, is overwritten
+/// as they run, but a recurrent state has no position to go back to: so
+/// the caller has the model [`save`](Self::save) its state at the position
+/// it may rewind to, and [`restore`](Self::restore) it before it does.
 pub trait LanguageModel {
     /// Runs `tokens`, the first at position `pos`, through the model, and
     /// returns the logits for the token that follows the last of them.
@@ -24,6 +31,13 @@ pub trait LanguageModel {
 
     /// Longest sequence the state has room for.
     fn max_len(&self) -> usize;
+
+    /// Keeps a copy of the state that is not kept by position, as it is
+    /// after the tokens run so far, for `restore`.
+    fn save(&mut self);
+
+    /// Puts back the state `save` copied, as if no token had run since.
+    fn restore(&mut self);
 }
 
 impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
@@ -33,6 +47,14 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn max_len(&self) -> usize {
         (**self).max_len()
+    }
+
+    fn save(&mut self) {
+        (**self).save()
+    }
+
+    fn restore(&mut self) {
+        (**self).restore()
     }
 }
 

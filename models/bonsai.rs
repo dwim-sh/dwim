@@ -532,6 +532,32 @@ impl<D: Device> LanguageModel for Model<D> {
     fn max_len(&self) -> usize {
         self.state.max_len
     }
+
+    /// Copies the convolution and recurrent states of the linear attention
+    /// layers aside. The key/value caches are kept by position and need
+    /// no copy.
+    fn save(&mut self) {
+        let (d, s) = (&self.device, &mut self.state);
+        for (slot, [a, b]) in s.conv_state.iter().enumerate() {
+            let state = if s.parity { a } else { b };
+            d.copy(&mut s.conv_saved[slot], 0, state, 0, s.conv_width);
+        }
+        for (slot, state) in s.ssm_state.iter().enumerate() {
+            d.copy(&mut s.ssm_saved[slot], 0, state, 0, s.ssm_width);
+        }
+    }
+
+    /// Puts the copied states back where the next batch reads them.
+    fn restore(&mut self) {
+        let (d, s) = (&self.device, &mut self.state);
+        for (slot, [a, b]) in s.conv_state.iter_mut().enumerate() {
+            let state = if s.parity { a } else { b };
+            d.copy(state, 0, &s.conv_saved[slot], 0, s.conv_width);
+        }
+        for (slot, state) in s.ssm_state.iter_mut().enumerate() {
+            d.copy(state, 0, &s.ssm_saved[slot], 0, s.ssm_width);
+        }
+    }
 }
 
 /// Buffers the forward pass computes in, with room for a batch of
@@ -565,6 +591,12 @@ struct State<D: Device> {
     conv_state: Vec<[D::Buffer; 2]>,
     parity: bool,
     ssm_state: Vec<D::Buffer>,
+    /// Copies of the states as they were when last saved, one per linear
+    /// layer, and the states' lengths.
+    conv_saved: Vec<D::Buffer>,
+    ssm_saved: Vec<D::Buffer>,
+    conv_width: usize,
+    ssm_width: usize,
     rope: D::Buffer,
     max_len: usize,
 }
@@ -593,6 +625,7 @@ impl<D: Device> State<D> {
         let mut rope = d.alloc(table.len());
         d.write(&mut rope, &table);
         let conv_width = (CONV_KERNEL - 1) * (2 * k_dim + v_dim);
+        let ssm_width = c.v_heads * c.state_dim * c.state_dim;
         Self {
             widths,
             x,
@@ -614,7 +647,11 @@ impl<D: Device> State<D> {
             v_cache: (0..caches).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
             conv_state: (0..slots).map(|_| [d.alloc(conv_width), d.alloc(conv_width)]).collect(),
             parity: false,
-            ssm_state: (0..slots).map(|_| d.alloc(c.v_heads * c.state_dim * c.state_dim)).collect(),
+            ssm_state: (0..slots).map(|_| d.alloc(ssm_width)).collect(),
+            conv_saved: (0..slots).map(|_| d.alloc(conv_width)).collect(),
+            ssm_saved: (0..slots).map(|_| d.alloc(ssm_width)).collect(),
+            conv_width,
+            ssm_width,
             rope,
             max_len,
         }
@@ -833,6 +870,56 @@ mod tests {
         let text = String::from_utf8_lossy(&text);
         eprintln!("completion: {text:?}");
         assert!(text.starts_with(" Paris."), "{text:?}");
+    }
+
+    /// Runs a history, then a detour, then rewinds to the history and runs
+    /// the answer, and returns the logits, against those of running the
+    /// history and the answer alone.
+    fn rewind<D: Device>(path: &Path, device: D) -> (Vec<f32>, Vec<f32>) {
+        let gguf = Arc::new(Gguf::open(path).unwrap());
+        let (history, thoughts, answer) = ([3, 17, 42, 7, 9], [11, 12, 13, 14], [21, 22, 23]);
+        let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
+        model.forward(&history, 0);
+        model.save();
+        model.forward(&thoughts, 5);
+        model.forward(&answer, 9);
+        model.restore();
+        let rewound = model.forward(&answer, 5);
+        // Saved twice over: the second save must not have been touched by
+        // the restore.
+        model.restore();
+        let again = model.forward(&answer, 5);
+        assert_eq!(rewound, again);
+        model.restore();
+        model.forward(&[1], 5);
+        model.restore();
+        model.forward(&answer, 5);
+        model.forward(&[1, 2], 8);
+        model.restore();
+        let fresh = model.forward(&answer, 5);
+        (rewound, fresh)
+    }
+
+    #[test]
+    fn rewinding_restores_the_recurrent_state() {
+        let dir = std::env::temp_dir().join(format!("dwim-rewind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path);
+        let (rewound, fresh) = rewind(&path, Cpu);
+        assert_eq!(rewound, fresh);
+        // And the same as a model that never took the detour.
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        let mut straight = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        straight.forward(&[3, 17, 42, 7, 9], 0);
+        assert_eq!(straight.forward(&[21, 22, 23], 5), fresh);
+        if let Ok(gpu) = Gpu::new() {
+            let (rewound, fresh) = rewind(&path, gpu);
+            for (a, b) in rewound.iter().zip(&fresh) {
+                assert!((a - b).abs() <= 1e-5 * (1.0 + a.abs()), "{a} vs {b}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
