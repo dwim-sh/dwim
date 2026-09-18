@@ -34,7 +34,7 @@ last commit?"` answers one thing and exits, and `man ./man/dwim.1` has the rest.
   `AGENTS.md`.
 - **A 27B model in 6 GB.** Bonsai 2 27B, PrismML's ternary version of
   Qwen3.8-27B: every weight is -1, 0, or 1, so it fits on a laptop GPU.
-- **Its own inference engine.** No llama.cpp, no CUDA. Metal on macOS, Vulkan
+- **Its own inference engine.** No llama.cpp. Metal on macOS, Vulkan
   everywhere else, and a CPU reference the GPU kernels are tested against.
 
 ## License
