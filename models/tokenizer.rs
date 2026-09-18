@@ -1,11 +1,19 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::collections::HashMap;
 
 use fancy_regex::Regex;
-use serde_json::Value;
 
-use crate::Result;
+use crate::{Result, gguf::Gguf};
 
-/// A byte-level BPE tokenizer, loaded from a Hugging Face `tokenizer.json`.
+/// The regular expression Qwen's tokenizers split text into words with.
+const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Token types in a GGUF vocabulary that stand for special tokens: control
+/// tokens such as `<|im_start|>`, and user-defined ones such as
+/// `<tool_call>`.
+const CONTROL: i64 = 3;
+const USER_DEFINED: i64 = 4;
+
+/// A byte-level BPE tokenizer, loaded from the vocabulary in a GGUF file.
 ///
 /// Text is first split into words by a regular expression. Each word starts
 /// out as one token per UTF-8 byte, and adjacent tokens are then merged
@@ -25,30 +33,44 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    pub fn load(path: &Path) -> Result<Self> {
-        let json: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    /// Loads the vocabulary a GGUF file carries: its tokens, their types,
+    /// and the merges.
+    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let pre = gguf.str("tokenizer.ggml.pre")?;
+        if !matches!(pre, "qwen2" | "qwen35") {
+            return Err(format!("the '{pre}' pre-tokenizer is not supported").into());
+        }
+        let texts = gguf.array("tokenizer.ggml.tokens")?;
+        let types = gguf.array("tokenizer.ggml.token_type")?;
+        if texts.len() != types.len() {
+            return Err("tokens and token types differ in number".into());
+        }
 
         // Byte-level vocabularies write each byte as a printable character, so
-        // decode every token back into the bytes it stands for.
+        // decode every token back into the bytes it stands for. Special tokens
+        // are written as they are.
         let to_byte: HashMap<char, u8> = byte_chars()
             .iter()
             .enumerate()
             .map(|(byte, &c)| (c, byte as u8))
             .collect();
-        let vocab = json["model"]["vocab"].as_object().ok_or("missing vocabulary")?;
         let mut ids = HashMap::new();
-        let mut tokens = Vec::new();
-        for (text, id) in vocab {
-            let id = id.as_u64().ok_or("invalid token id")? as usize;
-            let bytes = text
-                .chars()
-                .map(|c| to_byte.get(&c).copied().ok_or("invalid byte-level token"))
-                .collect::<std::result::Result<Vec<u8>, _>>()?;
-            if tokens.len() <= id {
-                tokens.resize(id + 1, Vec::new());
+        let mut tokens = Vec::with_capacity(texts.len());
+        let mut special = HashMap::new();
+        for (id, (text, kind)) in texts.iter().zip(types).enumerate() {
+            let text = text.as_str().ok_or("invalid token")?;
+            let kind = kind.as_i64().ok_or("invalid token type")?;
+            if kind == CONTROL || kind == USER_DEFINED {
+                special.insert(text.to_string(), id as u32);
+                tokens.push(text.as_bytes().to_vec());
+            } else {
+                let bytes = text
+                    .chars()
+                    .map(|c| to_byte.get(&c).copied().ok_or("invalid byte-level token"))
+                    .collect::<std::result::Result<Vec<u8>, _>>()?;
+                tokens.push(bytes);
             }
-            tokens[id] = bytes;
-            ids.insert(text.as_str(), id as u32);
+            ids.insert(text, id as u32);
         }
 
         let mut bytes = [0; 256];
@@ -57,40 +79,17 @@ impl Tokenizer {
         }
 
         let mut merges = HashMap::new();
-        let list = json["model"]["merges"].as_array().ok_or("missing merges")?;
-        for (rank, merge) in list.iter().enumerate() {
-            // Merges are either ["a", "b"] pairs or "a b" strings.
-            let (a, b) = match merge {
-                Value::Array(pair) => (pair[0].as_str(), pair[1].as_str()),
-                Value::String(pair) => match pair.split_once(' ') {
-                    Some((a, b)) => (Some(a), Some(b)),
-                    None => (None, None),
-                },
-                _ => (None, None),
-            };
-            let (a, b) = a.zip(b).ok_or("invalid merge")?;
+        for (rank, merge) in gguf.array("tokenizer.ggml.merges")?.iter().enumerate() {
+            let (a, b) = merge.as_str().and_then(|m| m.split_once(' ')).ok_or("invalid merge")?;
             let merged = format!("{a}{b}");
-            let (Some(&a), Some(&b), Some(&merged)) =
-                (ids.get(a), ids.get(b), ids.get(merged.as_str()))
-            else {
+            let (Some(&a), Some(&b), Some(&merged)) = (ids.get(a), ids.get(b), ids.get(merged.as_str())) else {
                 return Err("merge refers to an unknown token".into());
             };
             merges.insert((a, b), (rank, merged));
         }
 
-        let mut special = HashMap::new();
-        for token in json["added_tokens"].as_array().ok_or("missing added tokens")? {
-            let id = token["id"].as_u64().ok_or("invalid token id")? as usize;
-            let content = token["content"].as_str().ok_or("invalid token")?;
-            if tokens.len() <= id {
-                tokens.resize(id + 1, Vec::new());
-            }
-            tokens[id] = content.as_bytes().to_vec();
-            special.insert(content.to_string(), id as u32);
-        }
-
         Ok(Self {
-            pattern: Regex::new(split_pattern(&json["pre_tokenizer"]).ok_or("missing split pattern")?)?,
+            pattern: Regex::new(QWEN_PATTERN)?,
             tokens,
             bytes,
             merges,
@@ -189,15 +188,4 @@ fn byte_chars() -> [char; 256] {
         };
     }
     chars
-}
-
-/// Finds the regular expression a pre-tokenizer splits words with.
-fn split_pattern(pre_tokenizer: &Value) -> Option<&str> {
-    if pre_tokenizer["type"] == "Split" {
-        return pre_tokenizer["pattern"]["Regex"].as_str();
-    }
-    pre_tokenizer["pretokenizers"]
-        .as_array()?
-        .iter()
-        .find_map(split_pattern)
 }

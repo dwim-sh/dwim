@@ -1,5 +1,6 @@
 // Rotary position embeddings: each thread rotates one pair of elements,
-// half a head apart, by the angle for the token's position.
+// half the rotated part of a head apart, by the angle for the token's
+// position.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -7,6 +8,7 @@ using namespace metal;
 struct Params {
     uint n_heads;
     uint head_dim;
+    uint rot_dim;
     uint pos;
     uint n;
 };
@@ -17,7 +19,7 @@ kernel void rope(
     constant Params& p [[buffer(2)]],
     uint id [[thread_position_in_grid]])
 {
-    uint pairs = p.head_dim / 2;
+    uint pairs = p.rot_dim / 2;
     if (id >= p.n * p.n_heads * pairs) {
         return;
     }

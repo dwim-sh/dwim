@@ -5,7 +5,7 @@ use crate::models;
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
-    /// model to run (default: qwen3-0.6b)
+    /// model to run (default: bonsai-2-27b)
     #[argh(option, default = "models::DEFAULT.to_string()")]
     pub model: String,
 

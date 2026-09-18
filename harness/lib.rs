@@ -6,7 +6,7 @@
 //! them as they happen. The one tool is `bash`, which runs a shell command,
 //! and the system prompt pushes the model to use it rather than answer from
 //! memory or ask the user for a command. It also tells the model about the
-//! project it works in, since a small model won't go looking on its own.
+//! project it works in, since a model won't always go looking on its own.
 
 use std::{
     error::Error,
@@ -34,17 +34,6 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
-/// How a model writes tool calls: the form its chat template trained it
-/// on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolFormat {
-    /// A JSON object in `<tool_call>` tags, as Qwen3 writes them.
-    Json,
-    /// A `<function=...>` block of `<parameter=...>` values in `<tool_call>`
-    /// tags, as Qwen3-Coder writes them.
-    Xml,
-}
-
 /// How the agent should behave: the start of the system prompt.
 const INSTRUCTIONS: &str = r#"You are hack, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
 
@@ -57,41 +46,14 @@ const INSTRUCTIONS: &str = r#"You are hack, a coding agent working in the user's
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
 
-/// The tools, declared in the form Qwen3's chat template puts them: the end
-/// of the system prompt.
-const TOOLS_JSON: &str = r#"# Tools
-
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return its output.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>"#;
-
-/// The tools, declared in the form Qwen3-Coder's chat template puts them:
-/// the end of the system prompt.
-const TOOLS_XML: &str = r#"# Tools
+/// The tools, declared as Bonsai's chat template puts them: the start of
+/// the system prompt, before what the user's system prompt says.
+const TOOLS: &str = r#"# Tools
 
 You have access to the following functions:
 
 <tools>
-<function>
-<name>bash</name>
-<description>Run a shell command and return its output.</description>
-<parameters>
-<parameter>
-<name>command</name>
-<type>string</type>
-<description>The command to run.</description>
-</parameter>
-<required>["command"]</required>
-</parameters>
-</function>
+{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return its output.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}
 </tools>
 
 If you choose to call a function ONLY reply in the following format with NO suffix:
@@ -117,20 +79,15 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// The system prompt for an agent working in `dir`: how to behave, where it
-/// is and what the project looks like, the project's own instructions from
-/// its `AGENTS.md` if it has one, and the tools, declared in the given form.
-pub fn system_prompt(dir: &Path, tools: ToolFormat) -> String {
-    let mut prompt = format!("{INSTRUCTIONS}\n\n{}", environment(dir));
+/// The system prompt for an agent working in `dir`: the tools, then how to
+/// behave, where it is and what the project looks like, and the project's
+/// own instructions from its `AGENTS.md` if it has one.
+pub fn system_prompt(dir: &Path) -> String {
+    let mut prompt = format!("{TOOLS}\n\n{INSTRUCTIONS}\n\n{}", environment(dir));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str(&format!("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"));
     }
-    prompt.push_str("\n\n");
-    prompt.push_str(match tools {
-        ToolFormat::Json => TOOLS_JSON,
-        ToolFormat::Xml => TOOLS_XML,
-    });
     prompt
 }
 
@@ -372,10 +329,9 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let prompt = system_prompt(dir, ToolFormat::Json);
-        assert!(prompt.starts_with(INSTRUCTIONS));
-        assert!(prompt.ends_with(TOOLS_JSON));
-        assert!(system_prompt(dir, ToolFormat::Xml).ends_with(TOOLS_XML));
+        let prompt = system_prompt(dir);
+        assert!(prompt.starts_with(TOOLS));
+        assert!(prompt.contains(INSTRUCTIONS));
         let files = prompt.lines().find_map(|line| line.strip_prefix("Files: ")).unwrap();
         assert!(files.split(' ').any(|file| file == "Cargo.toml"));
         assert!(files.split(' ').any(|file| file == "harness/"));

@@ -20,7 +20,7 @@ DESCRIPTION
 
 OPTIONS
        --model <model>
-              Model to run (default: qwen3-0.6b).
+              Model to run (default: bonsai-2-27b).
 
        --device <device>
               Device to run the model on: gpu (default), or cpu.
@@ -58,5 +58,5 @@ EXIT STATUS
 SEE ALSO
        claude(1), codex(1), opencode(1)
 
-hack                              2026-09-15                            HACK(1)
+hack                              2026-09-18                            HACK(1)
 ```
