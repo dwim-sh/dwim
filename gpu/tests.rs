@@ -162,7 +162,7 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
     // The last attends over more positions than one dispatch has scores
     // for, all its tokens at once.
-    let cases = [(4, 8, 2, 3, 5), (16, 128, 8, 2, 300), (2, 128, 1, 1, 0), (16, 128, 4, 64, 32704)];
+    let cases = [(4, 8, 2, 3, 5), (16, 128, 8, 2, 300), (2, 128, 1, 1, 0), (32, 128, 4, 3, 1000), (16, 128, 4, 64, 32704)];
     for (n_heads, head_dim, n_kv_heads, n, pos) in cases {
         let kv_dim = n_kv_heads * head_dim;
         let q = rng.floats(n * n_heads * head_dim);

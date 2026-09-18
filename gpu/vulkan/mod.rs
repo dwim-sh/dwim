@@ -684,7 +684,7 @@ impl Device for Vulkan {
         let n = q.len / (n_heads * head_dim);
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
+        assert!(head_dim.is_multiple_of(4) && head_dim <= 128);
         // Every token's heads get a row of scores as long as the last token
         // attends over, as many tokens to a dispatch as the scores fit.
         let stride = pos + n;

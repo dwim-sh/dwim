@@ -5,10 +5,11 @@
 
 use std::{fs, path::Path, sync::Arc};
 
-use hack_gpu::bf16;
+use hack_gpu::{bf16, cpu};
+use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::{Device, LanguageModel, Result, experts::Experts, pack::Pack, rope_table};
+use crate::{Device, LanguageModel, Result, Tensor, experts::Experts, pack::Pack, rope_table};
 
 /// Most tokens a forward pass runs through the model at once.
 pub const BATCH: usize = 64;
@@ -56,7 +57,9 @@ struct Layer<D: Device> {
     q_norm: D::Weight,
     k_norm: D::Weight,
     mlp_norm: D::Weight,
-    router: D::Weight,
+    /// The router stays on the CPU, beside the experts it picks: it is
+    /// small, and its input has to be read back for them anyway.
+    router: Tensor,
     experts: Experts,
 }
 
@@ -69,7 +72,7 @@ impl<D: Device> Model<D> {
         let config = Config::load(&dir.join("config.json"))?;
         let c = &config;
         let d = &device;
-        let total = c.num_hidden_layers * 9 + 2;
+        let total = c.num_hidden_layers * 8 + 2;
         let mut done = 0;
         let mut load = |name: &str| -> Result<D::Weight> {
             let weight = d.upload(pack.bf16(name)?);
@@ -90,7 +93,7 @@ impl<D: Device> Model<D> {
                 q_norm: load(&format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: load(&format!("{p}.self_attn.k_norm.weight"))?,
                 mlp_norm: load(&format!("{p}.post_attention_layernorm.weight"))?,
-                router: load(&format!("{p}.mlp.gate.weight"))?,
+                router: pack.bf16(&format!("{p}.mlp.gate.weight"))?,
                 experts: Experts::new(pack.clone(), &format!("{p}.mlp.experts"), c.num_experts_per_tok)?,
             });
         }
@@ -153,13 +156,12 @@ impl<D: Device> Model<D> {
             d.matmul(&mut s.xb, &layer.o, &s.att);
             d.add(&mut s.x, &s.xb);
 
-            // The mixture of experts, likewise added back: the router on the
-            // device, the experts it picks on the CPU.
+            // The mixture of experts, likewise added back: the router and the
+            // experts it picks on the CPU.
             d.copy(&mut s.xb, 0, &s.x, 0, n * c.hidden_size);
             d.rmsnorm(&mut s.xb, &layer.mlp_norm, eps);
-            d.matmul(&mut s.router, &layer.router, &s.xb);
             let xb = d.read(&s.xb);
-            let logits = d.read(&s.router);
+            let logits = route(&layer.router, &xb);
             let mut moe = vec![0.0; n * c.hidden_size];
             layer.experts.forward(&xb, &logits, &mut moe);
             d.write(&mut s.xb, &moe);
@@ -173,6 +175,26 @@ impl<D: Device> Model<D> {
         d.matmul(&mut s.logits, &self.lm_head, &s.xb);
         d.read(&s.logits)
     }
+}
+
+/// The router's logits for each token in `x`: the dot product of each row
+/// of its weights with the token. A single token's go one after another,
+/// cheaper than handing them to other threads; a batch's are spread over its
+/// tokens.
+fn route(router: &Tensor, x: &[f32]) -> Vec<f32> {
+    let (rows, cols) = (router.shape[0], router.shape[1]);
+    let mut logits = vec![0.0; x.len() / cols * rows];
+    let token = |(logits, x): (&mut [f32], &[f32])| {
+        for (logit, row) in logits.iter_mut().zip(router.data.chunks_exact(cols)) {
+            *logit = cpu::dot(row, x);
+        }
+    };
+    if x.len() == cols {
+        token((&mut logits, x));
+    } else {
+        logits.par_chunks_mut(rows).zip(x.par_chunks(cols)).for_each(token);
+    }
+    logits
 }
 
 impl<D: Device> LanguageModel for Model<D> {
@@ -199,14 +221,13 @@ impl<D: Device> LanguageModel for Model<D> {
 /// position there is room for.
 struct State<D: Device> {
     /// Activations per token of each per-token buffer, in field order.
-    widths: [usize; 7],
+    widths: [usize; 6],
     x: D::Buffer,
     xb: D::Buffer,
     q: D::Buffer,
     k: D::Buffer,
     v: D::Buffer,
     att: D::Buffer,
-    router: D::Buffer,
     logits: D::Buffer,
     k_cache: Vec<D::Cache>,
     v_cache: Vec<D::Cache>,
@@ -219,8 +240,8 @@ impl<D: Device> State<D> {
     fn new(c: &Config, d: &D, max_len: usize) -> Self {
         let q_dim = c.num_attention_heads * c.head_dim;
         let kv_dim = c.num_key_value_heads * c.head_dim;
-        let widths = [c.hidden_size, c.hidden_size, q_dim, kv_dim, kv_dim, q_dim, c.num_experts];
-        let [x, xb, q, k, v, att, router] = widths.map(|width| d.alloc(BATCH * width));
+        let widths = [c.hidden_size, c.hidden_size, q_dim, kv_dim, kv_dim, q_dim];
+        let [x, xb, q, k, v, att] = widths.map(|width| d.alloc(BATCH * width));
         let table = rope_table(max_len, c.head_dim, c.rope_theta);
         let mut rope = d.alloc(table.len());
         d.write(&mut rope, &table);
@@ -232,7 +253,6 @@ impl<D: Device> State<D> {
             k,
             v,
             att,
-            router,
             logits: d.alloc(c.vocab_size),
             k_cache: (0..c.num_hidden_layers).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
             v_cache: (0..c.num_hidden_layers).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
@@ -251,7 +271,6 @@ impl<D: Device> State<D> {
             &mut self.k,
             &mut self.v,
             &mut self.att,
-            &mut self.router,
         ];
         for (buffer, width) in buffers.into_iter().zip(self.widths) {
             device.resize(buffer, n * width);

@@ -1,9 +1,10 @@
 // Causal attention over f16 caches, two half-precision floats to a word:
 // one workgroup per (token, head). The threads first score the positions the
 // token attends to, strided, into the workgroup's row of the scores buffer;
-// then softmax the scores; then each thread sums one element of the head
-// over the values, reading them coalesced. A dispatch covers the tokens from
-// `first` on, and each workgroup's row of scores is `stride` long.
+// then softmax the scores; then sum the values the scores weigh, strided
+// too and a whole head at a time, and add the threads' sums together. A
+// dispatch covers the tokens from `first` on, and each workgroup's row of
+// scores is `stride` long.
 
 struct Params {
     n_heads: u32,
@@ -23,6 +24,7 @@ var<immediate> p: Params;
 @group(0) @binding(4) var<storage, read_write> scores: array<f32>;
 
 var<workgroup> partial: array<f32, 16>;
+var<workgroup> values: array<array<vec4<f32>, 32>, 16>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -43,6 +45,13 @@ fn main(
     let quads = p.head_dim / 4u;
     let row = wg.x * p.stride;
 
+    // The query, copied out of its buffer once rather than read at every
+    // position.
+    var query: array<vec4<f32>, 32>;
+    for (var d = 0u; d < quads; d++) {
+        query[d] = q[qbase / 4u + d];
+    }
+
     // Scores, and their maximum for a stable softmax.
     var m = -1e30;
     for (var pos = lid; pos < len; pos += 256u) {
@@ -50,7 +59,7 @@ fn main(
         let kbase = (pos * kv_dim + kv) / 2u;
         for (var d = 0u; d < quads; d++) {
             let k = vec4(unpack2x16float(k_cache[kbase + 2u * d]), unpack2x16float(k_cache[kbase + 2u * d + 1u]));
-            s += dot(q[qbase / 4u + d], k);
+            s += dot(query[d], k);
         }
         s *= scale;
         scores[row + pos] = s;
@@ -82,13 +91,37 @@ fn main(
         total += partial[i];
     }
 
-    // Each thread owns one element of the head.
-    if lid < p.head_dim {
-        var o = 0.0;
-        for (var pos = 0u; pos < len; pos++) {
-            let e = pos * kv_dim + kv + lid;
-            o += scores[row + pos] * unpack2x16float(v_cache[e / 2u])[e % 2u];
+    // Each thread takes every 256th position, strided, and sums the whole
+    // head's values weighed by their scores; the threads then add their
+    // sums together.
+    var acc: array<vec4<f32>, 32>;
+    for (var pos = lid; pos < len; pos += 256u) {
+        let e = scores[row + pos];
+        let vbase = (pos * kv_dim + kv) / 2u;
+        for (var d = 0u; d < quads; d++) {
+            acc[d] += e * vec4(unpack2x16float(v_cache[vbase + 2u * d]), unpack2x16float(v_cache[vbase + 2u * d + 1u]));
         }
-        out[qbase + lid] = o / total;
+    }
+    for (var d = 0u; d < quads; d++) {
+        acc[d] = subgroupAdd(acc[d]);
+    }
+    if sinv == 0u {
+        values[sid] = acc;
+    }
+    workgroupBarrier();
+    if lid == 0u {
+        var sum: array<vec4<f32>, 32>;
+        for (var i = 0u; i < nsg; i++) {
+            for (var d = 0u; d < quads; d++) {
+                sum[d] += values[i][d];
+            }
+        }
+        for (var d = 0u; d < quads; d++) {
+            let o = sum[d] / total;
+            out[qbase + 4u * d] = o.x;
+            out[qbase + 4u * d + 1u] = o.y;
+            out[qbase + 4u * d + 2u] = o.z;
+            out[qbase + 4u * d + 3u] = o.w;
+        }
     }
 }
