@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag must name the version in Cargo.toml, which scripts/release sets.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml; use scripts/release"
+            exit 1
+          fi
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Ubuntu 22.04 so the binaries run on distributions with an older glibc.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p dwim-cli
+      - name: Package
+        run: |
+          name=dwim-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp target/release/dwim man/dwim.1 README.md LICENSE.md dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          cd dist && shasum -a 256 $name.tar.gz > $name.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dwim-${{ matrix.target }}
+          path: dist/dwim-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes dist/*
+        env:
+          GH_TOKEN: ${{ github.token }}

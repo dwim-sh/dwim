@@ -72,3 +72,19 @@ earlier run wrote, and `--help` lists the rest.
 **The agent runs shell commands from an untrusted issue, in a checkout of an
 untrusted repository, as you.** Run it in a container or a virtual machine,
 not on a machine you care about.
+
+## Releasing
+
+The version is in the workspace's `Cargo.toml`, which every crate inherits.
+
+```
+scripts/release 0.2.0
+git push --atomic origin main v0.2.0
+```
+
+`scripts/release` sets the version in `Cargo.toml`, `Cargo.lock` and the
+manual page, commits it as `dwim v0.2.0`, and tags the commit `v0.2.0`, but
+pushes nothing. Pushing the tag runs `.github/workflows/release.yml`, which
+checks that the tag matches `Cargo.toml`, builds `dwim` for Apple silicon
+macOS and x86-64 and ARM64 Linux, and publishes them as a GitHub release.
+`https://dwim.sh/install.sh` installs the latest release from there.

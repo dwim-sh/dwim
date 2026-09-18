@@ -1,0 +1,53 @@
+#!/bin/sh
+# Prepares a release: sets the version, commits it as "dwim v<version>", and
+# tags that commit v<version>. Nothing leaves this machine; pushing the tag is
+# what builds the release, and the script ends by saying how.
+#
+#     scripts/release 0.2.0
+
+set -eu
+
+fail() {
+    printf 'release: %s\n' "$1" >&2
+    exit 1
+}
+
+[ $# -eq 1 ] || fail "usage: scripts/release <version>"
+version="${1#v}"
+tag="v$version"
+echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
+    fail "'$1' is not a version like 0.2.0"
+
+cd "$(dirname "$0")/.."
+
+[ "$(git branch --show-current)" = main ] || fail "not on main"
+[ -z "$(git status --porcelain)" ] || fail "the working tree has changes; commit or stash them first"
+! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || fail "tag $tag already exists"
+
+current="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+[ "$current" != "$version" ] || fail "the version is already $version"
+
+# The version is in the workspace's Cargo.toml, which every crate inherits,
+# and in the manual page's header, along with the date of the release.
+sed '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"$/version = "'"$version"'"/' Cargo.toml > Cargo.toml.new
+mv Cargo.toml.new Cargo.toml
+sed '1 s/^\.TH DWIM 1 [^ ]* "dwim [^"]*"/.TH DWIM 1 '"$(date +%Y-%m-%d)"' "dwim '"$version"'"/' man/dwim.1 > man/dwim.1.new
+mv man/dwim.1.new man/dwim.1
+cargo update --workspace --quiet
+
+built="$(cargo run --quiet -p dwim-cli -- --version)"
+[ "$built" = "dwim $version" ] || fail "dwim --version says '$built', not 'dwim $version'"
+
+git commit --quiet -m "dwim $tag" Cargo.toml Cargo.lock man/dwim.1
+git tag -a "$tag" -m "dwim $tag"
+
+cat <<EOF
+Committed and tagged dwim $tag ($current -> $version). To publish it:
+
+    git push --atomic origin main $tag
+
+Pushing the tag builds the binaries and creates the GitHub release, which
+https://dwim.sh/install.sh then installs. To undo instead:
+
+    git tag -d $tag && git reset --hard HEAD~1
+EOF
