@@ -68,6 +68,17 @@ on a line with text clears it.
 .B AGENTS.md
 If present in the working directory, its contents are given to the agent as
 project instructions.
+.TP
+.I $TMPDIR/dwim-<pid>-<n>/
+Where the whole output of a command that printed more than the model is
+shown is kept, readable by the user alone, as a file per stream named by the
+command's number, such as
+.IR 3.stdout .
+The result the model sees names the file. The directory is removed when
+.B dwim
+exits, and any left by an earlier
+.B dwim
+that is no longer running are removed by the next one to start.
 .SH EXIT STATUS
 .TP
 .B 0

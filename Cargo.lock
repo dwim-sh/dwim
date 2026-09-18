@@ -326,6 +326,8 @@ name = "dwim-harness"
 version = "0.1.0"
 dependencies = [
  "dwim-models",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

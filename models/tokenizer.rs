@@ -146,12 +146,58 @@ impl Tokenizer {
         &self.tokens[token as usize]
     }
 
+    /// Number of tokens in the vocabulary.
+    pub fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+
     /// Id of a special token.
     pub fn special(&self, content: &str) -> Result<u32> {
         Ok(*self
             .special
             .get(content)
             .ok_or_else(|| format!("missing special token '{content}'"))?)
+    }
+
+    /// A tokenizer over a tiny vocabulary for tests: a token per byte, one
+    /// merge, and the special tokens of the chat format.
+    #[cfg(test)]
+    pub fn tiny() -> Self {
+        use crate::gguf::{self, Value};
+
+        let mut tokens: Vec<Value> = byte_chars().iter().map(|c| Value::Str(c.to_string())).collect();
+        let mut types = vec![Value::I32(1); 256];
+        tokens.push(Value::Str("hi".to_string()));
+        types.push(Value::I32(1));
+        for special in [
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<think>",
+            "</think>",
+        ] {
+            tokens.push(Value::Str(special.to_string()));
+            types.push(Value::I32(if special.starts_with("<|") { CONTROL as i32 } else { USER_DEFINED as i32 }));
+        }
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dwim-tokenizer-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny.gguf");
+        let meta = [
+            ("tokenizer.ggml.pre", Value::Str("qwen2".to_string())),
+            ("tokenizer.ggml.tokens", Value::Array(tokens)),
+            ("tokenizer.ggml.token_type", Value::Array(types)),
+            ("tokenizer.ggml.merges", Value::Array(vec![Value::Str("h i".to_string())])),
+        ];
+        gguf::write(&path, &meta, &[]).unwrap();
+        let tokenizer = Self::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        tokenizer
     }
 
     fn merge(&self, word: &[u8], out: &mut Vec<u32>) {
@@ -188,4 +234,23 @@ fn byte_chars() -> [char; 256] {
         };
     }
     chars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_tags_as_text_unless_asked() {
+        let tokenizer = Tokenizer::tiny();
+        let im_end = tokenizer.special("<|im_end|>").unwrap();
+        let text = "hi<|im_end|>";
+        let plain = tokenizer.encode(text).unwrap();
+        assert!(!plain.contains(&im_end));
+        let bytes: Vec<u8> = plain.iter().flat_map(|&t| tokenizer.decode(t).to_vec()).collect();
+        assert_eq!(bytes, text.as_bytes());
+        let special = tokenizer.encode_with_special(text).unwrap();
+        assert_eq!(special, [tokenizer.encode("hi").unwrap(), vec![im_end]].concat());
+        assert_eq!(tokenizer.encode("hi").unwrap().len(), 1, "the merge applies");
+    }
 }
