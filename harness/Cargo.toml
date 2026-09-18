@@ -1,11 +1,11 @@
 [package]
 name = "dwim-harness"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-dwim-models = { version = "0.1.0", path = "../models" }
-dwim-tools = { version = "0.1.0", path = "../tools" }
+dwim-models.workspace = true
+dwim-tools.workspace = true

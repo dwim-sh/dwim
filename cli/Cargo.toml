@@ -1,7 +1,7 @@
 [package]
 name = "dwim-cli"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [[bin]]
 name = "dwim"
@@ -11,8 +11,8 @@ path = "main.rs"
 argh = "0.1.19"
 crossterm = "0.29.0"
 dirs = "7.0.0"
-dwim-gpu = { version = "0.1.0", path = "../gpu" }
-dwim-harness = { version = "0.1.0", path = "../harness" }
-dwim-models = { version = "0.1.0", path = "../models" }
+dwim-gpu.workspace = true
+dwim-harness.workspace = true
+dwim-models.workspace = true
 unicode-width = "0.2.2"
 ureq = "3.4.1"

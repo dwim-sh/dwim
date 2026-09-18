@@ -17,6 +17,10 @@ pub struct Opts {
     #[argh(option, default = "models::DEFAULT_CONTEXT")]
     pub context: usize,
 
+    /// print the version and exit
+    #[argh(switch)]
+    pub version: bool,
+
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,

@@ -2,6 +2,16 @@
 members = ["cli", "gpu", "harness", "models", "tools"]
 resolver = "3"
 
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+
+[workspace.dependencies]
+dwim-gpu = { path = "gpu" }
+dwim-harness = { path = "harness" }
+dwim-models = { path = "models" }
+dwim-tools = { path = "tools" }
+
 # The forward pass is unusably slow unoptimized on the CPU, so optimize the
 # model and the CPU device even in debug builds.
 [profile.dev.package.dwim-models]

@@ -9,6 +9,10 @@ use opts::Opts;
 
 fn main() {
     let opts: Opts = argh::from_env();
+    if opts.version {
+        println!("dwim {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // A prompt on the command line is a one-off: answer it and exit, with
     // nothing on standard output but the reply. Without one, open the shell.

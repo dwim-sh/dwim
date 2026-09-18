@@ -1,12 +1,12 @@
 [package]
 name = "dwim-tools"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-dwim-models = { version = "0.1.0", path = "../models" }
+dwim-models.workspace = true
 libc = "0.2.189"
 serde_json = "1.0.151"
