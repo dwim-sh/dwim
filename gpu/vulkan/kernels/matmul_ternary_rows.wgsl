@@ -4,7 +4,9 @@
 // walks its row's blocks one after another. Faster than
 // `matmul_ternary.wgsl` for matrices of few rows and many columns, where
 // each lane's stretch of its row is long, and slower for tall ones. The
-// block layout is that of `ternary.rs`.
+// block layout is that of `ternary.rs`, and the blocks are stored
+// block-major, as `matmul_ternary.wgsl` describes, so that the lanes of a
+// subgroup read adjacent blocks.
 
 struct Params {
     rows: u32,
@@ -73,7 +75,7 @@ fn main(
             var xsum = 0.0;
             var sum = 0.0;
             if r < p.rows {
-                let wbase = r * blocks * WORDS + b * WORDS;
+                let wbase = (b * p.rows + r) * WORDS;
                 var words: array<u32, 7>;
                 for (var i = 0u; i < WORDS; i++) {
                     words[i] = w[wbase + i];

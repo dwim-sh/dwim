@@ -2,7 +2,8 @@
 // `matmul_ternary.wgsl`, but taking the tokens four at a time, so that a
 // block is unpacked once per four tokens rather than once per token. A
 // last, shorter group of tokens has zero activations for the ones it
-// lacks, and costs the same.
+// lacks, and costs the same. The weights are stored block-major, as
+// `matmul_ternary.wgsl` describes.
 
 struct Params {
     rows: u32,
@@ -100,7 +101,7 @@ fn main(
                 if r0 + r >= p.rows {
                     continue;
                 }
-                let wbase = (r0 + r) * blocks * WORDS + b * WORDS;
+                let wbase = (b * p.rows + r0 + r) * WORDS;
                 var sum: array<f32, TOKENS>;
                 for (var k = 0u; k < TOKENS; k++) {
                     sum[k] = -xsum[k];

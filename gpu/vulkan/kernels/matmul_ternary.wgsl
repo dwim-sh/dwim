@@ -7,9 +7,10 @@
 // same position of four consecutive bytes belong to four consecutive
 // elements: each thread of a group unpacks one word of the block, four
 // bytes at a time, and multiplies each round of four trits into the four
-// activations they belong to. The block layout is that of `ternary.rs`.
-// Tokens go one after another; `matmul_ternary_batch.wgsl` takes several at
-// once.
+// activations they belong to. The block layout is that of `ternary.rs`,
+// and the blocks are stored block-major, a block of every row before the
+// next block, so that a group's eight rows read adjacent blocks. Tokens go
+// one after another; `matmul_ternary_batch.wgsl` takes several at once.
 
 struct Params {
     rows: u32,
@@ -104,7 +105,7 @@ fn main(
                 if r0 + r >= p.rows {
                     continue;
                 }
-                let wbase = (r0 + r) * blocks * WORDS + b * WORDS;
+                let wbase = (b * p.rows + r0 + r) * WORDS;
                 var sum = -xsum;
                 if j < 6u {
                     // Words 0 to 3 hold elements 4j + i + 16n in byte
