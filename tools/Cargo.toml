@@ -1,5 +1,5 @@
 [package]
-name = "dwim-harness"
+name = "dwim-tools"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,4 +8,5 @@ path = "lib.rs"
 
 [dependencies]
 dwim-models = { version = "0.1.0", path = "../models" }
-dwim-tools = { version = "0.1.0", path = "../tools" }
+libc = "0.2.189"
+serde_json = "1.0.151"

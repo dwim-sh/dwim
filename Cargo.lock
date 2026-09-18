@@ -326,8 +326,7 @@ name = "dwim-harness"
 version = "0.1.0"
 dependencies = [
  "dwim-models",
- "libc",
- "serde_json",
+ "dwim-tools",
 ]
 
 [[package]]
@@ -339,6 +338,15 @@ dependencies = [
  "fancy-regex",
  "libc",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dwim-tools"
+version = "0.1.0"
+dependencies = [
+ "dwim-models",
+ "libc",
  "serde_json",
 ]
 
