@@ -1,62 +1,36 @@
+<div align="center">
+  <img src=".github/assets/hero.png" width="200" alt="dwim logo: a small robot sitting cross-legged, eyes closed, at peace">
+
+# dwim
+
+**A coding agent that runs on your own GPU.**
+
+The agent, the model, and the engine that runs it, in one Rust program:
+no API key, no server, and nothing leaves your machine.
+
+[![Model: Bonsai 2 27B](https://img.shields.io/badge/Model-Bonsai_2_27B-3ec98a)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
+
+</div>
+
+## Getting started
+
+```console
+cargo install --git https://github.com/dwim-sh/dwim
+dwim
 ```
-DWIM(1)                          User Commands                          DWIM(1)
 
-NAME
-       dwim - a coding agent
+The model is downloaded (about 6 GB) on first use. `dwim "what changed in the
+last commit?"` answers one thing and exits, and `man ./man/dwim.1` has the rest.
 
-SYNOPSIS
-       dwim [OPTIONS] [PROMPT]
+- **A real coding agent.** A shell where the model runs commands, reads their
+  output, and keeps going until the task is done. It follows your project's
+  `AGENTS.md`.
+- **A 27B model in 6 GB.** Bonsai 2 27B, PrismML's ternary version of
+  Qwen3.8-27B: every weight is -1, 0, or 1, so it fits on a laptop GPU.
+- **Its own inference engine.** No llama.cpp, no CUDA. Metal on macOS, Vulkan
+  everywhere else, and a CPU reference the GPU kernels are tested against.
 
-DESCRIPTION
-       dwim is a coding agent that runs in your terminal. It reads and
-       edits files, runs commands, and works through a task with you in
-       an interactive shell.
+## License
 
-       With no arguments, dwim starts an interactive session in the
-       current directory. If PROMPT is given, dwim answers it without
-       the shell and exits: the reply goes to standard output and
-       nothing else does, while progress, the model's thinking, the
-       commands it runs, and their output go to standard error.
-
-OPTIONS
-       --model <model>
-              Model to run (default: bonsai-2-27b).
-
-       --device <device>
-              Device to run the model on: gpu (default), or cpu.
-
-       --context <tokens>
-              Maximum conversation length in tokens (default: 32768).
-              Cannot exceed the model's supported context length.
-              Larger values reserve more memory on the selected device
-              at startup.
-
-       --help Display usage information.
-
-INTERACTIVE SHELL
-       The shell reads one message at a time. Anything you type is sent
-       to the agent. Lines starting with a slash are commands:
-
-       /model List the models dwim knows, where their weights are kept
-              and how much of each has been fetched, marking the one
-              running.
-
-       Ctrl-C or Esc interrupts the agent while it works. Ctrl-C or
-       Ctrl-D on an empty line exits dwim, and Ctrl-C on a line with
-       text clears it.
-
-FILES
-       AGENTS.md
-              If present in the working directory, its contents are
-              given to the agent as project instructions.
-
-EXIT STATUS
-       0      Success.
-
-       1      An error occurred.
-
-SEE ALSO
-       claude(1), codex(1), opencode(1)
-
-dwim                              2026-09-18                            DWIM(1)
-```
+[MIT](LICENSE.md).

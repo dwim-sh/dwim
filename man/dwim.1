@@ -1,0 +1,81 @@
+.TH DWIM 1 2026-09-18 "dwim 0.1.0" "User Commands"
+.SH NAME
+dwim \- a coding agent
+.SH SYNOPSIS
+.B dwim
+.RI [ OPTIONS ]
+.RI [ PROMPT ]
+.SH DESCRIPTION
+.B dwim
+is a coding agent that runs in your terminal.
+It reads and edits files, runs commands, and works through a task with you in
+an interactive shell.
+.PP
+With no arguments,
+.B dwim
+starts an interactive session in the current directory.
+If
+.I PROMPT
+is given,
+.B dwim
+answers it without the shell and exits: the reply goes to standard output and
+nothing else does, while progress, the model's thinking, the commands it runs,
+and their output go to standard error.
+.SH OPTIONS
+.TP
+.BI \-\-model " model"
+Model to run (default:
+.BR bonsai\-2\-27b ).
+.TP
+.BI \-\-device " device"
+Device to run the model on:
+.B gpu
+(default), or
+.BR cpu .
+.TP
+.BI \-\-context " tokens"
+Maximum conversation length in tokens (default: 32768).
+Cannot exceed the model's supported context length.
+Larger values reserve more memory on the selected device at startup.
+.TP
+.B \-\-help
+Display usage information.
+.SH INTERACTIVE SHELL
+The shell reads one message at a time.
+Anything you type is sent to the agent.
+Lines starting with a slash are commands:
+.TP
+.B /model
+List the models
+.B dwim
+knows, where their weights are kept and how much of each has been fetched,
+marking the one running.
+.PP
+.B Ctrl\-C
+or
+.B Esc
+interrupts the agent while it works.
+.B Ctrl\-C
+or
+.B Ctrl\-D
+on an empty line exits
+.BR dwim ,
+and
+.B Ctrl\-C
+on a line with text clears it.
+.SH FILES
+.TP
+.B AGENTS.md
+If present in the working directory, its contents are given to the agent as
+project instructions.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred.
+.SH SEE ALSO
+.BR claude (1),
+.BR codex (1),
+.BR opencode (1)
