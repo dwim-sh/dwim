@@ -13,6 +13,12 @@ no API key, no server, and nothing leaves your machine.
 
 </div>
 
+> [!WARNING]
+> **dwim is experimental software.** Expect bugs, rough edges, and changes that
+> break things from one commit to the next. The model runs shell commands on
+> your machine without asking first, so use it on code you have committed or
+> backed up.
+
 ## Getting started
 
 ```console
