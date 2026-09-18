@@ -35,24 +35,15 @@ const BATCH: usize = 64;
 /// which spells out a tag stays text: a command that prints `<|im_end|>`
 /// cannot end the turn or start another.
 ///
-/// The whole conversation stays in the model's state, so each turn only
-/// runs the model over its new tokens. The exception is the model's
-/// thoughts: the model sees the thoughts of the answer it is working on,
-/// but not those of earlier answers, whose `<think>` blocks it sees empty,
-/// so when the user sends a message, the answer to the last one is run
-/// again without them.
+/// The whole conversation, including earlier thoughts, stays in the model's
+/// state, as Bonsai's chat template preserves thinking by default. Each
+/// turn runs the model over only its new tokens.
 pub struct Chat<M: LanguageModel> {
     model: M,
     tokenizer: Tokenizer,
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
     len: usize,
-    /// Where the answer to the user's last message starts: the model's
-    /// replies to it, and the tool responses between them.
-    answer_start: usize,
-    /// The answer to the user's last message as later turns see it: without
-    /// the model's thoughts.
-    answer: Vec<u32>,
     im_start: u32,
     im_end: u32,
     end_of_text: u32,
@@ -135,8 +126,6 @@ impl<M: LanguageModel> Chat<M> {
             tokenizer,
             sampler,
             len: 0,
-            answer_start: 0,
-            answer: Vec::new(),
         })
     }
 
@@ -155,7 +144,6 @@ impl<M: LanguageModel> Chat<M> {
             self.feed(batch)?;
             on_progress(i * BATCH + batch.len(), turn.len());
         }
-        self.answer_start = self.len;
         Ok(())
     }
 
@@ -169,11 +157,9 @@ impl<M: LanguageModel> Chat<M> {
     /// model wrote them. The reply ends early if `on_chunk` breaks, and then
     /// makes no calls.
     pub fn send(&mut self, message: &str, on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
-        self.forget_thoughts()?;
         let content = self.tokenizer.encode(message)?;
         let turn = self.turn("user", content)?;
         self.feed(&turn)?;
-        self.answer_start = self.len;
         self.generate(on_chunk)
     }
 
@@ -193,19 +179,7 @@ impl<M: LanguageModel> Chat<M> {
         }
         let turn = self.turn("user", content)?;
         self.feed(&turn)?;
-        self.answer.extend(turn);
         self.generate(on_chunk)
-    }
-
-    /// Runs the answer to the user's last message through the model again
-    /// without the thoughts in it, if it had any.
-    fn forget_thoughts(&mut self) -> Result<()> {
-        let answer = std::mem::take(&mut self.answer);
-        if self.len != self.answer_start + answer.len() {
-            self.len = self.answer_start;
-            self.feed(&answer)?;
-        }
-        Ok(())
     }
 
     /// Encodes a turn of the conversation around its content's tokens.
@@ -220,17 +194,12 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Generates the assistant's reply to the conversation so far.
     fn generate(&mut self, mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
-        // The template opens the thought for the model. Later turns see the
-        // thought empty: `<think>\n\n</think>\n\n` before the answer.
+        // The template opens the thought for the model.
         let mut prompt = vec![self.im_start];
         prompt.extend(self.tokenizer.encode("assistant\n")?);
         prompt.push(self.think);
         prompt.extend(self.tokenizer.encode("\n")?);
         let mut logits = self.feed(&prompt)?;
-        self.answer.extend(&prompt[..prompt.len() - 1]);
-        self.answer.extend(self.tokenizer.encode("\n\n")?);
-        self.answer.push(self.think_end);
-        self.answer.extend(self.tokenizer.encode("\n\n")?);
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
@@ -238,9 +207,6 @@ impl<M: LanguageModel> Chat<M> {
         let mut thinking = true;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;
-        // Whether the model's thought just ended, and blank lines after it
-        // are left out of the answer with it.
-        let mut after_thought = false;
         // Whether the reply has shown any text, or called a tool.
         let mut replied = false;
         // Whether the model tried to end the reply without doing either, and
@@ -270,11 +236,6 @@ impl<M: LanguageModel> Chat<M> {
                     continue;
                 }
             }
-            let blank = self.tokenizer.decode(token).iter().all(|&b| b == b'\n');
-            if !(thinking || token == self.think || token == self.think_end || (after_thought && blank)) {
-                self.answer.push(token);
-            }
-            after_thought = token == self.think_end || (after_thought && blank);
             let flow = if token == self.think {
                 thinking = true;
                 ControlFlow::Continue(())
@@ -314,10 +275,15 @@ impl<M: LanguageModel> Chat<M> {
 
         // End the reply the way the chat format expects, ready for the next
         // message, even if it was cut short.
-        let mut end = vec![self.im_end];
+        let mut end = Vec::new();
+        if thinking {
+            end.extend(self.tokenizer.encode("\n")?);
+            end.push(self.think_end);
+            end.extend(self.tokenizer.encode("\n\n")?);
+        }
+        end.push(self.im_end);
         end.extend(self.tokenizer.encode("\n")?);
         self.feed(&end)?;
-        self.answer.extend(end);
         Ok(if interrupted { Vec::new() } else { calls })
     }
 
@@ -385,7 +351,7 @@ mod tests {
 
     impl LanguageModel for Scripted {
         fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-            self.fed.truncate(pos);
+            assert_eq!(pos, self.fed.len(), "the conversation must only append tokens");
             self.fed.extend(tokens);
             // The reply's prompt ends with `<think>\n`; a sampled token
             // comes alone.
@@ -430,6 +396,81 @@ mod tests {
             }
             ControlFlow::Continue(())
         }
+    }
+
+    #[test]
+    fn preserves_thoughts_across_user_turns() {
+        let mut chat = chat(&["First thought.\n</think>\n\nOne.", "Second thought.\n</think>\n\nTwo."]);
+        let mut thoughts = String::new();
+        let mut reply = String::new();
+        chat.send("first", |chunk| {
+            match chunk {
+                Chunk::Thought(text) => thoughts.push_str(text),
+                Chunk::Text(text) => reply.push_str(text),
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(thoughts, "First thought.\n");
+        assert_eq!(reply.trim(), "One.");
+
+        chat.send("second", |_| ControlFlow::Continue(())).unwrap();
+        let expected = chat
+            .tokenizer
+            .encode_with_special(concat!(
+                "<|im_start|>system\nBe brief.<|im_end|>\n",
+                "<|im_start|>user\nfirst<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\nFirst thought.\n</think>\n\nOne.<|im_end|>\n",
+                "<|im_start|>user\nsecond<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\nSecond thought.\n</think>\n\nTwo.<|im_end|>\n",
+            ))
+            .unwrap();
+        assert_eq!(chat.model.fed, expected);
+        assert_eq!(chat.tokens(), expected.len());
+    }
+
+    #[test]
+    fn preserves_tool_exchange_thoughts_on_the_next_user_turn() {
+        let call = "<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>";
+        let first = format!("Check the date.\n</think>\n\n<tool_call>\n{call}\n</tool_call>");
+        let second = "The date is known.\n</think>\n\nMonday.";
+        let third = "The user is done.\n</think>\n\nBye.";
+        let mut chat = chat(&[&first, second, third]);
+        assert_eq!(chat.send("date?", |_| ControlFlow::Continue(())).unwrap().len(), 1);
+        chat.respond(&["Mon".to_string()], |_| ControlFlow::Continue(())).unwrap();
+        chat.send("thanks", |_| ControlFlow::Continue(())).unwrap();
+
+        let expected = chat
+            .tokenizer
+            .encode_with_special(&format!(
+                "<|im_start|>system\nBe brief.<|im_end|>\n\
+                 <|im_start|>user\ndate?<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n{first}<|im_end|>\n\
+                 <|im_start|>user\n<tool_response>\nMon\n</tool_response><|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n{second}<|im_end|>\n\
+                 <|im_start|>user\nthanks<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n{third}<|im_end|>\n"
+            ))
+            .unwrap();
+        assert_eq!(chat.model.fed, expected);
+    }
+
+    #[test]
+    fn closes_and_preserves_an_interrupted_thought() {
+        let mut chat = chat(&["X unfinished.</think>\n\nUnseen.", "Continue.\n</think>\n\nDone."]);
+        assert!(chat.send("first", |_| ControlFlow::Break(())).unwrap().is_empty());
+        chat.send("second", |_| ControlFlow::Continue(())).unwrap();
+        let expected = chat
+            .tokenizer
+            .encode_with_special(concat!(
+                "<|im_start|>system\nBe brief.<|im_end|>\n",
+                "<|im_start|>user\nfirst<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\nX\n</think>\n\n<|im_end|>\n",
+                "<|im_start|>user\nsecond<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\nContinue.\n</think>\n\nDone.<|im_end|>\n",
+            ))
+            .unwrap();
+        assert_eq!(chat.model.fed, expected);
     }
 
     #[test]
