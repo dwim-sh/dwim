@@ -1,5 +1,5 @@
 [package]
-name = "hack-models"
+name = "dwim-models"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,7 +9,7 @@ path = "lib.rs"
 [dependencies]
 fancy-regex = "0.19.1"
 libc = "0.2.189"
-hack-gpu = { version = "0.1.0", path = "../gpu" }
+dwim-gpu = { version = "0.1.0", path = "../gpu" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 

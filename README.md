@@ -1,19 +1,19 @@
 ```
-HACK(1)                          User Commands                          HACK(1)
+DWIM(1)                          User Commands                          DWIM(1)
 
 NAME
-       hack - a coding agent
+       dwim - a coding agent
 
 SYNOPSIS
-       hack [OPTIONS] [PROMPT]
+       dwim [OPTIONS] [PROMPT]
 
 DESCRIPTION
-       hack is a coding agent that runs in your terminal. It reads and
+       dwim is a coding agent that runs in your terminal. It reads and
        edits files, runs commands, and works through a task with you in
        an interactive shell.
 
-       With no arguments, hack starts an interactive session in the
-       current directory. If PROMPT is given, hack answers it without
+       With no arguments, dwim starts an interactive session in the
+       current directory. If PROMPT is given, dwim answers it without
        the shell and exits: the reply goes to standard output and
        nothing else does, while progress, the model's thinking, the
        commands it runs, and their output go to standard error.
@@ -37,12 +37,12 @@ INTERACTIVE SHELL
        The shell reads one message at a time. Anything you type is sent
        to the agent. Lines starting with a slash are commands:
 
-       /model List the models hack knows, where their weights are kept
+       /model List the models dwim knows, where their weights are kept
               and how much of each has been fetched, marking the one
               running.
 
        Ctrl-C or Esc interrupts the agent while it works. Ctrl-C or
-       Ctrl-D on an empty line exits hack, and Ctrl-C on a line with
+       Ctrl-D on an empty line exits dwim, and Ctrl-C on a line with
        text clears it.
 
 FILES
@@ -58,5 +58,5 @@ EXIT STATUS
 SEE ALSO
        claude(1), codex(1), opencode(1)
 
-hack                              2026-09-18                            HACK(1)
+dwim                              2026-09-18                            DWIM(1)
 ```

@@ -13,9 +13,9 @@ use std::{
     sync::Arc,
 };
 
-use hack_gpu::{Cpu, Gpu};
-use hack_harness::{self as harness, Harness};
-use hack_models::{Chat, Gguf, Tokenizer};
+use dwim_gpu::{Cpu, Gpu};
+use dwim_harness::{self as harness, Harness};
+use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{fetch, models, opts::Device};
 
@@ -42,7 +42,7 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str) -> Result<
 
 /// Loads `name` onto `device`, with room for `context` tokens, and answers
 /// `prompt` with it.
-fn answer<D: hack_gpu::Device + 'static>(
+fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     name: &str,

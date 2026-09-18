@@ -1,5 +1,5 @@
 [package]
-name = "hack-harness"
+name = "dwim-harness"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,4 +7,4 @@ edition = "2024"
 path = "lib.rs"
 
 [dependencies]
-hack-models = { version = "0.1.0", path = "../models" }
+dwim-models = { version = "0.1.0", path = "../models" }

@@ -1,10 +1,10 @@
-# Hack
+# `dwim`
 
 A coding agent harness in Rust.
 
 ## Layout
 
-* `cli/`: the `hack` command: arguments, fetching the model, and the terminal UI.
+* `cli/`: the `dwim` command: arguments, fetching the model, and the terminal UI.
 * `models/`: the language model: `gguf` reads the file the weights ship in, `tokenizer` builds the byte-level BPE tokenizer from the vocabulary in it, `bonsai` is the transformer as operations on a device, and `chat` is the conversation around it.
 * `harness/`: the agent around the model: runs the tools it calls and feeds the results back until it replies with text alone. The system prompt declares the `bash` tool in the form the model's chat template uses: a JSON signature, and calls as `<function=…>` blocks.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference, `vulkan` with hand-written WGSL compute kernels compiled to SPIR-V at build time, and `metal` with hand-written Metal Shading Language kernels compiled when the device opens. `ternary` is the 1.75-bit weight format. `Gpu` is Metal on Apple platforms and Vulkan elsewhere. The Vulkan ternary matmul comes in three kernels picked by shape: a lane per row for matrices of few rows, eight rows per workgroup for tall ones, and four tokens at a time for batches; its attention splits positions into chunks of 256 across workgroups and merges them, reading each key/value head once for the query heads that share it; and it submits command buffers every 128 kernels from a ring so the GPU runs while the CPU records.
@@ -19,13 +19,13 @@ The model thinks by default (its template opens `<think>` for it), calls tools a
 
 ## Building
 
-`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `~/.cache/hack/models/` on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 64 KB per token of context for the key/value caches.
+`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `~/.cache/dwim/models/` on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 64 KB per token of context for the key/value caches.
 
 ## Verifying
 
-* `cargo test -p hack-gpu` checks every Vulkan and Metal kernel against the CPU reference, and skips a backend whose GPU is not available.
-* `cargo test -p hack-models` checks the GGUF reader and runs a tiny random model on the CPU and the GPU and compares their logits. `cargo test -p hack-models real_model -- --ignored --nocapture` completes a prompt with the real model if it is in the cache: it must say Paris, as PrismML's llama.cpp does, and it reports prompt and decode speeds.
-* Exercise `./target/debug/hack` in a terminal (or tmux) and ask the model something before calling a change done.
+* `cargo test -p dwim-gpu` checks every Vulkan and Metal kernel against the CPU reference, and skips a backend whose GPU is not available.
+* `cargo test -p dwim-models` checks the GGUF reader and runs a tiny random model on the CPU and the GPU and compares their logits. `cargo test -p dwim-models real_model -- --ignored --nocapture` completes a prompt with the real model if it is in the cache: it must say Paris, as PrismML's llama.cpp does, and it reports prompt and decode speeds.
+* Exercise `./target/debug/dwim` in a terminal (or tmux) and ask the model something before calling a change done.
 * `CONTRIBUTING.md` has the longer version of all this, and how to run SWE-bench Lite.
 
 ## Coding Style

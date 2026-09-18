@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use hack_gpu::{CONV_KERNEL, HADAMARD_BLOCK};
+use dwim_gpu::{CONV_KERNEL, HADAMARD_BLOCK};
 
 use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
 
@@ -648,7 +648,7 @@ impl<D: Device> State<D> {
 mod tests {
     use super::*;
     use crate::gguf::{self, Value};
-    use hack_gpu::{Cpu, Gpu};
+    use dwim_gpu::{Cpu, Gpu};
     use std::path::Path;
 
     struct Rng(u64);
@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn gpu_agrees_with_cpu() {
-        let dir = std::env::temp_dir().join(format!("hack-bonsai-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dwim-bonsai-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.gguf");
         synthetic(&path);
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir().unwrap().join("hack/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        let path = dirs::cache_dir().unwrap().join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;

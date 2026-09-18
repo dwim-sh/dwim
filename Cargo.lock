@@ -296,6 +296,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwim-cli"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "crossterm",
+ "dirs",
+ "dwim-gpu",
+ "dwim-harness",
+ "dwim-models",
+ "unicode-width",
+ "ureq",
+]
+
+[[package]]
+name = "dwim-gpu"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "naga",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "rayon",
+]
+
+[[package]]
+name = "dwim-harness"
+version = "0.1.0"
+dependencies = [
+ "dwim-models",
+]
+
+[[package]]
+name = "dwim-models"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "dwim-gpu",
+ "fancy-regex",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -360,51 +405,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
-]
-
-[[package]]
-name = "hack-cli"
-version = "0.1.0"
-dependencies = [
- "argh",
- "crossterm",
- "dirs",
- "hack-gpu",
- "hack-harness",
- "hack-models",
- "unicode-width",
- "ureq",
-]
-
-[[package]]
-name = "hack-gpu"
-version = "0.1.0"
-dependencies = [
- "ash",
- "naga",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "rayon",
-]
-
-[[package]]
-name = "hack-harness"
-version = "0.1.0"
-dependencies = [
- "hack-models",
-]
-
-[[package]]
-name = "hack-models"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "fancy-regex",
- "hack-gpu",
- "libc",
- "serde",
- "serde_json",
 ]
 
 [[package]]

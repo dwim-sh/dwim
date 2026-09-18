@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn wrap_only_changes_last_line_when_appending() {
-        let text = "Hack is a coding agent harness: a loop around a model that runs the tools \
+        let text = "`dwim` is a coding agent harness: a loop around a model that runs the tools \
                     it calls and feeds the results back. Supercalifragilisticexpialidocious   \
                     words    and\n\nparagraphs.";
         for width in 1..30 {
