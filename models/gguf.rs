@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn reads_back_what_it_wrote() {
-        let dir = std::env::temp_dir().join(format!("hack-gguf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dwim-gguf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.gguf");
         let meta = [

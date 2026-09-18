@@ -4,8 +4,8 @@ resolver = "3"
 
 # The forward pass is unusably slow unoptimized on the CPU, so optimize the
 # model and the CPU device even in debug builds.
-[profile.dev.package.hack-models]
+[profile.dev.package.dwim-models]
 opt-level = 3
 
-[profile.dev.package.hack-gpu]
+[profile.dev.package.dwim-gpu]
 opt-level = 3

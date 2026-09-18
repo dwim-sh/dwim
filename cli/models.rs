@@ -5,8 +5,8 @@ use std::{
     time::SystemTime,
 };
 
-use hack_gpu::Device;
-use hack_models::{Gguf, LanguageModel, Sampler, bonsai};
+use dwim_gpu::Device;
+use dwim_models::{Gguf, LanguageModel, Sampler, bonsai};
 
 /// Model used when none is named on the command line.
 pub const DEFAULT: &str = "bonsai-2-27b";
@@ -15,7 +15,7 @@ pub const DEFAULT: &str = "bonsai-2-27b";
 /// otherwise.
 pub const DEFAULT_CONTEXT: usize = 32768;
 
-/// Models hack knows how to fetch.
+/// Models `dwim` knows how to fetch.
 pub const MODELS: &[Model] = &[Model {
     name: "bonsai-2-27b",
     repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
@@ -54,7 +54,7 @@ impl Model {
     /// cache directory (`~/.cache` on Linux, `~/Library/Caches` on macOS):
     /// the files can always be fetched again.
     pub fn dir(&self) -> Option<PathBuf> {
-        dirs::cache_dir().map(|dir| dir.join("hack").join("models").join(self.name))
+        dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(self.name))
     }
 
     /// Opens the model's weights in `dir`.

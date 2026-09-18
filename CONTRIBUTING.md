@@ -14,20 +14,20 @@ cargo build --release    # for anything that runs the model for long
 Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
 driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 
-The weights are downloaded on first use into `~/Library/Caches/hack/models`
-on macOS, and `~/.cache/hack/models` elsewhere. Bonsai 2 27B, the one model,
+The weights are downloaded on first use into `~/Library/Caches/dwim/models`
+on macOS, and `~/.cache/dwim/models` elsewhere. Bonsai 2 27B, the one model,
 is a 6 GB file; an interrupted download resumes on the next run.
 
 ## Running
 
 ```
-hack                     # the shell
-hack "what changed in the last commit?"
-hack --device cpu --context 4096 "what files are here?"
+dwim                     # the shell
+dwim "what changed in the last commit?"
+dwim --device cpu --context 4096 "what files are here?"
 ```
 
-With a prompt, hack answers it and exits. The reply goes to standard output
-and nothing else does, so `hack "…" 2>/dev/null` gives the reply alone, while
+With a prompt, `dwim` answers it and exits. The reply goes to standard output
+and nothing else does, so `dwim "…" 2>/dev/null` gives the reply alone, while
 progress, the model's thinking, the commands it runs, and their output go to
 standard error.
 
@@ -38,9 +38,9 @@ cargo test --workspace   # the GPU kernels are checked against the CPU reference
 cargo clippy --workspace --all-targets
 ```
 
-`cargo test -p hack-gpu` skips a backend whose GPU is not available, so it
+`cargo test -p dwim-gpu` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the
-model in the cache, `cargo test -p hack-models real_model -- --ignored
+model in the cache, `cargo test -p dwim-models real_model -- --ignored
 --nocapture` completes a prompt with it and reports the speed.
 
 Run the agent before calling a change done. The model is easy to break in
@@ -62,8 +62,8 @@ scripts/swebench.py --limit 10                         # the first ten
 scripts/swebench.py                                    # all 300
 ```
 
-The script builds hack, checks each repository out at its base commit, gives
-hack the issue, takes what it changed as the patch, and scores the patches
+The script builds `dwim`, checks each repository out at its base commit, gives
+`dwim` the issue, takes what it changed as the patch, and scores the patches
 with the official harness, which runs each project's tests in Docker. It
 tells you what to install if Docker or the harness is missing. `--no-score`
 writes `predictions.jsonl` without scoring, `--score-only` scores what an

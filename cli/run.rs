@@ -20,9 +20,9 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use hack_gpu::{Cpu, Gpu};
-use hack_harness::{self as harness, Harness};
-use hack_models::{Chat, Gguf, Tokenizer};
+use dwim_gpu::{Cpu, Gpu};
+use dwim_harness::{self as harness, Harness};
+use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{
     fetch::{self, Progress},
@@ -137,7 +137,7 @@ fn work(
 }
 
 /// Loads the model and answers messages until the UI hangs up.
-fn serve<D: hack_gpu::Device + 'static>(
+fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     context: usize,
@@ -659,7 +659,7 @@ fn tilde(path: &Path) -> String {
     }
 }
 
-/// The models hack knows, where their weights are kept, and how much of
+/// The models `dwim` knows, where their weights are kept, and how much of
 /// each is there, for the `/model` command. The one running is marked.
 fn models_listing(running: &str) -> Vec<Line> {
     let mut lines = Vec::new();

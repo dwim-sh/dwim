@@ -9,7 +9,7 @@ mod tokenizer;
 
 pub use chat::{Chat, Chunk, ToolCall};
 pub use gguf::Gguf;
-pub use hack_gpu::{Device, Tensor, ternary};
+pub use dwim_gpu::{Device, Tensor, ternary};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 

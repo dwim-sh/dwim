@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Runs hack over SWE-bench Lite and scores what it changed.
+"""Runs `dwim` over SWE-bench Lite and scores what it changed.
 
 For each instance: check the repository out at the commit before the fix,
-give hack the issue, and take whatever it changed as the patch. The patches
+give `dwim` the issue, and take whatever it changed as the patch. The patches
 go to predictions.jsonl, and are then scored by the official SWE-bench
 harness, which runs each project's tests in Docker.
 
@@ -30,11 +30,11 @@ def instances():
 
 
 def binary(path):
-    """The hack binary, built if it isn't already."""
+    """The `dwim` binary, built if it isn't already."""
     if path:
         return str(pathlib.Path(path).resolve())
-    built = ROOT / "target" / "release" / "hack"
-    print("building hack", file=sys.stderr)
+    built = ROOT / "target" / "release" / "dwim"
+    print("building dwim", file=sys.stderr)
     subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
     return str(built)
 
@@ -50,14 +50,14 @@ def checkout(repo, commit, repos):
     return clone
 
 
-def solve(row, args, hack, repos, work):
-    """Runs hack over one instance, and returns the patch it leaves behind."""
+def solve(row, args, dwim, repos, work):
+    """Runs `dwim` over one instance, and returns the patch it leaves behind."""
     clone = checkout(row["repo"], row["base_commit"], repos)
     log = work / f"{row['instance_id']}.log"
     try:
         with open(log, "w") as output:
             subprocess.run(
-                [hack, "--model", args.model, row["problem_statement"]],
+                [dwim, "--model", args.model, row["problem_statement"]],
                 cwd=clone,
                 stdout=output,
                 stderr=output,
@@ -69,7 +69,7 @@ def solve(row, args, hack, repos, work):
 
 
 def run(args, predictions):
-    """Runs hack over the instances, writing a prediction for each."""
+    """Runs `dwim` over the instances, writing a prediction for each."""
     rows = instances()
     if args.instance:
         rows = [row for row in rows if row["instance_id"] in args.instance]
@@ -79,18 +79,18 @@ def run(args, predictions):
     if args.limit is not None:
         rows = rows[: args.limit]
 
-    hack = binary(args.hack)
+    dwim = binary(args.dwim)
     work = pathlib.Path(args.work).resolve()
     repos = work / "repos"
     repos.mkdir(parents=True, exist_ok=True)
     with open(predictions, "w") as out:
         for i, row in enumerate(rows, 1):
             print(f"[{i}/{len(rows)}] {row['instance_id']}", file=sys.stderr)
-            patch = solve(row, args, hack, repos, work)
+            patch = solve(row, args, dwim, repos, work)
             print(f"  {len(patch)} bytes of patch, log in {work}", file=sys.stderr)
             prediction = {
                 "instance_id": row["instance_id"],
-                "model_name_or_path": f"hack-{args.model}",
+                "model_name_or_path": f"dwim-{args.model}",
                 "model_patch": patch,
             }
             out.write(json.dumps(prediction) + "\n")
@@ -136,14 +136,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instance", action="append", help="instance to run, repeatable (default: all 300)")
     parser.add_argument("--limit", type=int, help="run only the first so many instances")
-    parser.add_argument("--model", default="bonsai-2-27b", help="model for hack to run (default: %(default)s)")
+    parser.add_argument("--model", default="bonsai-2-27b", help="model for `dwim` to run (default: %(default)s)")
     parser.add_argument("--timeout", type=int, default=600, help="seconds per instance (default: %(default)s)")
     parser.add_argument("--work", default="swebench-work", help="where clones and logs go (default: %(default)s)")
     parser.add_argument("--out", default="predictions.jsonl", help="where the patches go (default: %(default)s)")
-    parser.add_argument("--hack", help="hack binary to run (default: build target/release/hack)")
+    parser.add_argument("--dwim", help="dwim binary to run (default: build target/release/dwim)")
     parser.add_argument("--no-score", action="store_true", help="write the patches without scoring them")
     parser.add_argument("--score-only", action="store_true", help="score patches written by an earlier run")
-    parser.add_argument("--run-id", default="hack", help="name for this run in the harness (default: %(default)s)")
+    parser.add_argument("--run-id", default="dwim", help="name for this run in the harness (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=4, help="instances scored at once (default: %(default)s)")
     args = parser.parse_args()
 
