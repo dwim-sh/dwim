@@ -242,6 +242,11 @@ impl<M: LanguageModel> Chat<M> {
             } else if token == self.think_end {
                 thinking = false;
                 ControlFlow::Continue(())
+            } else if (token == self.tool_call || token == self.tool_call_end) && thinking {
+                // A tool call contemplated in the thought is not made: the
+                // tag is part of the thought, shown as written.
+                let chunk = text.push(self.tokenizer.decode(token));
+                on_chunk(Chunk::Thought(&chunk))
             } else if token == self.tool_call {
                 replied = true;
                 call = Some(String::new());
@@ -497,6 +502,28 @@ mod tests {
         let calls = chat.respond(&["Mon".to_string()], text(&mut reply)).unwrap();
         assert!(calls.is_empty());
         assert_eq!(reply.trim(), "Done.");
+    }
+
+    #[test]
+    fn does_not_make_calls_contemplated_in_thoughts() {
+        let call = "<function=bash>\n<parameter=command>\nrm -rf /\n</parameter>\n</function>";
+        let mut chat = chat(&[&format!(
+            "I could run <tool_call>\n{call}\n</tool_call> but I won't.\n</think>\n\nNo action taken."
+        )]);
+        let mut thoughts = String::new();
+        let mut reply = String::new();
+        let calls = chat
+            .send("go", |chunk| {
+                match chunk {
+                    Chunk::Thought(text) => thoughts.push_str(text),
+                    Chunk::Text(text) => reply.push_str(text),
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(calls.is_empty());
+        assert_eq!(thoughts, format!("I could run <tool_call>\n{call}\n</tool_call> but I won't.\n"));
+        assert_eq!(reply.trim(), "No action taken.");
     }
 
     #[test]
