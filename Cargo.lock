@@ -372,9 +372,6 @@ dependencies = [
  "hack-gpu",
  "hack-harness",
  "hack-models",
- "rayon",
- "serde",
- "serde_json",
  "unicode-width",
  "ureq",
 ]
@@ -402,10 +399,10 @@ dependencies = [
 name = "hack-models"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "fancy-regex",
  "hack-gpu",
  "libc",
- "rayon",
  "serde",
  "serde_json",
 ]

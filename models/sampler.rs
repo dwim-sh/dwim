@@ -19,15 +19,18 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        let mut candidates: Vec<(u32, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(token, &logit)| (token as u32, logit))
-            .collect();
-        let k = self.top_k.clamp(1, candidates.len());
-        candidates.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-        candidates.truncate(k);
-        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // The top k in one pass over the logits, kept in order: a vocabulary
+        // is a quarter of a million entries, and k is twenty.
+        let k = self.top_k.clamp(1, logits.len());
+        let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (token, &logit) in logits.iter().enumerate() {
+            if candidates.len() == k && logit <= candidates[k - 1].1 {
+                continue;
+            }
+            let at = candidates.partition_point(|&(_, l)| l >= logit);
+            candidates.insert(at, (token as u32, logit));
+            candidates.truncate(k);
+        }
         if self.temperature == 0.0 {
             return candidates[0].0;
         }
@@ -71,5 +74,30 @@ impl Rng {
         self.0 ^= self.0 >> 27;
         let bits = self.0.wrapping_mul(0x2545F4914F6CDD1D);
         (bits >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_from_the_top_k_in_order() {
+        let mut logits = vec![0.0; 1000];
+        logits[7] = 5.0;
+        logits[300] = 4.0;
+        logits[999] = 3.0;
+        let mut greedy = Sampler::new(0.0, 20, 0.95, 1);
+        assert_eq!(greedy.sample(&logits), 7);
+        // At a low temperature the top token is all but certain, and with
+        // top_p of nearly nothing it is the only one kept.
+        let mut sampler = Sampler::new(1.0, 3, 0.01, 1);
+        for _ in 0..20 {
+            assert_eq!(sampler.sample(&logits), 7);
+        }
+        // With k of two, the third never comes up.
+        let mut sampler = Sampler::new(100.0, 2, 1.0, 1);
+        let picks: std::collections::HashSet<u32> = (0..200).map(|_| sampler.sample(&logits)).collect();
+        assert!(picks.contains(&7) && picks.contains(&300) && !picks.contains(&999));
     }
 }

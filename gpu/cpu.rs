@@ -3,7 +3,7 @@
 
 use rayon::prelude::*;
 
-use crate::{Device, Tensor, bf16, from_f16, sigmoid, to_f16};
+use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, sigmoid, softplus, ternary, to_f16};
 
 pub struct Cpu;
 
@@ -47,40 +47,30 @@ impl Device for Cpu {
         }
     }
 
-    fn embed(&self, out: &mut Vec<f32>, table: &Tensor, tokens: &[u32]) {
-        let dim = table.shape[1];
-        assert_eq!(out.len(), tokens.len() * dim);
-        for (out, &token) in out.chunks_exact_mut(dim).zip(tokens) {
-            let row = &table.data[token as usize * dim..][..dim];
-            for (o, &w) in out.iter_mut().zip(row) {
-                *o = bf16(w);
-            }
-        }
-    }
-
     fn matmul(&self, out: &mut Vec<f32>, w: &Tensor, x: &Vec<f32>) {
-        let (rows, cols) = (w.shape[0], w.shape[1]);
+        let (rows, cols) = (w.shape()[0], w.shape()[1]);
         let n = x.len() / cols;
         assert_eq!(x.len(), n * cols);
         assert_eq!(out.len(), n * rows);
-        if n == 1 {
-            out.par_iter_mut()
-                .zip(w.data.par_chunks_exact(cols))
-                .for_each(|(o, row)| *o = dot(row, x));
-            return;
-        }
         // Each row of the weights is read from memory once, for every
         // token: the results come out by row, and are transposed into `out`,
         // which holds them by token.
         let mut by_row = vec![0.0; rows * n];
-        by_row
-            .par_chunks_exact_mut(n)
-            .zip(w.data.par_chunks_exact(cols))
-            .for_each(|(results, row)| {
-                for (result, x) in results.iter_mut().zip(x.chunks_exact(cols)) {
-                    *result = dot(row, x);
-                }
-            });
+        let row_dot = |results: &mut [f32], dot: &dyn Fn(&[f32]) -> f32| {
+            for (result, x) in results.iter_mut().zip(x.chunks_exact(cols)) {
+                *result = dot(x);
+            }
+        };
+        match w {
+            Tensor::Bf16 { data, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(data.par_chunks_exact(cols))
+                .for_each(|(results, row)| row_dot(results, &|x| dot(row, x))),
+            Tensor::Ternary { data, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(data.par_chunks_exact(ternary::row_bytes(cols)))
+                .for_each(|(results, row)| row_dot(results, &|x| ternary::dot(row, x))),
+        }
         for (r, results) in by_row.chunks_exact(n).enumerate() {
             for (t, &result) in results.iter().enumerate() {
                 out[t * rows + r] = result;
@@ -94,23 +84,32 @@ impl Device for Cpu {
         }
     }
 
-    fn rmsnorm(&self, x: &mut Vec<f32>, weight: &Tensor, eps: f32) {
-        let dim = weight.data.len();
+    fn rmsnorm(&self, x: &mut Vec<f32>, weight: &Vec<f32>, eps: f32) {
+        let dim = weight.len();
         for row in x.chunks_exact_mut(dim) {
             let mean_square = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
             let scale = 1.0 / (mean_square + eps).sqrt();
-            for (v, &w) in row.iter_mut().zip(&weight.data) {
-                *v *= scale * bf16(w);
+            for (v, &w) in row.iter_mut().zip(weight) {
+                *v *= scale * w;
             }
         }
     }
 
-    fn rope(&self, x: &mut Vec<f32>, table: &Vec<f32>, pos: usize, n_heads: usize, head_dim: usize) {
-        // Each head is rotated as pairs of elements half a head apart, each
-        // pair by its own angle.
-        let half = head_dim / 2;
+    fn l2norm(&self, x: &mut Vec<f32>, dim: usize, eps: f32) {
+        for row in x.chunks_exact_mut(dim) {
+            let scale = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for v in row {
+                *v *= scale;
+            }
+        }
+    }
+
+    fn rope(&self, x: &mut Vec<f32>, table: &Vec<f32>, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
+        // The rotated part of each head is rotated as pairs of elements
+        // half of it apart, each pair by its own angle.
+        let half = rot_dim / 2;
         for (t, token) in x.chunks_exact_mut(n_heads * head_dim).enumerate() {
-            let angles = &table[(pos + t) * head_dim..][..head_dim];
+            let angles = &table[(pos + t) * rot_dim..][..rot_dim];
             for head in token.chunks_exact_mut(head_dim) {
                 for (i, angle) in angles.chunks_exact(2).enumerate() {
                     let (cos, sin) = (angle[0], angle[1]);
@@ -162,6 +161,173 @@ impl Device for Cpu {
         for (g, &u) in gate.iter_mut().zip(up) {
             *g = *g * sigmoid(*g) * u;
         }
+    }
+
+    fn sigmoid_mul(&self, x: &mut Vec<f32>, gate: &Vec<f32>) {
+        for (x, &g) in x.iter_mut().zip(gate) {
+            *x *= sigmoid(g);
+        }
+    }
+
+    fn hadamard(&self, x: &mut Vec<f32>, signs: &Vec<f32>, inverse: bool) {
+        let width = signs.len();
+        assert!(x.len().is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        for row in x.chunks_exact_mut(width) {
+            for (block, signs) in row.chunks_exact_mut(HADAMARD_BLOCK).zip(signs.chunks_exact(HADAMARD_BLOCK)) {
+                if !inverse {
+                    for (v, &s) in block.iter_mut().zip(signs) {
+                        *v *= s;
+                    }
+                }
+                walsh_hadamard(block);
+                if inverse {
+                    for (v, &s) in block.iter_mut().zip(signs) {
+                        *v *= s;
+                    }
+                }
+            }
+        }
+    }
+
+    fn norm_rotate(&self, out: &mut Vec<f32>, x: &Vec<f32>, weight: &Vec<f32>, signs: &Vec<f32>, eps: f32) {
+        assert_eq!(out.len(), x.len());
+        out.copy_from_slice(x);
+        self.rmsnorm(out, weight, eps);
+        self.hadamard(out, signs, false);
+    }
+
+    fn conv(
+        &self,
+        q: &mut Vec<f32>,
+        k: &mut Vec<f32>,
+        v: &mut Vec<f32>,
+        state_out: &mut Vec<f32>,
+        x: &Vec<f32>,
+        state: &Vec<f32>,
+        weight: &Vec<f32>,
+    ) {
+        let channels = weight.len() / CONV_KERNEL;
+        let n = x.len() / channels;
+        assert_eq!(x.len(), n * channels);
+        assert!(state.len() == (CONV_KERNEL - 1) * channels && state_out.len() == state.len());
+        let (q_dim, k_dim, v_dim) = (q.len() / n, k.len() / n, v.len() / n);
+        assert_eq!(q_dim + k_dim + v_dim, channels);
+        // The rows before the batch, then the batch.
+        let input = |t: isize, c: usize| {
+            if t < 0 {
+                state[(t + CONV_KERNEL as isize - 1) as usize * channels + c]
+            } else {
+                x[t as usize * channels + c]
+            }
+        };
+        for t in 0..n {
+            for c in 0..channels {
+                let mut acc = 0.0;
+                for j in 0..CONV_KERNEL {
+                    acc += weight[c * CONV_KERNEL + j] * input(t as isize + j as isize + 1 - CONV_KERNEL as isize, c);
+                }
+                let y = acc * sigmoid(acc);
+                if c < q_dim {
+                    q[t * q_dim + c] = y;
+                } else if c < q_dim + k_dim {
+                    k[t * k_dim + c - q_dim] = y;
+                } else {
+                    v[t * v_dim + c - q_dim - k_dim] = y;
+                }
+            }
+        }
+        for s in 0..CONV_KERNEL - 1 {
+            for c in 0..channels {
+                state_out[s * channels + c] = input(n as isize + s as isize + 1 - CONV_KERNEL as isize, c);
+            }
+        }
+    }
+
+    fn delta_net(
+        &self,
+        out: &mut Vec<f32>,
+        q: &Vec<f32>,
+        k: &Vec<f32>,
+        v: &Vec<f32>,
+        gates: &Vec<f32>,
+        decay: &Vec<f32>,
+        state: &mut Vec<f32>,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        head_dim: usize,
+    ) {
+        let n = v.len() / (n_v_heads * head_dim);
+        assert_eq!(v.len(), n * n_v_heads * head_dim);
+        assert!(q.len() == n * n_k_heads * head_dim && k.len() == q.len() && out.len() == v.len());
+        assert!(gates.len() == n * 2 * n_v_heads && decay.len() == 2 * n_v_heads);
+        assert_eq!(state.len(), n_v_heads * head_dim * head_dim);
+        let group = n_v_heads / n_k_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        // One head at a time, its state as `s[key][value]`.
+        let outs: Vec<Vec<f32>> = state
+            .par_chunks_exact_mut(head_dim * head_dim)
+            .enumerate()
+            .map(|(h, s)| {
+                let kh = h / group;
+                let mut out = vec![0.0; n * head_dim];
+                let mut kv = vec![0.0; head_dim];
+                for t in 0..n {
+                    let q = &q[(t * n_k_heads + kh) * head_dim..][..head_dim];
+                    let k = &k[(t * n_k_heads + kh) * head_dim..][..head_dim];
+                    let v = &v[(t * n_v_heads + h) * head_dim..][..head_dim];
+                    let alpha = gates[t * 2 * n_v_heads + h];
+                    let beta = sigmoid(gates[t * 2 * n_v_heads + n_v_heads + h]);
+                    let g = (decay[h] * softplus(alpha + decay[n_v_heads + h])).exp();
+                    for e in s.iter_mut() {
+                        *e *= g;
+                    }
+                    kv.fill(0.0);
+                    for (i, &ki) in k.iter().enumerate() {
+                        for (j, &sij) in s[i * head_dim..][..head_dim].iter().enumerate() {
+                            kv[j] += sij * ki;
+                        }
+                    }
+                    for (i, &ki) in k.iter().enumerate() {
+                        for (j, sij) in s[i * head_dim..][..head_dim].iter_mut().enumerate() {
+                            *sij += ki * (v[j] - kv[j]) * beta;
+                        }
+                    }
+                    let o = &mut out[t * head_dim..][..head_dim];
+                    for (i, &qi) in q.iter().enumerate() {
+                        for (j, &sij) in s[i * head_dim..][..head_dim].iter().enumerate() {
+                            o[j] += sij * qi * scale;
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        for (h, o) in outs.iter().enumerate() {
+            for t in 0..n {
+                out[(t * n_v_heads + h) * head_dim..][..head_dim].copy_from_slice(&o[t * head_dim..][..head_dim]);
+            }
+        }
+    }
+}
+
+/// The normalized Walsh-Hadamard transform of a block, in place: the sums
+/// and differences of pairs one, two, four, and so on apart, over 1/√n.
+fn walsh_hadamard(x: &mut [f32]) {
+    let n = x.len();
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(2 * h) {
+            for j in i..i + h {
+                let (a, b) = (x[j], x[j + h]);
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    for v in x {
+        *v *= scale;
     }
 }
 
@@ -246,7 +412,7 @@ fn softmax(x: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::from_f16_8;
+    use super::{from_f16_8, walsh_hadamard};
     use crate::{F16_MAX, from_f16, to_f16};
 
     #[test]
@@ -280,5 +446,25 @@ mod tests {
         assert_eq!(from_f16(to_f16(1e6)), F16_MAX);
         assert_eq!(from_f16(to_f16(-1e6)), -F16_MAX);
         assert_eq!(from_f16(to_f16(1e-9)), 0.0);
+    }
+
+    #[test]
+    fn walsh_hadamard_is_sylvesters_matrix_and_its_own_inverse() {
+        // Row i of the matrix is the transform of the ith unit vector, and
+        // has the sign of the parity of i & j in column j.
+        let n = 16;
+        for i in 0..n {
+            let mut x = vec![0.0; n];
+            x[i] = 1.0;
+            walsh_hadamard(&mut x);
+            for (j, &v) in x.iter().enumerate() {
+                let sign = if (i & j).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+                assert_eq!(v, sign / 4.0, "row {i} column {j}");
+            }
+            walsh_hadamard(&mut x);
+            for (j, &v) in x.iter().enumerate() {
+                assert!((v - if i == j { 1.0 } else { 0.0 }).abs() < 1e-6);
+            }
+        }
     }
 }

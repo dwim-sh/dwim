@@ -1,5 +1,4 @@
-// Normalizes each row of x by its root mean square and scales it by the
-// weight: one threadgroup per row.
+// Normalizes each row of x to unit length: one threadgroup per row.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -9,10 +8,9 @@ struct Params {
     float eps;
 };
 
-kernel void rmsnorm(
+kernel void l2norm(
     device float* x [[buffer(0)]],
-    const device float* weight [[buffer(1)]],
-    constant Params& p [[buffer(2)]],
+    constant Params& p [[buffer(1)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -35,8 +33,8 @@ kernel void rmsnorm(
     for (uint i = 0; i < nsg; i++) {
         total += partial[i];
     }
-    float scale = rsqrt(total / float(p.dim) + p.eps);
+    float scale = rsqrt(total + p.eps);
     for (uint i = lid; i < p.dim; i += threads) {
-        v[i] *= scale * weight[i];
+        v[i] *= scale;
     }
 }

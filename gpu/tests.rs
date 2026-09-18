@@ -1,6 +1,6 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::{Cpu, Device, Tensor};
+use crate::{CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, ternary};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -10,13 +10,18 @@ macro_rules! check_against_cpu {
             $open;
             write_and_read_round_trip,
             alloc_is_zeroed_and_copy_moves_ranges,
-            embed_matches_cpu,
             matmul_matches_cpu,
+            ternary_matmul_matches_cpu,
             rmsnorm_matches_cpu,
+            l2norm_matches_cpu,
             rope_matches_cpu,
             attention_matches_cpu,
             store_rounds_like_cpu,
             elementwise_match_cpu,
+            hadamard_matches_cpu,
+            norm_rotate_matches_cpu,
+            conv_matches_cpu,
+            delta_net_matches_cpu,
             resize_keeps_capacity
         );
     };
@@ -46,19 +51,37 @@ impl Rng {
         (0..n).map(|_| self.next()).collect()
     }
 
-    fn tensor(&mut self, shape: &[usize]) -> Tensor {
+    fn bf16(&mut self, shape: &[usize]) -> Tensor {
         let n = shape.iter().product();
-        Tensor {
+        Tensor::Bf16 {
             shape: shape.to_vec(),
             data: (0..n).map(|_| (self.next().to_bits() >> 16) as u16).collect(),
         }
     }
+
+    fn ternary(&mut self, shape: &[usize]) -> Tensor {
+        let (rows, cols) = (shape[0], shape[1]);
+        let mut data = vec![0; rows * ternary::row_bytes(cols)];
+        for row in data.chunks_exact_mut(ternary::row_bytes(cols)) {
+            ternary::quantize_row(&self.floats(cols), row);
+        }
+        Tensor::Ternary {
+            shape: shape.to_vec(),
+            data,
+        }
+    }
 }
 
-fn bf16_tensor(t: &Tensor) -> Tensor {
-    Tensor {
-        shape: t.shape.clone(),
-        data: t.data.clone(),
+fn clone(t: &Tensor) -> Tensor {
+    match t {
+        Tensor::Bf16 { shape, data } => Tensor::Bf16 {
+            shape: shape.clone(),
+            data: data.clone(),
+        },
+        Tensor::Ternary { shape, data } => Tensor::Ternary {
+            shape: shape.clone(),
+            data: data.clone(),
+        },
     }
 }
 
@@ -105,24 +128,28 @@ pub fn alloc_is_zeroed_and_copy_moves_ranges<D: Device>(gpu: &D) {
     assert_eq!(gpu.read(&dst), want);
 }
 
-pub fn embed_matches_cpu<D: Device>(gpu: &D) {
-    let table = Rng(3).tensor(&[50, 24]);
-    let tokens = [3, 49, 0, 17];
-    let mut want = vec![0.0; tokens.len() * 24];
-    Cpu.embed(&mut want, &bf16_tensor(&table), &tokens);
-    let weight = gpu.upload(table);
-    let mut out = gpu.alloc(tokens.len() * 24);
-    gpu.embed(&mut out, &weight, &tokens);
-    assert_eq!(gpu.read(&out), want);
-}
-
 pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(4);
     for (rows, cols, n) in [(1, 8, 1), (200, 192, 1), (77, 1032, 3), (70_000, 8, 2)] {
-        let w = rng.tensor(&[rows, cols]);
+        let w = rng.bf16(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
-        Cpu.matmul(&mut want, &bf16_tensor(&w), &x);
+        Cpu.matmul(&mut want, &clone(&w), &x);
+        let weight = gpu.upload(w);
+        let x = buffer(gpu, &x);
+        let mut out = gpu.alloc(n * rows);
+        gpu.matmul(&mut out, &weight, &x);
+        close(&gpu.read(&out), &want, 1e-4);
+    }
+}
+
+pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(14);
+    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2)] {
+        let w = rng.ternary(&[rows, cols]);
+        let x = rng.floats(n * cols);
+        let mut want = vec![0.0; n * rows];
+        Cpu.matmul(&mut want, &clone(&w), &x);
         let weight = gpu.upload(w);
         let x = buffer(gpu, &x);
         let mut out = gpu.alloc(n * rows);
@@ -134,35 +161,55 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
 pub fn rmsnorm_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(5);
     for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
-        let w = rng.tensor(&[dim]);
+        let w = rng.floats(dim);
         let x = rng.floats(dim * rows);
         let mut want = x.clone();
-        Cpu.rmsnorm(&mut want, &bf16_tensor(&w), 1e-6);
-        let weight = gpu.upload(w);
+        Cpu.rmsnorm(&mut want, &w, 1e-6);
+        let weight = buffer(gpu, &w);
         let mut buf = buffer(gpu, &x);
         gpu.rmsnorm(&mut buf, &weight, 1e-6);
         close(&gpu.read(&buf), &want, 1e-5);
     }
 }
 
+pub fn l2norm_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(15);
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+        let x = rng.floats(dim * rows);
+        let mut want = x.clone();
+        Cpu.l2norm(&mut want, dim, 1e-6);
+        let mut buf = buffer(gpu, &x);
+        gpu.l2norm(&mut buf, dim, 1e-6);
+        close(&gpu.read(&buf), &want, 1e-5);
+    }
+}
+
 pub fn rope_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(6);
-    let (n_heads, head_dim, n, pos) = (4, 16, 3, 7);
-    let table = rng.floats((pos + n) * head_dim);
-    let x = rng.floats(n * n_heads * head_dim);
-    let mut want = x.clone();
-    Cpu.rope(&mut want, &table, pos, n_heads, head_dim);
-    let table = buffer(gpu, &table);
-    let mut buf = buffer(gpu, &x);
-    gpu.rope(&mut buf, &table, pos, n_heads, head_dim);
-    close(&gpu.read(&buf), &want, 1e-5);
+    for (n_heads, head_dim, rot_dim, n, pos) in [(4, 16, 16, 3, 7), (3, 256, 64, 2, 5)] {
+        let table = rng.floats((pos + n) * rot_dim);
+        let x = rng.floats(n * n_heads * head_dim);
+        let mut want = x.clone();
+        Cpu.rope(&mut want, &table, pos, n_heads, head_dim, rot_dim);
+        let table = buffer(gpu, &table);
+        let mut buf = buffer(gpu, &x);
+        gpu.rope(&mut buf, &table, pos, n_heads, head_dim, rot_dim);
+        close(&gpu.read(&buf), &want, 1e-5);
+    }
 }
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
     // The last attends over more positions than one dispatch has scores
     // for, all its tokens at once.
-    let cases = [(4, 8, 2, 3, 5), (16, 128, 8, 2, 300), (2, 128, 1, 1, 0), (32, 128, 4, 3, 1000), (16, 128, 4, 64, 32704)];
+    let cases = [
+        (4, 8, 2, 3, 5),
+        (16, 128, 8, 2, 300),
+        (2, 128, 1, 1, 0),
+        (24, 256, 4, 3, 1000),
+        (3, 24, 1, 2, 9),
+        (16, 128, 4, 64, 32704),
+    ];
     for (n_heads, head_dim, n_kv_heads, n, pos) in cases {
         let kv_dim = n_kv_heads * head_dim;
         let q = rng.floats(n * n_heads * head_dim);
@@ -175,7 +222,11 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         let (k, v) = (cache(gpu, &k_cache, pos * kv_dim), cache(gpu, &v_cache, pos * kv_dim));
         let mut out = gpu.alloc(want.len());
         gpu.attention(&mut out, &q, &k, &v, pos, n_heads, head_dim, n_kv_heads);
-        close(&gpu.read(&out), &want, 1e-4);
+        // Within a couple of half-precision ulps: a driver whose `store`
+        // truncates rather than rounds (Mesa's `pack2x16float` does) puts
+        // slightly different keys and values in the cache, which
+        // `store_rounds_like_cpu` reports on its own.
+        close(&gpu.read(&out), &want, 3e-3);
     }
 }
 
@@ -220,10 +271,104 @@ pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
     close(&gpu.read(&gate), &want, 1e-6);
 
     let mut want = a.clone();
+    Cpu.sigmoid_mul(&mut want, &b);
+    let mut x = buffer(gpu, &a);
+    gpu.sigmoid_mul(&mut x, &up);
+    close(&gpu.read(&x), &want, 1e-6);
+
+    let mut want = a.clone();
     Cpu.add(&mut want, &b);
     let mut x = buffer(gpu, &a);
     gpu.add(&mut x, &up);
     close(&gpu.read(&x), &want, 1e-6);
+}
+
+pub fn hadamard_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(10);
+    for (width, rows) in [(HADAMARD_BLOCK, 1), (5 * HADAMARD_BLOCK, 3)] {
+        let signs: Vec<f32> = (0..width).map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 }).collect();
+        let x = rng.floats(width * rows);
+        for inverse in [false, true] {
+            let mut want = x.clone();
+            Cpu.hadamard(&mut want, &signs, inverse);
+            let signs = buffer(gpu, &signs);
+            let mut buf = buffer(gpu, &x);
+            gpu.hadamard(&mut buf, &signs, inverse);
+            close(&gpu.read(&buf), &want, 1e-5);
+        }
+        // The inverse undoes the rotation.
+        let mut back = x.clone();
+        Cpu.hadamard(&mut back, &signs, false);
+        Cpu.hadamard(&mut back, &signs, true);
+        close(&back, &x, 1e-5);
+    }
+}
+
+pub fn norm_rotate_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(13);
+    for (width, rows) in [(HADAMARD_BLOCK, 1), (5 * HADAMARD_BLOCK, 3)] {
+        let signs: Vec<f32> = (0..width).map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 }).collect();
+        let weight: Vec<f32> = (0..width).map(|_| 1.0 + 0.2 * rng.next()).collect();
+        let x = rng.floats(width * rows);
+        let mut want = vec![0.0; x.len()];
+        Cpu.norm_rotate(&mut want, &x, &weight, &signs, 1e-6);
+        let mut out = gpu.alloc(x.len());
+        gpu.norm_rotate(&mut out, &buffer(gpu, &x), &buffer(gpu, &weight), &buffer(gpu, &signs), 1e-6);
+        close(&gpu.read(&out), &want, 1e-5);
+    }
+}
+
+pub fn conv_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(11);
+    let (q_dim, k_dim, v_dim) = (16, 16, 48);
+    let channels = q_dim + k_dim + v_dim;
+    for n in [1, 2, 7] {
+        let x = rng.floats(n * channels);
+        let state = rng.floats((CONV_KERNEL - 1) * channels);
+        let weight = rng.floats(channels * CONV_KERNEL);
+        let (mut want_q, mut want_k, mut want_v) = (vec![0.0; n * q_dim], vec![0.0; n * k_dim], vec![0.0; n * v_dim]);
+        let mut want_state = vec![0.0; state.len()];
+        Cpu.conv(&mut want_q, &mut want_k, &mut want_v, &mut want_state, &x, &state, &weight);
+        let (mut q, mut k, mut v) = (gpu.alloc(n * q_dim), gpu.alloc(n * k_dim), gpu.alloc(n * v_dim));
+        let mut state_out = gpu.alloc(state.len());
+        gpu.conv(&mut q, &mut k, &mut v, &mut state_out, &buffer(gpu, &x), &buffer(gpu, &state), &buffer(gpu, &weight));
+        close(&gpu.read(&q), &want_q, 1e-5);
+        close(&gpu.read(&k), &want_k, 1e-5);
+        close(&gpu.read(&v), &want_v, 1e-5);
+        close(&gpu.read(&state_out), &want_state, 1e-6);
+    }
+}
+
+pub fn delta_net_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(12);
+    let (n_k_heads, n_v_heads, head_dim) = (2, 6, 128);
+    for n in [1, 5] {
+        let q = rng.floats(n * n_k_heads * head_dim);
+        let k = rng.floats(n * n_k_heads * head_dim);
+        let v = rng.floats(n * n_v_heads * head_dim);
+        let gates = rng.floats(n * 2 * n_v_heads);
+        let decay: Vec<f32> = (0..2 * n_v_heads).map(|i| if i < n_v_heads { -rng.next().abs() } else { 4.0 * rng.next() }).collect();
+        let state = rng.floats(n_v_heads * head_dim * head_dim);
+        let mut want = vec![0.0; v.len()];
+        let mut want_state = state.clone();
+        Cpu.delta_net(&mut want, &q, &k, &v, &gates, &decay, &mut want_state, n_k_heads, n_v_heads, head_dim);
+        let mut out = gpu.alloc(v.len());
+        let mut gpu_state = buffer(gpu, &state);
+        gpu.delta_net(
+            &mut out,
+            &buffer(gpu, &q),
+            &buffer(gpu, &k),
+            &buffer(gpu, &v),
+            &buffer(gpu, &gates),
+            &buffer(gpu, &decay),
+            &mut gpu_state,
+            n_k_heads,
+            n_v_heads,
+            head_dim,
+        );
+        close(&gpu.read(&out), &want, 1e-4);
+        close(&gpu.read(&gpu_state), &want_state, 1e-4);
+    }
 }
 
 pub fn resize_keeps_capacity<D: Device>(gpu: &D) {

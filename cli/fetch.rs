@@ -1,16 +1,17 @@
 use std::{
     error::Error,
-    fs::{self, File},
-    io::{self, Read, Write},
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    thread,
     time::Duration,
 };
 
 use crate::models::{MODELS, Model};
 
 /// How long a partial download can go without being written to before it is
-/// taken for the leftover of an interrupted run, rather than the work of
-/// another run still in progress, and removed.
+/// taken for the leftover of an interrupted run, to be resumed, rather than
+/// the work of another run still in progress, to be waited for.
 const STALE: Duration = Duration::from_secs(60);
 
 /// How far along the download of one of a model's files is.
@@ -48,7 +49,6 @@ pub fn on_disk(model: &Model, dir: &Path) -> (usize, u64) {
 /// and reporting progress on each one as it comes in.
 pub fn fetch(model: &'static Model, dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(dir)?;
-    remove_stale(dir)?;
     for file in model.files {
         let path = dir.join(file);
         if path.exists() {
@@ -59,52 +59,69 @@ pub fn fetch(model: &'static Model, dir: &Path, mut progress: impl FnMut(Progres
     Ok(())
 }
 
-/// Removes partial downloads left behind by interrupted runs.
-fn remove_stale(dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let partial = entry.file_name().to_str().is_some_and(|name| name.ends_with(".part"));
-        let untouched = entry.metadata()?.modified()?.elapsed().is_ok_and(|age| age > STALE);
-        if partial && untouched {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
-}
-
 /// Downloads one of the model's files to `path`.
 ///
-/// The file is written under a temporary name and renamed into place once
-/// complete, so an interrupted download never looks like a finished one. The
-/// name is unique to this process, so that runs started at the same time
-/// don't write over each other: whichever finishes first puts the file in
-/// place, and the others replace it with their identical copies.
+/// The file is written under a `.part` name and renamed into place once
+/// complete, so an interrupted download never looks like a finished one.
+/// A partial file another run is still writing is waited for; one nobody is
+/// writing is picked up where it left off, which matters for a model of
+/// several gigabytes on a slow link.
 pub fn download(
     model: &Model,
     file: &'static str,
     path: &Path,
     progress: &mut impl FnMut(Progress),
 ) -> Result<(), Box<dyn Error>> {
+    let partial = path.with_file_name(format!("{file}.part"));
+    let mut done = loop {
+        match fs::metadata(&partial) {
+            Ok(meta) if meta.modified()?.elapsed().is_ok_and(|age| age < STALE) => {
+                progress(Progress {
+                    file,
+                    done: meta.len(),
+                    total: None,
+                });
+                thread::sleep(Duration::from_secs(2));
+                if path.exists() {
+                    return Ok(());
+                }
+            }
+            Ok(meta) => break meta.len(),
+            Err(_) => break 0,
+        }
+    };
     progress(Progress {
         file,
-        done: 0,
+        done,
         total: None,
     });
-    let response = ureq::get(&model.url(file)).call()?;
-    let partial = path.with_file_name(format!("{file}.{}.part", std::process::id()));
-    let result = save(response, &partial, file, progress);
+    let mut request = ureq::get(&model.url(file));
+    if done > 0 {
+        request = request.header("Range", &format!("bytes={done}-"));
+    }
+    let response = request.call()?;
+    // A server that ignores the range sends the whole file, from the start.
+    if done > 0 && response.status() != 206 {
+        done = 0;
+    }
+    let result = save(response, &partial, done, file, progress);
     if result.is_err() {
-        let _ = fs::remove_file(&partial);
+        // Left for the next run to resume, unless nothing arrived.
+        if fs::metadata(&partial).is_ok_and(|meta| meta.len() == 0) {
+            let _ = fs::remove_file(&partial);
+        }
     }
     result?;
     fs::rename(&partial, path)?;
     Ok(())
 }
 
-/// Writes the body of a response to `partial`, reporting progress.
+/// Writes the body of a response to `partial` from `done` bytes in, which
+/// it holds already, reporting progress.
 fn save(
     response: ureq::http::Response<ureq::Body>,
     partial: &Path,
+    mut done: u64,
     file: &'static str,
     progress: &mut impl FnMut(Progress),
 ) -> Result<(), Box<dyn Error>> {
@@ -112,11 +129,13 @@ fn save(
         .headers()
         .get("content-length")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|length| done + length);
     let mut reader = response.into_body().into_reader();
-    let mut writer = File::create(partial)?;
+    let mut writer = OpenOptions::new().write(true).create(true).truncate(false).open(partial)?;
+    writer.set_len(done)?;
+    std::io::Seek::seek(&mut writer, std::io::SeekFrom::Start(done))?;
     let mut buf = vec![0; 1 << 20];
-    let mut done = 0;
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {

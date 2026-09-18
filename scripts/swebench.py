@@ -136,7 +136,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instance", action="append", help="instance to run, repeatable (default: all 300)")
     parser.add_argument("--limit", type=int, help="run only the first so many instances")
-    parser.add_argument("--model", default="qwen3-0.6b", help="model for hack to run (default: %(default)s)")
+    parser.add_argument("--model", default="bonsai-2-27b", help="model for hack to run (default: %(default)s)")
     parser.add_argument("--timeout", type=int, default=600, help="seconds per instance (default: %(default)s)")
     parser.add_argument("--work", default="swebench-work", help="where clones and logs go (default: %(default)s)")
     parser.add_argument("--out", default="predictions.jsonl", help="where the patches go (default: %(default)s)")
