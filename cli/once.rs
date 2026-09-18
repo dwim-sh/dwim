@@ -10,14 +10,14 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Write},
     ops::ControlFlow,
-    path::Path,
+    sync::Arc,
 };
 
 use hack_gpu::{Cpu, Gpu};
 use hack_harness::{self as harness, Harness};
-use hack_models::{Chat, Tokenizer};
+use hack_models::{Chat, Gguf, Tokenizer};
 
-use crate::{convert, fetch, models, opts::Device};
+use crate::{fetch, models, opts::Device};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone.
@@ -28,50 +28,36 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str) -> Result<
         let total = file.total.unwrap_or(file.done);
         progress.report(format!("downloading {}", file.file), megabytes(file.done), megabytes(total));
     })?;
-    if model.sharded {
-        convert::ensure_pack(model, &dir, |stage| {
-            let (stage, done, total) = match stage {
-                convert::Progress::Planning => ("planning the conversion".to_string(), 0, 0),
-                convert::Progress::Downloading { shard, total, download } => (
-                    format!("downloading shard {shard}/{total}"),
-                    download.map_or(0, |file| megabytes(file.done)),
-                    download.map_or(0, |file| megabytes(file.total.unwrap_or(file.done))),
-                ),
-                convert::Progress::Converting { shard, total, done, tensors } => (format!("converting shard {shard}/{total}"), done, tensors),
-            };
-            progress.report(stage, done, total);
-        })?;
-    }
+    let gguf = model.open(&dir)?;
     match device {
-        Device::Cpu => answer(&dir, Cpu, name, "the CPU", context, model.tools, prompt),
+        Device::Cpu => answer(gguf, Cpu, name, "the CPU", context, prompt),
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let device = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
-            answer(&dir, gpu, name, &device, context, model.tools, prompt)
+            answer(gguf, gpu, name, &device, context, prompt)
         }
     }
 }
 
 /// Loads `name` onto `device`, with room for `context` tokens, and answers
-/// `prompt` with it, declaring the tools in the form the model writes calls
-/// in.
+/// `prompt` with it.
 fn answer<D: hack_gpu::Device + 'static>(
-    dir: &Path,
+    gguf: Arc<Gguf>,
     device: D,
     name: &str,
     on: &str,
     context: usize,
-    tools: harness::ToolFormat,
     prompt: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mut progress = Progress::new();
-    let model = models::load(dir, device, context, |done, total| {
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let sampler = models::sampler(&gguf);
+    let model = models::load(gguf, device, context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
-    let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"))?;
-    let mut chat = Chat::new(model, tokenizer, models::sampler(dir))?;
-    chat.system(&harness::system_prompt(&env::current_dir()?, tools), |read, total| {
+    let mut chat = Chat::new(model, tokenizer, sampler)?;
+    chat.system(&harness::system_prompt(&env::current_dir()?), |read, total| {
         progress.report("reading the system prompt".to_string(), read, total);
     })?;
 

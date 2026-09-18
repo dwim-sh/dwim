@@ -1,5 +1,4 @@
-// Normalizes each row of x by its root mean square and scales it by the
-// weight: one workgroup per row.
+// Normalizes each row of x to unit length: one workgroup per row.
 
 struct Params {
     dim: u32,
@@ -9,7 +8,6 @@ struct Params {
 var<immediate> p: Params;
 
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(1) var<storage, read> weight: array<f32>;
 
 var<workgroup> partial: array<f32, 16>;
 
@@ -36,8 +34,8 @@ fn main(
     for (var i = 0u; i < nsg; i++) {
         total += partial[i];
     }
-    let scale = inverseSqrt(total / f32(p.dim) + p.eps);
+    let scale = inverseSqrt(total + p.eps);
     for (var i = lid; i < p.dim; i += 256u) {
-        x[base + i] *= scale * weight[i];
+        x[base + i] *= scale;
     }
 }

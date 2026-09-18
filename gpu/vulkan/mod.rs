@@ -1,28 +1,42 @@
 //! The model on a GPU, through Vulkan compute: every operation is a
 //! hand-written kernel in `kernels/`, compiled to SPIR-V at build time.
 //!
-//! Operations are recorded into one command buffer as they are called, with
-//! a barrier between each, and submitted together the first time something
-//! is read back. A forward pass is therefore one submission per batch of
-//! tokens, and the GPU never waits on the CPU between kernels.
+//! Operations are recorded into a command buffer as they are called, with a
+//! barrier between each, and submitted every so many of them without
+//! waiting, from a ring of command buffers, so that the GPU works on the
+//! first kernels of a forward pass while the CPU records the rest. Reading
+//! a buffer back waits for everything submitted.
 
 use std::{error::Error, io::Cursor, slice, sync::Mutex};
 
 use ash::{khr::push_descriptor, vk};
 
-use crate::{Device, Tensor};
+use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
 
 /// Size of the staging buffer host memory is copied to and from the device
 /// through.
 const STAGING: usize = 64 << 20;
 
-/// Most tokens one embedding lookup can take: the size of the tokens buffer.
-const MAX_TOKENS: usize = 1024;
+/// Rows of ternary weights one workgroup of the matmul kernel takes.
+const TERNARY_ROWS: usize = 8;
 
-/// Most attention scores one dispatch of the attention kernel computes, one
-/// per head of each token for each position it attends to: the size of the
-/// scores buffer. Longer batches are dispatched a few tokens at a time.
-const SCORES: usize = 16 << 20;
+/// Most rows a ternary matrix has for the lane-per-row kernel to be the
+/// faster one for a single token, as measured on an RX 5700 XT.
+const TERNARY_ROWS_KERNEL_LIMIT: usize = 8192;
+
+/// Command buffers in the ring, and kernels recorded into one before it is
+/// submitted.
+const RING: usize = 4;
+const SUBMIT_EVERY: usize = 128;
+
+/// Positions one workgroup of the attention kernel takes.
+const CHUNK: usize = 256;
+
+/// Most floats of attention partials one dispatch writes, one chunk's
+/// maximum, sum, and weighted values per head of each token: the size of
+/// the partials buffer. Longer batches are dispatched a few tokens at a
+/// time.
+const PARTIALS: usize = 16 << 20;
 
 /// A vector of f32 activations in device memory.
 pub struct Buffer {
@@ -37,34 +51,53 @@ pub struct Cache {
     len: usize,
 }
 
-/// A bf16 weight tensor in device memory.
+/// A weight matrix in device memory, bf16 or ternary.
 pub struct Weight {
     buf: vk::Buffer,
     shape: Vec<usize>,
+    ternary: bool,
 }
 
 struct Kernels {
-    embed: vk::Pipeline,
     matmul: vk::Pipeline,
+    matmul_ternary: vk::Pipeline,
+    matmul_ternary_batch: vk::Pipeline,
+    matmul_ternary_rows: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
+    l2norm: vk::Pipeline,
     rope: vk::Pipeline,
     attention: vk::Pipeline,
+    attention_combine: vk::Pipeline,
     silu_mul: vk::Pipeline,
+    sigmoid_mul: vk::Pipeline,
     store: vk::Pipeline,
+    hadamard: vk::Pipeline,
+    norm_rotate: vk::Pipeline,
+    conv: vk::Pipeline,
+    delta_net: vk::Pipeline,
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 8] {
+    fn all(&self) -> [vk::Pipeline; 17] {
         [
-            self.embed,
             self.matmul,
+            self.matmul_ternary,
+            self.matmul_ternary_batch,
+            self.matmul_ternary_rows,
             self.add,
             self.rmsnorm,
+            self.l2norm,
             self.rope,
             self.attention,
+            self.attention_combine,
             self.silu_mul,
+            self.sigmoid_mul,
             self.store,
+            self.hadamard,
+            self.norm_rotate,
+            self.conv,
+            self.delta_net,
         ]
     }
 }
@@ -82,23 +115,35 @@ pub struct Vulkan {
     push: push_descriptor::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    cmds: Vec<vk::CommandBuffer>,
+    fences: Vec<vk::Fence>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     kernels: Kernels,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     staging: Mapped,
-    tokens: Mapped,
-    scores: vk::Buffer,
+    partials: vk::Buffer,
     max_groups: u32,
+    /// Lanes in a subgroup, which the ternary matmul takes rows by.
+    subgroup_size: usize,
     name: String,
     /// Every buffer and its memory, freed when the device is dropped.
     allocations: Mutex<Vec<(vk::Buffer, vk::DeviceMemory)>>,
-    /// Whether the command buffer is open with commands not yet submitted.
-    recording: Mutex<bool>,
-    /// Whether a pending command still reads from staging.
-    staging_busy: Mutex<bool>,
+    ring: Mutex<Ring>,
+}
+
+/// Where recording and submission stand in the ring of command buffers.
+struct Ring {
+    /// The command buffer being recorded into, or to record into next.
+    current: usize,
+    /// Whether it is open with commands not yet submitted.
+    recording: bool,
+    /// Which command buffers are submitted and not yet waited for.
+    in_flight: [bool; RING],
+    /// Kernels recorded into the current command buffer.
+    recorded: usize,
+    /// Whether a command not yet waited for still reads from staging.
+    staging_busy: bool,
 }
 
 // The mapped pointers are only used from whichever thread owns the device.
@@ -161,13 +206,16 @@ impl Vulkan {
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )?;
-            let cmd = device.allocate_command_buffers(
+            let cmds = device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )?[0];
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                    .command_buffer_count(RING as u32),
+            )?;
+            let mut fences = Vec::with_capacity(RING);
+            for _ in 0..RING {
+                fences.push(device.create_fence(&vk::FenceCreateInfo::default(), None)?);
+            }
 
             // Every kernel binds up to eight storage buffers, pushed with each
             // dispatch, and takes its sizes as push constants.
@@ -219,14 +267,23 @@ impl Vulkan {
             }
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let kernels = Kernels {
-                embed: spv!("embed"),
                 matmul: spv!("matmul"),
+                matmul_ternary: spv!("matmul_ternary"),
+                matmul_ternary_batch: spv!("matmul_ternary_batch"),
+                matmul_ternary_rows: spv!("matmul_ternary_rows"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
+                l2norm: spv!("l2norm"),
                 rope: spv!("rope"),
                 attention: spv!("attention"),
+                attention_combine: spv!("attention_combine"),
                 silu_mul: spv!("silu_mul"),
+                sigmoid_mul: spv!("sigmoid_mul"),
                 store: spv!("store"),
+                hadamard: spv!("hadamard"),
+                norm_rotate: spv!("norm_rotate"),
+                conv: spv!("conv"),
+                delta_net: spv!("delta_net"),
             };
 
             let mut gpu = Self {
@@ -236,8 +293,8 @@ impl Vulkan {
                 push,
                 queue,
                 pool,
-                cmd,
-                fence,
+                cmds,
+                fences,
                 set_layout,
                 layout,
                 kernels,
@@ -246,20 +303,21 @@ impl Vulkan {
                     buf: vk::Buffer::null(),
                     ptr: std::ptr::null_mut(),
                 },
-                tokens: Mapped {
-                    buf: vk::Buffer::null(),
-                    ptr: std::ptr::null_mut(),
-                },
-                scores: vk::Buffer::null(),
+                partials: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
+                subgroup_size: subgroup.subgroup_size as usize,
                 name,
                 allocations: Mutex::new(Vec::new()),
-                recording: Mutex::new(false),
-                staging_busy: Mutex::new(false),
+                ring: Mutex::new(Ring {
+                    current: 0,
+                    recording: false,
+                    in_flight: [false; RING],
+                    recorded: 0,
+                    staging_busy: false,
+                }),
             };
             gpu.staging = gpu.map(STAGING)?;
-            gpu.tokens = gpu.map(MAX_TOKENS * 4)?;
-            gpu.scores = gpu.buffer(SCORES * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
+            gpu.partials = gpu.buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
             Ok(gpu)
         }
     }
@@ -315,24 +373,40 @@ impl Vulkan {
             .0
     }
 
-    /// The command buffer, open for recording.
+    /// The command buffer open for recording: the current one of the ring,
+    /// begun if it is not open, once the GPU is done with it.
     fn cmd(&self) -> vk::CommandBuffer {
-        let mut recording = self.recording.lock().unwrap();
-        if !*recording {
+        let mut ring = self.ring.lock().unwrap();
+        let current = ring.current;
+        let cmd = self.cmds[current];
+        if !ring.recording {
+            if ring.in_flight[current] {
+                self.wait(&mut ring, current);
+            }
             unsafe {
                 self.device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                     .unwrap();
                 self.device
                     .begin_command_buffer(
-                        self.cmd,
+                        cmd,
                         &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                     )
                     .unwrap();
             }
-            *recording = true;
+            ring.recording = true;
+            ring.recorded = 0;
         }
-        self.cmd
+        cmd
+    }
+
+    /// Waits for the GPU to finish command buffer `i` of the ring.
+    fn wait(&self, ring: &mut Ring, i: usize) {
+        unsafe {
+            self.device.wait_for_fences(&[self.fences[i]], true, u64::MAX).unwrap();
+            self.device.reset_fences(&[self.fences[i]]).unwrap();
+        }
+        ring.in_flight[i] = false;
     }
 
     /// Makes everything recorded so far visible to everything recorded next.
@@ -352,51 +426,73 @@ impl Vulkan {
         }
     }
 
-    /// Submits everything recorded and waits for it to finish.
-    fn flush(&self) {
-        let mut recording = self.recording.lock().unwrap();
-        if !*recording {
+    /// Submits what is recorded, without waiting, and moves on to the next
+    /// command buffer of the ring.
+    fn submit(&self) {
+        let mut ring = self.ring.lock().unwrap();
+        if !ring.recording {
             return;
         }
+        let i = ring.current;
         unsafe {
-            self.device.end_command_buffer(self.cmd).unwrap();
-            let cmds = [self.cmd];
+            self.device.end_command_buffer(self.cmds[i]).unwrap();
+            let cmds = [self.cmds[i]];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            self.device.queue_submit(self.queue, &[submit], self.fence).unwrap();
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
-            self.device.reset_fences(&[self.fence]).unwrap();
+            self.device.queue_submit(self.queue, &[submit], self.fences[i]).unwrap();
         }
-        *recording = false;
-        *self.staging_busy.lock().unwrap() = false;
+        ring.in_flight[i] = true;
+        ring.recording = false;
+        ring.current = (i + 1) % RING;
+    }
+
+    /// Submits everything recorded and waits for all of it to finish.
+    fn flush(&self) {
+        self.submit();
+        let mut ring = self.ring.lock().unwrap();
+        for i in 0..RING {
+            if ring.in_flight[i] {
+                self.wait(&mut ring, i);
+            }
+        }
+        ring.staging_busy = false;
     }
 
     /// Records a kernel over `groups` workgroups, bound to `buffers` in
     /// order, with `params` as its push constants.
     fn dispatch<P: Copy>(&self, pipeline: vk::Pipeline, buffers: &[vk::Buffer], params: &P, groups: (u32, u32)) {
         let cmd = self.cmd();
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
-            .iter()
-            .map(|&buf| [vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE)])
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info)
-            })
-            .collect();
+        // A kernel binds at most eight buffers; a thousand dispatches a token
+        // is worth not allocating for.
+        assert!(buffers.len() <= 8);
+        let mut infos = [vk::DescriptorBufferInfo::default(); 8];
+        for (info, &buf) in infos.iter_mut().zip(buffers) {
+            *info = vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE);
+        }
+        let mut writes = [vk::WriteDescriptorSet::default(); 8];
+        for (i, (write, info)) in writes.iter_mut().zip(&infos).enumerate() {
+            *write = vk::WriteDescriptorSet::default()
+                .dst_binding(i as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(info));
+        }
         unsafe {
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push
-                .cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &writes);
+                .cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &writes[..buffers.len()]);
             self.device
                 .cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes(params));
             self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
         }
         self.barrier(cmd);
+        // Enough recorded for the GPU to get going on.
+        let recorded = {
+            let mut ring = self.ring.lock().unwrap();
+            ring.recorded += 1;
+            ring.recorded
+        };
+        if recorded >= SUBMIT_EVERY {
+            self.submit();
+        }
     }
 
     /// Workgroups for `count` items of work in a one-dimensional kernel.
@@ -414,11 +510,8 @@ impl Vulkan {
     fn upload_bytes(&self, dst: vk::Buffer, offset: usize, data: &[u8]) {
         let chunks = data.chunks(STAGING).count();
         for (i, chunk) in data.chunks(STAGING).enumerate() {
-            let mut busy = self.staging_busy.lock().unwrap();
-            if *busy {
-                drop(busy);
+            if self.ring.lock().unwrap().staging_busy {
                 self.flush();
-                busy = self.staging_busy.lock().unwrap();
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging.ptr, chunk.len());
@@ -429,8 +522,7 @@ impl Vulkan {
                 self.device.cmd_copy_buffer(cmd, self.staging.buf, dst, &[region]);
                 self.barrier(cmd);
             }
-            *busy = true;
-            drop(busy);
+            self.ring.lock().unwrap().staging_busy = true;
             if chunks > 1 {
                 self.flush();
             }
@@ -460,12 +552,14 @@ impl Drop for Vulkan {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for &fence in &self.fences {
+                self.device.destroy_fence(fence, None);
+            }
             for pipeline in self.kernels.all() {
                 self.device.destroy_pipeline(pipeline, None);
             }
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
-            self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.pool, None);
             for (buf, mem) in self.allocations.lock().unwrap().drain(..) {
                 self.device.destroy_buffer(buf, None);
@@ -488,13 +582,6 @@ struct MatmulParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct EmbedParams {
-    dim: u32,
-    n: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct RmsnormParams {
     dim: u32,
     eps: f32,
@@ -505,8 +592,34 @@ struct RmsnormParams {
 struct RopeParams {
     n_heads: u32,
     head_dim: u32,
+    rot_dim: u32,
     pos: u32,
     n: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HadamardParams {
+    width: u32,
+    inverse: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConvParams {
+    n: u32,
+    channels: u32,
+    q_dim: u32,
+    k_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaNetParams {
+    n: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    head_dim: u32,
 }
 
 #[repr(C)]
@@ -517,7 +630,7 @@ struct AttentionParams {
     n_kv_heads: u32,
     pos: u32,
     first: u32,
-    stride: u32,
+    chunks: u32,
 }
 
 #[repr(C)]
@@ -539,15 +652,31 @@ impl Device for Vulkan {
     type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
-        assert!(tensor.data.len().is_multiple_of(8), "weights must come in multiples of eight");
-        let buf = self.device_buffer(tensor.data.len() * 2);
-        // bf16 bits, two to a 32-bit word, in memory order: the kernels take
-        // the low half of a word as the first weight, as little-endian does.
-        let data = unsafe { slice::from_raw_parts(tensor.data.as_ptr().cast::<u8>(), tensor.data.len() * 2) };
-        self.upload_bytes(buf, 0, data);
-        Weight {
-            buf,
-            shape: tensor.shape,
+        match tensor {
+            Tensor::Bf16 { shape, data } => {
+                assert!(data.len().is_multiple_of(8), "weights must come in multiples of eight");
+                let buf = self.device_buffer(data.len() * 2);
+                // bf16 bits, two to a 32-bit word, in memory order: the
+                // kernels take the low half of a word as the first weight,
+                // as little-endian does.
+                let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+                self.upload_bytes(buf, 0, bytes);
+                Weight {
+                    buf,
+                    shape,
+                    ternary: false,
+                }
+            }
+            Tensor::Ternary { shape, data } => {
+                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
+                let buf = self.device_buffer(data.len());
+                self.upload_bytes(buf, 0, &data);
+                Weight {
+                    buf,
+                    shape,
+                    ternary: true,
+                }
+            }
         }
     }
 
@@ -608,38 +737,35 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.store, &[cache.buf, src.buf], &params, groups);
     }
 
-    fn embed(&self, out: &mut Buffer, table: &Weight, tokens: &[u32]) {
-        let dim = table.shape[1];
-        assert_eq!(out.len, tokens.len() * dim);
-        assert!(tokens.len() <= MAX_TOKENS);
-        // The tokens buffer is read by the pending commands, which must
-        // finish before it is written over.
-        self.flush();
-        unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tokens.ptr.cast::<u32>(), tokens.len()) };
-        let params = EmbedParams {
-            dim: dim as u32,
-            n: tokens.len() as u32,
-        };
-        let groups = self.groups(tokens.len() * dim / 2, 256);
-        self.dispatch(self.kernels.embed, &[out.buf, table.buf, self.tokens.buf], &params, groups);
-    }
-
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
         let (rows, cols) = (w.shape[0], w.shape[1]);
         let n = x.len / cols;
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
-        // One workgroup per row, in a grid as wide as the GPU allows.
-        let width = rows.min(self.max_groups as usize);
-        let groups = (width as u32, rows.div_ceil(width) as u32);
+        // One workgroup per row, or per eight rows of ternary weights, in a
+        // grid as wide as the GPU allows. A batch of tokens is worth
+        // unpacking the ternary weights once for several; a single token
+        // through a matrix of few rows does better with a lane per row.
+        let (kernel, per_group) = if w.ternary && n > 1 {
+            (self.kernels.matmul_ternary_batch, TERNARY_ROWS)
+        } else if w.ternary && rows <= TERNARY_ROWS_KERNEL_LIMIT {
+            (self.kernels.matmul_ternary_rows, self.subgroup_size)
+        } else if w.ternary {
+            (self.kernels.matmul_ternary, TERNARY_ROWS)
+        } else {
+            (self.kernels.matmul, 1)
+        };
+        let count = rows.div_ceil(per_group);
+        let width = count.min(self.max_groups as usize);
+        let groups = (width as u32, count.div_ceil(width) as u32);
         let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
             n: n as u32,
             stride: width as u32,
         };
-        self.dispatch(self.kernels.matmul, &[out.buf, w.buf, x.buf], &params, groups);
+        self.dispatch(kernel, &[out.buf, w.buf, x.buf], &params, groups);
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -649,24 +775,33 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.add, &[x.buf, y.buf], &params, groups);
     }
 
-    fn rmsnorm(&self, x: &mut Buffer, weight: &Weight, eps: f32) {
-        let dim = weight.shape[0];
+    fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
+        let dim = weight.len;
         assert_eq!(x.len % dim, 0);
         let params = RmsnormParams { dim: dim as u32, eps };
         let groups = self.groups(x.len / dim, 1);
         self.dispatch(self.kernels.rmsnorm, &[x.buf, weight.buf], &params, groups);
     }
 
-    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize) {
+    fn l2norm(&self, x: &mut Buffer, dim: usize, eps: f32) {
+        assert_eq!(x.len % dim, 0);
+        let params = RmsnormParams { dim: dim as u32, eps };
+        let groups = self.groups(x.len / dim, 1);
+        self.dispatch(self.kernels.l2norm, &[x.buf], &params, groups);
+    }
+
+    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
         let n = x.len / (n_heads * head_dim);
         assert_eq!(x.len, n * n_heads * head_dim);
+        assert!(rot_dim <= head_dim && rot_dim.is_multiple_of(2));
         let params = RopeParams {
             n_heads: n_heads as u32,
             head_dim: head_dim as u32,
+            rot_dim: rot_dim as u32,
             pos: pos as u32,
             n: n as u32,
         };
-        let groups = self.groups(n * n_heads * head_dim / 2, 256);
+        let groups = self.groups(n * n_heads * rot_dim / 2, 256);
         self.dispatch(self.kernels.rope, &[x.buf, table.buf], &params, groups);
     }
 
@@ -684,28 +819,35 @@ impl Device for Vulkan {
         let n = q.len / (n_heads * head_dim);
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(4) && head_dim <= 128);
-        // Every token's heads get a row of scores as long as the last token
-        // attends over, as many tokens to a dispatch as the scores fit.
-        let stride = pos + n;
-        assert!(n_heads * stride <= SCORES, "attention over {stride} positions needs more scores than {SCORES}");
-        let per_dispatch = SCORES / (n_heads * stride);
+        assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
+        assert!(n_heads / n_kv_heads <= 8, "the kernel holds up to eight query heads per key/value head");
+        // Every token's heads get as many chunks as the last token attends
+        // over, as many tokens to a dispatch as the partials fit.
+        let chunks = (pos + n).div_ceil(CHUNK);
+        let per_token = n_heads * chunks * (head_dim + 2);
+        assert!(per_token <= PARTIALS, "attention over {} positions needs more partials than {PARTIALS}", pos + n);
+        let per_dispatch = PARTIALS / per_token;
         for first in (0..n).step_by(per_dispatch) {
+            let tokens = per_dispatch.min(n - first);
             let params = AttentionParams {
                 n_heads: n_heads as u32,
                 head_dim: head_dim as u32,
                 n_kv_heads: n_kv_heads as u32,
                 pos: pos as u32,
                 first: first as u32,
-                stride: stride as u32,
+                chunks: chunks as u32,
             };
-            let groups = self.groups(per_dispatch.min(n - first) * n_heads, 1);
+            let groups = self.groups(tokens * n_kv_heads * chunks, 1);
             self.dispatch(
                 self.kernels.attention,
-                &[out.buf, q.buf, k_cache.buf, v_cache.buf, self.scores],
+                &[out.buf, q.buf, k_cache.buf, v_cache.buf, self.partials],
                 &params,
                 groups,
             );
+            if chunks > 1 {
+                let groups = self.groups(tokens * n_heads, 1);
+                self.dispatch(self.kernels.attention_combine, &[out.buf, self.partials], &params, groups);
+            }
         }
     }
 
@@ -714,6 +856,89 @@ impl Device for Vulkan {
         let params = LenParams { len: gate.len as u32 };
         let groups = self.groups(gate.len, 256);
         self.dispatch(self.kernels.silu_mul, &[gate.buf, up.buf], &params, groups);
+    }
+
+    fn sigmoid_mul(&self, x: &mut Buffer, gate: &Buffer) {
+        assert_eq!(x.len, gate.len);
+        let params = LenParams { len: x.len as u32 };
+        let groups = self.groups(x.len, 256);
+        self.dispatch(self.kernels.sigmoid_mul, &[x.buf, gate.buf], &params, groups);
+    }
+
+    fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
+        let width = signs.len;
+        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        let params = HadamardParams {
+            width: width as u32,
+            inverse: inverse as u32,
+        };
+        let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
+        self.dispatch(self.kernels.hadamard, &[x.buf, signs.buf], &params, groups);
+    }
+
+    fn norm_rotate(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+        let width = signs.len;
+        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        assert!(out.len == x.len && weight.len == width);
+        let params = RmsnormParams { dim: width as u32, eps };
+        let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
+        self.dispatch(self.kernels.norm_rotate, &[out.buf, x.buf, weight.buf, signs.buf], &params, groups);
+    }
+
+    fn conv(
+        &self,
+        q: &mut Buffer,
+        k: &mut Buffer,
+        v: &mut Buffer,
+        state_out: &mut Buffer,
+        x: &Buffer,
+        state: &Buffer,
+        weight: &Buffer,
+    ) {
+        let channels = weight.len / CONV_KERNEL;
+        let n = x.len / channels;
+        assert_eq!(x.len, n * channels);
+        assert!(state.len == (CONV_KERNEL - 1) * channels && state_out.len == state.len);
+        let (q_dim, k_dim, v_dim) = (q.len / n, k.len / n, v.len / n);
+        assert_eq!(q_dim + k_dim + v_dim, channels);
+        let params = ConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            q_dim: q_dim as u32,
+            k_dim: k_dim as u32,
+        };
+        let groups = self.groups(n * channels, 256);
+        let buffers = [q.buf, k.buf, v.buf, state_out.buf, x.buf, state.buf, weight.buf];
+        self.dispatch(self.kernels.conv, &buffers, &params, groups);
+    }
+
+    fn delta_net(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        gates: &Buffer,
+        decay: &Buffer,
+        state: &mut Buffer,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        head_dim: usize,
+    ) {
+        let n = v.len / (n_v_heads * head_dim);
+        assert_eq!(v.len, n * n_v_heads * head_dim);
+        assert!(q.len == n * n_k_heads * head_dim && k.len == q.len && out.len == v.len);
+        assert!(gates.len == n * 2 * n_v_heads && decay.len == 2 * n_v_heads);
+        assert_eq!(state.len, n_v_heads * head_dim * head_dim);
+        assert_eq!(head_dim, 128, "the kernel is written for 128-wide heads");
+        let params = DeltaNetParams {
+            n: n as u32,
+            n_k_heads: n_k_heads as u32,
+            n_v_heads: n_v_heads as u32,
+            head_dim: head_dim as u32,
+        };
+        let buffers = [out.buf, q.buf, k.buf, v.buf, gates.buf, decay.buf, state.buf];
+        self.dispatch(self.kernels.delta_net, &buffers, &params, self.groups(n_v_heads, 1));
     }
 }
 

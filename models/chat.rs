@@ -23,19 +23,19 @@ const BATCH: usize = 64;
 /// Hi there!<|im_end|>
 /// ```
 ///
-/// The model thinks inside `<think>` tags before it replies, and the thought
-/// is streamed apart from the reply. It may also call tools, if the system
-/// prompt describes them, by replying with `<tool_call>` blocks. Their
-/// results go back to it in a user turn of `<tool_response>` blocks. `Chat`
-/// only speaks the format: what the tools are and running them is up to the
-/// caller.
+/// The model thinks inside `<think>` tags before it replies: its chat
+/// template opens the tag for it, and the thought is streamed apart from
+/// the reply. It may also call tools, if the system prompt describes them,
+/// by replying with `<tool_call>` blocks. Their results go back to it in a
+/// user turn of `<tool_response>` blocks. `Chat` only speaks the format:
+/// what the tools are and running them is up to the caller.
 ///
 /// The whole conversation stays in the model's state, so each turn only
 /// runs the model over its new tokens. The exception is the model's
-/// thoughts: as in Qwen3's chat template, the model sees the thoughts of the
-/// answer it is working on, but not those of earlier answers, so when the
-/// user sends a message, the answer to the last one is run again without
-/// them.
+/// thoughts: the model sees the thoughts of the answer it is working on,
+/// but not those of earlier answers, whose `<think>` blocks it sees empty,
+/// so when the user sends a message, the answer to the last one is run
+/// again without them.
 pub struct Chat<M: LanguageModel> {
     model: M,
     tokenizer: Tokenizer,
@@ -203,15 +203,22 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Generates the assistant's reply to the conversation so far.
     fn generate(&mut self, mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
+        // The template opens the thought for the model. Later turns see the
+        // thought empty: `<think>\n\n</think>\n\n` before the answer.
         let mut prompt = vec![self.im_start];
         prompt.extend(self.tokenizer.encode("assistant\n")?);
-
+        prompt.push(self.think);
+        prompt.extend(self.tokenizer.encode("\n")?);
         let mut logits = self.feed(&prompt)?;
-        self.answer.extend(prompt);
+        self.answer.extend(&prompt[..prompt.len() - 1]);
+        self.answer.extend(self.tokenizer.encode("\n\n")?);
+        self.answer.push(self.think_end);
+        self.answer.extend(self.tokenizer.encode("\n\n")?);
+
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
         // Whether the model is inside its <think> block.
-        let mut thinking = false;
+        let mut thinking = true;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;
         // Whether the model's thought just ended, and blank lines after it
@@ -247,7 +254,7 @@ impl<M: LanguageModel> Chat<M> {
                 }
             }
             let blank = self.tokenizer.decode(token).iter().all(|&b| b == b'\n');
-            if !(thinking || token == self.think || (after_thought && blank)) {
+            if !(thinking || token == self.think || token == self.think_end || (after_thought && blank)) {
                 self.answer.push(token);
             }
             after_thought = token == self.think_end || (after_thought && blank);

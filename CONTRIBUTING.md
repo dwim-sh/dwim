@@ -15,15 +15,15 @@ Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
 driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 
 The weights are downloaded on first use into `~/Library/Caches/hack/models`
-on macOS, and `~/.cache/hack/models` elsewhere. Qwen3-0.6B, the default, is
-about 1.5 GB.
+on macOS, and `~/.cache/hack/models` elsewhere. Bonsai 2 27B, the one model,
+is a 6 GB file; an interrupted download resumes on the next run.
 
 ## Running
 
 ```
 hack                     # the shell
 hack "what changed in the last commit?"
-hack --model qwen3-0.6b --device cpu "what files are here?"
+hack --device cpu --context 4096 "what files are here?"
 ```
 
 With a prompt, hack answers it and exits. The reply goes to standard output
@@ -39,11 +39,13 @@ cargo clippy --workspace --all-targets
 ```
 
 `cargo test -p hack-gpu` skips a backend whose GPU is not available, so it
-passes on a machine with no GPU without having checked anything.
+passes on a machine with no GPU without having checked anything. With the
+model in the cache, `cargo test -p hack-models real_model -- --ignored
+--nocapture` completes a prompt with it and reports the speed.
 
-Run the agent before calling a change done. A model of this size is easy to
-break in ways tests don't catch, such as replies that end with nothing to
-show, so ask it something in the shell, and check a one-off prompt too.
+Run the agent before calling a change done. The model is easy to break in
+ways tests don't catch, such as replies that end with nothing to show, so
+ask it something in the shell, and check a one-off prompt too.
 
 The coding style is in `CLAUDE.md`. Commit messages say what changed and why,
 in the imperative, with the reasoning in the body.

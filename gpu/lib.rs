@@ -10,6 +10,7 @@ mod tests;
 pub mod cpu;
 #[cfg(target_vendor = "apple")]
 pub mod metal;
+pub mod ternary;
 pub mod vulkan;
 
 pub use cpu::Cpu;
@@ -24,10 +25,25 @@ pub type Gpu = Metal;
 #[cfg(not(target_vendor = "apple"))]
 pub type Gpu = Vulkan;
 
-/// A bf16 tensor on the host: its shape, and its values as raw bf16 bits.
-pub struct Tensor {
-    pub shape: Vec<usize>,
-    pub data: Vec<u16>,
+/// Elements the Hadamard rotation transforms at a time.
+pub const HADAMARD_BLOCK: usize = 1024;
+
+/// Taps of the causal convolution in linear attention.
+pub const CONV_KERNEL: usize = 4;
+
+/// A weight matrix on the host, of shape `[rows, cols]`: either raw bf16
+/// bits, or rows of ternary blocks.
+pub enum Tensor {
+    Bf16 { shape: Vec<usize>, data: Vec<u16> },
+    Ternary { shape: Vec<usize>, data: Vec<u8> },
+}
+
+impl Tensor {
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Tensor::Bf16 { shape, .. } | Tensor::Ternary { shape, .. } => shape,
+        }
+    }
 }
 
 /// The operations a transformer's forward pass is built from.
@@ -40,13 +56,13 @@ pub trait Device {
     /// on rows of activations, one per token, take a buffer's length as a
     /// whole number of rows.
     type Buffer;
-    /// A bf16 weight tensor in device memory.
+    /// A weight matrix in device memory, bf16 or ternary.
     type Weight;
     /// A key or value cache in device memory: activations stored as IEEE
     /// half-precision floats, for half the memory attention reads.
     type Cache;
 
-    /// Copies a weight tensor into device memory.
+    /// Copies a weight matrix into device memory.
     fn upload(&self, tensor: Tensor) -> Self::Weight;
 
     /// Allocates a zeroed buffer of `len` activations.
@@ -74,10 +90,6 @@ pub trait Device {
     /// largest finite one.
     fn store(&self, cache: &mut Self::Cache, offset: usize, src: &Self::Buffer);
 
-    /// `out[t] = table[tokens[t]]`: looks up each token's row of an embedding
-    /// table.
-    fn embed(&self, out: &mut Self::Buffer, table: &Self::Weight, tokens: &[u32]);
-
     /// `out[t] = w · x[t]` for each row `x[t]` of `x`, for a weight matrix
     /// `w` of shape `[rows, cols]`: `x` holds `cols` activations per token,
     /// and `out` `rows` per token.
@@ -88,15 +100,19 @@ pub trait Device {
 
     /// Normalizes each `weight.len()`-long row of `x` by its root mean square,
     /// then scales it by `weight`.
-    fn rmsnorm(&self, x: &mut Self::Buffer, weight: &Self::Weight, eps: f32);
+    fn rmsnorm(&self, x: &mut Self::Buffer, weight: &Self::Buffer, eps: f32);
 
-    /// Rotates each `head_dim`-long head of `x`, which holds `n_heads` heads
-    /// per token, to encode the token's position (rotary position
-    /// embeddings): `pos` for the first token, `pos + 1` for the next, and so
-    /// on. Element `i` of a head at position `p` pairs with element
-    /// `i + head_dim / 2`, rotated by the angle whose cosine and sine are at
-    /// `table[(p * head_dim / 2 + i) * 2..][..2]`.
-    fn rope(&self, x: &mut Self::Buffer, table: &Self::Buffer, pos: usize, n_heads: usize, head_dim: usize);
+    /// Normalizes each `dim`-long row of `x` to unit length.
+    fn l2norm(&self, x: &mut Self::Buffer, dim: usize, eps: f32);
+
+    /// Rotates the first `rot_dim` elements of each `head_dim`-long head of
+    /// `x`, which holds `n_heads` heads per token, to encode the token's
+    /// position (rotary position embeddings): `pos` for the first token,
+    /// `pos + 1` for the next, and so on. Element `i` of a head at position
+    /// `p` pairs with element `i + rot_dim / 2`, rotated by the angle whose
+    /// cosine and sine are at `table[(p * rot_dim / 2 + i) * 2..][..2]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope(&self, x: &mut Self::Buffer, table: &Self::Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize);
 
     /// Causal self-attention for the tokens in `q`, the first at position
     /// `pos`: each of a token's `n_heads` heads, each `head_dim` long,
@@ -119,10 +135,78 @@ pub trait Device {
 
     /// `gate = silu(gate) * up`: the SwiGLU activation.
     fn silu_mul(&self, gate: &mut Self::Buffer, up: &Self::Buffer);
+
+    /// `x *= sigmoid(gate)`
+    fn sigmoid_mul(&self, x: &mut Self::Buffer, gate: &Self::Buffer);
+
+    /// Rotates each row of `x`, as wide as `signs`, into the basis the
+    /// weights are stored in: every [`HADAMARD_BLOCK`] of the row is
+    /// multiplied by the signs, then by the normalized Walsh-Hadamard matrix
+    /// of that order. The inverse multiplies by the matrix first and the
+    /// signs after, which undoes the rotation.
+    fn hadamard(&self, x: &mut Self::Buffer, signs: &Self::Buffer, inverse: bool);
+
+    /// `out = rotate(rmsnorm(x) * weight)`: normalizes each row of `x`, as
+    /// wide as `weight` and `signs`, by its root mean square, scales it by
+    /// `weight`, and rotates it as [`hadamard`](Self::hadamard) does, into
+    /// `out`. What every matrix multiplication's input goes through, in one
+    /// pass.
+    fn norm_rotate(&self, out: &mut Self::Buffer, x: &Self::Buffer, weight: &Self::Buffer, signs: &Self::Buffer, eps: f32);
+
+    /// The causal convolution of linear attention: each channel of `x`,
+    /// which holds a row of channels per token, is convolved over the last
+    /// [`CONV_KERNEL`] tokens with its taps from `weight`, which holds that
+    /// many per channel, and passed through SiLU. `state` holds the rows of
+    /// the `CONV_KERNEL - 1` tokens before the batch, and `state_out` gets
+    /// the rows of the last `CONV_KERNEL - 1` tokens of it. The channels of
+    /// the result are split by token into `q`, `k`, and `v`, in that order,
+    /// as wide as each is per token.
+    #[allow(clippy::too_many_arguments)]
+    fn conv(
+        &self,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        state_out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        state: &Self::Buffer,
+        weight: &Self::Buffer,
+    );
+
+    /// The gated delta rule of linear attention, one token after another.
+    /// Each of the `n_v_heads` heads keeps a `head_dim` by `head_dim` state
+    /// in `state`, which decays by `exp(a * softplus(alpha + dt_bias))` per
+    /// token, forgets what it holds for the token's key in proportion to
+    /// `sigmoid(beta)`, and stores the token's value in its place; the
+    /// head's output is what the state holds for the token's query, scaled
+    /// by the inverse square root of `head_dim`. `q` and `k` hold
+    /// `n_k_heads` heads per token, each shared by the value heads in turn;
+    /// `gates` holds `alpha` for every value head then `beta` for every one
+    /// per token; and `decay` holds `a` for every value head then `dt_bias`
+    /// for every one.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net(
+        &self,
+        out: &mut Self::Buffer,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        gates: &Self::Buffer,
+        decay: &Self::Buffer,
+        state: &mut Self::Buffer,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        head_dim: usize,
+    );
 }
 
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// `ln(1 + e^x)`, without overflowing for large `x`.
+pub fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
 }
 
 /// Converts bf16 bits to f32: bf16 is the top half of an f32.

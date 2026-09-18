@@ -19,10 +19,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::{Device, Tensor};
-
-/// Most tokens one embedding lookup can take: the size of the tokens buffer.
-const MAX_TOKENS: usize = 1024;
+use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
 
 /// Most attention scores one dispatch of the attention kernel computes, one
 /// per head of each token for each position it attends to: the size of the
@@ -32,9 +29,12 @@ const SCORES: usize = 16 << 20;
 /// Threads in a threadgroup of every kernel but attention's.
 const THREADS: usize = 256;
 
+/// Rows of ternary weights one SIMD group of the matmul kernel takes.
+const TERNARY_ROWS: usize = 8;
+
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
-const ATTENTION_THREADS: usize = 128;
+const ATTENTION_THREADS: usize = 256;
 
 type Object<P> = Retained<ProtocolObject<P>>;
 
@@ -51,22 +51,30 @@ pub struct Cache {
     len: usize,
 }
 
-/// A bf16 weight tensor in memory shared with the GPU.
+/// A weight matrix in memory shared with the GPU, bf16 or ternary.
 pub struct Weight {
     buf: Object<dyn MTLBuffer>,
     shape: Vec<usize>,
+    ternary: bool,
 }
 
 struct Kernels {
-    embed: Object<dyn MTLComputePipelineState>,
     matmul: Object<dyn MTLComputePipelineState>,
+    matmul_ternary: Object<dyn MTLComputePipelineState>,
+    matmul_ternary_batch: Object<dyn MTLComputePipelineState>,
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
+    l2norm: Object<dyn MTLComputePipelineState>,
     rope: Object<dyn MTLComputePipelineState>,
     attention: Object<dyn MTLComputePipelineState>,
     silu_mul: Object<dyn MTLComputePipelineState>,
+    sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
     store: Object<dyn MTLComputePipelineState>,
+    hadamard: Object<dyn MTLComputePipelineState>,
+    norm_rotate: Object<dyn MTLComputePipelineState>,
+    conv: Object<dyn MTLComputePipelineState>,
+    delta_net: Object<dyn MTLComputePipelineState>,
 }
 
 /// A command buffer with commands encoded but not yet committed.
@@ -79,7 +87,6 @@ pub struct Metal {
     device: Object<dyn MTLDevice>,
     queue: Object<dyn MTLCommandQueue>,
     kernels: Kernels,
-    tokens: Object<dyn MTLBuffer>,
     scores: Object<dyn MTLBuffer>,
     /// Rows of the weights each matmul threadgroup takes: one per SIMD group.
     matmul_rows: usize,
@@ -118,20 +125,24 @@ impl Metal {
             };
         }
         let kernels = Kernels {
-            embed: msl!("embed"),
             matmul: msl!("matmul"),
+            matmul_ternary: msl!("matmul_ternary"),
+            matmul_ternary_batch: msl!("matmul_ternary_batch"),
             add: msl!("add"),
             rmsnorm: msl!("rmsnorm"),
+            l2norm: msl!("l2norm"),
             rope: msl!("rope"),
             attention: msl!("attention"),
             silu_mul: msl!("silu_mul"),
+            sigmoid_mul: msl!("sigmoid_mul"),
             copy: msl!("copy"),
             store: msl!("store"),
+            hadamard: msl!("hadamard"),
+            norm_rotate: msl!("norm_rotate"),
+            conv: msl!("conv"),
+            delta_net: msl!("delta_net"),
         };
         let matmul_rows = THREADS / kernels.matmul.threadExecutionWidth();
-        let tokens = device
-            .newBufferWithLength_options(MAX_TOKENS * 4, MTLResourceOptions::StorageModeShared)
-            .ok_or("out of GPU memory")?;
         let scores = device
             .newBufferWithLength_options(SCORES * 4, MTLResourceOptions::StorageModePrivate)
             .ok_or("out of GPU memory")?;
@@ -139,7 +150,6 @@ impl Metal {
             device,
             queue,
             kernels,
-            tokens,
             scores,
             matmul_rows,
             name,
@@ -230,13 +240,6 @@ struct MatmulParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct EmbedParams {
-    dim: u32,
-    n: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct RmsnormParams {
     dim: u32,
     eps: f32,
@@ -247,8 +250,34 @@ struct RmsnormParams {
 struct RopeParams {
     n_heads: u32,
     head_dim: u32,
+    rot_dim: u32,
     pos: u32,
     n: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HadamardParams {
+    width: u32,
+    inverse: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConvParams {
+    n: u32,
+    channels: u32,
+    q_dim: u32,
+    k_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaNetParams {
+    n: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    head_dim: u32,
 }
 
 #[repr(C)]
@@ -289,16 +318,26 @@ impl Device for Metal {
     type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
-        assert!(tensor.data.len().is_multiple_of(8), "weights must come in multiples of eight");
-        let data = NonNull::from(tensor.data.as_slice()).cast();
+        let (shape, bytes, ternary) = match &tensor {
+            Tensor::Bf16 { shape, data } => {
+                assert!(data.len().is_multiple_of(8), "weights must come in multiples of eight");
+                let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+                (shape, bytes, false)
+            }
+            Tensor::Ternary { shape, data } => {
+                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
+                (shape, data.as_slice(), true)
+            }
+        };
         let buf = unsafe {
             self.device
-                .newBufferWithBytes_length_options(data, tensor.data.len() * 2, MTLResourceOptions::StorageModeShared)
+                .newBufferWithBytes_length_options(NonNull::from(bytes).cast(), bytes.len(), MTLResourceOptions::StorageModeShared)
                 .expect("out of GPU memory")
         };
         Weight {
             buf,
-            shape: tensor.shape,
+            shape: shape.clone(),
+            ternary,
         }
     }
 
@@ -355,22 +394,6 @@ impl Device for Metal {
         self.dispatch(&self.kernels.store, &[&cache.buf, &src.buf], &params, groups, THREADS);
     }
 
-    fn embed(&self, out: &mut Buffer, table: &Weight, tokens: &[u32]) {
-        let dim = table.shape[1];
-        assert_eq!(out.len, tokens.len() * dim);
-        assert!(tokens.len() <= MAX_TOKENS);
-        // The tokens buffer is read by the pending commands, which must
-        // finish before it is written over.
-        self.flush();
-        unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tokens.contents().as_ptr().cast(), tokens.len()) };
-        let params = EmbedParams {
-            dim: dim as u32,
-            n: tokens.len() as u32,
-        };
-        let groups = (tokens.len() * dim).div_ceil(THREADS);
-        self.dispatch(&self.kernels.embed, &[&out.buf, &table.buf, &self.tokens], &params, groups, THREADS);
-    }
-
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
         let (rows, cols) = (w.shape[0], w.shape[1]);
         let n = x.len / cols;
@@ -382,8 +405,17 @@ impl Device for Metal {
             cols: cols as u32,
             n: n as u32,
         };
-        let groups = rows.div_ceil(self.matmul_rows);
-        self.dispatch(&self.kernels.matmul, &[&out.buf, &w.buf, &x.buf], &params, groups, THREADS);
+        // Each SIMD group takes one row, or eight rows of ternary weights. A
+        // batch of tokens is worth unpacking the ternary weights once for
+        // several.
+        let (kernel, per_group) = if w.ternary && n > 1 {
+            (&self.kernels.matmul_ternary_batch, self.matmul_rows * TERNARY_ROWS)
+        } else if w.ternary {
+            (&self.kernels.matmul_ternary, self.matmul_rows * TERNARY_ROWS)
+        } else {
+            (&self.kernels.matmul, self.matmul_rows)
+        };
+        self.dispatch(kernel, &[&out.buf, &w.buf, &x.buf], &params, rows.div_ceil(per_group), THREADS);
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -392,23 +424,31 @@ impl Device for Metal {
         self.dispatch(&self.kernels.add, &[&x.buf, &y.buf], &params, x.len.div_ceil(THREADS), THREADS);
     }
 
-    fn rmsnorm(&self, x: &mut Buffer, weight: &Weight, eps: f32) {
-        let dim = weight.shape[0];
+    fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
+        let dim = weight.len;
         assert_eq!(x.len % dim, 0);
         let params = RmsnormParams { dim: dim as u32, eps };
         self.dispatch(&self.kernels.rmsnorm, &[&x.buf, &weight.buf], &params, x.len / dim, THREADS);
     }
 
-    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize) {
+    fn l2norm(&self, x: &mut Buffer, dim: usize, eps: f32) {
+        assert_eq!(x.len % dim, 0);
+        let params = RmsnormParams { dim: dim as u32, eps };
+        self.dispatch(&self.kernels.l2norm, &[&x.buf], &params, x.len / dim, THREADS);
+    }
+
+    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
         let n = x.len / (n_heads * head_dim);
         assert_eq!(x.len, n * n_heads * head_dim);
+        assert!(rot_dim <= head_dim && rot_dim.is_multiple_of(2));
         let params = RopeParams {
             n_heads: n_heads as u32,
             head_dim: head_dim as u32,
+            rot_dim: rot_dim as u32,
             pos: pos as u32,
             n: n as u32,
         };
-        let groups = (n * n_heads * head_dim / 2).div_ceil(THREADS);
+        let groups = (n * n_heads * rot_dim / 2).div_ceil(THREADS);
         self.dispatch(&self.kernels.rope, &[&x.buf, &table.buf], &params, groups, THREADS);
     }
 
@@ -456,6 +496,86 @@ impl Device for Metal {
         let params = LenParams { len: gate.len as u32 };
         let groups = gate.len.div_ceil(THREADS);
         self.dispatch(&self.kernels.silu_mul, &[&gate.buf, &up.buf], &params, groups, THREADS);
+    }
+
+    fn sigmoid_mul(&self, x: &mut Buffer, gate: &Buffer) {
+        assert_eq!(x.len, gate.len);
+        let params = LenParams { len: x.len as u32 };
+        let groups = x.len.div_ceil(THREADS);
+        self.dispatch(&self.kernels.sigmoid_mul, &[&x.buf, &gate.buf], &params, groups, THREADS);
+    }
+
+    fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
+        let width = signs.len;
+        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        let params = HadamardParams {
+            width: width as u32,
+            inverse: inverse as u32,
+        };
+        self.dispatch(&self.kernels.hadamard, &[&x.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
+    }
+
+    fn norm_rotate(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+        let width = signs.len;
+        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        assert!(out.len == x.len && weight.len == width);
+        let params = RmsnormParams { dim: width as u32, eps };
+        self.dispatch(&self.kernels.norm_rotate, &[&out.buf, &x.buf, &weight.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
+    }
+
+    fn conv(
+        &self,
+        q: &mut Buffer,
+        k: &mut Buffer,
+        v: &mut Buffer,
+        state_out: &mut Buffer,
+        x: &Buffer,
+        state: &Buffer,
+        weight: &Buffer,
+    ) {
+        let channels = weight.len / CONV_KERNEL;
+        let n = x.len / channels;
+        assert_eq!(x.len, n * channels);
+        assert!(state.len == (CONV_KERNEL - 1) * channels && state_out.len == state.len);
+        let (q_dim, k_dim, v_dim) = (q.len / n, k.len / n, v.len / n);
+        assert_eq!(q_dim + k_dim + v_dim, channels);
+        let params = ConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            q_dim: q_dim as u32,
+            k_dim: k_dim as u32,
+        };
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [&q.buf, &k.buf, &v.buf, &state_out.buf, &x.buf, &state.buf, &weight.buf];
+        self.dispatch(&self.kernels.conv, &buffers, &params, (n * channels).div_ceil(THREADS), THREADS);
+    }
+
+    fn delta_net(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        gates: &Buffer,
+        decay: &Buffer,
+        state: &mut Buffer,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        head_dim: usize,
+    ) {
+        let n = v.len / (n_v_heads * head_dim);
+        assert_eq!(v.len, n * n_v_heads * head_dim);
+        assert!(q.len == n * n_k_heads * head_dim && k.len == q.len && out.len == v.len);
+        assert!(gates.len == n * 2 * n_v_heads && decay.len == 2 * n_v_heads);
+        assert_eq!(state.len, n_v_heads * head_dim * head_dim);
+        assert_eq!(head_dim, 128, "the kernel is written for 128-wide heads");
+        let params = DeltaNetParams {
+            n: n as u32,
+            n_k_heads: n_k_heads as u32,
+            n_v_heads: n_v_heads as u32,
+            head_dim: head_dim as u32,
+        };
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [&out.buf, &q.buf, &k.buf, &v.buf, &gates.buf, &decay.buf, &state.buf];
+        self.dispatch(&self.kernels.delta_net, &buffers, &params, n_v_heads, THREADS);
     }
 }
 
