@@ -2,8 +2,9 @@
 //! printed as a preview, its standard output apart from its standard
 //! error, with a line of how it ended that is always there. A stream
 //! that outgrows its preview is shown by its start and its end, and is
-//! kept whole in a file of the tool's own, which the result names, so the
-//! model can read the rest of it instead of running the command again.
+//! kept whole in a file of the tool's own, which the result names along
+//! with the line to `read` it from, so the model can get the rest with
+//! that tool instead of running the command again.
 
 use std::{
     collections::VecDeque,
@@ -22,7 +23,7 @@ use serde_json::Value;
 use crate::string;
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code. Long output is cut to its start and end, and kept whole in a file the result names.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code. Long output is cut to its start and end, and kept whole in a file the result names for `read`.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
@@ -282,8 +283,12 @@ impl Stream {
         let last = self.newlines - tail.iter().filter(|&&b| b == b'\n').count() as u64 + u64::from(midline);
         let bytes = self.total - head.len() as u64 - tail.len() as u64;
         let lines = if first == last { format!("line {first}") } else { format!("lines {first}–{last}") };
+        let next = match self.kept {
+            0 => String::new(),
+            _ => format!("; next: read {} from line {first}", self.path.display()),
+        };
         format!(
-            "{}\n[… {lines} ({bytes} bytes) not shown …]\n{}",
+            "{}\n[… {lines} ({bytes} bytes) not shown{next} …]\n{}",
             String::from_utf8_lossy(head).trim_end(),
             String::from_utf8_lossy(tail).trim_end(),
         )
@@ -445,6 +450,7 @@ mod tests {
         // The lines the preview says it left out are the ones between what
         // it shows, so a range read gets what is missing.
         let marker = output.lines().find(|line| line.starts_with("[… lines ")).unwrap();
+        assert!(marker.contains(&format!("; next: read {} from line ", path.display())), "{marker}");
         let range = marker.strip_prefix("[… lines ").unwrap().split(' ').next().unwrap();
         let (first, last) = range.split_once('–').unwrap();
         let (first, last): (u64, u64) = (first.parse().unwrap(), last.parse().unwrap());
@@ -461,6 +467,10 @@ mod tests {
         let read = sh(&format!("sed -n '{first},{}p;{},{last}p' {}", first + 2, last - 2, path.display()), &mut bash);
         let read: Vec<u64> = read.lines().filter_map(|line| line.parse().ok()).collect();
         assert_eq!(read, [first, first + 1, first + 2, last - 2, last - 1, last]);
+        // And the read tool, from the line the marker names, starts on the
+        // first line left out.
+        let page = crate::read::run(&serde_json::json!({ "path": path.to_str().unwrap(), "start": first }));
+        assert!(page.starts_with(&format!("{first}\t{first}\n")), "{page}");
         assert_eq!(sh(&format!("sed -n '500,502p' {}", path.display()), &mut bash), "500\n501\n502\n[exit code 0]");
 
         drop(bash);

@@ -3,11 +3,12 @@
 //!
 //! A [`Harness`] wraps a [`Chat`] and reports each turn's thoughts, text,
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
-//! them as they happen. The one tool is `bash`, which runs a shell command;
-//! it lives in `dwim_tools`. The system prompt pushes the model to use it
-//! rather than answer from memory or ask the user for a command. It also
-//! tells the model about the project it works in, since a model won't
-//! always go looking on its own.
+//! them as they happen. The tools are `bash`, which runs a shell command,
+//! and `read`, which reads a file a page at a time; they live in
+//! `dwim_tools`. The system prompt pushes the model to use them rather
+//! than answer from memory or ask the user for a command. It also tells
+//! the model about the project it works in, since a model won't always go
+//! looking on its own.
 
 use std::{
     error::Error,
@@ -33,14 +34,15 @@ const MAX_FILES: usize = 50;
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
 /// How the agent should behave: the start of the system prompt.
-const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, and you may use it at any time without asking.
+const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there and a read tool that reads files, and you may use them at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
 - Never say you can't access files or run commands, and never ask the user which command to run: pick one yourself.
 - When a request could be a question or a task, treat it as a task and do it.
 - To change something, run the commands that change it instead of explaining how.
+- To read a file, use read, not cat: it gives you a page of 200 numbered lines and says where the next page starts. Read the next page when you need more, and start from a line to read the middle of a file.
 - If a command fails, read the error and try another way. A command's result ends with its exit code, and what it printed to standard error comes after a `[stderr]` line.
-- When a command prints more than fits, the result shows the start and the end of its output and names a file that holds all of it: read the part you need from the file with `sed -n 'A,Bp'` or `grep -n` instead of running the command again.
+- When a command prints more than fits, the result shows the start and the end of its output and names a file that holds all of it, with the line to read it from: use read on that file instead of running the command again.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
@@ -275,6 +277,7 @@ mod tests {
         let prompt = system_prompt(dir);
         assert!(prompt.starts_with("# Tools\n"));
         assert!(prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\""));
+        assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
         assert!(prompt.contains(INSTRUCTIONS));
         let files = prompt.lines().find_map(|line| line.strip_prefix("Files: ")).unwrap();
