@@ -42,6 +42,12 @@ const TILE_WORKGROUPS: usize = 80;
 const TILE_SPLITS: usize = 8;
 /// Tokens a workgroup of the bf16 matmul kernel takes at once.
 const BF16_TOKENS: usize = 8;
+/// Rows a workgroup of the single-token sums kernel takes, the workgroups
+/// it splits a matrix's blocks to reach, and the fewest rows a matrix
+/// needs for building the tables to pay off.
+const SUMS_ROWS: usize = 1024;
+const SUMS_WORKGROUPS: usize = 80;
+const SUMS_MIN_ROWS: usize = 2048;
 /// Most words of packed activations a batch through the batch or the tile
 /// kernel has, two tokens to a word: the size of the buffer they are
 /// packed into.
@@ -87,6 +93,7 @@ struct Kernels {
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
     matmul_ternary_tile_reduce: vk::Pipeline,
+    matmul_ternary_sums: vk::Pipeline,
     pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -104,13 +111,14 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 19] {
+    fn all(&self) -> [vk::Pipeline; 20] {
         [
             self.matmul_bf16,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
             self.matmul_ternary_tile_reduce,
+            self.matmul_ternary_sums,
             self.pack_halves,
             self.add,
             self.rmsnorm,
@@ -315,6 +323,7 @@ impl Vulkan {
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
                 matmul_ternary_tile_reduce: spv!("matmul_ternary_tile_reduce"),
+                matmul_ternary_sums: spv!("matmul_ternary_sums"),
                 pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -869,6 +878,30 @@ impl Device for Vulkan {
             if splits > 1 {
                 let groups = self.groups(n * rows, 256);
                 self.dispatch(self.kernels.matmul_ternary_tile_reduce, &[out.buf, self.partials], &params, groups);
+            }
+            return;
+        }
+        // A single token through ternary weights looks each byte up in
+        // tables of its activations' sums, a workgroup per 1024 rows, with
+        // the blocks of a matrix of few rows split among workgroups whose
+        // partial sums are added up after.
+        if w.ternary && n == 1 && rows >= SUMS_MIN_ROWS {
+            let blocks = cols / 128;
+            let tiles = rows.div_ceil(SUMS_ROWS);
+            let splits = (SUMS_WORKGROUPS / tiles).clamp(1, blocks);
+            let splits = if splits > 1 && splits * rows <= PARTIALS { splits } else { 1 };
+            let count = tiles * splits;
+            let width = count.min(self.max_groups as usize);
+            let params = MatmulParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                n: 1,
+                stride: width as u32,
+                splits: splits as u32,
+            };
+            self.dispatch(self.kernels.matmul_ternary_sums, &[out.buf, w.buf, x.buf, self.partials], &params, (width as u32, count.div_ceil(width) as u32));
+            if splits > 1 {
+                self.dispatch(self.kernels.matmul_ternary_tile_reduce, &[out.buf, self.partials], &params, self.groups(rows, 256));
             }
             return;
         }
