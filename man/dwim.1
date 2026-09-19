@@ -95,8 +95,11 @@ project instructions.
 .I ~/.cache/dwim/states/
 The model's state after the system prompt, saved when a prompt is first
 read and taken up by later runs with the same model and prompt in place of
-reading it again. The prompt changes with the directory, its files and the
-day, and the newest four states are kept. On macOS the directory is
+reading it again. The prompt changes only with the project's
+.BR AGENTS.md ,
+since where the agent is, the files there, the branch and the date go with
+the first message instead, and the newest four states are kept. On macOS the
+directory is
 .I ~/Library/Caches/dwim/states/
 instead.
 .TP

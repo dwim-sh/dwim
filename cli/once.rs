@@ -85,17 +85,18 @@ fn answer<D: dwim_gpu::Device + 'static>(
     })?;
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
+    let cwd = env::current_dir()?;
     models::start(
         &mut chat,
         which,
-        &harness::system_prompt(&env::current_dir()?),
+        &harness::system_prompt(&cwd),
         |read, total| {
             progress.report("reading the system prompt".to_string(), read, total);
         },
     )?;
 
     let mut printer = Printer::default();
-    let mut harness = Harness::new(chat);
+    let mut harness = Harness::new(chat, &cwd);
     harness.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())
