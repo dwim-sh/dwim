@@ -38,7 +38,7 @@ const RING: usize = 4;
 const SUBMIT_EVERY: usize = 128;
 
 /// Positions one workgroup of the attention kernel takes.
-const CHUNK: usize = 256;
+const CHUNK: usize = 128;
 
 /// Most floats of attention partials one dispatch writes, one chunk's
 /// maximum, sum, and weighted values per head of each token: the size of

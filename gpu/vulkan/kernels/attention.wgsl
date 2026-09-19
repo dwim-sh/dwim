@@ -1,5 +1,5 @@
 // Causal attention over f16 caches, two half-precision floats to a word:
-// one workgroup per (token, key/value head, chunk of 256 positions), for
+// one workgroup per (token, key/value head, chunk of 128 positions), for
 // every query head that shares the key/value head, so that the caches are
 // read once for the group and a long context spreads over the GPU. A
 // subgroup scores one position at a time, its lanes each taking a few
@@ -30,13 +30,13 @@ var<immediate> p: Params;
 @group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 @group(0) @binding(4) var<storage, read_write> partials: array<f32>;
 
-const CHUNK: u32 = 256u;
+const CHUNK: u32 = 128u;
 
 // Most query heads to a key/value head.
 const GROUP: u32 = 8u;
 
 var<workgroup> partial: array<array<f32, GROUP>, 16>;
-var<workgroup> scores: array<array<f32, 256>, GROUP>;
+var<workgroup> scores: array<array<f32, CHUNK>, GROUP>;
 var<workgroup> values: array<vec4<f32>, 256>;
 
 @compute @workgroup_size(256)
@@ -125,7 +125,9 @@ fn main(
     workgroupBarrier();
     var total: array<f32, GROUP>;
     for (var g = 0u; g < group; g++) {
-        scores[g][lid] = e[g];
+        if lid < CHUNK {
+            scores[g][lid] = e[g];
+        }
         let sum = subgroupAdd(e[g]);
         if sinv == 0u {
             partial[sid][g] = sum;
