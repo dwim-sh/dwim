@@ -22,6 +22,8 @@ struct Params {
     // Workgroups per row of the dispatch grid, for matrices with more rows
     // than one dimension of the grid allows.
     stride: u32,
+    // Column splits, which only the tile kernel takes.
+    splits: u32,
 }
 
 var<immediate> p: Params;

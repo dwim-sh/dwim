@@ -35,6 +35,12 @@ const TERNARY_TILE_TOKENS: usize = 64;
 /// Workgroup memory the tile kernel takes: the rows' and the tokens' block
 /// as half floats.
 const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS + TERNARY_TILE_TOKENS) * 2 * 128;
+/// Workgroups the tile kernel splits a small matrix's columns to reach,
+/// and the most splits.
+const TILE_WORKGROUPS: usize = 80;
+const TILE_SPLITS: usize = 8;
+/// Tokens a workgroup of the bf16 matmul kernel takes at once.
+const BF16_TOKENS: usize = 8;
 /// Most tokens the kernel for a few tokens takes at once.
 const TERNARY_FEW_TOKENS: usize = 8;
 /// Most words of packed activations a batch through the tile kernel or the
@@ -82,6 +88,7 @@ struct Kernels {
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
     matmul_ternary_few: vk::Pipeline,
+    matmul_reduce: vk::Pipeline,
     pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -99,13 +106,14 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 19] {
+    fn all(&self) -> [vk::Pipeline; 20] {
         [
             self.matmul,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
             self.matmul_ternary_few,
+            self.matmul_reduce,
             self.pack_halves,
             self.add,
             self.rmsnorm,
@@ -310,6 +318,7 @@ impl Vulkan {
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
                 matmul_ternary_few: spv!("matmul_ternary_few"),
+                matmul_reduce: spv!("matmul_reduce"),
                 pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -633,6 +642,7 @@ struct MatmulParams {
     cols: u32,
     n: u32,
     stride: u32,
+    splits: u32,
 }
 
 #[repr(C)]
@@ -845,6 +855,7 @@ impl Device for Vulkan {
                 cols: cols as u32,
                 n: n as u32,
                 stride: width as u32,
+                splits: 1,
             };
             self.dispatch(self.kernels.matmul_ternary_few, &[out.buf, w.buf, self.packed], &params, (width as u32, count.div_ceil(width) as u32));
             return;
@@ -852,15 +863,27 @@ impl Device for Vulkan {
         if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
-            let height = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
+            let tiles = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
+            // A matrix of few rows makes too few tiles to fill the GPU: its
+            // columns are split among workgroups, whose partial results a
+            // second kernel adds up.
+            let blocks = cols / 128;
+            let splits = TILE_WORKGROUPS.div_ceil(tiles).clamp(1, TILE_SPLITS.min(blocks));
+            let splits = if splits > 1 && splits * n * rows <= PARTIALS { splits } else { 1 };
+            let height = tiles * splits;
             assert!(height <= self.max_groups as usize, "{height} rows of workgroups is more than the GPU allows");
             let params = MatmulParams {
                 rows: rows as u32,
                 cols: cols as u32,
                 n: n as u32,
                 stride: width as u32,
+                splits: splits as u32,
             };
-            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, self.packed], &params, (width as u32, height as u32));
+            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, self.packed, self.partials], &params, (width as u32, height as u32));
+            if splits > 1 {
+                let groups = self.groups(n * rows, 256);
+                self.dispatch(self.kernels.matmul_reduce, &[out.buf, self.partials], &params, groups);
+            }
             return;
         }
         // One workgroup per row, or per eight rows of ternary weights, in a
@@ -875,12 +898,16 @@ impl Device for Vulkan {
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
-        let groups = (width as u32, count.div_ceil(width) as u32);
+        // The bf16 kernel takes the tokens eight at a time, each group of
+        // them a row of the grid.
+        let token_groups = if w.ternary { 1 } else { n.div_ceil(BF16_TOKENS) };
+        let groups = (width as u32, (count.div_ceil(width) * token_groups) as u32);
         let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
             n: n as u32,
             stride: width as u32,
+            splits: 1,
         };
         self.dispatch(kernel, &[out.buf, w.buf, x.buf], &params, groups);
     }
