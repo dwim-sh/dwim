@@ -1,5 +1,6 @@
-// out[i] = the sum over the column splits of `matmul_ternary_tile.wgsl` of
-// their partial results, a thread per output: the batch's tokens by rows.
+// out[i] = the sum over the column splits of `matmul_ternary_tile.wgsl`, or
+// the block ranges of `matmul_ternary_sums.wgsl`, of their partial results,
+// a thread per output: the batch's tokens by rows.
 
 struct Params {
     rows: u32,

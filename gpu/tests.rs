@@ -147,14 +147,16 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
-    // Single tokens, small batches, and batches of half a tile of tokens or
+    // Single tokens through matrices of few rows and of the model's shapes,
+    // whose blocks the Vulkan sums kernel splits among workgroups or takes
+    // in one range; small batches; and batches of half a tile of tokens or
     // more at the edges of the tiles: a whole one, partial row and token
     // tiles, and the model's width. A device may multiply a batch in half
     // precision, as the Vulkan batch kernels do, so a batch is held to an
     // error of a thousandth of the outputs' typical magnitude in root mean
     // square and a hundredth at worst, which is a tenth of what eight-bit
     // activations would cost; a single token to the usual.
-    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (200, 5120, 8), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (300, 1152, 130), (2500, 5120, 64)] {
+    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (2500, 5120, 1), (17408, 5120, 1), (5120, 17408, 1), (100_000, 256, 1), (77, 1024, 3), (70_000, 128, 2), (200, 5120, 8), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (300, 1152, 130), (2500, 5120, 64)] {
         let w = rng.ternary(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
