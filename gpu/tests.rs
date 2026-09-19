@@ -92,6 +92,10 @@ fn close(a: &[f32], b: &[f32], tolerance: f32) {
     }
 }
 
+fn within(a: &[f32], b: &[f32], tolerance: f32) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() <= tolerance * (1.0 + a.abs().max(b.abs())))
+}
+
 fn buffer<D: Device>(gpu: &D, data: &[f32]) -> D::Buffer {
     let mut buf = gpu.alloc(data.len());
     gpu.write(&mut buf, data);
@@ -145,19 +149,26 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
-    // Single tokens, small batches, and batches of a tile of tokens or more
-    // at the edges of the tiles: a whole one, a partial row tile with
-    // partial token tiles, and the model's width.
-    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (2500, 5120, 64)] {
+    // Single tokens, small batches, and batches of half a tile of tokens or
+    // more at the edges of the tiles: a whole one, partial row and token
+    // tiles, and the model's width. A device may multiply a batch of that
+    // size with the activations rounded to half floats, as the Vulkan tile
+    // kernel does, or as they are, as Metal does: the result must match
+    // the CPU on one or the other.
+    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (300, 1152, 130), (2500, 5120, 64)] {
         let w = rng.ternary(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
         Cpu.matmul(&mut want, &clone(&w), &x);
-        let weight = gpu.upload(w);
-        let x = buffer(gpu, &x);
+        let weight = gpu.upload(clone(&w));
         let mut out = gpu.alloc(n * rows);
-        gpu.matmul(&mut out, &weight, &x);
-        close(&gpu.read(&out), &want, 1e-4);
+        gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
+        let got = gpu.read(&out);
+        if n >= 32 && !within(&got, &want, 1e-4) {
+            let halved: Vec<f32> = x.iter().map(|&v| crate::from_f16(crate::to_f16(v))).collect();
+            Cpu.matmul(&mut want, &clone(&w), &halved);
+        }
+        close(&got, &want, 1e-4);
     }
 }
 
@@ -167,7 +178,7 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
     let mut rng = Rng(21);
     let (rows, cols) = (17408, 5120);
     let weight = gpu.upload(rng.ternary(&[rows, cols]));
-    for n in [1, 4, 8, 16, 32, 64, 128, 256] {
+    for n in [1, 4, 8, 16, 32, 64, 96, 128, 256] {
         let x = buffer(gpu, &rng.floats(n * cols));
         let mut out = gpu.alloc(n * rows);
         // Warm up until the clocks are up.

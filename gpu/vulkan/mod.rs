@@ -26,11 +26,14 @@ const STAGING: usize = 64 << 20;
 const TERNARY_ROWS: usize = 8;
 /// Rows and tokens of a tile of `matmul_ternary_tile.wgsl`; a batch of at
 /// least half a tile's tokens goes through it.
-const TERNARY_TILE_ROWS: usize = 128;
-const TERNARY_TILE_TOKENS: usize = 32;
-/// Workgroup memory the tile kernel takes: the rows' block as half floats
-/// and the tokens' as floats.
-const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS * 2 + TERNARY_TILE_TOKENS * 4) * 128;
+const TERNARY_TILE_ROWS: usize = 64;
+const TERNARY_TILE_TOKENS: usize = 64;
+/// Workgroup memory the tile kernel takes: the rows' and the tokens' block
+/// as half floats.
+const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS + TERNARY_TILE_TOKENS) * 2 * 128;
+/// Most words of packed activations a batch through the tile kernel has,
+/// two tokens to a word: the size of the buffer they are packed into.
+const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
 /// submitted.
@@ -71,6 +74,7 @@ struct Kernels {
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
+    pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
     l2norm: vk::Pipeline,
@@ -87,12 +91,13 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 17] {
+    fn all(&self) -> [vk::Pipeline; 18] {
         [
             self.matmul,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
+            self.pack_halves,
             self.add,
             self.rmsnorm,
             self.l2norm,
@@ -131,6 +136,8 @@ pub struct Vulkan {
     memory_types: vk::PhysicalDeviceMemoryProperties,
     staging: Mapped,
     partials: vk::Buffer,
+    /// A batch's activations as half floats, for the tile kernel.
+    packed: vk::Buffer,
     max_groups: u32,
     name: String,
     /// Every buffer and its memory, freed when the device is dropped.
@@ -280,6 +287,7 @@ impl Vulkan {
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
+                pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
                 l2norm: spv!("l2norm"),
@@ -313,6 +321,7 @@ impl Vulkan {
                     ptr: std::ptr::null_mut(),
                 },
                 partials: vk::Buffer::null(),
+                packed: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
                 name,
                 allocations: Mutex::new(Vec::new()),
@@ -326,6 +335,7 @@ impl Vulkan {
             };
             gpu.staging = gpu.map(STAGING)?;
             gpu.partials = gpu.buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
+            gpu.packed = gpu.buffer(PACKED * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
             Ok(gpu)
         }
     }
@@ -632,6 +642,13 @@ struct DeltaNetParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PackParams {
+    n: u32,
+    cols: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct AttentionParams {
     n_heads: u32,
     head_dim: u32,
@@ -753,10 +770,19 @@ impl Device for Vulkan {
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
         // A batch of many tokens through ternary weights is a tiled matrix
-        // product: a workgroup per tile of rows and tokens, the row tiles
-        // across the grid and down it as wide as the GPU allows, and each
-        // row of the grid repeated for every tile of tokens.
+        // product over the activations packed as half floats: a workgroup
+        // per tile of rows and tokens, the row tiles across the grid and
+        // down it as wide as the GPU allows, and each row of the grid
+        // repeated for every tile of tokens.
         if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+            let pairs = n.div_ceil(2).next_multiple_of(4);
+            assert!(pairs * cols <= PACKED, "a batch of {n} tokens of {cols} is more than the tile kernel packs");
+            let params = PackParams {
+                n: n as u32,
+                cols: cols as u32,
+            };
+            let groups = (cols.div_ceil(256) as u32, pairs as u32);
+            self.dispatch(self.kernels.pack_halves, &[self.packed, x.buf], &params, groups);
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
             let height = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
@@ -767,7 +793,7 @@ impl Device for Vulkan {
                 n: n as u32,
                 stride: width as u32,
             };
-            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, x.buf], &params, (width as u32, height as u32));
+            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, self.packed], &params, (width as u32, height as u32));
             return;
         }
         // One workgroup per row, or per eight rows of ternary weights, in a
