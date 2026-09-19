@@ -12,6 +12,8 @@ struct Params {
     // than one dimension of the grid allows. The grid's second dimension
     // counts the groups of tokens of each such row.
     stride: u32,
+    // Column splits, which only the tile kernel takes.
+    splits: u32,
 }
 
 var<immediate> p: Params;

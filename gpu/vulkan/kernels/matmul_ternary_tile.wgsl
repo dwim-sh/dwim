@@ -31,8 +31,13 @@ struct Params {
     n: u32,
     // Workgroups per row of the dispatch grid, for matrices with more rows
     // than one dimension of the grid allows. The grid's second dimension
-    // counts the token tiles of each such row.
+    // counts the token tiles of each such row, and the column splits of
+    // each of those.
     stride: u32,
+    // Splits of the columns, each a workgroup of its own, for a matrix of
+    // too few rows to fill the GPU: their partial results go by split to
+    // `partial` for `matmul_reduce.wgsl` to add up.
+    splits: u32,
 }
 
 var<immediate> p: Params;
@@ -42,6 +47,7 @@ var<immediate> p: Params;
 // The activations as `pack_halves.wgsl` lays them out: by column, the
 // tokens in pairs of halves, padded to a multiple of four pairs.
 @group(0) @binding(2) var<storage, read> x: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> partial: array<f32>;
 
 const THREADS: u32 = 128u;
 // Rows and tokens of a tile, and the rows and tokens a thread multiplies.
@@ -182,20 +188,26 @@ fn stage(f: Fetch, lid: u32) {
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let token_tiles = (p.n + TOKENS - 1u) / TOKENS;
-    let r0 = ((wg.y / token_tiles) * p.stride + wg.x) * ROWS;
-    let t0 = (wg.y % token_tiles) * TOKENS;
+    let split = wg.y % p.splits;
+    let tile = wg.y / p.splits;
+    let r0 = ((tile / token_tiles) * p.stride + wg.x) * ROWS;
+    let t0 = (tile % token_tiles) * TOKENS;
     let blocks = p.cols / BLOCK;
+    // The split's share of the blocks.
+    let per_split = (blocks + p.splits - 1u) / p.splits;
+    let b0 = split * per_split;
+    let b1 = min(blocks, b0 + per_split);
     // The thread's rows are tr, tr + 8, ..., tr + 56, and its tokens 4tv
     // to 4tv + 3.
     let tr = lid / 16u;
     let tv = lid % 16u;
     var acc: array<array<f32, MT>, MR>;
-    var next = fetch(0u, r0, t0, lid);
-    for (var b = 0u; b < blocks; b++) {
+    var next = fetch(b0, r0, t0, lid);
+    for (var b = b0; b < b1; b++) {
         workgroupBarrier();
         stage(next, lid);
         workgroupBarrier();
-        if b + 1u < blocks {
+        if b + 1u < b1 {
             next = fetch(b + 1u, r0, t0, lid);
         }
         // Two pairs of columns at a time: a thread's eight rows are eight
@@ -243,7 +255,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         for (var q = 0u; q < MT; q++) {
             let t = t0 + 4u * tv + q;
             if r < p.rows && t < p.n {
-                out[t * p.rows + r] = acc[m][q];
+                if p.splits == 1u {
+                    out[t * p.rows + r] = acc[m][q];
+                } else {
+                    partial[(split * p.n + t) * p.rows + r] = acc[m][q];
+                }
             }
         }
     }
