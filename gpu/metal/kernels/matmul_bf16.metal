@@ -18,7 +18,7 @@ static float4 weights(uint2 pairs) {
                   as_type<float>(pairs.y << 16), as_type<float>(pairs.y & 0xffff0000u));
 }
 
-kernel void matmul(
+kernel void matmul_bf16(
     device float* out [[buffer(0)]],
     const device uint4* w [[buffer(1)]],
     const device float4* x [[buffer(2)]],

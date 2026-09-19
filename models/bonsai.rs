@@ -400,7 +400,7 @@ impl<D: Device> Model<D> {
             // The token mixer, with its result added back into the
             // residual stream. It sees the normalized activations rotated,
             // and the recurrent-state projections see them as they are.
-            d.norm_rotate(&mut s.xh, &s.x, &layer.attn_norm, signs(c.hidden), eps);
+            d.rmsnorm_hadamard(&mut s.xh, &s.x, &layer.attn_norm, signs(c.hidden), eps);
             match &layer.mixer {
                 Mixer::Attention { q, gate, k, v, o, q_norm, k_norm, cache } => {
                     let q_dim = c.heads * c.head_dim;
@@ -453,7 +453,7 @@ impl<D: Device> Model<D> {
             d.add(&mut s.x, &s.xb);
 
             // Feed-forward network, likewise added back.
-            d.norm_rotate(&mut s.xh, &s.x, &layer.mlp_norm, signs(c.hidden), eps);
+            d.rmsnorm_hadamard(&mut s.xh, &s.x, &layer.mlp_norm, signs(c.hidden), eps);
             d.matmul(&mut s.up, &layer.gate, &s.xh);
             d.matmul(&mut s.gate_ffn, &layer.up, &s.xh);
             d.silu_mul(&mut s.up, &s.gate_ffn);
@@ -467,7 +467,7 @@ impl<D: Device> Model<D> {
         d.resize(&mut s.xb, c.hidden);
         d.resize(&mut s.xh, c.hidden);
         d.copy(&mut s.xb, 0, &s.x, (n - 1) * c.hidden, c.hidden);
-        d.norm_rotate(&mut s.xh, &s.xb, &self.norm, signs(c.hidden), eps);
+        d.rmsnorm_hadamard(&mut s.xh, &s.xb, &self.norm, signs(c.hidden), eps);
         d.matmul(&mut s.logits, &self.lm_head, &s.xh);
         d.read(&s.logits)
     }

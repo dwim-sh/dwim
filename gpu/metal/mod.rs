@@ -59,7 +59,7 @@ pub struct Weight {
 }
 
 struct Kernels {
-    matmul: Object<dyn MTLComputePipelineState>,
+    matmul_bf16: Object<dyn MTLComputePipelineState>,
     matmul_ternary: Object<dyn MTLComputePipelineState>,
     matmul_ternary_batch: Object<dyn MTLComputePipelineState>,
     add: Object<dyn MTLComputePipelineState>,
@@ -70,9 +70,9 @@ struct Kernels {
     silu_mul: Object<dyn MTLComputePipelineState>,
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
-    store: Object<dyn MTLComputePipelineState>,
+    store_halves: Object<dyn MTLComputePipelineState>,
     hadamard: Object<dyn MTLComputePipelineState>,
-    norm_rotate: Object<dyn MTLComputePipelineState>,
+    rmsnorm_hadamard: Object<dyn MTLComputePipelineState>,
     conv: Object<dyn MTLComputePipelineState>,
     delta_net: Object<dyn MTLComputePipelineState>,
 }
@@ -125,7 +125,7 @@ impl Metal {
             };
         }
         let kernels = Kernels {
-            matmul: msl!("matmul"),
+            matmul_bf16: msl!("matmul_bf16"),
             matmul_ternary: msl!("matmul_ternary"),
             matmul_ternary_batch: msl!("matmul_ternary_batch"),
             add: msl!("add"),
@@ -136,13 +136,13 @@ impl Metal {
             silu_mul: msl!("silu_mul"),
             sigmoid_mul: msl!("sigmoid_mul"),
             copy: msl!("copy"),
-            store: msl!("store"),
+            store_halves: msl!("store_halves"),
             hadamard: msl!("hadamard"),
-            norm_rotate: msl!("norm_rotate"),
+            rmsnorm_hadamard: msl!("rmsnorm_hadamard"),
             conv: msl!("conv"),
             delta_net: msl!("delta_net"),
         };
-        let matmul_rows = THREADS / kernels.matmul.threadExecutionWidth();
+        let matmul_rows = THREADS / kernels.matmul_bf16.threadExecutionWidth();
         let scores = device
             .newBufferWithLength_options(SCORES * 4, MTLResourceOptions::StorageModePrivate)
             .ok_or("out of GPU memory")?;
@@ -391,7 +391,7 @@ impl Device for Metal {
             len: src.len as u32,
         };
         let groups = src.len.div_ceil(THREADS);
-        self.dispatch(&self.kernels.store, &[&cache.buf, &src.buf], &params, groups, THREADS);
+        self.dispatch(&self.kernels.store_halves, &[&cache.buf, &src.buf], &params, groups, THREADS);
     }
 
     fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
@@ -426,7 +426,7 @@ impl Device for Metal {
         } else if w.ternary {
             (&self.kernels.matmul_ternary, self.matmul_rows * TERNARY_ROWS)
         } else {
-            (&self.kernels.matmul, self.matmul_rows)
+            (&self.kernels.matmul_bf16, self.matmul_rows)
         };
         self.dispatch(kernel, &[&out.buf, &w.buf, &x.buf], &params, rows.div_ceil(per_group), THREADS);
     }
@@ -528,12 +528,12 @@ impl Device for Metal {
         self.dispatch(&self.kernels.hadamard, &[&x.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
     }
 
-    fn norm_rotate(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+    fn rmsnorm_hadamard(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
         let params = RmsnormParams { dim: width as u32, eps };
-        self.dispatch(&self.kernels.norm_rotate, &[&out.buf, &x.buf, &weight.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
+        self.dispatch(&self.kernels.rmsnorm_hadamard, &[&out.buf, &x.buf, &weight.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
     }
 
     fn conv(

@@ -159,7 +159,7 @@ pub trait Device {
     /// `weight`, and rotates it as [`hadamard`](Self::hadamard) does, into
     /// `out`. What every matrix multiplication's input goes through, in one
     /// pass.
-    fn norm_rotate(&self, out: &mut Self::Buffer, x: &Self::Buffer, weight: &Self::Buffer, signs: &Self::Buffer, eps: f32);
+    fn rmsnorm_hadamard(&self, out: &mut Self::Buffer, x: &Self::Buffer, weight: &Self::Buffer, signs: &Self::Buffer, eps: f32);
 
     /// The causal convolution of linear attention: each channel of `x`,
     /// which holds a row of channels per token, is convolved over the last

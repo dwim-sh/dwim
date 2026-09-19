@@ -36,7 +36,7 @@ struct Params {
     stride: u32,
     // Splits of the columns, each a workgroup of its own, for a matrix of
     // too few rows to fill the GPU: their partial results go by split to
-    // `partial` for `matmul_reduce.wgsl` to add up.
+    // `partial` for `matmul_ternary_tile_reduce.wgsl` to add up.
     splits: u32,
 }
 
