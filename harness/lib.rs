@@ -6,9 +6,12 @@
 //! them as they happen. The tools are `bash`, which runs a shell command,
 //! and `read`, which reads a file a page at a time; they live in
 //! `dwim_tools`. The system prompt pushes the model to use them rather
-//! than answer from memory or ask the user for a command. It also tells
-//! the model about the project it works in, since a model won't always go
-//! looking on its own.
+//! than answer from memory or ask the user for a command, and carries the
+//! project's own instructions. Where the model is, and what the project
+//! looks like, go ahead of the first message instead, since a model won't
+//! always go looking on its own: they change from one run to the next,
+//! and keeping them out of the system prompt keeps the state saved after
+//! it good across days, branches, and directories.
 
 use std::{
     error::Error,
@@ -73,10 +76,11 @@ Reminder:
 </IMPORTANT>"#;
 
 /// The system prompt for an agent working in `dir`: the tools, then how to
-/// behave, where it is and what the project looks like, and the project's
-/// own instructions from its `AGENTS.md` if it has one.
+/// behave, and the project's own instructions from its `AGENTS.md` if it
+/// has one. Where the agent is goes in [`environment`] instead, so that the
+/// prompt is the same from one run to the next.
 pub fn system_prompt(dir: &Path) -> String {
-    let mut prompt = format!("{}\n\n{INSTRUCTIONS}\n\n{}", tools(), environment(dir));
+    let mut prompt = format!("{}\n\n{INSTRUCTIONS}", tools());
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str(&format!(
@@ -96,8 +100,9 @@ fn tools() -> String {
 }
 
 /// Where the agent is: the working directory and the files in it, whether
-/// it is a git repository, the platform, and the date.
-fn environment(dir: &Path) -> String {
+/// it is a git repository, the platform, and the date. The harness puts it
+/// ahead of the first message.
+pub fn environment(dir: &Path) -> String {
     let branch = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(dir)
@@ -202,6 +207,8 @@ pub enum Event<'a> {
 pub struct Harness<M: LanguageModel> {
     chat: Chat<M>,
     tools: Tools,
+    /// Where the agent is, until the first message carries it.
+    environment: Option<String>,
     calls: usize,
     tool_seconds: f64,
 }
@@ -276,10 +283,13 @@ impl Stats {
 }
 
 impl<M: LanguageModel> Harness<M> {
-    pub fn new(chat: Chat<M>) -> Self {
+    /// An agent on `chat`, which has read the system prompt, working in
+    /// `dir`.
+    pub fn new(chat: Chat<M>, dir: &Path) -> Self {
         Self {
             chat,
             tools: Tools::new(),
+            environment: Some(environment(dir)),
             calls: 0,
             tool_seconds: 0.0,
         }
@@ -299,15 +309,19 @@ impl<M: LanguageModel> Harness<M> {
         self.chat.tokens()
     }
 
-    /// Sends a message from the user, reporting the reply and any tool
-    /// calls it makes to `on_event`. The turn ends early if `on_event`
-    /// breaks.
+    /// Sends a message from the user, with where the agent is ahead of the
+    /// first one, reporting the reply and any tool calls it makes to
+    /// `on_event`. The turn ends early if `on_event` breaks.
     pub fn send(
         &mut self,
         message: &str,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut calls = self.chat.send(message, |chunk| on_event(event(chunk)))?;
+        let message = match self.environment.take() {
+            Some(environment) => format!("{environment}\n\n{message}"),
+            None => message.to_string(),
+        };
+        let mut calls = self.chat.send(&message, |chunk| on_event(event(chunk)))?;
         // The last call run, as its name and arguments.
         let mut last = None;
         while !calls.is_empty() {
@@ -417,13 +431,27 @@ mod tests {
         assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
         assert!(prompt.contains(INSTRUCTIONS));
-        let files = prompt
+        assert!(prompt.contains("From AGENTS.md:\n\n# `dwim`"));
+        // What changes between runs is not in the prompt, so that the state
+        // saved after it is good for the next run.
+        assert!(!prompt.contains("# Environment"));
+        assert!(!prompt.contains("Date: "));
+    }
+
+    #[test]
+    fn describes_the_environment() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let environment = environment(dir);
+        assert!(environment.starts_with("# Environment\n"));
+        assert!(environment.contains(&format!("Working directory: {}\n", dir.display())));
+        let files = environment
             .lines()
             .find_map(|line| line.strip_prefix("Files: "))
             .unwrap();
         assert!(files.split(' ').any(|file| file == "Cargo.toml"));
         assert!(files.split(' ').any(|file| file == "harness/"));
         assert!(!files.contains(".git"));
-        assert!(prompt.contains("From AGENTS.md:\n\n# `dwim`"));
+        assert!(environment.contains("\nGit repository: yes"));
+        assert!(environment.contains("\nDate: "));
     }
 }

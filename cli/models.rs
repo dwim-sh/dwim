@@ -10,7 +10,7 @@ use dwim_gpu::Device;
 use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
 
 /// Saved states kept, newest first: a state is a few hundred megabytes,
-/// and the system prompt changes with the directory and the day.
+/// and the system prompt changes with the project's `AGENTS.md`.
 const STATES_KEPT: usize = 4;
 
 /// Model used when none is named on the command line.

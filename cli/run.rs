@@ -195,7 +195,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
             let _ = replies.send(Reply::Prompting { read, total });
         },
     )?;
-    let mut harness = Harness::new(chat);
+    let mut harness = Harness::new(chat, &cwd);
     let _ = replies.send(Reply::Ready);
 
     for message in requests {
