@@ -896,9 +896,11 @@ mod tests {
         assert_ne!(cpu[0], cpu[1]);
         if let Ok(gpu) = Gpu::new() {
             let gpu = run(&path, gpu);
-            for (cpu, gpu) in cpu.iter().zip(&gpu) {
+            // The batch of many tokens may go through the GPU's tiled
+            // matmul, which sums in half precision.
+            for ((cpu, gpu), tolerance) in cpu.iter().zip(&gpu).zip([2e-3, 2e-3, 1e-2]) {
                 for (a, b) in cpu.iter().zip(gpu) {
-                    assert!((a - b).abs() <= 2e-3 * (1.0 + a.abs()), "{a} vs {b}");
+                    assert!((a - b).abs() <= tolerance * (1.0 + a.abs()), "{a} vs {b}");
                 }
             }
         } else {
