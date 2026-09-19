@@ -35,8 +35,14 @@ use crate::{
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
 
-/// Runs the shell until the user quits.
-pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Error>> {
+/// Runs the shell until the user quits, showing the model's thinking if
+/// `thinking` is set, or once ctrl+o is pressed.
+pub fn run(
+    name: &str,
+    device: Device,
+    context: usize,
+    thinking: bool,
+) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
     let (requests, requests_rx) = mpsc::channel();
@@ -81,6 +87,7 @@ pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Err
         reply_width: 0,
         committed: 0,
         interrupted: false,
+        thinking,
         lines: Vec::new(),
         requests,
         replies,
@@ -276,6 +283,10 @@ struct App {
     reply_width: usize,
     committed: usize,
     interrupted: bool,
+    /// Whether the model's thinking is shown. While it is hidden, the
+    /// thought is kept but none of it is printed, so showing it prints
+    /// all of it so far.
+    thinking: bool,
     /// Lines waiting to be printed above the live region.
     lines: Vec<Line>,
     requests: Sender<String>,
@@ -340,6 +351,15 @@ impl App {
                 self.input.insert("\n")
             }
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
+            KeyCode::Char('o') if ctrl => {
+                self.thinking = !self.thinking;
+                if self.thinking
+                    && self.segment == Segment::Thought
+                    && matches!(self.status, Status::Generating { .. })
+                {
+                    self.commit(false);
+                }
+            }
             KeyCode::Enter if !busy => self.submit(),
             KeyCode::Enter => {}
             KeyCode::Char('a') if ctrl => self.input.home(),
@@ -552,6 +572,9 @@ impl App {
     /// reply is done, and otherwise all but the last, which may still grow.
     /// Blank lines are held back until something follows them.
     fn commit(&mut self, done: bool) {
+        if self.segment == Segment::Thought && !self.thinking {
+            return;
+        }
         let lines = tui::wrap(&self.reply, self.reply_width);
         let end = if done { lines.len() } else { lines.len() - 1 };
         let end = lines[..end]
@@ -598,7 +621,9 @@ impl App {
         // The line of the reply still being generated, and the status. The
         // message a reply is to, or a tool's output, already ends in a blank
         // line.
-        if matches!(self.status, Status::Generating { .. }) {
+        if matches!(self.status, Status::Generating { .. })
+            && (self.segment == Segment::Text || self.thinking)
+        {
             let lines = tui::wrap(&self.reply, self.reply_width);
             let segment = self.segment;
             live.extend(
@@ -689,8 +714,13 @@ impl App {
                 },
                 start,
                 format!(
-                    "{tokens} tokens · {:.1} tok/s · esc to interrupt",
-                    tokens as f32 / start.elapsed().as_secs_f32()
+                    "{tokens} tokens · {:.1} tok/s · {}esc to interrupt",
+                    tokens as f32 / start.elapsed().as_secs_f32(),
+                    match (self.segment, self.thinking) {
+                        (Segment::Thought, false) => "ctrl+o to show · ",
+                        (Segment::Thought, true) => "ctrl+o to hide · ",
+                        (Segment::Text, _) => "",
+                    }
                 ),
             ),
         };

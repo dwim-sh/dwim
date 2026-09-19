@@ -25,6 +25,10 @@ pub struct Opts {
     #[argh(switch)]
     pub stats: bool,
 
+    /// show the model's thinking in the shell, which ctrl+o toggles
+    #[argh(switch)]
+    pub thinking: bool,
+
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,
