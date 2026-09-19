@@ -81,9 +81,6 @@ pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Err
         reply_width: 0,
         committed: 0,
         interrupted: false,
-        context: 0,
-        max_context: context,
-        speed: None,
         lines: Vec::new(),
         requests,
         replies,
@@ -115,9 +112,7 @@ enum Reply {
         total: usize,
     },
     /// The model is ready for a message.
-    Ready {
-        tokens: usize,
-    },
+    Ready,
     /// Part of the model's thought, before it replies.
     Thought(String),
     Text(String),
@@ -128,10 +123,8 @@ enum Reply {
     },
     /// What the tool returned.
     Output(String),
-    Done {
-        tokens: usize,
-        stats: harness::Stats,
-    },
+    /// The reply is over, and where the conversation's time has gone.
+    Done(harness::Stats),
     Failed(String),
 }
 
@@ -196,9 +189,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
         },
     )?;
     let mut harness = Harness::new(chat);
-    let _ = replies.send(Reply::Ready {
-        tokens: harness.tokens(),
-    });
+    let _ = replies.send(Reply::Ready);
 
     for message in requests {
         harness.send(&message, |event| {
@@ -218,10 +209,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
                 ControlFlow::Continue(())
             }
         })?;
-        let _ = replies.send(Reply::Done {
-            tokens: harness.tokens(),
-            stats: harness.stats(),
-        });
+        let _ = replies.send(Reply::Done(harness.stats()));
     }
     Ok(())
 }
@@ -288,11 +276,6 @@ struct App {
     reply_width: usize,
     committed: usize,
     interrupted: bool,
-    /// Tokens in the conversation so far, and how many it has room for.
-    context: usize,
-    max_context: usize,
-    /// Tokens per second of the last reply.
-    speed: Option<f32>,
     /// Lines waiting to be printed above the live region.
     lines: Vec<Line>,
     requests: Sender<String>,
@@ -482,10 +465,7 @@ impl App {
                 };
                 self.status = Status::Prompting { since, read, total };
             }
-            Reply::Ready { tokens } => {
-                self.context = tokens;
-                self.status = Status::Idle;
-            }
+            Reply::Ready => self.status = Status::Idle,
             Reply::Thought(text) => self.generated(Segment::Thought, &text),
             Reply::Text(text) => self.generated(Segment::Text, &text),
             Reply::Call { name, detail } => {
@@ -514,17 +494,13 @@ impl App {
                 }
                 self.lines.push(Line::new());
             }
-            Reply::Done { tokens, stats } => {
+            Reply::Done(stats) => {
                 self.stats = stats;
                 self.reply.truncate(self.reply.trim_end().len());
                 self.commit(true);
                 if self.interrupted {
                     self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
                 }
-                if let Status::Generating { start, tokens } = self.status {
-                    self.speed = Some(tokens as f32 / start.elapsed().as_secs_f32());
-                }
-                self.context = tokens;
                 self.status = Status::Idle;
             }
             Reply::Failed(e) => return Err(e.into()),
@@ -671,7 +647,7 @@ impl App {
             live.push(tui::boxed(vec![prompt, content], columns));
         }
         live.push(border("╰", "╯"));
-        live.push(self.footer(columns));
+        live.push(self.footer());
 
         let lines = std::mem::take(&mut self.lines);
         self.screen.draw(&lines, &live, cursor)?;
@@ -689,7 +665,10 @@ impl App {
                 download_details(progress, since.elapsed()),
             ),
             Status::Loading { since, done, total } => (
-                format!("Loading {}…", self.model),
+                match &self.device {
+                    Some(device) => format!("Loading {} onto {device}…", self.model),
+                    None => format!("Loading {}…", self.model),
+                },
                 since,
                 format!("{done}/{total} tensors · {}s", since.elapsed().as_secs()),
             ),
@@ -722,22 +701,9 @@ impl App {
         ])
     }
 
-    /// What's running and how full the context is, with the keys to know.
-    fn footer(&self, columns: usize) -> Line {
-        let mut left = format!("  {} · {}", tilde(&self.cwd), self.model);
-        if let Some(device) = &self.device {
-            left.push_str(&format!(" · {device}"));
-        }
-        left.push_str(&format!(" · {}/{} tokens", self.context, self.max_context));
-        if let Some(speed) = self.speed {
-            left.push_str(&format!(" · {speed:.1} tok/s"));
-        }
-        let right = "shift+enter for newline · ctrl+c to quit  ";
-        tui::spread(
-            vec![span(left).dark_grey()],
-            vec![span(right).dark_grey()],
-            columns,
-        )
+    /// The directory the agent works in.
+    fn footer(&self) -> Line {
+        vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()]
     }
 }
 
