@@ -185,6 +185,45 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
         let flops = 2.0 * (rows * cols * n) as f64 / each;
         eprintln!("{rows}x{cols} n={n:<3} {:8.3} ms  {:6.3} ms/token  {:6.2} TFLOP/s", each * 1e3, each * 1e3 / n as f64, flops / 1e12);
     }
+    // The model's other shapes, for a single token: the ones with fewer
+    // rows take the other kernels.
+    for (rows, cols) in [(5120, 17408), (6144, 5120), (10240, 5120), (1024, 5120)] {
+        let weight = gpu.upload(rng.ternary(&[rows, cols]));
+        let x = buffer(gpu, &rng.floats(cols));
+        let mut out = gpu.alloc(rows);
+        for _ in 0..2000 {
+            gpu.matmul(&mut out, &weight, &x);
+        }
+        gpu.read(&out);
+        let runs = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            gpu.matmul(&mut out, &weight, &x);
+        }
+        gpu.read(&out);
+        let each = start.elapsed().as_secs_f64() / runs as f64;
+        let bytes = rows * ternary::row_bytes(cols);
+        eprintln!("{rows}x{cols} n=1   {:8.3} ms  {:6.0} GB/s", each * 1e3, bytes as f64 / each / 1e9);
+    }
+}
+
+/// Times a run of small elementwise dispatches, for the cost of a dispatch
+/// itself: adds of a token's width of activations, back to back.
+pub fn dispatch_overhead<D: Device>(gpu: &D) {
+    let mut rng = Rng(22);
+    let mut x = buffer(gpu, &rng.floats(5120));
+    let y = buffer(gpu, &rng.floats(5120));
+    for _ in 0..2000 {
+        gpu.add(&mut x, &y);
+    }
+    gpu.read(&x);
+    let runs = 4000;
+    let start = std::time::Instant::now();
+    for _ in 0..runs {
+        gpu.add(&mut x, &y);
+    }
+    gpu.read(&x);
+    eprintln!("add of 5120: {:.2} us a dispatch", start.elapsed().as_secs_f64() * 1e6 / runs as f64);
 }
 
 pub fn rmsnorm_matches_cpu<D: Device>(gpu: &D) {

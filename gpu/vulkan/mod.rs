@@ -21,7 +21,8 @@ use crate::{
 /// through.
 const STAGING: usize = 64 << 20;
 
-/// Rows of ternary weights one workgroup of the matmul kernel takes.
+/// Rows of ternary weights one workgroup of the single-token and batch
+/// matmul kernels takes.
 const TERNARY_ROWS: usize = 8;
 /// Rows and tokens of a tile of `matmul_ternary_tile.wgsl`; a batch of at
 /// least half a tile's tokens goes through it.
@@ -30,10 +31,6 @@ const TERNARY_TILE_TOKENS: usize = 32;
 /// Workgroup memory the tile kernel takes: the rows' block as half floats
 /// and the tokens' as floats.
 const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS * 2 + TERNARY_TILE_TOKENS * 4) * 128;
-
-/// Most rows a ternary matrix has for the lane-per-row kernel to be the
-/// faster one for a single token, as measured on an RX 5700 XT.
-const TERNARY_ROWS_KERNEL_LIMIT: usize = 8192;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
 /// submitted.
@@ -74,7 +71,6 @@ struct Kernels {
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
-    matmul_ternary_rows: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
     l2norm: vk::Pipeline,
@@ -91,13 +87,12 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 18] {
+    fn all(&self) -> [vk::Pipeline; 17] {
         [
             self.matmul,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
-            self.matmul_ternary_rows,
             self.add,
             self.rmsnorm,
             self.l2norm,
@@ -137,8 +132,6 @@ pub struct Vulkan {
     staging: Mapped,
     partials: vk::Buffer,
     max_groups: u32,
-    /// Lanes in a subgroup, which the ternary matmul takes rows by.
-    subgroup_size: usize,
     name: String,
     /// Every buffer and its memory, freed when the device is dropped.
     allocations: Mutex<Vec<(vk::Buffer, vk::DeviceMemory)>>,
@@ -188,7 +181,7 @@ impl Vulkan {
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
             instance.get_physical_device_properties2(physical, &mut props2);
-            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC;
+            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
             if !subgroup.supported_operations.contains(needed) || subgroup.subgroup_size < 16 {
                 return Err(format!("{name} lacks the subgroup operations the kernels use").into());
             }
@@ -287,7 +280,6 @@ impl Vulkan {
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
-                matmul_ternary_rows: spv!("matmul_ternary_rows"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
                 l2norm: spv!("l2norm"),
@@ -322,7 +314,6 @@ impl Vulkan {
                 },
                 partials: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
-                subgroup_size: subgroup.subgroup_size as usize,
                 name,
                 allocations: Mutex::new(Vec::new()),
                 ring: Mutex::new(Ring {
@@ -781,12 +772,9 @@ impl Device for Vulkan {
         }
         // One workgroup per row, or per eight rows of ternary weights, in a
         // grid as wide as the GPU allows. A few tokens are worth unpacking
-        // the ternary weights once for several; a single token through a
-        // matrix of few rows does better with a lane per row.
+        // the ternary weights once for several.
         let (kernel, per_group) = if w.ternary && n > 1 {
             (self.kernels.matmul_ternary_batch, TERNARY_ROWS)
-        } else if w.ternary && rows <= TERNARY_ROWS_KERNEL_LIMIT {
-            (self.kernels.matmul_ternary_rows, self.subgroup_size)
         } else if w.ternary {
             (self.kernels.matmul_ternary, TERNARY_ROWS)
         } else {
@@ -1014,6 +1002,16 @@ mod tests {
     fn ternary_matmul_speed() {
         match super::Vulkan::new() {
             Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the cost of a dispatch; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dispatch_overhead() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::dispatch_overhead(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
