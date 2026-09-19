@@ -21,7 +21,7 @@ The model thinks by default (its template opens `<think>` for it), calls tools a
 
 ## Building
 
-`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `~/.cache/dwim/models/` on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 64 KB per token of context for the key/value caches.
+`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `dwim/models/` under the user's cache directory (`~/Library/Caches` on macOS, `~/.cache` elsewhere) on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 64 KB per token of context for the key/value caches.
 
 ## Verifying
 
