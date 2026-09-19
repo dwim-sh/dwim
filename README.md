@@ -19,15 +19,23 @@ no API key, no server, and nothing leaves your machine.
 > your machine without asking first, so use it on code you have committed or
 > backed up.
 
-## Getting started
+## Installation
+
+To install the latest release:
+
+```console
+curl -fsSL https://dwim.sh/install.sh | sh
+```
+
+To install the latest development version:
 
 ```console
 cargo install --git https://github.com/dwim-sh/dwim
-dwim
 ```
 
-The model is downloaded (about 6 GB) on first use. `dwim "what changed in the
-last commit?"` answers one thing and exits, and `man ./man/dwim.1` has the rest.
+Either way, the model (about 6 GB) is downloaded on first use.
+
+## Features
 
 - **A real coding agent.** A shell where the model runs commands, reads their
   output, and keeps going until the task is done. It follows your project's
@@ -36,6 +44,28 @@ last commit?"` answers one thing and exits, and `man ./man/dwim.1` has the rest.
   Qwen3.8-27B: every weight is -1, 0, or 1, so it fits on a laptop GPU.
 - **Its own inference engine.** No llama.cpp. Metal on macOS, Vulkan
   everywhere else, and a CPU reference the GPU kernels are tested against.
+
+## Getting started
+
+Run `dwim` in a project directory. It opens a shell: type what you want, and
+the model reads files, runs commands, and answers.
+
+<div align="center">
+  <img src=".github/assets/session.png" width="760" alt="A dwim session: after typing Explain this codebase to me in one sentence, the model reads README.md and replies with one sentence">
+</div>
+
+To ask one thing and exit, give the prompt on the command line:
+
+```console
+dwim "Explain this codebase to me in one sentence."
+```
+
+The manual page has the options, the shell's commands and keys, and the files
+it reads:
+
+```console
+man dwim
+```
 
 ## License
 
