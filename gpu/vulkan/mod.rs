@@ -1006,6 +1006,17 @@ mod tests {
         }
     }
 
+    /// Times the kernels other than the ternary matmuls at the model's
+    /// shapes; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kernel_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::kernel_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
     /// Times the cost of a dispatch; run with `--ignored --nocapture`.
     #[test]
     #[ignore]
