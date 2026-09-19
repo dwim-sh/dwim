@@ -38,7 +38,7 @@ const RING: usize = 4;
 const SUBMIT_EVERY: usize = 128;
 
 /// Positions one workgroup of the attention kernel takes.
-const CHUNK: usize = 256;
+const CHUNK: usize = 128;
 
 /// Most floats of attention partials one dispatch writes, one chunk's
 /// maximum, sum, and weighted values per head of each token: the size of
@@ -1002,6 +1002,17 @@ mod tests {
     fn ternary_matmul_speed() {
         match super::Vulkan::new() {
             Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the kernels other than the ternary matmuls at the model's
+    /// shapes; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kernel_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::kernel_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }

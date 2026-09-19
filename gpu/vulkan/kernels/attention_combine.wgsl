@@ -17,7 +17,7 @@ var<immediate> p: Params;
 @group(0) @binding(0) var<storage, read_write> out: array<f32>;
 @group(0) @binding(1) var<storage, read> partials: array<f32>;
 
-const CHUNK: u32 = 256u;
+const CHUNK: u32 = 128u;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {

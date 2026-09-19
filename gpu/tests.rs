@@ -226,6 +226,81 @@ pub fn dispatch_overhead<D: Device>(gpu: &D) {
     eprintln!("add of 5120: {:.2} us a dispatch", start.elapsed().as_secs_f64() * 1e6 / runs as f64);
 }
 
+/// Times every kernel but the ternary matmuls at the model's shapes for one
+/// decoded token, and prints each one's cost and, times its calls a token,
+/// its share of the token.
+pub fn kernel_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(23);
+    let (hidden, inter, heads, head_dim, rot_dim, kv_heads) = (5120, 17408, 24, 256, 64, 4);
+    let (k_heads, v_heads, state_dim) = (16, 48, 128);
+    let (k_dim, v_dim) = (k_heads * state_dim, v_heads * state_dim);
+    let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+    let channels = 2 * k_dim + v_dim;
+    let context = 1024;
+    let sync = gpu.alloc(1);
+    let mut total = 0.0;
+    let mut time = |name: &str, calls: usize, op: &mut dyn FnMut()| {
+        for _ in 0..200 {
+            op();
+        }
+        gpu.read(&sync);
+        let runs = 500;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            op();
+        }
+        gpu.read(&sync);
+        let each = start.elapsed().as_secs_f64() / runs as f64;
+        total += each * calls as f64;
+        eprintln!("{name:<28} {:7.1} us  x{calls:<3} {:6.2} ms/token", each * 1e6, each * calls as f64 * 1e3);
+    };
+    let (mut h, mut i, mut qd, mut vd, mut kd) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(inter)), buffer(gpu, &rng.floats(q_dim)), buffer(gpu, &rng.floats(v_dim)), buffer(gpu, &rng.floats(kv_dim)));
+    let (h2, i2, vd2) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(inter)), buffer(gpu, &rng.floats(v_dim)));
+    let (signs_h, signs_i, signs_v) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(inter)), buffer(gpu, &rng.floats(v_dim)));
+    let (norm_h, norm_head, norm_state) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(head_dim)), buffer(gpu, &rng.floats(state_dim)));
+    let mut out_h = gpu.alloc(hidden);
+    time("norm_rotate 5120", 129, &mut || gpu.norm_rotate(&mut out_h, &h, &norm_h, &signs_h, 1e-6));
+    time("hadamard 6144", 64, &mut || gpu.hadamard(&mut vd, &signs_v, false));
+    time("hadamard 17408", 64, &mut || gpu.hadamard(&mut i, &signs_i, false));
+    time("rmsnorm 5120", 48, &mut || gpu.rmsnorm(&mut h, &norm_h, 1e-6));
+    time("rmsnorm 6144 by 256", 16, &mut || gpu.rmsnorm(&mut qd, &norm_head, 1e-6));
+    time("rmsnorm 1024 by 256", 16, &mut || gpu.rmsnorm(&mut kd, &norm_head, 1e-6));
+    time("rmsnorm 6144 by 128", 48, &mut || gpu.rmsnorm(&mut vd, &norm_state, 1e-6));
+    time("add 5120", 128, &mut || gpu.add(&mut h, &h2));
+    time("copy 5120", 48, &mut || gpu.copy(&mut h, 0, &h2, 0, hidden));
+    time("silu_mul 17408", 64, &mut || gpu.silu_mul(&mut i, &i2));
+    time("silu_mul 6144", 48, &mut || gpu.silu_mul(&mut vd, &vd2));
+    time("sigmoid_mul 6144", 16, &mut || gpu.sigmoid_mul(&mut qd, &vd2));
+    let mut kq = buffer(gpu, &rng.floats(k_dim));
+    time("l2norm 2048 by 128", 96, &mut || gpu.l2norm(&mut kq, state_dim, 1e-6));
+    let table = buffer(gpu, &rng.floats(context * rot_dim));
+    time("rope 24 heads", 16, &mut || gpu.rope(&mut qd, &table, 500, heads, head_dim, rot_dim));
+    time("rope 4 heads", 16, &mut || gpu.rope(&mut kd, &table, 500, kv_heads, head_dim, rot_dim));
+    let mut k_cache = cache(gpu, &rng.floats(context * kv_dim), 0);
+    let v_cache = cache(gpu, &rng.floats(context * kv_dim), 0);
+    time("store 1024", 32, &mut || gpu.store(&mut k_cache, 500 * kv_dim, &kd));
+    let mut att = gpu.alloc(q_dim);
+    time("attention at 1024", 16, &mut || gpu.attention(&mut att, &qd, &k_cache, &v_cache, context - 1, heads, head_dim, kv_heads));
+    let long = 4 * context;
+    let k_long = cache(gpu, &rng.floats(long * kv_dim), 0);
+    let v_long = cache(gpu, &rng.floats(long * kv_dim), 0);
+    time("attention at 4096", 16, &mut || gpu.attention(&mut att, &qd, &k_long, &v_long, long - 1, heads, head_dim, kv_heads));
+    let (mut cq, mut ck, mut cv) = (gpu.alloc(k_dim), gpu.alloc(k_dim), gpu.alloc(v_dim));
+    let (xc, cstate, cweight) = (buffer(gpu, &rng.floats(channels)), buffer(gpu, &rng.floats((CONV_KERNEL - 1) * channels)), buffer(gpu, &rng.floats(channels * CONV_KERNEL)));
+    let mut cstate_out = gpu.alloc((CONV_KERNEL - 1) * channels);
+    time("conv 10240", 48, &mut || gpu.conv(&mut cq, &mut ck, &mut cv, &mut cstate_out, &xc, &cstate, &cweight));
+    let gates = buffer(gpu, &rng.floats(2 * v_heads));
+    let decay: Vec<f32> = (0..2 * v_heads).map(|i| if i < v_heads { -rng.next().abs() } else { 4.0 * rng.next() }).collect();
+    let decay = buffer(gpu, &decay);
+    let mut dstate = buffer(gpu, &rng.floats(v_heads * state_dim * state_dim));
+    let mut dout = gpu.alloc(v_dim);
+    time("delta_net 48 heads", 48, &mut || gpu.delta_net(&mut dout, &cq, &ck, &cv, &gates, &decay, &mut dstate, k_heads, v_heads, state_dim));
+    let ab = gpu.upload(rng.bf16(&[2 * v_heads, hidden]));
+    let mut gout = gpu.alloc(2 * v_heads);
+    time("matmul bf16 96x5120", 48, &mut || gpu.matmul(&mut gout, &ab, &h));
+    eprintln!("{:<28} {:22} {:6.2} ms/token", "total", "", total * 1e3);
+}
+
 pub fn rmsnorm_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(5);
     for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
