@@ -305,6 +305,7 @@ dependencies = [
  "dwim-gpu",
  "dwim-harness",
  "dwim-models",
+ "libc",
  "unicode-width",
  "ureq",
 ]
