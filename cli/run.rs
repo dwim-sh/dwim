@@ -61,6 +61,9 @@ pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Err
         history: Vec::new(),
         recalled: None,
         status: Status::Loading { since: Instant::now(), done: 0, total: 0 },
+        started: Instant::now(),
+        loading: Duration::ZERO,
+        stats: harness::Stats::default(),
         reply: String::new(),
         segment: Segment::Text,
         reply_width: 0,
@@ -102,7 +105,7 @@ enum Reply {
     Call { name: String, detail: String },
     /// What the tool returned.
     Output(String),
-    Done { tokens: usize },
+    Done { tokens: usize, stats: harness::Stats },
     Failed(String),
 }
 
@@ -176,7 +179,10 @@ fn serve<D: dwim_gpu::Device + 'static>(
                 ControlFlow::Continue(())
             }
         })?;
-        let _ = replies.send(Reply::Done { tokens: harness.tokens() });
+        let _ = replies.send(Reply::Done {
+            tokens: harness.tokens(),
+            stats: harness.stats(),
+        });
     }
     Ok(())
 }
@@ -217,6 +223,11 @@ struct App {
     history: Vec<String>,
     recalled: Option<usize>,
     status: Status,
+    /// When the shell started, how long loading the model took, and where
+    /// the conversation's time has gone, as of the last reply.
+    started: Instant,
+    loading: Duration,
+    stats: harness::Stats,
     /// The part of the reply being generated, which part it is, the width
     /// it is wrapped at, and how many of its lines have been printed.
     reply: String,
@@ -389,6 +400,10 @@ impl App {
             Reply::Prompting { read, total } => {
                 let since = match self.status {
                     Status::Prompting { since, .. } => since,
+                    Status::Loading { since, .. } => {
+                        self.loading = since.elapsed();
+                        Instant::now()
+                    }
                     _ => Instant::now(),
                 };
                 self.status = Status::Prompting { since, read, total };
@@ -424,7 +439,8 @@ impl App {
                 }
                 self.lines.push(Line::new());
             }
-            Reply::Done { tokens } => {
+            Reply::Done { tokens, stats } => {
+                self.stats = stats;
                 self.reply.truncate(self.reply.trim_end().len());
                 self.commit(true);
                 if self.interrupted {
@@ -504,6 +520,10 @@ impl App {
         let (columns, _) = self.screen.size();
         let lines = match command.trim() {
             "model" => models_listing(&self.model),
+            "stats" => {
+                let report = self.stats.report(self.loading, self.started.elapsed());
+                report.into_iter().map(|line| vec![span(format!("  {line}"))]).collect()
+            }
             other => vec![vec![span(format!("● Unknown command /{other}"))]],
         };
         self.lines.extend(lines.iter().map(|line| tui::truncate(line, columns)));

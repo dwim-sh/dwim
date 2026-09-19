@@ -1,4 +1,4 @@
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, time::Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -55,6 +55,39 @@ pub struct Chat<M: LanguageModel> {
     /// as text in a vocabulary without them.
     tool_response: Vec<u32>,
     tool_response_end: Vec<u32>,
+    stats: Stats,
+}
+
+/// Where a conversation's time has gone: the tokens the model read as
+/// prompts, the ones it generated while thinking, and the ones it
+/// generated as replies, with the time spent on each.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    pub prompt: Tally,
+    pub thought: Tally,
+    pub answer: Tally,
+}
+
+/// Tokens of one kind, and the seconds the model took over them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    pub tokens: usize,
+    pub seconds: f64,
+}
+
+impl Tally {
+    /// Tokens a second, or zero before there are any.
+    pub fn rate(&self) -> f64 {
+        if self.seconds > 0.0 { self.tokens as f64 / self.seconds } else { 0.0 }
+    }
+}
+
+/// What tokens fed to the model count as.
+#[derive(Clone, Copy)]
+enum Kind {
+    Prompt,
+    Thought,
+    Answer,
 }
 
 /// A piece of the model's reply, as it is generated.
@@ -126,6 +159,7 @@ impl<M: LanguageModel> Chat<M> {
             tokenizer,
             sampler,
             len: 0,
+            stats: Stats::default(),
         })
     }
 
@@ -141,7 +175,7 @@ impl<M: LanguageModel> Chat<M> {
         let turn = self.turn("system", content)?;
         on_progress(0, turn.len());
         for (i, batch) in turn.chunks(BATCH).enumerate() {
-            self.feed(batch)?;
+            self.feed(batch, Kind::Prompt)?;
             on_progress(i * BATCH + batch.len(), turn.len());
         }
         Ok(())
@@ -152,6 +186,11 @@ impl<M: LanguageModel> Chat<M> {
         self.len
     }
 
+    /// Where the conversation's time has gone so far.
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
     /// Sends a message from the user, streaming the reply to `on_chunk` as
     /// it is generated, and returns the tool calls the reply made, as the
     /// model wrote them. The reply ends early if `on_chunk` breaks, and then
@@ -159,7 +198,7 @@ impl<M: LanguageModel> Chat<M> {
     pub fn send(&mut self, message: &str, on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Vec<String>> {
         let content = self.tokenizer.encode(message)?;
         let turn = self.turn("user", content)?;
-        self.feed(&turn)?;
+        self.feed(&turn, Kind::Prompt)?;
         self.generate(on_chunk)
     }
 
@@ -178,7 +217,7 @@ impl<M: LanguageModel> Chat<M> {
             content.extend(&self.tool_response_end);
         }
         let turn = self.turn("user", content)?;
-        self.feed(&turn)?;
+        self.feed(&turn, Kind::Prompt)?;
         self.generate(on_chunk)
     }
 
@@ -199,7 +238,7 @@ impl<M: LanguageModel> Chat<M> {
         prompt.extend(self.tokenizer.encode("assistant\n")?);
         prompt.push(self.think);
         prompt.extend(self.tokenizer.encode("\n")?);
-        let mut logits = self.feed(&prompt)?;
+        let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
@@ -220,6 +259,7 @@ impl<M: LanguageModel> Chat<M> {
                 }
             }
             let mut token = self.sampler.sample(&logits);
+            let kind = if thinking { Kind::Thought } else { Kind::Answer };
             if token == self.im_end || token == self.end_of_text {
                 if thinking {
                     // The model sometimes ends its reply while still
@@ -271,7 +311,7 @@ impl<M: LanguageModel> Chat<M> {
             };
             // Feed the token even if the reply ends here, so that the model
             // remembers the reply exactly as far as it was shown.
-            logits = self.feed(&[token])?;
+            logits = self.feed(&[token], kind)?;
             if flow.is_break() {
                 interrupted = true;
                 break;
@@ -288,16 +328,25 @@ impl<M: LanguageModel> Chat<M> {
         }
         end.push(self.im_end);
         end.extend(self.tokenizer.encode("\n")?);
-        self.feed(&end)?;
+        self.feed(&end, Kind::Prompt)?;
         Ok(if interrupted { Vec::new() } else { calls })
     }
 
-    /// Runs tokens through the model, returning the logits after the last one.
-    fn feed(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// Runs tokens through the model, returning the logits after the last
+    /// one, and counts them and their time as `kind`.
+    fn feed(&mut self, tokens: &[u32], kind: Kind) -> Result<Vec<f32>> {
         if self.len + tokens.len() > self.model.max_len() {
             return Err("the conversation no longer fits in the context window".into());
         }
+        let start = Instant::now();
         let logits = self.model.forward(tokens, self.len);
+        let tally = match kind {
+            Kind::Prompt => &mut self.stats.prompt,
+            Kind::Thought => &mut self.stats.thought,
+            Kind::Answer => &mut self.stats.answer,
+        };
+        tally.tokens += tokens.len();
+        tally.seconds += start.elapsed().as_secs_f64();
         self.len += tokens.len();
         Ok(logits)
     }
@@ -401,6 +450,19 @@ mod tests {
             }
             ControlFlow::Continue(())
         }
+    }
+
+    #[test]
+    fn counts_tokens_by_kind() {
+        let mut chat = chat(&["A thought.\n</think>\n\nAn answer."]);
+        chat.send("hello", |_| ControlFlow::Continue(())).unwrap();
+        let stats = chat.stats();
+        // The thought's tokens and the tag that ends it; the answer's tokens
+        // but not the tag that ends the reply, which is fed as part of the
+        // reply's ending rather than sampled; and everything else read.
+        assert_eq!(stats.thought.tokens, chat.tokenizer.encode("A thought.\n").unwrap().len() + 1);
+        assert_eq!(stats.answer.tokens, chat.tokenizer.encode("\n\nAn answer.").unwrap().len());
+        assert_eq!(stats.prompt.tokens + stats.thought.tokens + stats.answer.tokens, chat.model.fed.len());
     }
 
     #[test]

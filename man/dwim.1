@@ -38,6 +38,12 @@ Maximum conversation length in tokens (default: 32768).
 Cannot exceed the model's supported context length.
 Larger values reserve more memory on the selected device at startup.
 .TP
+.B \-\-stats
+When answering a prompt given on the command line, print where the time
+went once the reply ends: the time loading the model; the tokens read as
+prompts, generated while thinking, and generated as the reply, with the
+time and rate of each; and the tools run.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -53,6 +59,11 @@ List the models
 .B dwim
 knows, where their weights are kept and how much of each has been fetched,
 marking the one running.
+.TP
+.B /stats
+Show where the conversation's time has gone, as
+.B \-\-stats
+does.
 .PP
 .B Ctrl\-C
 or
