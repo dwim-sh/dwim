@@ -1032,13 +1032,18 @@ mod tests {
         }
     }
 
-    /// Times the kernels other than the ternary matmuls at the model's
-    /// shapes; run with `--ignored --nocapture`.
+    /// Times the kernels at the model's shapes, for one token and for a
+    /// batch of 64; run with `--ignored --nocapture`.
     #[test]
     #[ignore]
     fn kernel_speed() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::tests::kernel_speed(&gpu),
+            Ok(gpu) => {
+                for n in [1, 64] {
+                    eprintln!("batch of {n}:");
+                    crate::tests::kernel_speed(&gpu, n);
+                }
+            }
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
