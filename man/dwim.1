@@ -44,6 +44,11 @@ went once the reply ends: the time loading the model; the tokens read as
 prompts, generated while thinking, and generated as the reply, with the
 time and rate of each; and the tools run.
 .TP
+.B \-\-thinking
+Show the model's thinking in the shell from the start, as
+.B Ctrl\-O
+does.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -65,6 +70,10 @@ Show where the conversation's time has gone, as
 .B \-\-stats
 does.
 .PP
+The model thinks before it replies, and the shell hides the thought unless
+.B Ctrl\-O
+shows it: pressed while the model thinks, it prints the thought so far and
+what follows, and pressed again it hides the rest.
 .B Ctrl\-C
 or
 .B Esc

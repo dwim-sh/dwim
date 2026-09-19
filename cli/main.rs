@@ -18,7 +18,7 @@ fn main() {
     // nothing on standard output but the reply. Without one, open the shell.
     let prompt = opts.prompt.join(" ");
     let result = match prompt.trim() {
-        "" => run::run(&opts.model, opts.device, opts.context),
+        "" => run::run(&opts.model, opts.device, opts.context, opts.thinking),
         prompt => once::once(&opts.model, opts.device, opts.context, prompt, opts.stats),
     };
     if let Err(e) = result {
