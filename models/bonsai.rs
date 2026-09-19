@@ -28,7 +28,7 @@ use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
 /// rather than once per token; the activations are allocated for this many.
 /// A batch is one submission to the device, which a driver may abandon as
 /// hung if it runs for seconds, so batches are kept short.
-pub const BATCH: usize = 16;
+pub const BATCH: usize = 64;
 
 /// The architecture, read from the GGUF metadata.
 #[derive(Debug)]
@@ -767,13 +767,16 @@ mod tests {
         gguf::write(path, &meta, &tensors).unwrap();
     }
 
-    fn run<D: Device>(path: &Path, device: D) -> (Vec<f32>, Vec<f32>) {
+    fn run<D: Device>(path: &Path, device: D) -> [Vec<f32>; 3] {
         let gguf = Arc::new(Gguf::open(path).unwrap());
         let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
-        // A batch of several tokens, then one more, carrying the state.
+        // A batch of several tokens, then one more, then a batch of many,
+        // each carrying the state.
         let first = model.forward(&[3, 17, 42, 7, 9], 0);
         let second = model.forward(&[11], 5);
-        (first, second)
+        let many: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
+        let third = model.forward(&many, 6);
+        [first, second, third]
     }
 
     #[test]
@@ -782,14 +785,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.gguf");
         synthetic(&path);
-        let (cpu_first, cpu_second) = run(&path, Cpu);
-        assert!(cpu_first.iter().all(|v| v.is_finite()));
-        assert!(cpu_first.iter().any(|&v| v != 0.0));
-        assert_ne!(cpu_first, cpu_second);
+        let cpu = run(&path, Cpu);
+        assert!(cpu[0].iter().all(|v| v.is_finite()));
+        assert!(cpu[0].iter().any(|&v| v != 0.0));
+        assert_ne!(cpu[0], cpu[1]);
         if let Ok(gpu) = Gpu::new() {
-            let (gpu_first, gpu_second) = run(&path, gpu);
-            for (a, b) in cpu_first.iter().zip(&gpu_first).chain(cpu_second.iter().zip(&gpu_second)) {
-                assert!((a - b).abs() <= 2e-3 * (1.0 + a.abs()), "{a} vs {b}");
+            let gpu = run(&path, gpu);
+            for (cpu, gpu) in cpu.iter().zip(&gpu) {
+                for (a, b) in cpu.iter().zip(gpu) {
+                    assert!((a - b).abs() <= 2e-3 * (1.0 + a.abs()), "{a} vs {b}");
+                }
             }
         } else {
             eprintln!("skipping the GPU comparison: no GPU");
@@ -833,6 +838,14 @@ mod tests {
         let text = String::from_utf8_lossy(&text);
         eprintln!("completion: {text:?}");
         assert!(text.starts_with(" Paris."), "{text:?}");
+        // A long prompt, carrying on from the completion, for the speed of
+        // the batch kernels at their size.
+        let passage = "The quick brown fox jumps over the lazy dog while the river runs to the sea. ".repeat(20);
+        let mut long = tokenizer.encode(&passage).unwrap();
+        long.truncate(model.max_len() - tokens.len());
+        let start = std::time::Instant::now();
+        model.forward(&long, tokens.len());
+        eprintln!("long prompt: {:.1} tok/s over {} tokens", long.len() as f32 / start.elapsed().as_secs_f32(), long.len());
     }
 
     #[test]
