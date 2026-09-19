@@ -83,7 +83,10 @@ fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
         content = content.strip_suffix(b"\r").unwrap_or(content);
         let mut content = String::from_utf8_lossy(content).into_owned();
         if content.len() > LINE {
-            let end = (0..=LINE).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
+            let end = (0..=LINE)
+                .rev()
+                .find(|&i| content.is_char_boundary(i))
+                .unwrap_or(0);
             content.truncate(end);
             content.push('…');
             cut += 1;
@@ -95,14 +98,26 @@ fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
     let mut note = if lines == 0 {
         format!("[{path} is empty]")
     } else if shown == 0 {
-        format!("[{path} has {lines} {}; nothing from line {start}]", plural(lines, "line"))
+        format!(
+            "[{path} has {lines} {}; nothing from line {start}]",
+            plural(lines, "line")
+        )
     } else if end < lines {
-        format!("[lines {start}–{end} of {lines} in {path}; next: read {path} from line {}]", end + 1)
+        format!(
+            "[lines {start}–{end} of {lines} in {path}; next: read {path} from line {}]",
+            end + 1
+        )
     } else {
         format!("[lines {start}–{end} of {lines} in {path}; end of file]")
     };
     if cut > 0 {
-        note.insert_str(note.len() - 1, &format!("; {cut} {} longer than {LINE} bytes cut", plural(cut, "line")));
+        note.insert_str(
+            note.len() - 1,
+            &format!(
+                "; {cut} {} longer than {LINE} bytes cut",
+                plural(cut, "line")
+            ),
+        );
     }
     text.push_str(&note);
     Ok(text)
@@ -128,7 +143,11 @@ fn count(file: &mut impl BufRead) -> io::Result<u64> {
 
 /// `word`, or its plural if `n` is not one.
 fn plural(n: u64, word: &str) -> String {
-    if n == 1 { word.to_string() } else { format!("{word}s") }
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 #[cfg(test)]
@@ -165,27 +184,51 @@ mod tests {
         assert!(first.starts_with("1\tline 1\n2\tline 2\n"), "{first}");
         assert!(first.contains("\n200\tline 200\n"), "{first}");
         assert!(!first.contains("line 201\n"));
-        assert!(first.ends_with(&format!("[lines 1–200 of 450 in {path}; next: read {path} from line 201]")), "{first}");
+        assert!(
+            first.ends_with(&format!(
+                "[lines 1–200 of 450 in {path}; next: read {path} from line 201]"
+            )),
+            "{first}"
+        );
         assert_eq!(first.lines().count(), PAGE + 1);
 
         let second = read(&path, Some(201));
         assert!(second.starts_with("201\tline 201\n"), "{second}");
-        assert!(second.ends_with(&format!("[lines 201–400 of 450 in {path}; next: read {path} from line 401]")), "{second}");
+        assert!(
+            second.ends_with(&format!(
+                "[lines 201–400 of 450 in {path}; next: read {path} from line 401]"
+            )),
+            "{second}"
+        );
 
         let last = read(&path, Some(401));
         assert!(last.starts_with("401\tline 401\n"));
         assert!(last.contains("\n450\tline 450\n"));
-        assert!(last.ends_with(&format!("[lines 401–450 of 450 in {path}; end of file]")), "{last}");
+        assert!(
+            last.ends_with(&format!("[lines 401–450 of 450 in {path}; end of file]")),
+            "{last}"
+        );
 
         // Following the cursor covers the file exactly once.
         let mut seen = Vec::new();
         for page in [&first, &second, &last] {
-            seen.extend(page.lines().filter(|line| !line.starts_with('[')).map(|line| line.split('\t').next().unwrap().parse::<u64>().unwrap()));
+            seen.extend(
+                page.lines()
+                    .filter(|line| !line.starts_with('['))
+                    .map(|line| line.split('\t').next().unwrap().parse::<u64>().unwrap()),
+            );
         }
         assert_eq!(seen, (1..=450).collect::<Vec<_>>());
 
-        assert_eq!(read(&path, Some(451)), format!("[{path} has 450 lines; nothing from line 451]"));
-        assert_eq!(read(&path, Some(0)).lines().next().unwrap(), "1\tline 1", "a start below 1 means the first line");
+        assert_eq!(
+            read(&path, Some(451)),
+            format!("[{path} has 450 lines; nothing from line 451]")
+        );
+        assert_eq!(
+            read(&path, Some(0)).lines().next().unwrap(),
+            "1\tline 1",
+            "a start below 1 means the first line"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -196,15 +239,28 @@ mod tests {
         let one = dir.join("one.txt");
         fs::write(&one, "just this").unwrap();
         let one = one.to_str().unwrap();
-        assert_eq!(read(one, None), format!("1\tjust this\n[lines 1–1 of 1 in {one}; end of file]"));
+        assert_eq!(
+            read(one, None),
+            format!("1\tjust this\n[lines 1–1 of 1 in {one}; end of file]")
+        );
         let crlf = dir.join("crlf.txt");
         fs::write(&crlf, "a\r\nb\r\n").unwrap();
         let crlf = crlf.to_str().unwrap();
-        assert_eq!(read(crlf, None), format!("1\ta\n2\tb\n[lines 1–2 of 2 in {crlf}; end of file]"));
+        assert_eq!(
+            read(crlf, None),
+            format!("1\ta\n2\tb\n[lines 1–2 of 2 in {crlf}; end of file]")
+        );
         let bytes = dir.join("bytes.bin");
-        fs::write(&bytes, [b"x\xc3\xa4\n".as_slice(), &[0xff, 0xfe, b'y']].concat()).unwrap();
+        fs::write(
+            &bytes,
+            [b"x\xc3\xa4\n".as_slice(), &[0xff, 0xfe, b'y']].concat(),
+        )
+        .unwrap();
         let bytes = bytes.to_str().unwrap();
-        assert_eq!(read(bytes, None), format!("1\tx\u{e4}\n2\t\u{FFFD}\u{FFFD}y\n[lines 1–2 of 2 in {bytes}; end of file]"));
+        assert_eq!(
+            read(bytes, None),
+            format!("1\tx\u{e4}\n2\t\u{FFFD}\u{FFFD}y\n[lines 1–2 of 2 in {bytes}; end of file]")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -218,15 +274,28 @@ mod tests {
         assert!(second.ends_with('…'));
         assert!(!second.contains('\u{FFFD}'));
         assert!(second.len() <= "2\t".len() + LINE + '…'.len_utf8());
-        assert!(page.ends_with(&format!("[lines 1–2 of 2 in {path}; end of file; 1 line longer than {LINE} bytes cut]")), "{page}");
+        assert!(
+            page.ends_with(&format!(
+                "[lines 1–2 of 2 in {path}; end of file; 1 line longer than {LINE} bytes cut]"
+            )),
+            "{page}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn refuses_what_it_cannot_read() {
-        assert!(read("/nonexistent/file", None).starts_with("error: cannot read /nonexistent/file: "));
+        assert!(
+            read("/nonexistent/file", None).starts_with("error: cannot read /nonexistent/file: ")
+        );
         assert!(read("/", None).starts_with("error: / is a directory"));
-        assert_eq!(run(&serde_json::json!({ "path": "Cargo.toml", "start": "abc" })), "error: 'start' is a line number");
-        assert!(run(&serde_json::json!({ "path": "Cargo.toml", "start": "1" })).starts_with("1\t[package]"));
+        assert_eq!(
+            run(&serde_json::json!({ "path": "Cargo.toml", "start": "abc" })),
+            "error: 'start' is a line number"
+        );
+        assert!(
+            run(&serde_json::json!({ "path": "Cargo.toml", "start": "1" }))
+                .starts_with("1\t[package]")
+        );
     }
 }

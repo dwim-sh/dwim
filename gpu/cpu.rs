@@ -3,7 +3,9 @@
 
 use rayon::prelude::*;
 
-use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, sigmoid, softplus, ternary, to_f16};
+use crate::{
+    CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, sigmoid, softplus, ternary, to_f16,
+};
 
 pub struct Cpu;
 
@@ -25,7 +27,11 @@ impl Device for Cpu {
     }
 
     fn resize(&self, buf: &mut Vec<f32>, len: usize) {
-        assert!(len <= buf.capacity(), "a buffer of {} activations can't hold {len}", buf.capacity());
+        assert!(
+            len <= buf.capacity(),
+            "a buffer of {} activations can't hold {len}",
+            buf.capacity()
+        );
         buf.resize(len, 0.0);
     }
 
@@ -37,7 +43,14 @@ impl Device for Cpu {
         buf.copy_from_slice(data);
     }
 
-    fn copy(&self, dst: &mut Vec<f32>, dst_offset: usize, src: &Vec<f32>, src_offset: usize, len: usize) {
+    fn copy(
+        &self,
+        dst: &mut Vec<f32>,
+        dst_offset: usize,
+        src: &Vec<f32>,
+        src_offset: usize,
+        len: usize,
+    ) {
         dst[dst_offset..][..len].copy_from_slice(&src[src_offset..][..len]);
     }
 
@@ -112,7 +125,15 @@ impl Device for Cpu {
         }
     }
 
-    fn rope(&self, x: &mut Vec<f32>, table: &Vec<f32>, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
+    fn rope(
+        &self,
+        x: &mut Vec<f32>,
+        table: &Vec<f32>,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rot_dim: usize,
+    ) {
         // The rotated part of each head is rotated as pairs of elements
         // half of it apart, each pair by its own angle.
         let half = rot_dim / 2;
@@ -181,7 +202,10 @@ impl Device for Cpu {
         let width = signs.len();
         assert!(x.len().is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         for row in x.chunks_exact_mut(width) {
-            for (block, signs) in row.chunks_exact_mut(HADAMARD_BLOCK).zip(signs.chunks_exact(HADAMARD_BLOCK)) {
+            for (block, signs) in row
+                .chunks_exact_mut(HADAMARD_BLOCK)
+                .zip(signs.chunks_exact(HADAMARD_BLOCK))
+            {
                 if !inverse {
                     for (v, &s) in block.iter_mut().zip(signs) {
                         *v *= s;
@@ -197,7 +221,14 @@ impl Device for Cpu {
         }
     }
 
-    fn rmsnorm_hadamard(&self, out: &mut Vec<f32>, x: &Vec<f32>, weight: &Vec<f32>, signs: &Vec<f32>, eps: f32) {
+    fn rmsnorm_hadamard(
+        &self,
+        out: &mut Vec<f32>,
+        x: &Vec<f32>,
+        weight: &Vec<f32>,
+        signs: &Vec<f32>,
+        eps: f32,
+    ) {
         assert_eq!(out.len(), x.len());
         out.copy_from_slice(x);
         self.rmsnorm(out, weight, eps);
@@ -232,7 +263,8 @@ impl Device for Cpu {
             for c in 0..channels {
                 let mut acc = 0.0;
                 for j in 0..CONV_KERNEL {
-                    acc += weight[c * CONV_KERNEL + j] * input(t as isize + j as isize + 1 - CONV_KERNEL as isize, c);
+                    acc += weight[c * CONV_KERNEL + j]
+                        * input(t as isize + j as isize + 1 - CONV_KERNEL as isize, c);
                 }
                 let y = acc * sigmoid(acc);
                 if c < q_dim {
@@ -246,7 +278,8 @@ impl Device for Cpu {
         }
         for s in 0..CONV_KERNEL - 1 {
             for c in 0..channels {
-                state_out[s * channels + c] = input(n as isize + s as isize + 1 - CONV_KERNEL as isize, c);
+                state_out[s * channels + c] =
+                    input(n as isize + s as isize + 1 - CONV_KERNEL as isize, c);
             }
         }
     }
@@ -312,7 +345,8 @@ impl Device for Cpu {
             .collect();
         for (h, o) in outs.iter().enumerate() {
             for t in 0..n {
-                out[(t * n_v_heads + h) * head_dim..][..head_dim].copy_from_slice(&o[t * head_dim..][..head_dim]);
+                out[(t * n_v_heads + h) * head_dim..][..head_dim]
+                    .copy_from_slice(&o[t * head_dim..][..head_dim]);
             }
         }
     }
@@ -351,7 +385,11 @@ pub fn dot(w: &[u16], x: &[f32]) -> f32 {
         }
     }
     let done = w.len() / 8 * 8;
-    let rest: f32 = w[done..].iter().zip(&x[done..]).map(|(&w, x)| bf16(w) * x).sum();
+    let rest: f32 = w[done..]
+        .iter()
+        .zip(&x[done..])
+        .map(|(&w, x)| bf16(w) * x)
+        .sum();
     acc.iter().sum::<f32>() + rest
 }
 
@@ -366,7 +404,11 @@ fn dot_f16(a: &[f32], b: &[u16]) -> f32 {
         }
     }
     let done = a.len() / 8 * 8;
-    let rest: f32 = a[done..].iter().zip(&b[done..]).map(|(a, &b)| a * from_f16(b)).sum();
+    let rest: f32 = a[done..]
+        .iter()
+        .zip(&b[done..])
+        .map(|(a, &b)| a * from_f16(b))
+        .sum();
     acc.iter().sum::<f32>() + rest
 }
 
@@ -425,7 +467,18 @@ mod tests {
 
     #[test]
     fn f16_round_trips_what_it_can_represent() {
-        for x in [0.0, -0.0, 1.0, -2.5, 0.333_251_95, 65504.0, -65504.0, 1e-5, -3e-7, 2.0f32.powi(-14)] {
+        for x in [
+            0.0,
+            -0.0,
+            1.0,
+            -2.5,
+            0.333_251_95,
+            65504.0,
+            -65504.0,
+            1e-5,
+            -3e-7,
+            2.0f32.powi(-14),
+        ] {
             let bits = to_f16(x);
             let back = from_f16(bits);
             assert_eq!(to_f16(back), bits, "{x}");
@@ -439,17 +492,29 @@ mod tests {
 
     #[test]
     fn f16_converts_the_same_eight_at_a_time() {
-        let finite: Vec<u16> = (0..=u16::MAX).filter(|bits| bits & 0x7c00 != 0x7c00).collect();
+        let finite: Vec<u16> = (0..=u16::MAX)
+            .filter(|bits| bits & 0x7c00 != 0x7c00)
+            .collect();
         for bits in finite.chunks_exact(8) {
             let bits: &[u16; 8] = bits.try_into().unwrap();
-            assert_eq!(from_f16_8(bits).map(f32::to_bits), bits.map(|b| from_f16(b).to_bits()));
+            assert_eq!(
+                from_f16_8(bits).map(f32::to_bits),
+                bits.map(|b| from_f16(b).to_bits())
+            );
         }
     }
 
     #[test]
     fn f16_rounds_to_nearest_and_clamps() {
-        assert_eq!(from_f16(to_f16(1.0 + 2.0f32.powi(-11))), 1.0, "a tie rounds to even");
-        assert_eq!(from_f16(to_f16(1.0 + 3.0 * 2.0f32.powi(-11))), 1.0 + 2.0f32.powi(-9));
+        assert_eq!(
+            from_f16(to_f16(1.0 + 2.0f32.powi(-11))),
+            1.0,
+            "a tie rounds to even"
+        );
+        assert_eq!(
+            from_f16(to_f16(1.0 + 3.0 * 2.0f32.powi(-11))),
+            1.0 + 2.0f32.powi(-9)
+        );
         assert_eq!(from_f16(to_f16(0.1)), 0.099975586);
         assert_eq!(from_f16(to_f16(1e6)), F16_MAX);
         assert_eq!(from_f16(to_f16(-1e6)), -F16_MAX);
@@ -466,7 +531,11 @@ mod tests {
             x[i] = 1.0;
             walsh_hadamard(&mut x);
             for (j, &v) in x.iter().enumerate() {
-                let sign = if (i & j).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if (i & j).count_ones() % 2 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 assert_eq!(v, sign / 4.0, "row {i} column {j}");
             }
             walsh_hadamard(&mut x);

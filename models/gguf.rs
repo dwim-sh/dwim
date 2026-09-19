@@ -211,9 +211,19 @@ impl Gguf {
             }
             let dtype = r.u32()?;
             let offset = r.u64()?;
-            tensors.insert(name, Info { dims, dtype, offset });
+            tensors.insert(
+                name,
+                Info {
+                    dims,
+                    dtype,
+                    offset,
+                },
+            );
         }
-        let alignment = meta.get("general.alignment").and_then(Value::as_i64).unwrap_or(32) as usize;
+        let alignment = meta
+            .get("general.alignment")
+            .and_then(Value::as_i64)
+            .unwrap_or(32) as usize;
         let data_start = r.read.div_ceil(alignment) * alignment;
 
         let map = unsafe {
@@ -243,20 +253,30 @@ impl Gguf {
     }
 
     fn need(&self, key: &str) -> Result<&Value> {
-        self.meta.get(key).ok_or_else(|| format!("missing metadata '{key}'").into())
+        self.meta
+            .get(key)
+            .ok_or_else(|| format!("missing metadata '{key}'").into())
     }
 
     pub fn u32(&self, key: &str) -> Result<u32> {
-        let v = self.need(key)?.as_i64().ok_or_else(|| format!("metadata '{key}' is not an integer"))?;
+        let v = self
+            .need(key)?
+            .as_i64()
+            .ok_or_else(|| format!("metadata '{key}' is not an integer"))?;
         Ok(u32::try_from(v)?)
     }
 
     pub fn f32(&self, key: &str) -> Result<f32> {
-        Ok(self.need(key)?.as_f64().ok_or_else(|| format!("metadata '{key}' is not a number"))? as f32)
+        Ok(self
+            .need(key)?
+            .as_f64()
+            .ok_or_else(|| format!("metadata '{key}' is not a number"))? as f32)
     }
 
     pub fn str(&self, key: &str) -> Result<&str> {
-        self.need(key)?.as_str().ok_or_else(|| format!("metadata '{key}' is not a string").into())
+        self.need(key)?
+            .as_str()
+            .ok_or_else(|| format!("metadata '{key}' is not a string").into())
     }
 
     pub fn array(&self, key: &str) -> Result<&[Value]> {
@@ -272,7 +292,9 @@ impl Gguf {
     }
 
     pub fn info(&self, name: &str) -> Result<&Info> {
-        self.tensors.get(name).ok_or_else(|| format!("missing tensor '{name}'").into())
+        self.tensors
+            .get(name)
+            .ok_or_else(|| format!("missing tensor '{name}'").into())
     }
 
     /// The raw bytes of a tensor.
@@ -291,7 +313,11 @@ impl Gguf {
         if self.info(name)?.dtype != F32 {
             return Err(format!("tensor '{name}' is not f32").into());
         }
-        Ok(self.bytes(name)?.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+        Ok(self
+            .bytes(name)?
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
     }
 
     /// Copies out a bf16 matrix.
@@ -302,7 +328,11 @@ impl Gguf {
         }
         Ok(Tensor::Bf16 {
             shape: info.shape(),
-            data: self.bytes(name)?.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect(),
+            data: self
+                .bytes(name)?
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect(),
         })
     }
 
@@ -330,7 +360,11 @@ impl Drop for Gguf {
 /// Writes a GGUF file, for tests: the metadata, and tensors given by name,
 /// dimensions (innermost first), type, and data.
 #[cfg(test)]
-pub fn write(path: &Path, meta: &[(&str, Value)], tensors: &[(String, Vec<usize>, u32, Vec<u8>)]) -> Result<()> {
+pub fn write(
+    path: &Path,
+    meta: &[(&str, Value)],
+    tensors: &[(String, Vec<usize>, u32, Vec<u8>)],
+) -> Result<()> {
     use std::io::Write;
 
     fn string(out: &mut Vec<u8>, s: &str) {
@@ -423,7 +457,10 @@ mod tests {
             ("list", Value::Array(vec![Value::I32(-1), Value::I32(1)])),
             ("scale", Value::F32(0.5)),
         ];
-        let f32s: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32s: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let bf16: Vec<u8> = (0..8u16).flat_map(|v| (v << 8).to_le_bytes()).collect();
         let tern = vec![7u8; 2 * ternary::row_bytes(128)];
         let tensors = vec![

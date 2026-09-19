@@ -20,7 +20,10 @@ pub const BLOCK_BYTES: usize = 28;
 
 /// Bytes of a quantized row of `cols` weights.
 pub fn row_bytes(cols: usize) -> usize {
-    assert!(cols.is_multiple_of(BLOCK), "rows must be a whole number of blocks");
+    assert!(
+        cols.is_multiple_of(BLOCK),
+        "rows must be a whole number of blocks"
+    );
     cols / BLOCK * BLOCK_BYTES
 }
 
@@ -74,13 +77,19 @@ pub fn unpack(block: &[u8]) -> ([i8; BLOCK], f32) {
             q = (q * 3) & 0xff;
         }
     }
-    (trits, crate::from_f16(u16::from_le_bytes([block[26], block[27]])))
+    (
+        trits,
+        crate::from_f16(u16::from_le_bytes([block[26], block[27]])),
+    )
 }
 
 /// Reconstructs a quantized row's weights.
 pub fn dequantize_row(row: &[u8], out: &mut [f32]) {
     assert_eq!(row.len(), row_bytes(out.len()));
-    for (block, out) in row.chunks_exact(BLOCK_BYTES).zip(out.chunks_exact_mut(BLOCK)) {
+    for (block, out) in row
+        .chunks_exact(BLOCK_BYTES)
+        .zip(out.chunks_exact_mut(BLOCK))
+    {
         let (trits, d) = unpack(block);
         for (o, &t) in out.iter_mut().zip(&trits) {
             *o = t as f32 * d;
@@ -113,7 +122,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
             })
             .collect()
@@ -133,7 +144,10 @@ mod tests {
     #[test]
     fn round_trips_ternary_values() {
         // Weights that are already ternary come back exactly.
-        let mut x: Vec<f32> = row(512, 1).iter().map(|v| (v * 1.5).round() * 0.25).collect();
+        let mut x: Vec<f32> = row(512, 1)
+            .iter()
+            .map(|v| (v * 1.5).round() * 0.25)
+            .collect();
         x[0] = 0.25;
         let mut q = vec![0; row_bytes(512)];
         quantize_row(&x, &mut q);
@@ -184,7 +198,10 @@ mod tests {
             let mut back = vec![0.0; cols];
             dequantize_row(&q, &mut back);
             let want: f32 = back.iter().zip(&x).map(|(a, b)| a * b).sum();
-            assert!((dot(&q, &x) - want).abs() < 1e-3 * cols as f32, "cols {cols}");
+            assert!(
+                (dot(&q, &x) - want).abs() < 1e-3 * cols as f32,
+                "cols {cols}"
+            );
         }
     }
 }

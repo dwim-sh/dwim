@@ -23,13 +23,23 @@ use crate::{fetch, models, opts::Device};
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone; then reports where the time went, if
 /// `stats` asks for it.
-pub fn once(name: &str, device: Device, context: usize, prompt: &str, stats: bool) -> Result<(), Box<dyn Error>> {
+pub fn once(
+    name: &str,
+    device: Device,
+    context: usize,
+    prompt: &str,
+    stats: bool,
+) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let (model, dir) = fetch::locate(name)?;
     let mut progress = Progress::new();
     fetch::fetch(model, &dir, |file| {
         let total = file.total.unwrap_or(file.done);
-        progress.report(format!("downloading {}", file.file), megabytes(file.done), megabytes(total));
+        progress.report(
+            format!("downloading {}", file.file),
+            megabytes(file.done),
+            megabytes(total),
+        );
     })?;
     let gguf = model.open(&dir)?;
     let (report, loading) = match device {
@@ -37,7 +47,12 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str, stats: boo
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
-            let device = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
+            let device = gpu
+                .name()
+                .split(" (")
+                .next()
+                .unwrap_or(gpu.name())
+                .to_string();
             answer(gguf, gpu, model, &device, context, prompt)?
         }
     };
@@ -70,9 +85,14 @@ fn answer<D: dwim_gpu::Device + 'static>(
     })?;
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
-    models::start(&mut chat, which, &harness::system_prompt(&env::current_dir()?), |read, total| {
-        progress.report("reading the system prompt".to_string(), read, total);
-    })?;
+    models::start(
+        &mut chat,
+        which,
+        &harness::system_prompt(&env::current_dir()?),
+        |read, total| {
+            progress.report("reading the system prompt".to_string(), read, total);
+        },
+    )?;
 
     let mut printer = Printer::default();
     let mut harness = Harness::new(chat);
@@ -136,7 +156,11 @@ impl Printer {
     fn print(&mut self, event: harness::Event) {
         match event {
             harness::Event::Thought(text) => {
-                let text = if self.thinking { text } else { text.trim_start() };
+                let text = if self.thinking {
+                    text
+                } else {
+                    text.trim_start()
+                };
                 if !text.is_empty() {
                     eprint!("{text}");
                     let _ = io::stderr().flush();
@@ -145,7 +169,11 @@ impl Printer {
             }
             harness::Event::Text(text) => {
                 self.end_thought();
-                let text = if self.replied { text } else { text.trim_start() };
+                let text = if self.replied {
+                    text
+                } else {
+                    text.trim_start()
+                };
                 if !text.is_empty() {
                     print!("{text}");
                     let _ = io::stdout().flush();

@@ -42,12 +42,18 @@ pub fn on_disk(model: &Model, dir: &Path) -> (usize, u64) {
         .files
         .iter()
         .filter_map(|file| fs::metadata(dir.join(file)).ok())
-        .fold((0, 0), |(files, bytes), metadata| (files + 1, bytes + metadata.len()))
+        .fold((0, 0), |(files, bytes), metadata| {
+            (files + 1, bytes + metadata.len())
+        })
 }
 
 /// Downloads a model's files into `dir`, skipping any that are already there,
 /// and reporting progress on each one as it comes in.
-pub fn fetch(model: &'static Model, dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
+pub fn fetch(
+    model: &'static Model,
+    dir: &Path,
+    mut progress: impl FnMut(Progress),
+) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(dir)?;
     for file in model.files {
         let path = dir.join(file);
@@ -132,7 +138,11 @@ fn save(
         .and_then(|value| value.parse::<u64>().ok())
         .map(|length| done + length);
     let mut reader = response.into_body().into_reader();
-    let mut writer = OpenOptions::new().write(true).create(true).truncate(false).open(partial)?;
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(partial)?;
     writer.set_len(done)?;
     std::io::Seek::seek(&mut writer, std::io::SeekFrom::Start(done))?;
     let mut buf = vec![0; 1 << 20];

@@ -97,7 +97,8 @@ mod tests {
         }
         // With k of two, the third never comes up.
         let mut sampler = Sampler::new(100.0, 2, 1.0, 1);
-        let picks: std::collections::HashSet<u32> = (0..200).map(|_| sampler.sample(&logits)).collect();
+        let picks: std::collections::HashSet<u32> =
+            (0..200).map(|_| sampler.sample(&logits)).collect();
         assert!(picks.contains(&7) && picks.contains(&300) && !picks.contains(&999));
     }
 }

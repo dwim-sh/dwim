@@ -35,8 +35,12 @@ standard error.
 
 ```
 cargo test --workspace   # the GPU kernels are checked against the CPU reference
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
 ```
+
+CI runs these with the toolchain `rust-toolchain.toml` pins, which `rustup`
+picks up here too.
 
 `cargo test -p dwim-gpu` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the

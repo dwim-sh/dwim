@@ -79,7 +79,9 @@ pub fn system_prompt(dir: &Path) -> String {
     let mut prompt = format!("{}\n\n{INSTRUCTIONS}\n\n{}", tools(), environment(dir));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
-        prompt.push_str(&format!("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"));
+        prompt.push_str(&format!(
+            "\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"
+        ));
     }
     prompt
 }
@@ -113,7 +115,9 @@ fn environment(dir: &Path) -> String {
         "linux" => "Linux",
         os => os,
     };
-    let days = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() / 86400);
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() / 86400);
     format!(
         "# Environment\n\nWorking directory: {}\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
         dir.display(),
@@ -154,11 +158,16 @@ fn date(days: i64) -> String {
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let day_of_era = z.rem_euclid(146097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_index = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
 }
@@ -169,7 +178,10 @@ fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let end = (0..=max).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+    let end = (0..=max)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
     format!("{}…", &text[..end])
 }
 
@@ -210,17 +222,51 @@ impl Stats {
     /// model and the tools.
     pub fn report(&self, loading: Duration, total: Duration) -> Vec<String> {
         let m = &self.model;
-        let row = |name: &str, count: String, seconds: f64, rate: String| format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}");
-        let tokens = |name: &str, tally: &dwim_models::Tally| row(name, format!("{} tokens", tally.tokens), tally.seconds, format!("{:.0} tok/s", tally.rate()));
-        let accounted = loading.as_secs_f64() + m.cached.seconds + m.prompt.seconds + m.thought.seconds + m.answer.seconds + self.tool_seconds;
+        let row = |name: &str, count: String, seconds: f64, rate: String| {
+            format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}")
+        };
+        let tokens = |name: &str, tally: &dwim_models::Tally| {
+            row(
+                name,
+                format!("{} tokens", tally.tokens),
+                tally.seconds,
+                format!("{:.0} tok/s", tally.rate()),
+            )
+        };
+        let accounted = loading.as_secs_f64()
+            + m.cached.seconds
+            + m.prompt.seconds
+            + m.thought.seconds
+            + m.answer.seconds
+            + self.tool_seconds;
         vec![
-            row("loading", String::new(), loading.as_secs_f64(), String::new()),
-            row("cached", format!("{} tokens", m.cached.tokens), m.cached.seconds, String::new()),
+            row(
+                "loading",
+                String::new(),
+                loading.as_secs_f64(),
+                String::new(),
+            ),
+            row(
+                "cached",
+                format!("{} tokens", m.cached.tokens),
+                m.cached.seconds,
+                String::new(),
+            ),
             tokens("prompt", &m.prompt),
             tokens("thought", &m.thought),
             tokens("answer", &m.answer),
-            row("tools", format!("{} calls", self.calls), self.tool_seconds, String::new()),
-            row("other", String::new(), (total.as_secs_f64() - accounted).max(0.0), String::new()),
+            row(
+                "tools",
+                format!("{} calls", self.calls),
+                self.tool_seconds,
+                String::new(),
+            ),
+            row(
+                "other",
+                String::new(),
+                (total.as_secs_f64() - accounted).max(0.0),
+                String::new(),
+            ),
             row("total", String::new(), total.as_secs_f64(), String::new()),
         ]
         .into_iter()
@@ -297,7 +343,9 @@ impl<M: LanguageModel> Harness<M> {
                 }
                 outputs.push(output);
             }
-            calls = self.chat.respond(&outputs, |chunk| on_event(event(chunk)))?;
+            calls = self
+                .chat
+                .respond(&outputs, |chunk| on_event(event(chunk)))?;
         }
         Ok(())
     }
@@ -319,10 +367,22 @@ mod tests {
     fn reports_where_the_time_went() {
         let stats = Stats {
             model: dwim_models::Stats {
-                cached: dwim_models::Tally { tokens: 1500, seconds: 0.5 },
-                prompt: dwim_models::Tally { tokens: 1200, seconds: 15.0 },
-                thought: dwim_models::Tally { tokens: 900, seconds: 30.0 },
-                answer: dwim_models::Tally { tokens: 300, seconds: 10.0 },
+                cached: dwim_models::Tally {
+                    tokens: 1500,
+                    seconds: 0.5,
+                },
+                prompt: dwim_models::Tally {
+                    tokens: 1200,
+                    seconds: 15.0,
+                },
+                thought: dwim_models::Tally {
+                    tokens: 900,
+                    seconds: 30.0,
+                },
+                answer: dwim_models::Tally {
+                    tokens: 300,
+                    seconds: 10.0,
+                },
             },
             calls: 2,
             tool_seconds: 0.5,
@@ -351,11 +411,16 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let prompt = system_prompt(dir);
         assert!(prompt.starts_with("# Tools\n"));
-        assert!(prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\""));
+        assert!(
+            prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
+        );
         assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
         assert!(prompt.contains(INSTRUCTIONS));
-        let files = prompt.lines().find_map(|line| line.strip_prefix("Files: ")).unwrap();
+        let files = prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Files: "))
+            .unwrap();
         assert!(files.split(' ').any(|file| file == "Cargo.toml"));
         assert!(files.split(' ').any(|file| file == "harness/"));
         assert!(!files.contains(".git"));

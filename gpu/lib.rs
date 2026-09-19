@@ -83,7 +83,14 @@ pub trait Device {
     fn write(&self, buf: &mut Self::Buffer, data: &[f32]);
 
     /// `dst[dst_offset..][..len] = src[src_offset..][..len]`
-    fn copy(&self, dst: &mut Self::Buffer, dst_offset: usize, src: &Self::Buffer, src_offset: usize, len: usize);
+    fn copy(
+        &self,
+        dst: &mut Self::Buffer,
+        dst_offset: usize,
+        src: &Self::Buffer,
+        src_offset: usize,
+        len: usize,
+    );
 
     /// `cache[offset..][..src.len()] = f16(src)`: stores activations in a
     /// cache, rounded to the nearest half-precision float, and clamped to the
@@ -120,7 +127,15 @@ pub trait Device {
     /// `p` pairs with element `i + rot_dim / 2`, rotated by the angle whose
     /// cosine and sine are at `table[(p * rot_dim / 2 + i) * 2..][..2]`.
     #[allow(clippy::too_many_arguments)]
-    fn rope(&self, x: &mut Self::Buffer, table: &Self::Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize);
+    fn rope(
+        &self,
+        x: &mut Self::Buffer,
+        table: &Self::Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rot_dim: usize,
+    );
 
     /// Causal self-attention for the tokens in `q`, the first at position
     /// `pos`: each of a token's `n_heads` heads, each `head_dim` long,
@@ -159,7 +174,14 @@ pub trait Device {
     /// `weight`, and rotates it as [`hadamard`](Self::hadamard) does, into
     /// `out`. What every matrix multiplication's input goes through, in one
     /// pass.
-    fn rmsnorm_hadamard(&self, out: &mut Self::Buffer, x: &Self::Buffer, weight: &Self::Buffer, signs: &Self::Buffer, eps: f32);
+    fn rmsnorm_hadamard(
+        &self,
+        out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        signs: &Self::Buffer,
+        eps: f32,
+    );
 
     /// The causal convolution of linear attention: each channel of `x`,
     /// which holds a row of channels per token, is convolved over the last
