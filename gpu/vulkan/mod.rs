@@ -17,8 +17,9 @@ use crate::{
     ternary::{BLOCK, BLOCK_BYTES},
 };
 
-/// Size of the staging buffer host memory is copied to and from the device
-/// through.
+/// Size of each of the two staging buffers host memory is copied to and
+/// from the device through: uploads alternate between them, so that one is
+/// filled while the device copies from the other.
 const STAGING: usize = 64 << 20;
 
 /// Rows of ternary weights one workgroup of the single-token and batch
@@ -134,7 +135,7 @@ pub struct Vulkan {
     layout: vk::PipelineLayout,
     kernels: Kernels,
     memory_types: vk::PhysicalDeviceMemoryProperties,
-    staging: Mapped,
+    staging: [Mapped; 2],
     partials: vk::Buffer,
     /// A batch's activations as half floats, for the tile kernel.
     packed: vk::Buffer,
@@ -155,8 +156,11 @@ struct Ring {
     in_flight: [bool; RING],
     /// Kernels recorded into the current command buffer.
     recorded: usize,
-    /// Whether a command not yet waited for still reads from staging.
-    staging_busy: bool,
+    /// The command buffer of the ring whose submission reads each staging
+    /// buffer, if one may still be running, and which buffer the next
+    /// upload fills.
+    staging_slot: [Option<usize>; 2],
+    staging_next: usize,
 }
 
 // The mapped pointers are only used from whichever thread owns the device.
@@ -316,10 +320,16 @@ impl Vulkan {
                 layout,
                 kernels,
                 memory_types,
-                staging: Mapped {
-                    buf: vk::Buffer::null(),
-                    ptr: std::ptr::null_mut(),
-                },
+                staging: [
+                    Mapped {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                    },
+                    Mapped {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                    },
+                ],
                 partials: vk::Buffer::null(),
                 packed: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
@@ -330,10 +340,11 @@ impl Vulkan {
                     recording: false,
                     in_flight: [false; RING],
                     recorded: 0,
-                    staging_busy: false,
+                    staging_slot: [None; 2],
+                    staging_next: 0,
                 }),
             };
-            gpu.staging = gpu.map(STAGING)?;
+            gpu.staging = [gpu.map(STAGING)?, gpu.map(STAGING)?];
             gpu.partials = gpu.buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
             gpu.packed = gpu.buffer(PACKED * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
             Ok(gpu)
@@ -472,7 +483,7 @@ impl Vulkan {
                 self.wait(&mut ring, i);
             }
         }
-        ring.staging_busy = false;
+        ring.staging_slot = [None; 2];
     }
 
     /// Records a kernel over `groups` workgroups, bound to `buffers` in
@@ -522,28 +533,35 @@ impl Vulkan {
 
     /// Copies bytes from the host into a device buffer, through staging.
     ///
-    /// The copy is recorded behind whatever is pending and left there: it
-    /// runs with the next submission, and staging is not written again until
-    /// it has. Data larger than staging goes in chunks, each submitted.
+    /// Each chunk of a staging buffer's size is copied into the staging
+    /// buffer the last upload did not use, once whatever last read that one
+    /// has finished, and its copy to the device is submitted at once behind
+    /// whatever is pending, so that the device copies one chunk while the
+    /// host fills the other.
     fn upload_bytes(&self, dst: vk::Buffer, offset: usize, data: &[u8]) {
-        let chunks = data.chunks(STAGING).count();
         for (i, chunk) in data.chunks(STAGING).enumerate() {
-            if self.ring.lock().unwrap().staging_busy {
-                self.flush();
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging.ptr, chunk.len());
-                let cmd = self.cmd();
-                let region = vk::BufferCopy::default()
-                    .dst_offset((offset + i * STAGING) as u64)
-                    .size(chunk.len() as u64);
-                self.device.cmd_copy_buffer(cmd, self.staging.buf, dst, &[region]);
-                self.barrier(cmd);
-            }
-            self.ring.lock().unwrap().staging_busy = true;
-            if chunks > 1 {
-                self.flush();
-            }
+            let which = {
+                let mut ring = self.ring.lock().unwrap();
+                let which = ring.staging_next;
+                if let Some(slot) = ring.staging_slot[which].take()
+                    && ring.in_flight[slot]
+                {
+                    self.wait(&mut ring, slot);
+                }
+                which
+            };
+            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging[which].ptr, chunk.len()) };
+            let cmd = self.cmd();
+            let region = vk::BufferCopy::default()
+                .dst_offset((offset + i * STAGING) as u64)
+                .size(chunk.len() as u64);
+            unsafe { self.device.cmd_copy_buffer(cmd, self.staging[which].buf, dst, &[region]) };
+            self.barrier(cmd);
+            let slot = self.ring.lock().unwrap().current;
+            self.submit();
+            let mut ring = self.ring.lock().unwrap();
+            ring.staging_slot[which] = Some(slot);
+            ring.staging_next = 1 - which;
         }
     }
 
@@ -557,10 +575,10 @@ impl Vulkan {
                 let region = vk::BufferCopy::default()
                     .src_offset((i * STAGING) as u64)
                     .size(chunk.len() as u64);
-                self.device.cmd_copy_buffer(cmd, src, self.staging.buf, &[region]);
+                self.device.cmd_copy_buffer(cmd, src, self.staging[0].buf, &[region]);
                 self.barrier(cmd);
                 self.flush();
-                std::ptr::copy_nonoverlapping(self.staging.ptr, chunk.as_mut_ptr(), chunk.len());
+                std::ptr::copy_nonoverlapping(self.staging[0].ptr, chunk.as_mut_ptr(), chunk.len());
             }
         }
     }
