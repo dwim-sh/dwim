@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "dwim-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "argh",
  "crossterm",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "dwim-gpu"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ash",
  "naga",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "dwim-harness"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "dwim-models",
  "dwim-tools",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "dwim-models"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "dirs",
  "dwim-gpu",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "dwim-tools"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "dwim-models",
  "libc",
