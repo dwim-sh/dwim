@@ -33,12 +33,12 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str, stats: boo
     })?;
     let gguf = model.open(&dir)?;
     let (report, loading) = match device {
-        Device::Cpu => answer(gguf, Cpu, name, "the CPU", context, prompt)?,
+        Device::Cpu => answer(gguf, Cpu, model, "the CPU", context, prompt)?,
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let device = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
-            answer(gguf, gpu, name, &device, context, prompt)?
+            answer(gguf, gpu, model, &device, context, prompt)?
         }
     };
     if stats {
@@ -55,11 +55,12 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str, stats: boo
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
-    name: &str,
+    which: &models::Model,
     on: &str,
     context: usize,
     prompt: &str,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
+    let name = which.name;
     let mut progress = Progress::new();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
@@ -69,7 +70,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     })?;
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
-    chat.system(&harness::system_prompt(&env::current_dir()?), |read, total| {
+    models::start(&mut chat, which, &harness::system_prompt(&env::current_dir()?), |read, total| {
         progress.report("reading the system prompt".to_string(), read, total);
     })?;
 

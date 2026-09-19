@@ -63,6 +63,8 @@ pub struct Chat<M: LanguageModel> {
 /// generated as replies, with the time spent on each.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
+    /// Tokens taken from a saved state rather than read.
+    pub cached: Tally,
     pub prompt: Tally,
     pub thought: Tally,
     pub answer: Tally,
@@ -184,6 +186,25 @@ impl<M: LanguageModel> Chat<M> {
     /// Number of tokens in the conversation so far.
     pub fn tokens(&self) -> usize {
         self.len
+    }
+
+    /// The conversation so far as the model's state, for `restore` to take
+    /// up from, if the model can give it.
+    pub fn save(&self) -> Option<Vec<u8>> {
+        self.model.save(self.len)
+    }
+
+    /// Opens the conversation from a state `save` gave, in place of the
+    /// system prompt that produced it.
+    pub fn restore(&mut self, state: &[u8]) -> Result<()> {
+        if self.len != 0 {
+            return Err("the conversation has already started".into());
+        }
+        let start = Instant::now();
+        self.len = self.model.restore(state)?;
+        self.stats.cached.tokens = self.len;
+        self.stats.cached.seconds = start.elapsed().as_secs_f64();
+        Ok(())
     }
 
     /// Where the conversation's time has gone so far.

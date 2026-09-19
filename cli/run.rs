@@ -127,14 +127,14 @@ fn work(
     match device {
         Device::Cpu => {
             let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(gguf, Cpu, context, requests, replies, stop)
+            serve(gguf, Cpu, model, context, requests, replies, stop)
         }
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let name = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
             let _ = replies.send(Reply::Device(name));
-            serve(gguf, gpu, context, requests, replies, stop)
+            serve(gguf, gpu, model, context, requests, replies, stop)
         }
     }
 }
@@ -143,6 +143,7 @@ fn work(
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
+    which: &models::Model,
     context: usize,
     requests: Receiver<String>,
     replies: &Sender<Reply>,
@@ -155,7 +156,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    chat.system(&harness::system_prompt(&cwd), |read, total| {
+    models::start(&mut chat, which, &harness::system_prompt(&cwd), |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
     let mut harness = Harness::new(chat);

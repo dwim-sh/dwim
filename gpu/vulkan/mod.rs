@@ -763,6 +763,20 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.store, &[cache.buf, src.buf], &params, groups);
     }
 
+    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
+        assert!(len <= cache.len);
+        let mut out = vec![0u16; len];
+        let bytes = unsafe { slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len * 2) };
+        self.download_bytes(cache.buf, bytes);
+        out
+    }
+
+    fn write_cache(&self, cache: &mut Cache, data: &[u16]) {
+        assert!(data.len() <= cache.len);
+        let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+        self.upload_bytes(cache.buf, 0, bytes);
+    }
+
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
         let (rows, cols) = (w.shape[0], w.shape[1]);
         let n = x.len / cols;

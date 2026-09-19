@@ -114,6 +114,18 @@ impl Config {
 
     /// Width of the linear attention's queries and keys per token, and of
     /// its values.
+    /// Activations of a linear layer's convolution state: the tokens before
+    /// the batch, a row of channels each.
+    fn conv_width(&self) -> usize {
+        (CONV_KERNEL - 1) * (2 * self.k_dim() + self.v_dim())
+    }
+
+    /// Activations of a linear layer's recurrent state: a matrix per value
+    /// head.
+    fn ssm_width(&self) -> usize {
+        self.v_heads * self.state_dim * self.state_dim
+    }
+
     fn k_dim(&self) -> usize {
         self.k_heads * self.state_dim
     }
@@ -516,7 +528,79 @@ fn untile<T: Clone>(data: &[T], n_k: usize, n_v: usize, per_head: usize) -> Vec<
     out
 }
 
+/// The first bytes of a saved state, and its layout's version.
+const STATE_MAGIC: &[u8; 8] = b"dwimstat";
+const STATE_VERSION: u32 = 1;
+
 impl<D: Device> LanguageModel for Model<D> {
+    /// The state after `len` positions: a header of the layout's version and
+    /// the model's dimensions, then each attention layer's keys and values
+    /// for the positions, then each linear layer's convolution state and
+    /// recurrent state.
+    fn save(&self, len: usize) -> Option<Vec<u8>> {
+        let (c, d, s) = (&self.config, &self.device, &self.state);
+        let kv_dim = c.kv_heads * c.head_dim;
+        let mut out = Vec::new();
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        for value in [len, s.k_cache.len(), s.ssm_state.len(), kv_dim, c.conv_width(), c.ssm_width()] {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        for cache in s.k_cache.iter().chain(&s.v_cache) {
+            out.extend(d.read_cache(cache, len * kv_dim).iter().flat_map(|v| v.to_le_bytes()));
+        }
+        for slot in 0..s.ssm_state.len() {
+            // The convolution reads the batch before from one buffer of the
+            // pair or the other, by the parity.
+            let conv = &s.conv_state[slot][if s.parity { 0 } else { 1 }];
+            for buf in [conv, &s.ssm_state[slot]] {
+                out.extend(d.read(buf).iter().flat_map(|v| v.to_le_bytes()));
+            }
+        }
+        Some(out)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<usize> {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        let kv_dim = c.kv_heads * c.head_dim;
+        let mut at = 0;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let bytes = state.get(at..at + n).ok_or("the saved state is cut short")?;
+            at += n;
+            Ok(bytes)
+        };
+        if take(8)? != STATE_MAGIC {
+            return Err("not a saved state".into());
+        }
+        if u32::from_le_bytes(take(4)?.try_into()?) != STATE_VERSION {
+            return Err("a saved state of another version".into());
+        }
+        let mut header = [0; 6];
+        for value in &mut header {
+            *value = u64::from_le_bytes(take(8)?.try_into()?) as usize;
+        }
+        let len = header[0];
+        if header[1..] != [s.k_cache.len(), s.ssm_state.len(), kv_dim, c.conv_width(), c.ssm_width()] {
+            return Err("a saved state of another model".into());
+        }
+        if len > s.max_len {
+            return Err(format!("a saved state of {len} tokens does not fit in the context").into());
+        }
+        for cache in s.k_cache.iter_mut().chain(&mut s.v_cache) {
+            let halves: Vec<u16> = take(len * kv_dim * 2)?.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            d.write_cache(cache, &halves);
+        }
+        for slot in 0..s.ssm_state.len() {
+            let [conv, _] = &mut s.conv_state[slot];
+            for (buf, width) in [(conv, c.conv_width()), (&mut s.ssm_state[slot], c.ssm_width())] {
+                let floats: Vec<f32> = take(width * 4)?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                d.write(buf, &floats);
+            }
+        }
+        s.parity = true;
+        Ok(len)
+    }
+
     /// Adds the tokens to the model's state. Tokens run through the model
     /// in batches of up to [`BATCH`].
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
@@ -777,6 +861,27 @@ mod tests {
         let many: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
         let third = model.forward(&many, 6);
         [first, second, third]
+    }
+
+    #[test]
+    fn restores_a_saved_state() {
+        let dir = std::env::temp_dir().join(format!("dwim-bonsai-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path);
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        // A conversation of two batches, and one that takes up from the
+        // first's saved state: the same logits, since the state holds the
+        // caches exactly.
+        let mut whole = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
+        whole.forward(&[3, 17, 42, 7, 9], 0);
+        let state = whole.save(5).unwrap();
+        let want = whole.forward(&[11, 2], 5);
+        let mut resumed = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        assert_eq!(resumed.restore(&state).unwrap(), 5);
+        assert_eq!(resumed.forward(&[11, 2], 5), want);
+        assert!(resumed.restore(&state[..100]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

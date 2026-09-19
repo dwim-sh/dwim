@@ -83,6 +83,12 @@ on a line with text clears it.
 If present in the working directory, its contents are given to the agent as
 project instructions.
 .TP
+.I ~/.cache/dwim/states/
+The model's state after the system prompt, saved when a prompt is first
+read and taken up by later runs with the same model and prompt in place of
+reading it again. The prompt changes with the directory, its files and the
+day, and the newest four states are kept.
+.TP
 .I $TMPDIR/dwim-<pid>-<n>/
 Where the whole output of a command that printed more than the model is
 shown is kept, readable by the user alone, as a file per stream named by the
