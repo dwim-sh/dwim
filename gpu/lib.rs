@@ -90,6 +90,14 @@ pub trait Device {
     /// largest finite one.
     fn store(&self, cache: &mut Self::Cache, offset: usize, src: &Self::Buffer);
 
+    /// The first `len` activations of a cache, as the bits of the half-
+    /// precision floats they are stored as.
+    fn read_cache(&self, cache: &Self::Cache, len: usize) -> Vec<u16>;
+
+    /// `cache[..data.len()] = data`: bits as [`read_cache`](Self::read_cache)
+    /// gives them.
+    fn write_cache(&self, cache: &mut Self::Cache, data: &[u16]);
+
     /// `out[t] = w · x[t]` for each row `x[t]` of `x`, for a weight matrix
     /// `w` of shape `[rows, cols]`: `x` holds `cols` activations per token,
     /// and `out` `rows` per token.

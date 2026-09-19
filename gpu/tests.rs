@@ -17,6 +17,7 @@ macro_rules! check_against_cpu {
             rope_matches_cpu,
             attention_matches_cpu,
             store_rounds_like_cpu,
+            cache_round_trips,
             elementwise_match_cpu,
             hadamard_matches_cpu,
             norm_rotate_matches_cpu,
@@ -418,6 +419,19 @@ pub fn store_rounds_like_cpu<D: Device>(gpu: &D) {
     let mut out = gpu.alloc(head_dim);
     gpu.attention(&mut out, &buffer(gpu, &q), &gpu_v, &gpu_v, 0, 1, head_dim, 1);
     assert_eq!(gpu.read(&out), want);
+}
+
+pub fn cache_round_trips<D: Device>(gpu: &D) {
+    let data = Rng(10).floats(1002);
+    let mut c = cache(gpu, &data, 300);
+    let want: Vec<u16> = data.iter().map(|&v| crate::to_f16(v)).collect();
+    assert_eq!(gpu.read_cache(&c, 1002), want);
+    assert_eq!(gpu.read_cache(&c, 7), want[..7]);
+    let bits: Vec<u16> = (0..500).map(|i| i as u16 * 3).collect();
+    gpu.write_cache(&mut c, &bits);
+    let mut expect = want.clone();
+    expect[..500].copy_from_slice(&bits);
+    assert_eq!(gpu.read_cache(&c, 1002), expect);
 }
 
 pub fn elementwise_match_cpu<D: Device>(gpu: &D) {

@@ -394,6 +394,19 @@ impl Device for Metal {
         self.dispatch(&self.kernels.store, &[&cache.buf, &src.buf], &params, groups, THREADS);
     }
 
+    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
+        assert!(len <= cache.len);
+        self.flush();
+        unsafe { slice::from_raw_parts(cache.buf.contents().as_ptr().cast::<u16>(), len).to_vec() }
+    }
+
+    fn write_cache(&self, cache: &mut Cache, data: &[u16]) {
+        assert!(data.len() <= cache.len);
+        // The pending commands may use what the cache holds now.
+        self.flush();
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), cache.buf.contents().as_ptr().cast(), data.len()) };
+    }
+
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
         let (rows, cols) = (w.shape[0], w.shape[1]);
         let n = x.len / cols;

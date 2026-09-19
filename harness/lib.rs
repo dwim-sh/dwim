@@ -212,9 +212,10 @@ impl Stats {
         let m = &self.model;
         let row = |name: &str, count: String, seconds: f64, rate: String| format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}");
         let tokens = |name: &str, tally: &dwim_models::Tally| row(name, format!("{} tokens", tally.tokens), tally.seconds, format!("{:.0} tok/s", tally.rate()));
-        let accounted = loading.as_secs_f64() + m.prompt.seconds + m.thought.seconds + m.answer.seconds + self.tool_seconds;
+        let accounted = loading.as_secs_f64() + m.cached.seconds + m.prompt.seconds + m.thought.seconds + m.answer.seconds + self.tool_seconds;
         vec![
             row("loading", String::new(), loading.as_secs_f64(), String::new()),
+            row("cached", format!("{} tokens", m.cached.tokens), m.cached.seconds, String::new()),
             tokens("prompt", &m.prompt),
             tokens("thought", &m.thought),
             tokens("answer", &m.answer),
@@ -318,6 +319,7 @@ mod tests {
     fn reports_where_the_time_went() {
         let stats = Stats {
             model: dwim_models::Stats {
+                cached: dwim_models::Tally { tokens: 1500, seconds: 0.5 },
                 prompt: dwim_models::Tally { tokens: 1200, seconds: 15.0 },
                 thought: dwim_models::Tally { tokens: 900, seconds: 30.0 },
                 answer: dwim_models::Tally { tokens: 300, seconds: 10.0 },
@@ -327,12 +329,13 @@ mod tests {
         };
         let lines = stats.report(Duration::from_secs_f64(2.5), Duration::from_secs_f64(60.0));
         assert_eq!(lines[0], "loading                   2.5 s");
-        assert_eq!(lines[1], "prompt    1200 tokens    15.0 s   80 tok/s");
-        assert_eq!(lines[2], "thought    900 tokens    30.0 s   30 tok/s");
-        assert_eq!(lines[3], "answer     300 tokens    10.0 s   30 tok/s");
-        assert_eq!(lines[4], "tools         2 calls     0.5 s");
-        assert_eq!(lines[5], "other                     2.0 s");
-        assert_eq!(lines[6], "total                    60.0 s");
+        assert_eq!(lines[1], "cached    1500 tokens     0.5 s");
+        assert_eq!(lines[2], "prompt    1200 tokens    15.0 s   80 tok/s");
+        assert_eq!(lines[3], "thought    900 tokens    30.0 s   30 tok/s");
+        assert_eq!(lines[4], "answer     300 tokens    10.0 s   30 tok/s");
+        assert_eq!(lines[5], "tools         2 calls     0.5 s");
+        assert_eq!(lines[6], "other                     1.5 s");
+        assert_eq!(lines[7], "total                    60.0 s");
     }
 
     #[test]

@@ -47,6 +47,14 @@ impl Device for Cpu {
         }
     }
 
+    fn read_cache(&self, cache: &Vec<u16>, len: usize) -> Vec<u16> {
+        cache[..len].to_vec()
+    }
+
+    fn write_cache(&self, cache: &mut Vec<u16>, data: &[u16]) {
+        cache[..data.len()].copy_from_slice(data);
+    }
+
     fn matmul(&self, out: &mut Vec<f32>, w: &Tensor, x: &Vec<f32>) {
         let (rows, cols) = (w.shape()[0], w.shape()[1]);
         let n = x.len() / cols;

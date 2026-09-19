@@ -18,6 +18,19 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.
 pub trait LanguageModel {
+    /// The model's state after the first `len` positions, as bytes for
+    /// [`restore`](Self::restore) to take up from, if the model can give
+    /// it.
+    fn save(&self, _len: usize) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Puts the model in a state [`save`](Self::save) gave, and returns
+    /// how many positions it holds.
+    fn restore(&mut self, _state: &[u8]) -> Result<usize> {
+        Err("this model cannot restore a state".into())
+    }
+
     /// Runs `tokens`, the first at position `pos`, through the model, and
     /// returns the logits for the token that follows the last of them.
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
@@ -27,6 +40,14 @@ pub trait LanguageModel {
 }
 
 impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
+    fn save(&self, len: usize) -> Option<Vec<u8>> {
+        (**self).save(len)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<usize> {
+        (**self).restore(state)
+    }
+
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         (**self).forward(tokens, pos)
     }
