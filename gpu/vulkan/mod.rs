@@ -82,11 +82,11 @@ pub struct Weight {
 }
 
 struct Kernels {
-    matmul: vk::Pipeline,
+    matmul_bf16: vk::Pipeline,
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
-    matmul_reduce: vk::Pipeline,
+    matmul_ternary_tile_reduce: vk::Pipeline,
     pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -96,9 +96,9 @@ struct Kernels {
     attention_combine: vk::Pipeline,
     silu_mul: vk::Pipeline,
     sigmoid_mul: vk::Pipeline,
-    store: vk::Pipeline,
+    store_halves: vk::Pipeline,
     hadamard: vk::Pipeline,
-    norm_rotate: vk::Pipeline,
+    rmsnorm_hadamard: vk::Pipeline,
     conv: vk::Pipeline,
     delta_net: vk::Pipeline,
 }
@@ -106,11 +106,11 @@ struct Kernels {
 impl Kernels {
     fn all(&self) -> [vk::Pipeline; 19] {
         [
-            self.matmul,
+            self.matmul_bf16,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
-            self.matmul_reduce,
+            self.matmul_ternary_tile_reduce,
             self.pack_halves,
             self.add,
             self.rmsnorm,
@@ -120,9 +120,9 @@ impl Kernels {
             self.attention_combine,
             self.silu_mul,
             self.sigmoid_mul,
-            self.store,
+            self.store_halves,
             self.hadamard,
-            self.norm_rotate,
+            self.rmsnorm_hadamard,
             self.conv,
             self.delta_net,
         ]
@@ -310,11 +310,11 @@ impl Vulkan {
             }
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let kernels = Kernels {
-                matmul: spv!("matmul"),
+                matmul_bf16: spv!("matmul_bf16"),
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
-                matmul_reduce: spv!("matmul_reduce"),
+                matmul_ternary_tile_reduce: spv!("matmul_ternary_tile_reduce"),
                 pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -324,9 +324,9 @@ impl Vulkan {
                 attention_combine: spv!("attention_combine"),
                 silu_mul: spv!("silu_mul"),
                 sigmoid_mul: spv!("sigmoid_mul"),
-                store: spv!("store"),
+                store_halves: spv!("store_halves"),
                 hadamard: spv!("hadamard"),
-                norm_rotate: spv!("norm_rotate"),
+                rmsnorm_hadamard: spv!("rmsnorm_hadamard"),
                 conv: spv!("conv"),
                 delta_net: spv!("delta_net"),
             };
@@ -806,7 +806,7 @@ impl Device for Vulkan {
             len: src.len as u32,
         };
         let groups = self.groups(src.len / 2, 256);
-        self.dispatch(self.kernels.store, &[cache.buf, src.buf], &params, groups);
+        self.dispatch(self.kernels.store_halves, &[cache.buf, src.buf], &params, groups);
     }
 
     fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
@@ -868,7 +868,7 @@ impl Device for Vulkan {
             self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, self.packed, self.partials], &params, (width as u32, height as u32));
             if splits > 1 {
                 let groups = self.groups(n * rows, 256);
-                self.dispatch(self.kernels.matmul_reduce, &[out.buf, self.partials], &params, groups);
+                self.dispatch(self.kernels.matmul_ternary_tile_reduce, &[out.buf, self.partials], &params, groups);
             }
             return;
         }
@@ -887,7 +887,7 @@ impl Device for Vulkan {
         } else if w.ternary {
             (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
         } else {
-            (self.kernels.matmul, 1, BF16_TOKENS, x.buf)
+            (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf)
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
@@ -1010,13 +1010,13 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.hadamard, &[x.buf, signs.buf], &params, groups);
     }
 
-    fn norm_rotate(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+    fn rmsnorm_hadamard(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
         let params = RmsnormParams { dim: width as u32, eps };
         let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
-        self.dispatch(self.kernels.norm_rotate, &[out.buf, x.buf, weight.buf, signs.buf], &params, groups);
+        self.dispatch(self.kernels.rmsnorm_hadamard, &[out.buf, x.buf, weight.buf, signs.buf], &params, groups);
     }
 
     fn conv(

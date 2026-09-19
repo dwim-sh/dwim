@@ -13,7 +13,7 @@ struct Params {
 
 constant uint BLOCK = 1024;
 
-kernel void norm_rotate(
+kernel void rmsnorm_hadamard(
     device float* out [[buffer(0)]],
     const device float* x [[buffer(1)]],
     const device float* weight [[buffer(2)]],

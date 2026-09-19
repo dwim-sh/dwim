@@ -20,7 +20,7 @@ macro_rules! check_against_cpu {
             cache_round_trips,
             elementwise_match_cpu,
             hadamard_matches_cpu,
-            norm_rotate_matches_cpu,
+            rmsnorm_hadamard_matches_cpu,
             conv_matches_cpu,
             delta_net_matches_cpu,
             resize_keeps_capacity
@@ -310,7 +310,7 @@ pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
     let (signs_h, signs_i, signs_v) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(inter)), buffer(gpu, &rng.floats(v_dim)));
     let (norm_h, norm_head, norm_state) = (buffer(gpu, &rng.floats(hidden)), buffer(gpu, &rng.floats(head_dim)), buffer(gpu, &rng.floats(state_dim)));
     let mut out_h = gpu.alloc(n * hidden);
-    time("norm_rotate 5120", 129, &mut || gpu.norm_rotate(&mut out_h, &h, &norm_h, &signs_h, 1e-6));
+    time("rmsnorm_hadamard 5120", 129, &mut || gpu.rmsnorm_hadamard(&mut out_h, &h, &norm_h, &signs_h, 1e-6));
     time("hadamard 6144", 64, &mut || gpu.hadamard(&mut vd, &signs_v, false));
     time("hadamard 17408", 64, &mut || gpu.hadamard(&mut i, &signs_i, false));
     time("rmsnorm 5120", 48, &mut || gpu.rmsnorm(&mut h, &norm_h, 1e-6));
@@ -517,16 +517,16 @@ pub fn hadamard_matches_cpu<D: Device>(gpu: &D) {
     }
 }
 
-pub fn norm_rotate_matches_cpu<D: Device>(gpu: &D) {
+pub fn rmsnorm_hadamard_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(13);
     for (width, rows) in [(HADAMARD_BLOCK, 1), (5 * HADAMARD_BLOCK, 3)] {
         let signs: Vec<f32> = (0..width).map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 }).collect();
         let weight: Vec<f32> = (0..width).map(|_| 1.0 + 0.2 * rng.next()).collect();
         let x = rng.floats(width * rows);
         let mut want = vec![0.0; x.len()];
-        Cpu.norm_rotate(&mut want, &x, &weight, &signs, 1e-6);
+        Cpu.rmsnorm_hadamard(&mut want, &x, &weight, &signs, 1e-6);
         let mut out = gpu.alloc(x.len());
-        gpu.norm_rotate(&mut out, &buffer(gpu, &x), &buffer(gpu, &weight), &buffer(gpu, &signs), 1e-6);
+        gpu.rmsnorm_hadamard(&mut out, &buffer(gpu, &x), &buffer(gpu, &weight), &buffer(gpu, &signs), 1e-6);
         close(&gpu.read(&out), &want, 1e-5);
     }
 }

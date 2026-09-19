@@ -197,7 +197,7 @@ impl Device for Cpu {
         }
     }
 
-    fn norm_rotate(&self, out: &mut Vec<f32>, x: &Vec<f32>, weight: &Vec<f32>, signs: &Vec<f32>, eps: f32) {
+    fn rmsnorm_hadamard(&self, out: &mut Vec<f32>, x: &Vec<f32>, weight: &Vec<f32>, signs: &Vec<f32>, eps: f32) {
         assert_eq!(out.len(), x.len());
         out.copy_from_slice(x);
         self.rmsnorm(out, weight, eps);

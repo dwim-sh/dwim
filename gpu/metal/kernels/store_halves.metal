@@ -9,7 +9,7 @@ struct Params {
     uint len;
 };
 
-kernel void store(
+kernel void store_halves(
     device half* cache [[buffer(0)]],
     const device float* src [[buffer(1)]],
     constant Params& p [[buffer(2)]],
