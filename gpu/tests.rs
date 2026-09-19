@@ -145,7 +145,10 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
-    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2)] {
+    // Single tokens, small batches, and batches of a tile of tokens or more
+    // at the edges of the tiles: a whole one, a partial row tile with
+    // partial token tiles, and the model's width.
+    for (rows, cols, n) in [(1, 128, 1), (200, 5120, 1), (77, 1024, 3), (70_000, 128, 2), (64, 128, 16), (100, 256, 47), (1030, 1152, 33), (2500, 5120, 64)] {
         let w = rng.ternary(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
@@ -155,6 +158,32 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &x);
         close(&gpu.read(&out), &want, 1e-4);
+    }
+}
+
+/// Times the ternary matmul on the model's 17408x5120 for batches of
+/// tokens, and prints each batch's rate.
+pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(21);
+    let (rows, cols) = (17408, 5120);
+    let weight = gpu.upload(rng.ternary(&[rows, cols]));
+    for n in [1, 4, 8, 16, 32, 64, 128, 256] {
+        let x = buffer(gpu, &rng.floats(n * cols));
+        let mut out = gpu.alloc(n * rows);
+        // Warm up until the clocks are up.
+        for _ in 0..(1600 / n).max(40) {
+            gpu.matmul(&mut out, &weight, &x);
+        }
+        gpu.read(&out);
+        let runs = (800 / n).max(20);
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            gpu.matmul(&mut out, &weight, &x);
+        }
+        gpu.read(&out);
+        let each = start.elapsed().as_secs_f64() / runs as f64;
+        let flops = 2.0 * (rows * cols * n) as f64 / each;
+        eprintln!("{rows}x{cols} n={n:<3} {:8.3} ms  {:6.3} ms/token  {:6.2} TFLOP/s", each * 1e3, each * 1e3 / n as f64, flops / 1e12);
     }
 }
 

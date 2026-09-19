@@ -23,6 +23,13 @@ const STAGING: usize = 64 << 20;
 
 /// Rows of ternary weights one workgroup of the matmul kernel takes.
 const TERNARY_ROWS: usize = 8;
+/// Rows and tokens of a tile of `matmul_ternary_tile.wgsl`; a batch of at
+/// least half a tile's tokens goes through it.
+const TERNARY_TILE_ROWS: usize = 128;
+const TERNARY_TILE_TOKENS: usize = 32;
+/// Workgroup memory the tile kernel takes: the rows' block as half floats
+/// and the tokens' as floats.
+const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS * 2 + TERNARY_TILE_TOKENS * 4) * 128;
 
 /// Most rows a ternary matrix has for the lane-per-row kernel to be the
 /// faster one for a single token, as measured on an RX 5700 XT.
@@ -66,6 +73,7 @@ struct Kernels {
     matmul: vk::Pipeline,
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
+    matmul_ternary_tile: vk::Pipeline,
     matmul_ternary_rows: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -83,11 +91,12 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn all(&self) -> [vk::Pipeline; 17] {
+    fn all(&self) -> [vk::Pipeline; 18] {
         [
             self.matmul,
             self.matmul_ternary,
             self.matmul_ternary_batch,
+            self.matmul_ternary_tile,
             self.matmul_ternary_rows,
             self.add,
             self.rmsnorm,
@@ -183,6 +192,9 @@ impl Vulkan {
             if !subgroup.supported_operations.contains(needed) || subgroup.subgroup_size < 16 {
                 return Err(format!("{name} lacks the subgroup operations the kernels use").into());
             }
+            if (props.limits.max_compute_shared_memory_size as usize) < TERNARY_TILE_MEMORY {
+                return Err(format!("{name} has less than the {} KB of workgroup memory the kernels use", TERNARY_TILE_MEMORY / 1024).into());
+            }
             let extensions = instance.enumerate_device_extension_properties(physical)?;
             if !extensions.iter().any(|ext| ext.extension_name_as_c_str() == Ok(push_descriptor::NAME)) {
                 return Err(format!("{name} lacks {}", push_descriptor::NAME.to_string_lossy()).into());
@@ -274,6 +286,7 @@ impl Vulkan {
                 matmul: spv!("matmul"),
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
+                matmul_ternary_tile: spv!("matmul_ternary_tile"),
                 matmul_ternary_rows: spv!("matmul_ternary_rows"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -748,10 +761,28 @@ impl Device for Vulkan {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
+        // A batch of many tokens through ternary weights is a tiled matrix
+        // product: a workgroup per tile of rows and tokens, the row tiles
+        // across the grid and down it as wide as the GPU allows, and each
+        // row of the grid repeated for every tile of tokens.
+        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+            let count = rows.div_ceil(TERNARY_TILE_ROWS);
+            let width = count.min(self.max_groups as usize);
+            let height = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
+            assert!(height <= self.max_groups as usize, "{height} rows of workgroups is more than the GPU allows");
+            let params = MatmulParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                n: n as u32,
+                stride: width as u32,
+            };
+            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, x.buf], &params, (width as u32, height as u32));
+            return;
+        }
         // One workgroup per row, or per eight rows of ternary weights, in a
-        // grid as wide as the GPU allows. A batch of tokens is worth
-        // unpacking the ternary weights once for several; a single token
-        // through a matrix of few rows does better with a lane per row.
+        // grid as wide as the GPU allows. A few tokens are worth unpacking
+        // the ternary weights once for several; a single token through a
+        // matrix of few rows does better with a lane per row.
         let (kernel, per_group) = if w.ternary && n > 1 {
             (self.kernels.matmul_ternary_batch, TERNARY_ROWS)
         } else if w.ternary && rows <= TERNARY_ROWS_KERNEL_LIMIT {
@@ -975,4 +1006,15 @@ fn bytes<P: Copy>(params: &P) -> &[u8] {
 #[cfg(test)]
 mod tests {
     check_against_cpu!(super::Vulkan::new());
+
+    /// Times the ternary matmul on the model's shapes; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn ternary_matmul_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
 }
