@@ -11,6 +11,7 @@ use std::{
     io::{self, IsTerminal, Write},
     ops::ControlFlow,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use dwim_gpu::{Cpu, Gpu};
@@ -20,8 +21,10 @@ use dwim_models::{Chat, Gguf, Tokenizer};
 use crate::{fetch, models, opts::Device};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
-/// once it replies with text alone.
-pub fn once(name: &str, device: Device, context: usize, prompt: &str) -> Result<(), Box<dyn Error>> {
+/// once it replies with text alone; then reports where the time went, if
+/// `stats` asks for it.
+pub fn once(name: &str, device: Device, context: usize, prompt: &str, stats: bool) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
     let (model, dir) = fetch::locate(name)?;
     let mut progress = Progress::new();
     fetch::fetch(model, &dir, |file| {
@@ -29,19 +32,26 @@ pub fn once(name: &str, device: Device, context: usize, prompt: &str) -> Result<
         progress.report(format!("downloading {}", file.file), megabytes(file.done), megabytes(total));
     })?;
     let gguf = model.open(&dir)?;
-    match device {
-        Device::Cpu => answer(gguf, Cpu, name, "the CPU", context, prompt),
+    let (report, loading) = match device {
+        Device::Cpu => answer(gguf, Cpu, name, "the CPU", context, prompt)?,
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
             let device = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
-            answer(gguf, gpu, name, &device, context, prompt)
+            answer(gguf, gpu, name, &device, context, prompt)?
+        }
+    };
+    if stats {
+        for line in report.report(loading, started.elapsed()) {
+            eprintln!("{line}");
         }
     }
+    Ok(())
 }
 
 /// Loads `name` onto `device`, with room for `context` tokens, and answers
-/// `prompt` with it.
+/// `prompt` with it, returning where the time went and how long the
+/// loading took.
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
@@ -49,13 +59,15 @@ fn answer<D: dwim_gpu::Device + 'static>(
     on: &str,
     context: usize,
     prompt: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let mut progress = Progress::new();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
+    let loading = Instant::now();
     let model = models::load(gguf, device, context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
+    let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     chat.system(&harness::system_prompt(&env::current_dir()?), |read, total| {
         progress.report("reading the system prompt".to_string(), read, total);
@@ -67,7 +79,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
         printer.print(event);
         ControlFlow::Continue(())
     })?;
-    Ok(())
+    Ok((harness.stats(), loading))
 }
 
 /// Bytes as whole megabytes.

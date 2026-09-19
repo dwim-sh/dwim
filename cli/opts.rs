@@ -21,6 +21,10 @@ pub struct Opts {
     #[argh(switch)]
     pub version: bool,
 
+    /// print where the time went when the reply ends
+    #[argh(switch)]
+    pub stats: bool,
+
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,

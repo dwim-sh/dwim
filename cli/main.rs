@@ -19,7 +19,7 @@ fn main() {
     let prompt = opts.prompt.join(" ");
     let result = match prompt.trim() {
         "" => run::run(&opts.model, opts.device, opts.context),
-        prompt => once::once(&opts.model, opts.device, opts.context, prompt),
+        prompt => once::once(&opts.model, opts.device, opts.context, prompt, opts.stats),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

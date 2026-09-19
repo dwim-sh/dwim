@@ -16,7 +16,7 @@ use std::{
     ops::ControlFlow,
     path::Path,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dwim_models::{Chat, Chunk, LanguageModel, ToolCall};
@@ -190,6 +190,42 @@ pub enum Event<'a> {
 pub struct Harness<M: LanguageModel> {
     chat: Chat<M>,
     tools: Tools,
+    calls: usize,
+    tool_seconds: f64,
+}
+
+/// Where a conversation's time has gone: the model's, by what it was
+/// doing, and the tools'.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    pub model: dwim_models::Stats,
+    /// Tool calls run, and the time they took.
+    pub calls: usize,
+    pub tool_seconds: f64,
+}
+
+impl Stats {
+    /// The accounting as lines, given how long loading the model took and
+    /// how long everything took: what is left over is the time outside the
+    /// model and the tools.
+    pub fn report(&self, loading: Duration, total: Duration) -> Vec<String> {
+        let m = &self.model;
+        let row = |name: &str, count: String, seconds: f64, rate: String| format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}");
+        let tokens = |name: &str, tally: &dwim_models::Tally| row(name, format!("{} tokens", tally.tokens), tally.seconds, format!("{:.0} tok/s", tally.rate()));
+        let accounted = loading.as_secs_f64() + m.prompt.seconds + m.thought.seconds + m.answer.seconds + self.tool_seconds;
+        vec![
+            row("loading", String::new(), loading.as_secs_f64(), String::new()),
+            tokens("prompt", &m.prompt),
+            tokens("thought", &m.thought),
+            tokens("answer", &m.answer),
+            row("tools", format!("{} calls", self.calls), self.tool_seconds, String::new()),
+            row("other", String::new(), (total.as_secs_f64() - accounted).max(0.0), String::new()),
+            row("total", String::new(), total.as_secs_f64(), String::new()),
+        ]
+        .into_iter()
+        .map(|line| line.trim_end().to_string())
+        .collect()
+    }
 }
 
 impl<M: LanguageModel> Harness<M> {
@@ -197,6 +233,17 @@ impl<M: LanguageModel> Harness<M> {
         Self {
             chat,
             tools: Tools::new(),
+            calls: 0,
+            tool_seconds: 0.0,
+        }
+    }
+
+    /// Where the conversation's time has gone so far.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            model: self.chat.stats(),
+            calls: self.calls,
+            tool_seconds: self.tool_seconds,
         }
     }
 
@@ -235,7 +282,11 @@ impl<M: LanguageModel> Harness<M> {
                             REPEATED.to_string()
                         } else {
                             last = this;
-                            self.tools.run(&call)
+                            let start = Instant::now();
+                            let output = self.tools.run(&call);
+                            self.calls += 1;
+                            self.tool_seconds += start.elapsed().as_secs_f64();
+                            output
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
@@ -262,6 +313,27 @@ fn event(chunk: Chunk) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_where_the_time_went() {
+        let stats = Stats {
+            model: dwim_models::Stats {
+                prompt: dwim_models::Tally { tokens: 1200, seconds: 15.0 },
+                thought: dwim_models::Tally { tokens: 900, seconds: 30.0 },
+                answer: dwim_models::Tally { tokens: 300, seconds: 10.0 },
+            },
+            calls: 2,
+            tool_seconds: 0.5,
+        };
+        let lines = stats.report(Duration::from_secs_f64(2.5), Duration::from_secs_f64(60.0));
+        assert_eq!(lines[0], "loading                   2.5 s");
+        assert_eq!(lines[1], "prompt    1200 tokens    15.0 s   80 tok/s");
+        assert_eq!(lines[2], "thought    900 tokens    30.0 s   30 tok/s");
+        assert_eq!(lines[3], "answer     300 tokens    10.0 s   30 tok/s");
+        assert_eq!(lines[4], "tools         2 calls     0.5 s");
+        assert_eq!(lines[5], "other                     2.0 s");
+        assert_eq!(lines[6], "total                    60.0 s");
+    }
 
     #[test]
     fn dates() {
