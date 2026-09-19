@@ -35,6 +35,8 @@ const TERNARY_TILE_TOKENS: usize = 64;
 /// Workgroup memory the tile kernel takes: the rows' and the tokens' block
 /// as half floats.
 const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS + TERNARY_TILE_TOKENS) * 2 * 128;
+/// Tokens a workgroup of the bf16 matmul kernel takes at once.
+const BF16_TOKENS: usize = 8;
 /// Most tokens the kernel for a few tokens takes at once.
 const TERNARY_FEW_TOKENS: usize = 8;
 /// Most words of packed activations a batch through the tile kernel or the
@@ -875,7 +877,10 @@ impl Device for Vulkan {
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
-        let groups = (width as u32, count.div_ceil(width) as u32);
+        // The bf16 kernel takes the tokens eight at a time, each group of
+        // them a row of the grid.
+        let token_groups = if w.ternary { 1 } else { n.div_ceil(BF16_TOKENS) };
+        let groups = (width as u32, (count.div_ceil(width) * token_groups) as u32);
         let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
