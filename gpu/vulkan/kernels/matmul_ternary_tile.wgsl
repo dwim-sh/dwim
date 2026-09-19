@@ -23,6 +23,8 @@
 // swizzled by the row, for the threads reading different rows at the same
 // pair.
 
+enable f16;
+
 struct Params {
     rows: u32,
     cols: u32,
@@ -198,22 +200,39 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         // Two pairs of columns at a time: a thread's eight rows are eight
         // reads of two adjacent pairs, and its four tokens at each of the
-        // four columns are four reads of two pairs.
+        // four columns are four reads of two pairs. The block's products
+        // are summed in half precision, two tokens to an instruction, and
+        // added to the totals in single precision.
+        var sum: array<array<vec2<f16>, 2>, MR>;
         for (var pair = 0u; pair < PAIRS; pair += 2u) {
-            var wv: array<vec4<f32>, MR>;
+            var wv: array<vec4<f16>, MR>;
             for (var m = 0u; m < MR; m++) {
                 let at = wt_at(tr + 8u * m, pair);
-                wv[m] = vec4(unpack2x16float(wt[at]), unpack2x16float(wt[at + 1u]));
+                let lo = vec2<f16>(unpack2x16float(wt[at]));
+                let hi = vec2<f16>(unpack2x16float(wt[at + 1u]));
+                wv[m] = vec4<f16>(lo, hi);
             }
             // A column at a time across all the sums, so that consecutive
             // multiply-adds go to different sums and none waits on the
             // one before it.
             for (var c = 0u; c < 4u; c++) {
                 let at = xt_at(2u * pair + c, 2u * tv);
-                let xs = vec4(unpack2x16float(xt[at]), unpack2x16float(xt[at + 1u]));
+                let x01 = vec2<f16>(unpack2x16float(xt[at]));
+                let x23 = vec2<f16>(unpack2x16float(xt[at + 1u]));
                 for (var m = 0u; m < MR; m++) {
-                    for (var q = 0u; q < MT; q++) {
-                        acc[m][q] = fma(wv[m][c], xs[q], acc[m][q]);
+                    let w = vec2<f16>(wv[m][c]);
+                    sum[m][0] = fma(w, x01, sum[m][0]);
+                    sum[m][1] = fma(w, x23, sum[m][1]);
+                }
+            }
+            // Every 32 columns, so that a half sum stays short enough to
+            // keep its precision.
+            if (pair & 15u) == 14u {
+                for (var m = 0u; m < MR; m++) {
+                    for (var h = 0u; h < 2u; h++) {
+                        acc[m][2u * h] += f32(sum[m][h].x);
+                        acc[m][2u * h + 1u] += f32(sum[m][h].y);
+                        sum[m][h] = vec2<f16>(0.0h);
                     }
                 }
             }

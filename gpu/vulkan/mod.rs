@@ -9,7 +9,10 @@
 
 use std::{error::Error, io::Cursor, slice, sync::Mutex};
 
-use ash::{khr::push_descriptor, vk};
+use ash::{
+    khr::{push_descriptor, shader_float16_int8},
+    vk,
+};
 use rayon::prelude::*;
 
 use crate::{
@@ -200,8 +203,16 @@ impl Vulkan {
                 return Err(format!("{name} has less than the {} KB of workgroup memory the kernels use", TERNARY_TILE_MEMORY / 1024).into());
             }
             let extensions = instance.enumerate_device_extension_properties(physical)?;
-            if !extensions.iter().any(|ext| ext.extension_name_as_c_str() == Ok(push_descriptor::NAME)) {
-                return Err(format!("{name} lacks {}", push_descriptor::NAME.to_string_lossy()).into());
+            for needed in [push_descriptor::NAME, shader_float16_int8::NAME] {
+                if !extensions.iter().any(|ext| ext.extension_name_as_c_str() == Ok(needed)) {
+                    return Err(format!("{name} lacks {}", needed.to_string_lossy()).into());
+                }
+            }
+            let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut float16);
+            instance.get_physical_device_features2(physical, &mut features);
+            if float16.shader_float16 == 0 {
+                return Err(format!("{name} lacks 16-bit float arithmetic, which the kernels use").into());
             }
 
             let family = instance
@@ -212,10 +223,12 @@ impl Vulkan {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&[1.0])];
-            let extension_names = [push_descriptor::NAME.as_ptr()];
+            let extension_names = [push_descriptor::NAME.as_ptr(), shader_float16_int8::NAME.as_ptr()];
+            let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
-                .enabled_extension_names(&extension_names);
+                .enabled_extension_names(&extension_names)
+                .push_next(&mut float16);
             let device = instance.create_device(physical, &device_info, None)?;
             let push = push_descriptor::Device::new(&instance, &device);
             let queue = device.get_device_queue(family, 0);
@@ -1076,6 +1089,15 @@ mod tests {
                     crate::tests::kernel_speed(&gpu, n);
                 }
             }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn tile_error() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::tile_error(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
