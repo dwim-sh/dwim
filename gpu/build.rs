@@ -13,7 +13,10 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", kernels.display());
 
-    let mut entries: Vec<_> = fs::read_dir(&kernels).unwrap().map(|e| e.unwrap().path()).collect();
+    let mut entries: Vec<_> = fs::read_dir(&kernels)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     entries.sort();
     for path in entries {
         if path.extension().is_none_or(|ext| ext != "wgsl") {
@@ -21,7 +24,8 @@ fn main() {
         }
         println!("cargo:rerun-if-changed={}", path.display());
         let source = fs::read_to_string(&path).unwrap();
-        let module = wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", path.display(), e.emit_to_string(&source)));
+        let module = wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}: {}", path.display(), e.emit_to_string(&source)));
         // Barriers sit after loops whose trip counts differ per thread, which
         // the uniformity analysis is stricter about than the hardware.
         let flags = ValidationFlags::all() - ValidationFlags::CONTROL_FLOW_UNIFORMITY;

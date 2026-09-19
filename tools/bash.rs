@@ -229,7 +229,10 @@ impl Stream {
     /// stream was `before` bytes long before `bytes`.
     fn keep(&mut self, before: u64, bytes: &[u8]) -> io::Result<()> {
         if self.file.is_none() {
-            DirBuilder::new().mode(0o700).recursive(true).create(&self.dir)?;
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&self.dir)?;
             let mut file = File::create(&self.path)?;
             let kept = self.head.len().min(self.retain as usize);
             file.write_all(&self.head[..kept])?;
@@ -280,9 +283,14 @@ impl Stream {
         // starts in when it starts partway through a line.
         let first = head.iter().filter(|&&b| b == b'\n').count() as u64 + 1;
         let midline = skip == 0 || window[skip - 1] != b'\n';
-        let last = self.newlines - tail.iter().filter(|&&b| b == b'\n').count() as u64 + u64::from(midline);
+        let last = self.newlines - tail.iter().filter(|&&b| b == b'\n').count() as u64
+            + u64::from(midline);
         let bytes = self.total - head.len() as u64 - tail.len() as u64;
-        let lines = if first == last { format!("line {first}") } else { format!("lines {first}–{last}") };
+        let lines = if first == last {
+            format!("line {first}")
+        } else {
+            format!("lines {first}–{last}")
+        };
         let next = match self.kept {
             0 => String::new(),
             _ => format!("; next: read {} from line {first}", self.path.display()),
@@ -300,13 +308,21 @@ impl Stream {
         if self.total <= PREVIEW as u64 && self.error.is_none() {
             return None;
         }
-        let mut parts = vec![format!("{} {}, {} bytes", self.lines(), plural(self.lines(), "line"), self.total)];
+        let mut parts = vec![format!(
+            "{} {}, {} bytes",
+            self.lines(),
+            plural(self.lines(), "line"),
+            self.total
+        )];
         let path = self.path.display();
         if self.file.is_some() {
             parts.push(if self.kept == self.total {
                 format!("whole in {path}")
             } else {
-                format!("the first {} bytes in {path}, the rest discarded", self.kept)
+                format!(
+                    "the first {} bytes in {path}, the rest discarded",
+                    self.kept
+                )
             });
         }
         parts.extend(self.error.clone());
@@ -316,7 +332,11 @@ impl Stream {
 
 /// `word`, or its plural if `n` is not one.
 fn plural(n: u64, word: &str) -> String {
-    if n == 1 { word.to_string() } else { format!("{word}s") }
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 /// Where a cut at the end of `bytes` leaves no partial UTF-8 character:
@@ -333,7 +353,11 @@ fn char_end(bytes: &[u8]) -> usize {
             0xC0.. => 2,
             _ => 1,
         };
-        return if bytes.len() - i < need { i } else { bytes.len() };
+        return if bytes.len() - i < need {
+            i
+        } else {
+            bytes.len()
+        };
     }
     bytes.len()
 }
@@ -341,7 +365,11 @@ fn char_end(bytes: &[u8]) -> usize {
 /// Where a cut at the start of `bytes` leaves no partial UTF-8 character:
 /// past the continuation bytes of one cut off before them.
 fn char_start(bytes: &[u8]) -> usize {
-    bytes.iter().take(3).position(|&b| b & 0xC0 != 0x80).unwrap_or(bytes.len().min(3))
+    bytes
+        .iter()
+        .take(3)
+        .position(|&b| b & 0xC0 != 0x80)
+        .unwrap_or(bytes.len().min(3))
 }
 
 /// How a command ended, as the last line of its result.
@@ -396,7 +424,6 @@ fn report(stdout: &Stream, stderr: &Stream, status: &str) -> String {
     text
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::{sync::mpsc, time::Duration};
@@ -417,11 +444,17 @@ mod tests {
     #[test]
     fn runs_bash() {
         let mut bash = Bash::new();
-        assert_eq!(sh("echo hi; echo err >&2", &mut bash), "hi\n[stderr]\nerr\n[exit code 0]");
+        assert_eq!(
+            sh("echo hi; echo err >&2", &mut bash),
+            "hi\n[stderr]\nerr\n[exit code 0]"
+        );
         assert_eq!(sh("exit 3", &mut bash), "[exit code 3]");
         assert_eq!(sh("true", &mut bash), "[exit code 0]");
         assert_eq!(sh("echo; echo", &mut bash), "[exit code 0]");
-        assert_eq!(sh("kill -9 $$", &mut bash), "[killed by signal 9 (SIGKILL)]");
+        assert_eq!(
+            sh("kill -9 $$", &mut bash),
+            "[killed by signal 9 (SIGKILL)]"
+        );
         assert!(!bash.dir.exists(), "nothing outgrew its preview");
     }
 
@@ -431,8 +464,14 @@ mod tests {
         let output = sh("seq 1 50000; echo 'boom: it broke' >&2; exit 7", &mut bash);
         assert!(output.starts_with("1\n2\n3\n"), "{output}");
         assert!(output.contains("\n[… lines "), "{output}");
-        assert!(output.contains("\n49999\n50000\n[stderr]\nboom: it broke\n"), "{output}");
-        assert!(output.contains("\n[stdout: 50000 lines, 288894 bytes, whole in "), "{output}");
+        assert!(
+            output.contains("\n49999\n50000\n[stderr]\nboom: it broke\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("\n[stdout: 50000 lines, 288894 bytes, whole in "),
+            "{output}"
+        );
         assert!(output.ends_with("\n[exit code 7]"), "{output}");
         assert!(output.len() < PREVIEW + 400, "{}", output.len());
     }
@@ -442,36 +481,77 @@ mod tests {
         let mut bash = Bash::new();
         let output = sh("seq 1 50000", &mut bash);
         let path = bash.dir.join("1.stdout");
-        let note = output.lines().find(|line| line.starts_with("[stdout: ")).unwrap();
-        assert!(note.ends_with(&format!("whole in {}]", path.display())), "{note}");
+        let note = output
+            .lines()
+            .find(|line| line.starts_with("[stdout: "))
+            .unwrap();
+        assert!(
+            note.ends_with(&format!("whole in {}]", path.display())),
+            "{note}"
+        );
         let expected: String = (1..=50000).map(|i| format!("{i}\n")).collect();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
 
         // The lines the preview says it left out are the ones between what
         // it shows, so a range read gets what is missing.
-        let marker = output.lines().find(|line| line.starts_with("[… lines ")).unwrap();
-        assert!(marker.contains(&format!("; next: read {} from line ", path.display())), "{marker}");
-        let range = marker.strip_prefix("[… lines ").unwrap().split(' ').next().unwrap();
+        let marker = output
+            .lines()
+            .find(|line| line.starts_with("[… lines "))
+            .unwrap();
+        assert!(
+            marker.contains(&format!("; next: read {} from line ", path.display())),
+            "{marker}"
+        );
+        let range = marker
+            .strip_prefix("[… lines ")
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
         let (first, last) = range.split_once('–').unwrap();
         let (first, last): (u64, u64) = (first.parse().unwrap(), last.parse().unwrap());
         let shown: Vec<u64> = output
             .lines()
             .take_while(|line| !line.starts_with('['))
-            .chain(output.lines().skip_while(|line| !line.starts_with("[… lines")).skip(1))
+            .chain(
+                output
+                    .lines()
+                    .skip_while(|line| !line.starts_with("[… lines"))
+                    .skip(1),
+            )
             .filter_map(|line| line.parse().ok())
             .collect();
         assert!(shown.iter().all(|&n| n < first || n > last), "{output}");
         assert!(!shown.contains(&first) && !shown.contains(&last));
-        assert_eq!(shown.iter().filter(|&&n| n < first).max(), Some(&(first - 1)));
+        assert_eq!(
+            shown.iter().filter(|&&n| n < first).max(),
+            Some(&(first - 1))
+        );
         assert_eq!(shown.iter().filter(|&&n| n > last).min(), Some(&(last + 1)));
-        let read = sh(&format!("sed -n '{first},{}p;{},{last}p' {}", first + 2, last - 2, path.display()), &mut bash);
+        let read = sh(
+            &format!(
+                "sed -n '{first},{}p;{},{last}p' {}",
+                first + 2,
+                last - 2,
+                path.display()
+            ),
+            &mut bash,
+        );
         let read: Vec<u64> = read.lines().filter_map(|line| line.parse().ok()).collect();
-        assert_eq!(read, [first, first + 1, first + 2, last - 2, last - 1, last]);
+        assert_eq!(
+            read,
+            [first, first + 1, first + 2, last - 2, last - 1, last]
+        );
         // And the read tool, from the line the marker names, starts on the
         // first line left out.
-        let page = crate::read::run(&serde_json::json!({ "path": path.to_str().unwrap(), "start": first }));
+        let page = crate::read::run(
+            &serde_json::json!({ "path": path.to_str().unwrap(), "start": first }),
+        );
         assert!(page.starts_with(&format!("{first}\t{first}\n")), "{page}");
-        assert_eq!(sh(&format!("sed -n '500,502p' {}", path.display()), &mut bash), "500\n501\n502\n[exit code 0]");
+        assert_eq!(
+            sh(&format!("sed -n '500,502p' {}", path.display()), &mut bash),
+            "500\n501\n502\n[exit code 0]"
+        );
 
         drop(bash);
         assert!(!path.exists(), "the harness takes its files with it");
@@ -488,9 +568,17 @@ mod tests {
             );
             let _ = done.send(output);
         });
-        let output = finished.recv_timeout(Duration::from_secs(60)).expect("the command hung");
-        assert!(output.contains("\n[stdout: 1 line, 300000 bytes, whole in "), "{output}");
-        assert!(output.contains("\n[stderr: 1 line, 300000 bytes, whole in "), "{output}");
+        let output = finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the command hung");
+        assert!(
+            output.contains("\n[stdout: 1 line, 300000 bytes, whole in "),
+            "{output}"
+        );
+        assert!(
+            output.contains("\n[stderr: 1 line, 300000 bytes, whole in "),
+            "{output}"
+        );
         assert!(output.ends_with("[exit code 0]"));
     }
 
@@ -517,10 +605,16 @@ mod tests {
         bash.retain = 3000;
         let output = sh("seq 1 2000", &mut bash);
         let path = bash.dir.join("1.stdout");
-        let note = output.lines().find(|line| line.starts_with("[stdout: ")).unwrap();
+        let note = output
+            .lines()
+            .find(|line| line.starts_with("[stdout: "))
+            .unwrap();
         assert_eq!(
             note,
-            format!("[stdout: 2000 lines, 8893 bytes, the first 3000 bytes in {}, the rest discarded]", path.display())
+            format!(
+                "[stdout: 2000 lines, 8893 bytes, the first 3000 bytes in {}, the rest discarded]",
+                path.display()
+            )
         );
         let expected: String = (1..=2000).map(|i| format!("{i}\n")).collect();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected[..3000]);
@@ -533,8 +627,14 @@ mod tests {
         let mut bash = Bash::new();
         bash.dir = PathBuf::from("/dev/null/nowhere");
         let output = sh("seq 1 2000", &mut bash);
-        let note = output.lines().find(|line| line.starts_with("[stdout: ")).unwrap();
-        assert!(note.starts_with("[stdout: 2000 lines, 8893 bytes, could not keep the rest: "), "{note}");
+        let note = output
+            .lines()
+            .find(|line| line.starts_with("[stdout: "))
+            .unwrap();
+        assert!(
+            note.starts_with("[stdout: 2000 lines, 8893 bytes, could not keep the rest: "),
+            "{note}"
+        );
         assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
         assert!(output.ends_with("[exit code 0]"));
     }
@@ -557,7 +657,11 @@ mod tests {
 
     #[test]
     fn needs_a_command() {
-        assert!(Bash::new().run(&serde_json::json!({})).starts_with("error: bash needs"));
+        assert!(
+            Bash::new()
+                .run(&serde_json::json!({}))
+                .starts_with("error: bash needs")
+        );
     }
 
     #[test]
@@ -565,7 +669,8 @@ mod tests {
         let mut bash = Bash::new();
         let ls = call("<function=bash>\n<parameter=command>\nls -l\n</parameter>\n</function>");
         assert_eq!(ls.name, "bash");
-        let echo = call("<function=bash>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>");
+        let echo =
+            call("<function=bash>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>");
         assert_eq!(bash.run(&echo.arguments), "a\nb\n[exit code 0]");
         assert!(ToolCall::parse("<function=bash>\n<parameter=command>\nls").is_err());
     }

@@ -122,7 +122,12 @@ impl Screen {
 
     /// Prints `lines` into the scrollback, then redraws the live region below
     /// them, leaving the cursor at `cursor` (row, column) within it.
-    pub fn draw(&mut self, lines: &[Line], live: &[Line], cursor: (usize, usize)) -> io::Result<()> {
+    pub fn draw(
+        &mut self,
+        lines: &[Line],
+        live: &[Line],
+        cursor: (usize, usize),
+    ) -> io::Result<()> {
         let (columns, _) = self.size();
         // A line of the live region that wrapped would push it out of place
         // for the next draw, so they are cut to the terminal's width.
@@ -130,7 +135,11 @@ impl Screen {
         // If the terminal narrowed since the last draw, it has rewrapped
         // lines that no longer fit onto more rows.
         let rows = |width: usize| width.div_ceil(columns).max(1);
-        let up = self.widths[..self.cursor.0].iter().map(|&w| rows(w)).sum::<usize>() + self.cursor.1 / columns;
+        let up = self.widths[..self.cursor.0]
+            .iter()
+            .map(|&w| rows(w))
+            .sum::<usize>()
+            + self.cursor.1 / columns;
 
         queue!(self.out, BeginSynchronizedUpdate, MoveToColumn(0))?;
         if up > 0 {
@@ -151,7 +160,11 @@ impl Screen {
         if below > 0 {
             queue!(self.out, MoveUp(below as u16))?;
         }
-        queue!(self.out, MoveToColumn(cursor.1 as u16), EndSynchronizedUpdate)?;
+        queue!(
+            self.out,
+            MoveToColumn(cursor.1 as u16),
+            EndSynchronizedUpdate
+        )?;
         self.out.flush()?;
 
         self.widths = live.iter().map(width).collect();
@@ -183,7 +196,10 @@ impl Drop for Screen {
 /// Appending text only ever changes the last line, so the lines before it can
 /// be printed while the text is still streaming in.
 pub fn wrap(text: &str, width: usize) -> Vec<&str> {
-    wrap_ranges(text, width).into_iter().map(|range| &text[range]).collect()
+    wrap_ranges(text, width)
+        .into_iter()
+        .map(|range| &text[range])
+        .collect()
 }
 
 /// Wraps text like `wrap`, returning where in the text each line is.
@@ -237,7 +253,9 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
         let space = rest.starts_with(' ');
-        let end = rest.find(|c: char| (c == ' ') != space).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| (c == ' ') != space)
+            .unwrap_or(rest.len());
         let (word, tail) = rest.split_at(end);
         rest = tail;
         (!word.is_empty()).then_some(word)
@@ -350,7 +368,10 @@ impl Input {
         // Spaces at the end of a line are dropped from it, but the cursor
         // still moves over them as they are typed, as far as the line is
         // wide.
-        let row = lines.iter().rposition(|line| line.start <= self.cursor).unwrap_or(0);
+        let row = lines
+            .iter()
+            .rposition(|line| line.start <= self.cursor)
+            .unwrap_or(0);
         let line = &lines[row];
         let column = self.text[line.start..self.cursor].width().min(width);
         let lines = lines.into_iter().map(|line| &self.text[line]).collect();
@@ -362,15 +383,23 @@ impl Input {
     }
 
     fn line_end(&self) -> usize {
-        self.text[self.cursor..].find('\n').map_or(self.text.len(), |i| self.cursor + i)
+        self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.cursor + i)
     }
 
     fn prev(&self, i: usize) -> usize {
-        self.text[..i].char_indices().next_back().map_or(0, |(i, _)| i)
+        self.text[..i]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
     }
 
     fn next(&self, i: usize) -> usize {
-        self.text[i..].chars().next().map_or(i, |c| i + c.len_utf8())
+        self.text[i..]
+            .chars()
+            .next()
+            .map_or(i, |c| i + c.len_utf8())
     }
 }
 
@@ -395,7 +424,12 @@ mod tests {
             for end in (0..=text.len()).filter(|&end| text.is_char_boundary(end)) {
                 let prefix = wrap(&text[..end], width);
                 let stable = prefix.len() - 1;
-                assert_eq!(prefix[..stable], full[..stable], "width {width}, text {:?}", &text[..end]);
+                assert_eq!(
+                    prefix[..stable],
+                    full[..stable],
+                    "width {width}, text {:?}",
+                    &text[..end]
+                );
             }
         }
     }

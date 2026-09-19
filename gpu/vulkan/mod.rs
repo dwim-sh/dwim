@@ -193,17 +193,22 @@ impl Vulkan {
         unsafe {
             let entry = ash::Entry::load()?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
-            let instance = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)?;
+            let instance = entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                None,
+            )?;
 
             let physical = instance
                 .enumerate_physical_devices()?
                 .into_iter()
-                .min_by_key(|&pd| match instance.get_physical_device_properties(pd).device_type {
-                    vk::PhysicalDeviceType::DISCRETE_GPU => 0,
-                    vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
-                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
-                    _ => 3,
-                })
+                .min_by_key(
+                    |&pd| match instance.get_physical_device_properties(pd).device_type {
+                        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                        _ => 3,
+                    },
+                )
                 .ok_or("no Vulkan device")?;
             let props = instance.get_physical_device_properties(physical);
             let name = props.device_name_as_c_str()?.to_string_lossy().into_owned();
@@ -213,16 +218,25 @@ impl Vulkan {
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
             instance.get_physical_device_properties2(physical, &mut props2);
-            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
+            let needed = vk::SubgroupFeatureFlags::BASIC
+                | vk::SubgroupFeatureFlags::ARITHMETIC
+                | vk::SubgroupFeatureFlags::SHUFFLE;
             if !subgroup.supported_operations.contains(needed) || subgroup.subgroup_size < 16 {
                 return Err(format!("{name} lacks the subgroup operations the kernels use").into());
             }
             if (props.limits.max_compute_shared_memory_size as usize) < TERNARY_TILE_MEMORY {
-                return Err(format!("{name} has less than the {} KB of workgroup memory the kernels use", TERNARY_TILE_MEMORY / 1024).into());
+                return Err(format!(
+                    "{name} has less than the {} KB of workgroup memory the kernels use",
+                    TERNARY_TILE_MEMORY / 1024
+                )
+                .into());
             }
             let extensions = instance.enumerate_device_extension_properties(physical)?;
             for needed in [push_descriptor::NAME, shader_float16_int8::NAME] {
-                if !extensions.iter().any(|ext| ext.extension_name_as_c_str() == Ok(needed)) {
+                if !extensions
+                    .iter()
+                    .any(|ext| ext.extension_name_as_c_str() == Ok(needed))
+                {
                     return Err(format!("{name} lacks {}", needed.to_string_lossy()).into());
                 }
             }
@@ -230,7 +244,9 @@ impl Vulkan {
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut float16);
             instance.get_physical_device_features2(physical, &mut features);
             if float16.shader_float16 == 0 {
-                return Err(format!("{name} lacks 16-bit float arithmetic, which the kernels use").into());
+                return Err(
+                    format!("{name} lacks 16-bit float arithmetic, which the kernels use").into(),
+                );
             }
 
             let family = instance
@@ -241,8 +257,12 @@ impl Vulkan {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&[1.0])];
-            let extension_names = [push_descriptor::NAME.as_ptr(), shader_float16_int8::NAME.as_ptr()];
-            let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+            let extension_names = [
+                push_descriptor::NAME.as_ptr(),
+                shader_float16_int8::NAME.as_ptr(),
+            ];
+            let mut float16 =
+                vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&extension_names)
@@ -299,12 +319,17 @@ impl Vulkan {
 
             let kernel = |spv: &[u8]| -> Result<vk::Pipeline, Box<dyn Error>> {
                 let words = ash::util::read_spv(&mut Cursor::new(spv))?;
-                let module = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
+                let module = device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&words),
+                    None,
+                )?;
                 let stage = vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::COMPUTE)
                     .module(module)
                     .name(c"main");
-                let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+                let info = vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(layout);
                 let pipeline = device
                     .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
                     .map_err(|(_, e)| e)?[0];
@@ -378,8 +403,12 @@ impl Vulkan {
                 }),
             };
             gpu.staging = [gpu.map(STAGING)?, gpu.map(STAGING)?];
-            gpu.partials = gpu.buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
-            gpu.packed = gpu.buffer(PACKED * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?.0;
+            gpu.partials = gpu
+                .buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
+                .0;
+            gpu.packed = gpu
+                .buffer(PACKED * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
+                .0;
             Ok(gpu)
         }
     }
@@ -390,7 +419,11 @@ impl Vulkan {
     }
 
     /// Creates a buffer of `bytes` in memory of the given kind.
-    fn buffer(&self, bytes: usize, flags: vk::MemoryPropertyFlags) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn Error>> {
+    fn buffer(
+        &self,
+        bytes: usize,
+        flags: vk::MemoryPropertyFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn Error>> {
         unsafe {
             let info = vk::BufferCreateInfo::default()
                 .size(bytes.max(4) as u64)
@@ -402,11 +435,14 @@ impl Vulkan {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buf = self.device.create_buffer(&info, None)?;
             let req = self.device.get_buffer_memory_requirements(buf);
-            let types = &self.memory_types.memory_types[..self.memory_types.memory_type_count as usize];
+            let types =
+                &self.memory_types.memory_types[..self.memory_types.memory_type_count as usize];
             let index = types
                 .iter()
                 .enumerate()
-                .position(|(i, t)| req.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(flags))
+                .position(|(i, t)| {
+                    req.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(flags)
+                })
                 .ok_or("no suitable memory type")? as u32;
             let mem = self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -424,8 +460,14 @@ impl Vulkan {
     fn map(&self, bytes: usize) -> Result<Mapped, Box<dyn Error>> {
         let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let (buf, mem) = self.buffer(bytes, flags)?;
-        let ptr = unsafe { self.device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? };
-        Ok(Mapped { buf, ptr: ptr.cast() })
+        let ptr = unsafe {
+            self.device
+                .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+        };
+        Ok(Mapped {
+            buf,
+            ptr: ptr.cast(),
+        })
     }
 
     /// Creates a buffer in device memory.
@@ -452,7 +494,8 @@ impl Vulkan {
                 self.device
                     .begin_command_buffer(
                         cmd,
-                        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                     )
                     .unwrap();
             }
@@ -465,7 +508,9 @@ impl Vulkan {
     /// Waits for the GPU to finish command buffer `i` of the ring.
     fn wait(&self, ring: &mut Ring, i: usize) {
         unsafe {
-            self.device.wait_for_fences(&[self.fences[i]], true, u64::MAX).unwrap();
+            self.device
+                .wait_for_fences(&[self.fences[i]], true, u64::MAX)
+                .unwrap();
             self.device.reset_fences(&[self.fences[i]]).unwrap();
         }
         ring.in_flight[i] = false;
@@ -483,8 +528,15 @@ impl Vulkan {
                     | vk::AccessFlags::TRANSFER_WRITE,
             );
         unsafe {
-            self.device
-                .cmd_pipeline_barrier(cmd, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                stages,
+                stages,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
         }
     }
 
@@ -500,7 +552,9 @@ impl Vulkan {
             self.device.end_command_buffer(self.cmds[i]).unwrap();
             let cmds = [self.cmds[i]];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            self.device.queue_submit(self.queue, &[submit], self.fences[i]).unwrap();
+            self.device
+                .queue_submit(self.queue, &[submit], self.fences[i])
+                .unwrap();
         }
         ring.in_flight[i] = true;
         ring.recording = false;
@@ -521,14 +575,23 @@ impl Vulkan {
 
     /// Records a kernel over `groups` workgroups, bound to `buffers` in
     /// order, with `params` as its push constants.
-    fn dispatch<P: Copy>(&self, pipeline: vk::Pipeline, buffers: &[vk::Buffer], params: &P, groups: (u32, u32)) {
+    fn dispatch<P: Copy>(
+        &self,
+        pipeline: vk::Pipeline,
+        buffers: &[vk::Buffer],
+        params: &P,
+        groups: (u32, u32),
+    ) {
         let cmd = self.cmd();
         // A kernel binds at most eight buffers; a thousand dispatches a token
         // is worth not allocating for.
         assert!(buffers.len() <= 8);
         let mut infos = [vk::DescriptorBufferInfo::default(); 8];
         for (info, &buf) in infos.iter_mut().zip(buffers) {
-            *info = vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE);
+            *info = vk::DescriptorBufferInfo::default()
+                .buffer(buf)
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
         }
         let mut writes = [vk::WriteDescriptorSet::default(); 8];
         for (i, (write, info)) in writes.iter_mut().zip(&infos).enumerate() {
@@ -538,11 +601,22 @@ impl Vulkan {
                 .buffer_info(std::slice::from_ref(info));
         }
         unsafe {
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            self.push
-                .cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &writes[..buffers.len()]);
             self.device
-                .cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes(params));
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.push.cmd_push_descriptor_set(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layout,
+                0,
+                &writes[..buffers.len()],
+            );
+            self.device.cmd_push_constants(
+                cmd,
+                self.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes(params),
+            );
             self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
         }
         self.barrier(cmd);
@@ -560,7 +634,10 @@ impl Vulkan {
     /// Workgroups for `count` items of work in a one-dimensional kernel.
     fn groups(&self, count: usize, per_group: usize) -> (u32, u32) {
         let groups = count.div_ceil(per_group);
-        assert!(groups <= self.max_groups as usize, "{groups} workgroups is more than the GPU allows");
+        assert!(
+            groups <= self.max_groups as usize,
+            "{groups} workgroups is more than the GPU allows"
+        );
         (groups as u32, 1)
     }
 
@@ -583,12 +660,17 @@ impl Vulkan {
                 }
                 which
             };
-            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging[which].ptr, chunk.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging[which].ptr, chunk.len())
+            };
             let cmd = self.cmd();
             let region = vk::BufferCopy::default()
                 .dst_offset((offset + i * STAGING) as u64)
                 .size(chunk.len() as u64);
-            unsafe { self.device.cmd_copy_buffer(cmd, self.staging[which].buf, dst, &[region]) };
+            unsafe {
+                self.device
+                    .cmd_copy_buffer(cmd, self.staging[which].buf, dst, &[region])
+            };
             self.barrier(cmd);
             let slot = self.ring.lock().unwrap().current;
             self.submit();
@@ -608,7 +690,8 @@ impl Vulkan {
                 let region = vk::BufferCopy::default()
                     .src_offset((i * STAGING) as u64)
                     .size(chunk.len() as u64);
-                self.device.cmd_copy_buffer(cmd, src, self.staging[0].buf, &[region]);
+                self.device
+                    .cmd_copy_buffer(cmd, src, self.staging[0].buf, &[region]);
                 self.barrier(cmd);
                 self.flush();
                 std::ptr::copy_nonoverlapping(self.staging[0].ptr, chunk.as_mut_ptr(), chunk.len());
@@ -628,7 +711,8 @@ impl Drop for Vulkan {
                 self.device.destroy_pipeline(pipeline, None);
             }
             self.device.destroy_pipeline_layout(self.layout, None);
-            self.device.destroy_descriptor_set_layout(self.set_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_command_pool(self.pool, None);
             for (buf, mem) in self.allocations.lock().unwrap().drain(..) {
                 self.device.destroy_buffer(buf, None);
@@ -734,12 +818,16 @@ impl Device for Vulkan {
     fn upload(&self, tensor: Tensor) -> Weight {
         match tensor {
             Tensor::Bf16 { shape, data } => {
-                assert!(data.len().is_multiple_of(8), "weights must come in multiples of eight");
+                assert!(
+                    data.len().is_multiple_of(8),
+                    "weights must come in multiples of eight"
+                );
                 let buf = self.device_buffer(data.len() * 2);
                 // bf16 bits, two to a 32-bit word, in memory order: the
                 // kernels take the low half of a word as the first weight,
                 // as little-endian does.
-                let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+                let bytes =
+                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
                 self.upload_bytes(buf, 0, bytes);
                 Weight {
                     buf,
@@ -778,13 +866,18 @@ impl Device for Vulkan {
     }
 
     fn resize(&self, buf: &mut Buffer, len: usize) {
-        assert!(len <= buf.cap, "a buffer of {} activations can't hold {len}", buf.cap);
+        assert!(
+            len <= buf.cap,
+            "a buffer of {} activations can't hold {len}",
+            buf.cap
+        );
         buf.len = len;
     }
 
     fn read(&self, buf: &Buffer) -> Vec<f32> {
         let mut out = vec![0.0f32; buf.len];
-        let bytes = unsafe { slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), buf.len * 4) };
+        let bytes =
+            unsafe { slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), buf.len * 4) };
         self.download_bytes(buf.buf, bytes);
         out
     }
@@ -795,14 +888,24 @@ impl Device for Vulkan {
         self.upload_bytes(buf.buf, 0, bytes);
     }
 
-    fn copy(&self, dst: &mut Buffer, dst_offset: usize, src: &Buffer, src_offset: usize, len: usize) {
+    fn copy(
+        &self,
+        dst: &mut Buffer,
+        dst_offset: usize,
+        src: &Buffer,
+        src_offset: usize,
+        len: usize,
+    ) {
         assert!(dst_offset + len <= dst.len && src_offset + len <= src.len);
         let cmd = self.cmd();
         let region = vk::BufferCopy::default()
             .src_offset((src_offset * 4) as u64)
             .dst_offset((dst_offset * 4) as u64)
             .size((len * 4) as u64);
-        unsafe { self.device.cmd_copy_buffer(cmd, src.buf, dst.buf, &[region]) };
+        unsafe {
+            self.device
+                .cmd_copy_buffer(cmd, src.buf, dst.buf, &[region])
+        };
         self.barrier(cmd);
     }
 
@@ -815,7 +918,12 @@ impl Device for Vulkan {
             len: src.len as u32,
         };
         let groups = self.groups(src.len / 2, 256);
-        self.dispatch(self.kernels.store_halves, &[cache.buf, src.buf], &params, groups);
+        self.dispatch(
+            self.kernels.store_halves,
+            &[cache.buf, src.buf],
+            &params,
+            groups,
+        );
     }
 
     fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
@@ -845,14 +953,22 @@ impl Device for Vulkan {
         // repeated for every tile of tokens.
         let pairs = n.div_ceil(2).next_multiple_of(4);
         let pack = |group: usize| {
-            assert!(pairs * cols <= PACKED, "a batch of {n} tokens of {cols} is more than the kernels pack");
+            assert!(
+                pairs * cols <= PACKED,
+                "a batch of {n} tokens of {cols} is more than the kernels pack"
+            );
             let params = PackParams {
                 n: n as u32,
                 cols: cols as u32,
                 group: group as u32,
             };
             let groups = (cols.div_ceil(256) as u32, pairs as u32);
-            self.dispatch(self.kernels.pack_halves, &[self.packed, x.buf], &params, groups);
+            self.dispatch(
+                self.kernels.pack_halves,
+                &[self.packed, x.buf],
+                &params,
+                groups,
+            );
         };
         if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
             pack(pairs);
@@ -863,10 +979,19 @@ impl Device for Vulkan {
             // columns are split among workgroups, whose partial results a
             // second kernel adds up.
             let blocks = cols / 128;
-            let splits = TILE_WORKGROUPS.div_ceil(tiles).clamp(1, TILE_SPLITS.min(blocks));
-            let splits = if splits > 1 && splits * n * rows <= PARTIALS { splits } else { 1 };
+            let splits = TILE_WORKGROUPS
+                .div_ceil(tiles)
+                .clamp(1, TILE_SPLITS.min(blocks));
+            let splits = if splits > 1 && splits * n * rows <= PARTIALS {
+                splits
+            } else {
+                1
+            };
             let height = tiles * splits;
-            assert!(height <= self.max_groups as usize, "{height} rows of workgroups is more than the GPU allows");
+            assert!(
+                height <= self.max_groups as usize,
+                "{height} rows of workgroups is more than the GPU allows"
+            );
             let params = MatmulParams {
                 rows: rows as u32,
                 cols: cols as u32,
@@ -874,10 +999,20 @@ impl Device for Vulkan {
                 stride: width as u32,
                 splits: splits as u32,
             };
-            self.dispatch(self.kernels.matmul_ternary_tile, &[out.buf, w.buf, self.packed, self.partials], &params, (width as u32, height as u32));
+            self.dispatch(
+                self.kernels.matmul_ternary_tile,
+                &[out.buf, w.buf, self.packed, self.partials],
+                &params,
+                (width as u32, height as u32),
+            );
             if splits > 1 {
                 let groups = self.groups(n * rows, 256);
-                self.dispatch(self.kernels.matmul_ternary_tile_reduce, &[out.buf, self.partials], &params, groups);
+                self.dispatch(
+                    self.kernels.matmul_ternary_tile_reduce,
+                    &[out.buf, self.partials],
+                    &params,
+                    groups,
+                );
             }
             return;
         }
@@ -889,7 +1024,11 @@ impl Device for Vulkan {
             let blocks = cols / 128;
             let tiles = rows.div_ceil(SUMS_ROWS);
             let splits = (SUMS_WORKGROUPS / tiles).clamp(1, blocks);
-            let splits = if splits > 1 && splits * rows <= PARTIALS { splits } else { 1 };
+            let splits = if splits > 1 && splits * rows <= PARTIALS {
+                splits
+            } else {
+                1
+            };
             let count = tiles * splits;
             let width = count.min(self.max_groups as usize);
             let params = MatmulParams {
@@ -899,9 +1038,19 @@ impl Device for Vulkan {
                 stride: width as u32,
                 splits: splits as u32,
             };
-            self.dispatch(self.kernels.matmul_ternary_sums, &[out.buf, w.buf, x.buf, self.partials], &params, (width as u32, count.div_ceil(width) as u32));
+            self.dispatch(
+                self.kernels.matmul_ternary_sums,
+                &[out.buf, w.buf, x.buf, self.partials],
+                &params,
+                (width as u32, count.div_ceil(width) as u32),
+            );
             if splits > 1 {
-                self.dispatch(self.kernels.matmul_ternary_tile_reduce, &[out.buf, self.partials], &params, self.groups(rows, 256));
+                self.dispatch(
+                    self.kernels.matmul_ternary_tile_reduce,
+                    &[out.buf, self.partials],
+                    &params,
+                    self.groups(rows, 256),
+                );
             }
             return;
         }
@@ -916,7 +1065,12 @@ impl Device for Vulkan {
             pack(TERNARY_TOKENS / 2);
         }
         let (kernel, per_group, tokens, x) = if batch {
-            (self.kernels.matmul_ternary_batch, TERNARY_ROWS, TERNARY_TOKENS, self.packed)
+            (
+                self.kernels.matmul_ternary_batch,
+                TERNARY_ROWS,
+                TERNARY_TOKENS,
+                self.packed,
+            )
         } else if w.ternary {
             (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
         } else {
@@ -924,7 +1078,10 @@ impl Device for Vulkan {
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
-        let groups = (width as u32, (count.div_ceil(width) * n.div_ceil(tokens)) as u32);
+        let groups = (
+            width as u32,
+            (count.div_ceil(width) * n.div_ceil(tokens)) as u32,
+        );
         let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
@@ -945,19 +1102,33 @@ impl Device for Vulkan {
     fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
         let dim = weight.len;
         assert_eq!(x.len % dim, 0);
-        let params = RmsnormParams { dim: dim as u32, eps };
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
         let groups = self.groups(x.len / dim, 1);
         self.dispatch(self.kernels.rmsnorm, &[x.buf, weight.buf], &params, groups);
     }
 
     fn l2norm(&self, x: &mut Buffer, dim: usize, eps: f32) {
         assert_eq!(x.len % dim, 0);
-        let params = RmsnormParams { dim: dim as u32, eps };
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
         let groups = self.groups(x.len / dim, 1);
         self.dispatch(self.kernels.l2norm, &[x.buf], &params, groups);
     }
 
-    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
+    fn rope(
+        &self,
+        x: &mut Buffer,
+        table: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rot_dim: usize,
+    ) {
         let n = x.len / (n_heads * head_dim);
         assert_eq!(x.len, n * n_heads * head_dim);
         assert!(rot_dim <= head_dim && rot_dim.is_multiple_of(2));
@@ -987,12 +1158,19 @@ impl Device for Vulkan {
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
         assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
-        assert!(n_heads / n_kv_heads <= 8, "the kernel holds up to eight query heads per key/value head");
+        assert!(
+            n_heads / n_kv_heads <= 8,
+            "the kernel holds up to eight query heads per key/value head"
+        );
         // Every token's heads get as many chunks as the last token attends
         // over, as many tokens to a dispatch as the partials fit.
         let chunks = (pos + n).div_ceil(CHUNK);
         let per_token = n_heads * chunks * (head_dim + 2);
-        assert!(per_token <= PARTIALS, "attention over {} positions needs more partials than {PARTIALS}", pos + n);
+        assert!(
+            per_token <= PARTIALS,
+            "attention over {} positions needs more partials than {PARTIALS}",
+            pos + n
+        );
         let per_dispatch = PARTIALS / per_token;
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
@@ -1013,14 +1191,21 @@ impl Device for Vulkan {
             );
             if chunks > 1 {
                 let groups = self.groups(tokens * n_heads, 1);
-                self.dispatch(self.kernels.attention_combine, &[out.buf, self.partials], &params, groups);
+                self.dispatch(
+                    self.kernels.attention_combine,
+                    &[out.buf, self.partials],
+                    &params,
+                    groups,
+                );
             }
         }
     }
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {
         assert_eq!(gate.len, up.len);
-        let params = LenParams { len: gate.len as u32 };
+        let params = LenParams {
+            len: gate.len as u32,
+        };
         let groups = self.groups(gate.len, 256);
         self.dispatch(self.kernels.silu_mul, &[gate.buf, up.buf], &params, groups);
     }
@@ -1029,7 +1214,12 @@ impl Device for Vulkan {
         assert_eq!(x.len, gate.len);
         let params = LenParams { len: x.len as u32 };
         let groups = self.groups(x.len, 256);
-        self.dispatch(self.kernels.sigmoid_mul, &[x.buf, gate.buf], &params, groups);
+        self.dispatch(
+            self.kernels.sigmoid_mul,
+            &[x.buf, gate.buf],
+            &params,
+            groups,
+        );
     }
 
     fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
@@ -1043,13 +1233,28 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.hadamard, &[x.buf, signs.buf], &params, groups);
     }
 
-    fn rmsnorm_hadamard(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+    fn rmsnorm_hadamard(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        weight: &Buffer,
+        signs: &Buffer,
+        eps: f32,
+    ) {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
-        let params = RmsnormParams { dim: width as u32, eps };
+        let params = RmsnormParams {
+            dim: width as u32,
+            eps,
+        };
         let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
-        self.dispatch(self.kernels.rmsnorm_hadamard, &[out.buf, x.buf, weight.buf, signs.buf], &params, groups);
+        self.dispatch(
+            self.kernels.rmsnorm_hadamard,
+            &[out.buf, x.buf, weight.buf, signs.buf],
+            &params,
+            groups,
+        );
     }
 
     fn conv(
@@ -1075,7 +1280,15 @@ impl Device for Vulkan {
             k_dim: k_dim as u32,
         };
         let groups = self.groups(n * channels, 256);
-        let buffers = [q.buf, k.buf, v.buf, state_out.buf, x.buf, state.buf, weight.buf];
+        let buffers = [
+            q.buf,
+            k.buf,
+            v.buf,
+            state_out.buf,
+            x.buf,
+            state.buf,
+            weight.buf,
+        ];
         self.dispatch(self.kernels.conv, &buffers, &params, groups);
     }
 
@@ -1104,8 +1317,15 @@ impl Device for Vulkan {
             n_v_heads: n_v_heads as u32,
             head_dim: head_dim as u32,
         };
-        let buffers = [out.buf, q.buf, k.buf, v.buf, gates.buf, decay.buf, state.buf];
-        self.dispatch(self.kernels.delta_net, &buffers, &params, self.groups(n_v_heads, 1));
+        let buffers = [
+            out.buf, q.buf, k.buf, v.buf, gates.buf, decay.buf, state.buf,
+        ];
+        self.dispatch(
+            self.kernels.delta_net,
+            &buffers,
+            &params,
+            self.groups(n_v_heads, 1),
+        );
     }
 }
 
@@ -1116,16 +1336,18 @@ impl Device for Vulkan {
 fn block_major(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     let blocks = cols / BLOCK;
     let mut out = vec![0u8; data.len()];
-    out.par_chunks_mut(8 * rows * BLOCK_BYTES).enumerate().for_each(|(i, chunk)| {
-        let b0 = i * 8;
-        let count = chunk.len() / (rows * BLOCK_BYTES);
-        for r in 0..rows {
-            let src = &data[(r * blocks + b0) * BLOCK_BYTES..][..count * BLOCK_BYTES];
-            for (j, block) in src.chunks_exact(BLOCK_BYTES).enumerate() {
-                chunk[(j * rows + r) * BLOCK_BYTES..][..BLOCK_BYTES].copy_from_slice(block);
+    out.par_chunks_mut(8 * rows * BLOCK_BYTES)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let b0 = i * 8;
+            let count = chunk.len() / (rows * BLOCK_BYTES);
+            for r in 0..rows {
+                let src = &data[(r * blocks + b0) * BLOCK_BYTES..][..count * BLOCK_BYTES];
+                for (j, block) in src.chunks_exact(BLOCK_BYTES).enumerate() {
+                    chunk[(j * rows + r) * BLOCK_BYTES..][..BLOCK_BYTES].copy_from_slice(block);
+                }
             }
-        }
-    });
+        });
     out
 }
 

@@ -52,7 +52,10 @@ impl Model {
 
     /// URL to download one of the model's files from.
     pub fn url(&self, file: &str) -> String {
-        format!("https://huggingface.co/{}/resolve/{}/{}", self.repo, self.revision, file)
+        format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            self.repo, self.revision, file
+        )
     }
 
     /// Local directory the model's files are stored in, under the platform's
@@ -80,9 +83,17 @@ pub fn load<D: Device + 'static>(
     // Past the positions the model was trained on, its attention degrades.
     let trained = bonsai::Config::load(&gguf)?.context_length;
     if context == 0 || context > trained {
-        return Err(format!("a context of {context} tokens is outside the 1 to {trained} the model was trained for").into());
+        return Err(format!(
+            "a context of {context} tokens is outside the 1 to {trained} the model was trained for"
+        )
+        .into());
     }
-    Ok(Box::new(bonsai::Model::load(gguf, device, context, on_progress)?))
+    Ok(Box::new(bonsai::Model::load(
+        gguf,
+        device,
+        context,
+        on_progress,
+    )?))
 }
 
 /// The sampler for the model, with the settings its file recommends where
@@ -92,7 +103,12 @@ pub fn load<D: Device + 'static>(
 /// and it fits, and otherwise by reading the prompt, reporting progress as
 /// `Chat::system` does, and saving the state for the next run. Returns
 /// whether the state was restored.
-pub fn start<M: LanguageModel>(chat: &mut Chat<M>, model: &Model, prompt: &str, on_progress: impl FnMut(usize, usize)) -> Result<bool, Box<dyn Error>> {
+pub fn start<M: LanguageModel>(
+    chat: &mut Chat<M>,
+    model: &Model,
+    prompt: &str,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<bool, Box<dyn Error>> {
     let path = state_path(model, prompt);
     if let Some(path) = &path
         && let Ok(state) = fs::read(path)
@@ -121,7 +137,12 @@ fn state_path(model: &Model, prompt: &str) -> Option<PathBuf> {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Some(dirs::cache_dir()?.join("dwim").join("states").join(format!("{hash:016x}.bin")))
+    Some(
+        dirs::cache_dir()?
+            .join("dwim")
+            .join("states")
+            .join(format!("{hash:016x}.bin")),
+    )
 }
 
 /// Removes all but the newest saved states.
@@ -141,8 +162,16 @@ fn prune(dir: &Path) {
 }
 
 pub fn sampler(gguf: &Gguf) -> Sampler {
-    let number = |key: &str, default: f32| gguf.f32(&format!("general.sampling.{key}")).unwrap_or(default);
-    Sampler::new(number("temp", 1.0), number("top_k", 20.0) as usize, number("top_p", 0.95), seed())
+    let number = |key: &str, default: f32| {
+        gguf.f32(&format!("general.sampling.{key}"))
+            .unwrap_or(default)
+    };
+    Sampler::new(
+        number("temp", 1.0),
+        number("top_k", 20.0) as usize,
+        number("top_p", 0.95),
+        seed(),
+    )
 }
 
 /// Seed for sampling, different on every run.

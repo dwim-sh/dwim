@@ -46,7 +46,15 @@ pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Err
         let dir = dir.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            if let Err(e) = work(model, &dir, device, context, requests_rx, &replies_tx, &stop) {
+            if let Err(e) = work(
+                model,
+                &dir,
+                device,
+                context,
+                requests_rx,
+                &replies_tx,
+                &stop,
+            ) {
                 let _ = replies_tx.send(Reply::Failed(e.to_string()));
             }
         });
@@ -60,7 +68,11 @@ pub fn run(name: &str, device: Device, context: usize) -> Result<(), Box<dyn Err
         input: Input::default(),
         history: Vec::new(),
         recalled: None,
-        status: Status::Loading { since: Instant::now(), done: 0, total: 0 },
+        status: Status::Loading {
+            since: Instant::now(),
+            done: 0,
+            total: 0,
+        },
         started: Instant::now(),
         loading: Duration::ZERO,
         stats: harness::Stats::default(),
@@ -92,20 +104,34 @@ enum Reply {
     /// Which device the model is being loaded onto.
     Device(String),
     /// How many of the model's tensors are loaded, out of how many.
-    Loading { done: usize, total: usize },
+    Loading {
+        done: usize,
+        total: usize,
+    },
     /// The model is reading the system prompt: how many of its tokens so
     /// far, out of how many.
-    Prompting { read: usize, total: usize },
+    Prompting {
+        read: usize,
+        total: usize,
+    },
     /// The model is ready for a message.
-    Ready { tokens: usize },
+    Ready {
+        tokens: usize,
+    },
     /// Part of the model's thought, before it replies.
     Thought(String),
     Text(String),
     /// A tool is about to run: its name and how it was called.
-    Call { name: String, detail: String },
+    Call {
+        name: String,
+        detail: String,
+    },
     /// What the tool returned.
     Output(String),
-    Done { tokens: usize, stats: harness::Stats },
+    Done {
+        tokens: usize,
+        stats: harness::Stats,
+    },
     Failed(String),
 }
 
@@ -132,7 +158,12 @@ fn work(
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
-            let name = gpu.name().split(" (").next().unwrap_or(gpu.name()).to_string();
+            let name = gpu
+                .name()
+                .split(" (")
+                .next()
+                .unwrap_or(gpu.name())
+                .to_string();
             let _ = replies.send(Reply::Device(name));
             serve(gguf, gpu, model, context, requests, replies, stop)
         }
@@ -156,11 +187,18 @@ fn serve<D: dwim_gpu::Device + 'static>(
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    models::start(&mut chat, which, &harness::system_prompt(&cwd), |read, total| {
-        let _ = replies.send(Reply::Prompting { read, total });
-    })?;
+    models::start(
+        &mut chat,
+        which,
+        &harness::system_prompt(&cwd),
+        |read, total| {
+            let _ = replies.send(Reply::Prompting { read, total });
+        },
+    )?;
     let mut harness = Harness::new(chat);
-    let _ = replies.send(Reply::Ready { tokens: harness.tokens() });
+    let _ = replies.send(Reply::Ready {
+        tokens: harness.tokens(),
+    });
 
     for message in requests {
         harness.send(&message, |event| {
@@ -191,17 +229,31 @@ fn serve<D: dwim_gpu::Device + 'static>(
 /// What the model is doing.
 enum Status {
     /// Downloading one of the model's files, since when.
-    Downloading { since: Instant, progress: Progress },
+    Downloading {
+        since: Instant,
+        progress: Progress,
+    },
     /// Loading the weights, since when: how many tensors so far, out of how
     /// many.
-    Loading { since: Instant, done: usize, total: usize },
+    Loading {
+        since: Instant,
+        done: usize,
+        total: usize,
+    },
     /// Reading the system prompt, since when: how many of its tokens so
     /// far, out of how many.
-    Prompting { since: Instant, read: usize, total: usize },
+    Prompting {
+        since: Instant,
+        read: usize,
+        total: usize,
+    },
     Idle,
     /// Reading the prompt, before the first token of the reply.
     Reading(Instant),
-    Generating { start: Instant, tokens: usize },
+    Generating {
+        start: Instant,
+        tokens: usize,
+    },
 }
 
 /// What part of the reply is being generated.
@@ -272,7 +324,9 @@ impl App {
                 match self.replies.try_recv() {
                     Ok(reply) => self.reply(reply)?,
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return Err("the model stopped unexpectedly".into()),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err("the model stopped unexpectedly".into());
+                    }
                 }
                 dirty = true;
             }
@@ -295,7 +349,11 @@ impl App {
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => return true,
             KeyCode::Esc => self.interrupt(),
-            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
                 self.input.insert("\n")
             }
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
@@ -306,7 +364,9 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
             KeyCode::Char('w') if ctrl => self.input.delete_word(),
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => self.input.delete_word(),
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.input.delete_word()
+            }
             KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -342,7 +402,10 @@ impl App {
             (Some(i), _) if i < last => Some(i + 1),
             (Some(_), _) => None,
         };
-        let text = self.recalled.map(|i| self.history[i].clone()).unwrap_or_default();
+        let text = self
+            .recalled
+            .map(|i| self.history[i].clone())
+            .unwrap_or_default();
         self.input.set(text);
     }
 
@@ -359,8 +422,15 @@ impl App {
 
         let (columns, _) = self.screen.size();
         self.lines.push(Line::new());
-        for (i, line) in tui::wrap(&message, columns.saturating_sub(2)).into_iter().enumerate() {
-            let prompt = if i == 0 { span("› ").bold() } else { span("  ") };
+        for (i, line) in tui::wrap(&message, columns.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let prompt = if i == 0 {
+                span("› ").bold()
+            } else {
+                span("  ")
+            };
             self.lines.push(vec![prompt, span(line).bold()]);
         }
         self.lines.push(Line::new());
@@ -385,7 +455,10 @@ impl App {
             Reply::Downloading(progress) => {
                 // Time each file on its own, so the speed is of this one.
                 let since = match self.status {
-                    Status::Downloading { since, progress: last } if last.file == progress.file => since,
+                    Status::Downloading {
+                        since,
+                        progress: last,
+                    } if last.file == progress.file => since,
                     _ => Instant::now(),
                 };
                 self.status = Status::Downloading { since, progress };
@@ -435,7 +508,8 @@ impl App {
                     for text in tui::wrap(line, columns.saturating_sub(4)) {
                         let prefix = if first { "  ⎿ " } else { "    " };
                         first = false;
-                        self.lines.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
+                        self.lines
+                            .push(vec![span(format!("{prefix}{text}")).dark_grey()]);
                     }
                 }
                 self.lines.push(Line::new());
@@ -467,7 +541,11 @@ impl App {
         }
         let text = tui::sanitize(text);
         // The model tends to open with blank lines.
-        let text = if self.reply.is_empty() { text.trim_start() } else { &text };
+        let text = if self.reply.is_empty() {
+            text.trim_start()
+        } else {
+            &text
+        };
         self.reply.push_str(text);
         self.status = match self.status {
             Status::Generating { start, tokens } => Status::Generating {
@@ -500,7 +578,10 @@ impl App {
     fn commit(&mut self, done: bool) {
         let lines = tui::wrap(&self.reply, self.reply_width);
         let end = if done { lines.len() } else { lines.len() - 1 };
-        let end = lines[..end].iter().rposition(|line| !line.is_empty()).map_or(0, |i| i + 1);
+        let end = lines[..end]
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |i| i + 1);
         if end > self.committed {
             let segment = self.segment;
             let committed = self.committed;
@@ -523,11 +604,15 @@ impl App {
             "model" => models_listing(&self.model),
             "stats" => {
                 let report = self.stats.report(self.loading, self.started.elapsed());
-                report.into_iter().map(|line| vec![span(format!("  {line}"))]).collect()
+                report
+                    .into_iter()
+                    .map(|line| vec![span(format!("  {line}"))])
+                    .collect()
             }
             other => vec![vec![span(format!("● Unknown command /{other}"))]],
         };
-        self.lines.extend(lines.iter().map(|line| tui::truncate(line, columns)));
+        self.lines
+            .extend(lines.iter().map(|line| tui::truncate(line, columns)));
     }
 
     fn draw(&mut self) -> Result<(), Box<dyn Error>> {
@@ -562,7 +647,13 @@ impl App {
         let height = rows.saturating_sub(live.len() + 3).max(1);
         let first = (row + 1).saturating_sub(height);
         let border = |left: &str, right: &str| {
-            vec![span(format!("{left}{}{right}", "─".repeat(columns.saturating_sub(2)))).dark_grey()]
+            vec![
+                span(format!(
+                    "{left}{}{right}",
+                    "─".repeat(columns.saturating_sub(2))
+                ))
+                .dark_grey(),
+            ]
         };
         live.push(border("╭", "╮"));
         let cursor = (live.len() + row - first, 4 + column);
@@ -625,7 +716,10 @@ impl App {
             ),
         };
         let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
-        Some(vec![span(format!("{frame} {verb}")).bold(), span(format!(" {details}")).dark_grey()])
+        Some(vec![
+            span(format!("{frame} {verb}")).bold(),
+            span(format!(" {details}")).dark_grey(),
+        ])
     }
 
     /// What's running and how full the context is, with the keys to know.
@@ -639,7 +733,11 @@ impl App {
             left.push_str(&format!(" · {speed:.1} tok/s"));
         }
         let right = "shift+enter for newline · ctrl+c to quit  ";
-        tui::spread(vec![span(left).dark_grey()], vec![span(right).dark_grey()], columns)
+        tui::spread(
+            vec![span(left).dark_grey()],
+            vec![span(right).dark_grey()],
+            columns,
+        )
     }
 }
 
@@ -649,7 +747,11 @@ fn download_details(progress: Progress, elapsed: Duration) -> String {
     let Progress { file, done, total } = progress;
     let mut details = format!("{file} · {}", fetch::size(done));
     if let Some(total) = total {
-        details.push_str(&format!(" / {} ({}%)", fetch::size(total), done * 100 / total.max(1)));
+        details.push_str(&format!(
+            " / {} ({}%)",
+            fetch::size(total),
+            done * 100 / total.max(1)
+        ));
     }
     // Too early to tell the speed, or nothing has arrived yet.
     if elapsed < Duration::from_secs(1) || done == 0 {
@@ -686,7 +788,11 @@ fn models_listing(running: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
         let bullet = if i == 0 { "● " } else { "  " };
-        let mut line = vec![span(bullet), span(model.name).bold(), span(format!("  {}", model.repo))];
+        let mut line = vec![
+            span(bullet),
+            span(model.name).bold(),
+            span(format!("  {}", model.repo)),
+        ];
         if model.name == running {
             line.push(span("  running").dark_grey());
         }

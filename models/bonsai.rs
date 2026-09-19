@@ -89,7 +89,10 @@ impl Config {
             return Err("value heads are not a multiple of key heads".into());
         }
         for (key, want) in [
-            ("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard"),
+            (
+                "prism.hadamard.transform",
+                "normalized-sylvester-walsh-hadamard",
+            ),
             ("prism.hadamard.axis", "input-last-dimension"),
             ("prism.hadamard.sign_mode", "explicit"),
         ] {
@@ -98,11 +101,20 @@ impl Config {
                 return Err(format!("{key} is '{got}', not '{want}'").into());
             }
         }
-        if gguf.u32("prism.hadamard.version")? != 1 || gguf.u32("prism.hadamard.block_size")? as usize != HADAMARD_BLOCK {
+        if gguf.u32("prism.hadamard.version")? != 1
+            || gguf.u32("prism.hadamard.block_size")? as usize != HADAMARD_BLOCK
+        {
             return Err("the weights are rotated in a way the model does not implement".into());
         }
-        if gguf.get("prism.hadamard.gdn_v_grouped").and_then(|v| v.as_bool()) != Some(true) {
-            return Err("the linear attention output projection is not in the checkpoint's head order".into());
+        if gguf
+            .get("prism.hadamard.gdn_v_grouped")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        {
+            return Err(
+                "the linear attention output projection is not in the checkpoint's head order"
+                    .into(),
+            );
         }
         Ok(config)
     }
@@ -198,7 +210,12 @@ impl<D: Device> Model<D> {
     /// `device`, with state for sequences of up to `max_len` tokens, and
     /// reporting how many of its tensors are loaded, out of how many, as it
     /// goes.
-    pub fn load(gguf: Arc<Gguf>, device: D, max_len: usize, on_progress: impl FnMut(usize, usize)) -> Result<Self> {
+    pub fn load(
+        gguf: Arc<Gguf>,
+        device: D,
+        max_len: usize,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<Self> {
         let config = Config::load(&gguf)?;
         let c = &config;
         let attention_layers = (0..c.layers).filter(|&i| c.is_attention(i)).count();
@@ -225,7 +242,10 @@ impl<D: Device> Model<D> {
                 let (q, gate) = match g.ternary(&name)? {
                     Tensor::Ternary { shape, data } => {
                         let head = c.head_dim * ternary::row_bytes(shape[1]);
-                        let (mut q, mut gate) = (Vec::with_capacity(data.len() / 2), Vec::with_capacity(data.len() / 2));
+                        let (mut q, mut gate) = (
+                            Vec::with_capacity(data.len() / 2),
+                            Vec::with_capacity(data.len() / 2),
+                        );
                         for h in data.chunks_exact(2 * head) {
                             q.extend_from_slice(&h[..head]);
                             gate.extend_from_slice(&h[head..]);
@@ -272,13 +292,21 @@ impl<D: Device> Model<D> {
                 let name = format!("{p}.attn_gate.weight");
                 let z = match g.ternary(&name)? {
                     Tensor::Ternary { shape, data } => Tensor::Ternary {
-                        data: untile(&data, c.k_heads, c.v_heads, c.state_dim * ternary::row_bytes(shape[1])),
+                        data: untile(
+                            &data,
+                            c.k_heads,
+                            c.v_heads,
+                            c.state_dim * ternary::row_bytes(shape[1]),
+                        ),
                         shape,
                     },
                     _ => unreachable!(),
                 };
                 let z = l.rotated(&name, z);
-                let ab = match (g.bf16(&format!("{p}.ssm_alpha.weight"))?, g.bf16(&format!("{p}.ssm_beta.weight"))?) {
+                let ab = match (
+                    g.bf16(&format!("{p}.ssm_alpha.weight"))?,
+                    g.bf16(&format!("{p}.ssm_beta.weight"))?,
+                ) {
                     (Tensor::Bf16 { shape, data: alpha }, Tensor::Bf16 { data: beta, .. }) => {
                         let mut data = untile(&alpha, c.k_heads, c.v_heads, c.hidden);
                         data.extend(untile(&beta, c.k_heads, c.v_heads, c.hidden));
@@ -297,7 +325,12 @@ impl<D: Device> Model<D> {
                 conv[v..].copy_from_slice(&untiled);
                 let conv = l.buffer(conv);
                 let mut decay = untile(&g.f32s(&format!("{p}.ssm_a"))?, c.k_heads, c.v_heads, 1);
-                decay.extend(untile(&g.f32s(&format!("{p}.ssm_dt.bias"))?, c.k_heads, c.v_heads, 1));
+                decay.extend(untile(
+                    &g.f32s(&format!("{p}.ssm_dt.bias"))?,
+                    c.k_heads,
+                    c.v_heads,
+                    1,
+                ));
                 let decay = l.buffer(decay);
                 let norm = l.buffer(g.f32s(&format!("{p}.ssm_norm.weight"))?);
                 slots += 1;
@@ -337,7 +370,11 @@ impl<D: Device> Model<D> {
         if listed != l.rotated {
             return Err("the rotated weights are not the ones the model expects".into());
         }
-        let inverse: Vec<&str> = g.array("prism.hadamard.inverse_weight_names")?.iter().filter_map(|v| v.as_str()).collect();
+        let inverse: Vec<&str> = g
+            .array("prism.hadamard.inverse_weight_names")?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         if inverse != ["token_embd.weight"] {
             return Err("the embedding table is not rotated as the model expects".into());
         }
@@ -347,7 +384,12 @@ impl<D: Device> Model<D> {
         let mut at = 0;
         for width in widths {
             let width = width.as_i64().ok_or("invalid sign width")? as usize;
-            let values: Vec<f32> = values.get(at..at + width).ok_or("too few rotation signs")?.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
+            let values: Vec<f32> = values
+                .get(at..at + width)
+                .ok_or("too few rotation signs")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
             if !values.iter().all(|&s| s == 1.0 || s == -1.0) {
                 return Err("rotation signs must be 1 or -1".into());
             }
@@ -393,7 +435,14 @@ impl<D: Device> Model<D> {
         }
         d.write(&mut s.x, &x);
         // The signs of the rotation for activations of each width.
-        let signs = |width: usize| &self.signs.iter().find(|(w, _)| *w == width).expect("checked at load").1;
+        let signs = |width: usize| {
+            &self
+                .signs
+                .iter()
+                .find(|(w, _)| *w == width)
+                .expect("checked at load")
+                .1
+        };
         d.hadamard(&mut s.x, signs(c.hidden), true);
 
         for layer in &self.layers {
@@ -402,7 +451,16 @@ impl<D: Device> Model<D> {
             // and the recurrent-state projections see them as they are.
             d.rmsnorm_hadamard(&mut s.xh, &s.x, &layer.attn_norm, signs(c.hidden), eps);
             match &layer.mixer {
-                Mixer::Attention { q, gate, k, v, o, q_norm, k_norm, cache } => {
+                Mixer::Attention {
+                    q,
+                    gate,
+                    k,
+                    v,
+                    o,
+                    q_norm,
+                    k_norm,
+                    cache,
+                } => {
                     let q_dim = c.heads * c.head_dim;
                     d.resize(&mut s.q, n * q_dim);
                     d.resize(&mut s.gate, n * q_dim);
@@ -419,12 +477,30 @@ impl<D: Device> Model<D> {
                     d.rope(&mut s.k, &s.rope, pos, c.kv_heads, c.head_dim, c.rot_dim);
                     d.store(&mut s.k_cache[*cache], pos * kv_dim, &s.k);
                     d.store(&mut s.v_cache[*cache], pos * kv_dim, &s.v);
-                    d.attention(&mut s.att, &s.q, &s.k_cache[*cache], &s.v_cache[*cache], pos, c.heads, c.head_dim, c.kv_heads);
+                    d.attention(
+                        &mut s.att,
+                        &s.q,
+                        &s.k_cache[*cache],
+                        &s.v_cache[*cache],
+                        pos,
+                        c.heads,
+                        c.head_dim,
+                        c.kv_heads,
+                    );
                     d.sigmoid_mul(&mut s.att, &s.gate);
                     d.hadamard(&mut s.att, signs(q_dim), false);
                     d.matmul(&mut s.xb, o, &s.att);
                 }
-                Mixer::Linear { qkv, z, ab, conv, decay, norm, out, slot } => {
+                Mixer::Linear {
+                    qkv,
+                    z,
+                    ab,
+                    conv,
+                    decay,
+                    norm,
+                    out,
+                    slot,
+                } => {
                     let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
                     d.resize(&mut s.q, n * k_dim);
                     d.resize(&mut s.k, n * k_dim);
@@ -443,7 +519,18 @@ impl<D: Device> Model<D> {
                     d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
                     d.l2norm(&mut s.q, c.state_dim, eps);
                     d.l2norm(&mut s.k, c.state_dim, eps);
-                    d.delta_net(&mut s.att, &s.q, &s.k, &s.v, &s.ab, decay, &mut s.ssm_state[*slot], c.k_heads, c.v_heads, c.state_dim);
+                    d.delta_net(
+                        &mut s.att,
+                        &s.q,
+                        &s.k,
+                        &s.v,
+                        &s.ab,
+                        decay,
+                        &mut s.ssm_state[*slot],
+                        c.k_heads,
+                        c.v_heads,
+                        c.state_dim,
+                    );
                     d.rmsnorm(&mut s.att, norm, eps);
                     d.silu_mul(&mut s.z, &s.att);
                     d.hadamard(&mut s.z, signs(v_dim), false);
@@ -543,11 +630,22 @@ impl<D: Device> LanguageModel for Model<D> {
         let mut out = Vec::new();
         out.extend_from_slice(STATE_MAGIC);
         out.extend_from_slice(&STATE_VERSION.to_le_bytes());
-        for value in [len, s.k_cache.len(), s.ssm_state.len(), kv_dim, c.conv_width(), c.ssm_width()] {
+        for value in [
+            len,
+            s.k_cache.len(),
+            s.ssm_state.len(),
+            kv_dim,
+            c.conv_width(),
+            c.ssm_width(),
+        ] {
             out.extend_from_slice(&(value as u64).to_le_bytes());
         }
         for cache in s.k_cache.iter().chain(&s.v_cache) {
-            out.extend(d.read_cache(cache, len * kv_dim).iter().flat_map(|v| v.to_le_bytes()));
+            out.extend(
+                d.read_cache(cache, len * kv_dim)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()),
+            );
         }
         for slot in 0..s.ssm_state.len() {
             // The convolution reads the batch before from one buffer of the
@@ -565,7 +663,9 @@ impl<D: Device> LanguageModel for Model<D> {
         let kv_dim = c.kv_heads * c.head_dim;
         let mut at = 0;
         let mut take = |n: usize| -> Result<&[u8]> {
-            let bytes = state.get(at..at + n).ok_or("the saved state is cut short")?;
+            let bytes = state
+                .get(at..at + n)
+                .ok_or("the saved state is cut short")?;
             at += n;
             Ok(bytes)
         };
@@ -580,20 +680,39 @@ impl<D: Device> LanguageModel for Model<D> {
             *value = u64::from_le_bytes(take(8)?.try_into()?) as usize;
         }
         let len = header[0];
-        if header[1..] != [s.k_cache.len(), s.ssm_state.len(), kv_dim, c.conv_width(), c.ssm_width()] {
+        if header[1..]
+            != [
+                s.k_cache.len(),
+                s.ssm_state.len(),
+                kv_dim,
+                c.conv_width(),
+                c.ssm_width(),
+            ]
+        {
             return Err("a saved state of another model".into());
         }
         if len > s.max_len {
-            return Err(format!("a saved state of {len} tokens does not fit in the context").into());
+            return Err(
+                format!("a saved state of {len} tokens does not fit in the context").into(),
+            );
         }
         for cache in s.k_cache.iter_mut().chain(&mut s.v_cache) {
-            let halves: Vec<u16> = take(len * kv_dim * 2)?.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            let halves: Vec<u16> = take(len * kv_dim * 2)?
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
             d.write_cache(cache, &halves);
         }
         for slot in 0..s.ssm_state.len() {
             let [conv, _] = &mut s.conv_state[slot];
-            for (buf, width) in [(conv, c.conv_width()), (&mut s.ssm_state[slot], c.ssm_width())] {
-                let floats: Vec<f32> = take(width * 4)?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            for (buf, width) in [
+                (conv, c.conv_width()),
+                (&mut s.ssm_state[slot], c.ssm_width()),
+            ] {
+                let floats: Vec<f32> = take(width * 4)?
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
                 d.write(buf, &floats);
             }
         }
@@ -605,7 +724,10 @@ impl<D: Device> LanguageModel for Model<D> {
     /// in batches of up to [`BATCH`].
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         assert!(!tokens.is_empty(), "no tokens to run");
-        assert!(pos + tokens.len() <= self.state.max_len, "tokens past the end of the cache");
+        assert!(
+            pos + tokens.len() <= self.state.max_len,
+            "tokens past the end of the cache"
+        );
         let mut logits = Vec::new();
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
             logits = self.forward_batch(batch, pos + i * BATCH);
@@ -672,7 +794,8 @@ impl<D: Device> State<D> {
             v_dim,
             2 * c.v_heads,
         ];
-        let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] = widths.map(|width| d.alloc(BATCH * width));
+        let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] =
+            widths.map(|width| d.alloc(BATCH * width));
         let table = rope_table(max_len, c.rot_dim, c.rope_theta);
         let mut rope = d.alloc(table.len());
         d.write(&mut rope, &table);
@@ -694,11 +817,19 @@ impl<D: Device> State<D> {
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
             logits: d.alloc(c.vocab),
-            k_cache: (0..caches).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
-            v_cache: (0..caches).map(|_| d.alloc_cache(max_len * kv_dim)).collect(),
-            conv_state: (0..slots).map(|_| [d.alloc(conv_width), d.alloc(conv_width)]).collect(),
+            k_cache: (0..caches)
+                .map(|_| d.alloc_cache(max_len * kv_dim))
+                .collect(),
+            v_cache: (0..caches)
+                .map(|_| d.alloc_cache(max_len * kv_dim))
+                .collect(),
+            conv_state: (0..slots)
+                .map(|_| [d.alloc(conv_width), d.alloc(conv_width)])
+                .collect(),
             parity: false,
-            ssm_state: (0..slots).map(|_| d.alloc(c.v_heads * c.state_dim * c.state_dim)).collect(),
+            ssm_state: (0..slots)
+                .map(|_| d.alloc(c.v_heads * c.state_dim * c.state_dim))
+                .collect(),
             rope,
             max_len,
         }
@@ -739,16 +870,23 @@ mod tests {
 
     impl Rng {
         fn next(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         }
 
         fn floats(&mut self, n: usize, scale: f32, offset: f32) -> Vec<u8> {
-            (0..n).flat_map(|_| (self.next() * scale + offset).to_le_bytes()).collect()
+            (0..n)
+                .flat_map(|_| (self.next() * scale + offset).to_le_bytes())
+                .collect()
         }
 
         fn bf16(&mut self, n: usize, scale: f32) -> Vec<u8> {
-            (0..n).flat_map(|_| (((self.next() * scale).to_bits() >> 16) as u16).to_le_bytes()).collect()
+            (0..n)
+                .flat_map(|_| (((self.next() * scale).to_bits() >> 16) as u16).to_le_bytes())
+                .collect()
         }
 
         fn ternary(&mut self, rows: usize, cols: usize, scale: f32) -> Vec<u8> {
@@ -764,7 +902,8 @@ mod tests {
     /// Writes a tiny random model in the file format, four layers of which
     /// the last is full attention.
     fn synthetic(path: &Path) {
-        let (hidden, inter, layers, heads, kv_heads, head_dim, rot_dim) = (1024, 1024, 4, 4, 2, 256, 64);
+        let (hidden, inter, layers, heads, kv_heads, head_dim, rot_dim) =
+            (1024, 1024, 4, 4, 2, 256, 64);
         let (k_heads, v_heads, state_dim, vocab) = (2, 8, 128, 64);
         let (k_dim, v_dim) = (k_heads * state_dim, v_heads * state_dim);
         let mut rng = Rng(42);
@@ -779,18 +918,48 @@ mod tests {
         let mut tern = |name: &str, rows: usize, cols: usize, names: &mut Vec<Value>| {
             names.push(Value::Str(name.to_string()));
             let scale = 1.0 / (cols as f32).sqrt();
-            tensors.push((name.to_string(), vec![cols, rows], gguf::PTQ1_0, rng.ternary(rows, cols, scale)));
+            tensors.push((
+                name.to_string(),
+                vec![cols, rows],
+                gguf::PTQ1_0,
+                rng.ternary(rows, cols, scale),
+            ));
         };
         tern("output.weight", vocab, hidden, &mut names);
         for i in 0..layers {
             let p = format!("blk.{i}");
             if (i + 1) % 4 == 0 {
-                tern(&format!("{p}.attn_q.weight"), heads * head_dim * 2, hidden, &mut names);
-                tern(&format!("{p}.attn_k.weight"), kv_heads * head_dim, hidden, &mut names);
-                tern(&format!("{p}.attn_v.weight"), kv_heads * head_dim, hidden, &mut names);
-                tern(&format!("{p}.attn_output.weight"), hidden, heads * head_dim, &mut names);
+                tern(
+                    &format!("{p}.attn_q.weight"),
+                    heads * head_dim * 2,
+                    hidden,
+                    &mut names,
+                );
+                tern(
+                    &format!("{p}.attn_k.weight"),
+                    kv_heads * head_dim,
+                    hidden,
+                    &mut names,
+                );
+                tern(
+                    &format!("{p}.attn_v.weight"),
+                    kv_heads * head_dim,
+                    hidden,
+                    &mut names,
+                );
+                tern(
+                    &format!("{p}.attn_output.weight"),
+                    hidden,
+                    heads * head_dim,
+                    &mut names,
+                );
             } else {
-                tern(&format!("{p}.attn_qkv.weight"), 2 * k_dim + v_dim, hidden, &mut names);
+                tern(
+                    &format!("{p}.attn_qkv.weight"),
+                    2 * k_dim + v_dim,
+                    hidden,
+                    &mut names,
+                );
                 tern(&format!("{p}.attn_gate.weight"), v_dim, hidden, &mut names);
                 tern(&format!("{p}.ssm_out.weight"), hidden, v_dim, &mut names);
             }
@@ -799,23 +968,83 @@ mod tests {
             tern(&format!("{p}.ffn_down.weight"), hidden, inter, &mut names);
         }
         let mut rng = Rng(7);
-        tensors.push(("token_embd.weight".into(), vec![hidden, vocab], gguf::PTQ1_0, rng.ternary(vocab, hidden, 0.5)));
-        tensors.push(("output_norm.weight".into(), vec![hidden], gguf::F32, rng.floats(hidden, 0.1, 1.0)));
+        tensors.push((
+            "token_embd.weight".into(),
+            vec![hidden, vocab],
+            gguf::PTQ1_0,
+            rng.ternary(vocab, hidden, 0.5),
+        ));
+        tensors.push((
+            "output_norm.weight".into(),
+            vec![hidden],
+            gguf::F32,
+            rng.floats(hidden, 0.1, 1.0),
+        ));
         for i in 0..layers {
             let p = format!("blk.{i}");
-            tensors.push((format!("{p}.attn_norm.weight"), vec![hidden], gguf::F32, rng.floats(hidden, 0.1, 1.0)));
-            tensors.push((format!("{p}.post_attention_norm.weight"), vec![hidden], gguf::F32, rng.floats(hidden, 0.1, 1.0)));
+            tensors.push((
+                format!("{p}.attn_norm.weight"),
+                vec![hidden],
+                gguf::F32,
+                rng.floats(hidden, 0.1, 1.0),
+            ));
+            tensors.push((
+                format!("{p}.post_attention_norm.weight"),
+                vec![hidden],
+                gguf::F32,
+                rng.floats(hidden, 0.1, 1.0),
+            ));
             if (i + 1) % 4 == 0 {
-                tensors.push((format!("{p}.attn_q_norm.weight"), vec![head_dim], gguf::F32, rng.floats(head_dim, 0.1, 1.0)));
-                tensors.push((format!("{p}.attn_k_norm.weight"), vec![head_dim], gguf::F32, rng.floats(head_dim, 0.1, 1.0)));
+                tensors.push((
+                    format!("{p}.attn_q_norm.weight"),
+                    vec![head_dim],
+                    gguf::F32,
+                    rng.floats(head_dim, 0.1, 1.0),
+                ));
+                tensors.push((
+                    format!("{p}.attn_k_norm.weight"),
+                    vec![head_dim],
+                    gguf::F32,
+                    rng.floats(head_dim, 0.1, 1.0),
+                ));
             } else {
-                tensors.push((format!("{p}.ssm_alpha.weight"), vec![hidden, v_heads], gguf::BF16, rng.bf16(v_heads * hidden, 0.05)));
-                tensors.push((format!("{p}.ssm_beta.weight"), vec![hidden, v_heads], gguf::BF16, rng.bf16(v_heads * hidden, 0.05)));
+                tensors.push((
+                    format!("{p}.ssm_alpha.weight"),
+                    vec![hidden, v_heads],
+                    gguf::BF16,
+                    rng.bf16(v_heads * hidden, 0.05),
+                ));
+                tensors.push((
+                    format!("{p}.ssm_beta.weight"),
+                    vec![hidden, v_heads],
+                    gguf::BF16,
+                    rng.bf16(v_heads * hidden, 0.05),
+                ));
                 let channels = 2 * k_dim + v_dim;
-                tensors.push((format!("{p}.ssm_conv1d.weight"), vec![CONV_KERNEL, channels], gguf::F32, rng.floats(channels * CONV_KERNEL, 0.5, 0.0)));
-                tensors.push((format!("{p}.ssm_a"), vec![v_heads], gguf::F32, rng.floats(v_heads, 0.5, -0.6)));
-                tensors.push((format!("{p}.ssm_dt.bias"), vec![v_heads], gguf::F32, rng.floats(v_heads, 2.0, 0.0)));
-                tensors.push((format!("{p}.ssm_norm.weight"), vec![state_dim], gguf::F32, rng.floats(state_dim, 0.1, 1.0)));
+                tensors.push((
+                    format!("{p}.ssm_conv1d.weight"),
+                    vec![CONV_KERNEL, channels],
+                    gguf::F32,
+                    rng.floats(channels * CONV_KERNEL, 0.5, 0.0),
+                ));
+                tensors.push((
+                    format!("{p}.ssm_a"),
+                    vec![v_heads],
+                    gguf::F32,
+                    rng.floats(v_heads, 0.5, -0.6),
+                ));
+                tensors.push((
+                    format!("{p}.ssm_dt.bias"),
+                    vec![v_heads],
+                    gguf::F32,
+                    rng.floats(v_heads, 2.0, 0.0),
+                ));
+                tensors.push((
+                    format!("{p}.ssm_norm.weight"),
+                    vec![state_dim],
+                    gguf::F32,
+                    rng.floats(state_dim, 0.1, 1.0),
+                ));
             }
         }
         let n = |v: usize| Value::U32(v as u32);
@@ -839,13 +1068,22 @@ mod tests {
             ("qwen35.full_attention_interval", n(4)),
             ("prism.hadamard.version", n(1)),
             ("prism.hadamard.block_size", n(HADAMARD_BLOCK)),
-            ("prism.hadamard.transform", Value::Str("normalized-sylvester-walsh-hadamard".into())),
-            ("prism.hadamard.axis", Value::Str("input-last-dimension".into())),
+            (
+                "prism.hadamard.transform",
+                Value::Str("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                Value::Str("input-last-dimension".into()),
+            ),
             ("prism.hadamard.sign_mode", Value::Str("explicit".into())),
             ("prism.hadamard.weight_names", Value::Array(names)),
             ("prism.hadamard.sign_widths", Value::Array(vec![n(hidden)])),
             ("prism.hadamard.sign_values", Value::Array(signs)),
-            ("prism.hadamard.inverse_weight_names", Value::Array(vec![Value::Str("token_embd.weight".into())])),
+            (
+                "prism.hadamard.inverse_weight_names",
+                Value::Array(vec![Value::Str("token_embd.weight".into())]),
+            ),
             ("prism.hadamard.gdn_v_grouped", Value::Bool(true)),
         ];
         gguf::write(path, &meta, &tensors).unwrap();
@@ -915,7 +1153,9 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir().unwrap().join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        let path = dirs::cache_dir()
+            .unwrap()
+            .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;
@@ -933,26 +1173,40 @@ mod tests {
         let mut text = Vec::new();
         let start = std::time::Instant::now();
         let mut logits = model.forward(&tokens, 0);
-        eprintln!("prompt: {:.1} tok/s", tokens.len() as f32 / start.elapsed().as_secs_f32());
+        eprintln!(
+            "prompt: {:.1} tok/s",
+            tokens.len() as f32 / start.elapsed().as_secs_f32()
+        );
         let start = std::time::Instant::now();
         for _ in 0..decode {
-            let next = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+            let next = (0..logits.len())
+                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                .unwrap() as u32;
             text.extend_from_slice(tokenizer.decode(next));
             tokens.push(next);
             logits = model.forward(&tokens[tokens.len() - 1..], tokens.len() - 1);
         }
-        eprintln!("decode: {:.1} tok/s over {decode} tokens", decode as f32 / start.elapsed().as_secs_f32());
+        eprintln!(
+            "decode: {:.1} tok/s over {decode} tokens",
+            decode as f32 / start.elapsed().as_secs_f32()
+        );
         let text = String::from_utf8_lossy(&text);
         eprintln!("completion: {text:?}");
         assert!(text.starts_with(" Paris."), "{text:?}");
         // A long prompt, carrying on from the completion, for the speed of
         // the batch kernels at their size.
-        let passage = "The quick brown fox jumps over the lazy dog while the river runs to the sea. ".repeat(20);
+        let passage =
+            "The quick brown fox jumps over the lazy dog while the river runs to the sea. "
+                .repeat(20);
         let mut long = tokenizer.encode(&passage).unwrap();
         long.truncate(model.max_len() - tokens.len());
         let start = std::time::Instant::now();
         model.forward(&long, tokens.len());
-        eprintln!("long prompt: {:.1} tok/s over {} tokens", long.len() as f32 / start.elapsed().as_secs_f32(), long.len());
+        eprintln!(
+            "long prompt: {:.1} tok/s over {} tokens",
+            long.len() as f32 / start.elapsed().as_secs_f32(),
+            long.len()
+        );
     }
 
     #[test]

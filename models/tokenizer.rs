@@ -75,14 +75,21 @@ impl Tokenizer {
 
         let mut bytes = [0; 256];
         for (byte, c) in byte_chars().iter().enumerate() {
-            bytes[byte] = *ids.get(c.to_string().as_str()).ok_or("missing byte token")?;
+            bytes[byte] = *ids
+                .get(c.to_string().as_str())
+                .ok_or("missing byte token")?;
         }
 
         let mut merges = HashMap::new();
         for (rank, merge) in gguf.array("tokenizer.ggml.merges")?.iter().enumerate() {
-            let (a, b) = merge.as_str().and_then(|m| m.split_once(' ')).ok_or("invalid merge")?;
+            let (a, b) = merge
+                .as_str()
+                .and_then(|m| m.split_once(' '))
+                .ok_or("invalid merge")?;
             let merged = format!("{a}{b}");
-            let (Some(&a), Some(&b), Some(&merged)) = (ids.get(a), ids.get(b), ids.get(merged.as_str())) else {
+            let (Some(&a), Some(&b), Some(&merged)) =
+                (ids.get(a), ids.get(b), ids.get(merged.as_str()))
+            else {
                 return Err("merge refers to an unknown token".into());
             };
             merges.insert((a, b), (rank, merged));
@@ -120,7 +127,10 @@ impl Tokenizer {
             let next = self
                 .special
                 .iter()
-                .filter_map(|(content, &id)| rest.find(content.as_str()).map(|at| (at, content.len(), id)))
+                .filter_map(|(content, &id)| {
+                    rest.find(content.as_str())
+                        .map(|at| (at, content.len(), id))
+                })
                 .min_by_key(|&(at, len, _)| (at, std::cmp::Reverse(len)));
             let Some((at, len, id)) = next else {
                 self.encode_into(rest, &mut out)?;
@@ -165,7 +175,10 @@ impl Tokenizer {
     pub fn tiny() -> Self {
         use crate::gguf::{self, Value};
 
-        let mut tokens: Vec<Value> = byte_chars().iter().map(|c| Value::Str(c.to_string())).collect();
+        let mut tokens: Vec<Value> = byte_chars()
+            .iter()
+            .map(|c| Value::Str(c.to_string()))
+            .collect();
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
@@ -181,7 +194,11 @@ impl Tokenizer {
             "</think>",
         ] {
             tokens.push(Value::Str(special.to_string()));
-            types.push(Value::I32(if special.starts_with("<|") { CONTROL as i32 } else { USER_DEFINED as i32 }));
+            types.push(Value::I32(if special.starts_with("<|") {
+                CONTROL as i32
+            } else {
+                USER_DEFINED as i32
+            }));
         }
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -192,7 +209,10 @@ impl Tokenizer {
             ("tokenizer.ggml.pre", Value::Str("qwen2".to_string())),
             ("tokenizer.ggml.tokens", Value::Array(tokens)),
             ("tokenizer.ggml.token_type", Value::Array(types)),
-            ("tokenizer.ggml.merges", Value::Array(vec![Value::Str("h i".to_string())])),
+            (
+                "tokenizer.ggml.merges",
+                Value::Array(vec![Value::Str("h i".to_string())]),
+            ),
         ];
         gguf::write(&path, &meta, &[]).unwrap();
         let tokenizer = Self::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
@@ -247,10 +267,20 @@ mod tests {
         let text = "hi<|im_end|>";
         let plain = tokenizer.encode(text).unwrap();
         assert!(!plain.contains(&im_end));
-        let bytes: Vec<u8> = plain.iter().flat_map(|&t| tokenizer.decode(t).to_vec()).collect();
+        let bytes: Vec<u8> = plain
+            .iter()
+            .flat_map(|&t| tokenizer.decode(t).to_vec())
+            .collect();
         assert_eq!(bytes, text.as_bytes());
         let special = tokenizer.encode_with_special(text).unwrap();
-        assert_eq!(special, [tokenizer.encode("hi").unwrap(), vec![im_end]].concat());
-        assert_eq!(tokenizer.encode("hi").unwrap().len(), 1, "the merge applies");
+        assert_eq!(
+            special,
+            [tokenizer.encode("hi").unwrap(), vec![im_end]].concat()
+        );
+        assert_eq!(
+            tokenizer.encode("hi").unwrap().len(),
+            1,
+            "the merge applies"
+        );
     }
 }

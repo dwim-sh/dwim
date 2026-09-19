@@ -16,7 +16,8 @@ use objc2::{
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
 use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
@@ -104,7 +105,9 @@ impl Metal {
         let name = device.name().to_string();
         let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
 
-        let kernel = |name: &str, source: &str| -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
+        let kernel = |name: &str,
+                      source: &str|
+         -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
             let library = device
                 .newLibraryWithSource_options_error(&NSString::from_str(source), None)
                 .map_err(|e| format!("{name}.metal: {}", e.localizedDescription()))?;
@@ -187,7 +190,11 @@ impl Metal {
             for (i, &buf) in buffers.iter().enumerate() {
                 encoder.setBuffer_offset_atIndex(Some(buf), 0, i);
             }
-            encoder.setBytes_length_atIndex(NonNull::from(params).cast(), size_of::<P>(), buffers.len());
+            encoder.setBytes_length_atIndex(
+                NonNull::from(params).cast(),
+                size_of::<P>(),
+                buffers.len(),
+            );
         }
         let size = |width| MTLSize {
             width,
@@ -204,7 +211,9 @@ impl Metal {
         // than when the thread exits.
         autoreleasepool(|_| {
             let cmd = self.queue.commandBuffer().expect("no Metal command buffer");
-            let encoder = cmd.computeCommandEncoder().expect("no Metal compute encoder");
+            let encoder = cmd
+                .computeCommandEncoder()
+                .expect("no Metal compute encoder");
             Pending { cmd, encoder }
         })
     }
@@ -320,8 +329,12 @@ impl Device for Metal {
     fn upload(&self, tensor: Tensor) -> Weight {
         let (shape, bytes, ternary) = match &tensor {
             Tensor::Bf16 { shape, data } => {
-                assert!(data.len().is_multiple_of(8), "weights must come in multiples of eight");
-                let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
+                assert!(
+                    data.len().is_multiple_of(8),
+                    "weights must come in multiples of eight"
+                );
+                let bytes =
+                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
                 (shape, bytes, false)
             }
             Tensor::Ternary { shape, data } => {
@@ -331,7 +344,11 @@ impl Device for Metal {
         };
         let buf = unsafe {
             self.device
-                .newBufferWithBytes_length_options(NonNull::from(bytes).cast(), bytes.len(), MTLResourceOptions::StorageModeShared)
+                .newBufferWithBytes_length_options(
+                    NonNull::from(bytes).cast(),
+                    bytes.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
                 .expect("out of GPU memory")
         };
         Weight {
@@ -357,23 +374,42 @@ impl Device for Metal {
     }
 
     fn resize(&self, buf: &mut Buffer, len: usize) {
-        assert!(len <= buf.cap, "a buffer of {} activations can't hold {len}", buf.cap);
+        assert!(
+            len <= buf.cap,
+            "a buffer of {} activations can't hold {len}",
+            buf.cap
+        );
         buf.len = len;
     }
 
     fn read(&self, buf: &Buffer) -> Vec<f32> {
         self.flush();
-        unsafe { slice::from_raw_parts(buf.buf.contents().as_ptr().cast::<f32>(), buf.len).to_vec() }
+        unsafe {
+            slice::from_raw_parts(buf.buf.contents().as_ptr().cast::<f32>(), buf.len).to_vec()
+        }
     }
 
     fn write(&self, buf: &mut Buffer, data: &[f32]) {
         assert_eq!(buf.len, data.len());
         // The pending commands may use what the buffer holds now.
         self.flush();
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.buf.contents().as_ptr().cast(), data.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buf.buf.contents().as_ptr().cast(),
+                data.len(),
+            )
+        };
     }
 
-    fn copy(&self, dst: &mut Buffer, dst_offset: usize, src: &Buffer, src_offset: usize, len: usize) {
+    fn copy(
+        &self,
+        dst: &mut Buffer,
+        dst_offset: usize,
+        src: &Buffer,
+        src_offset: usize,
+        len: usize,
+    ) {
         assert!(dst_offset + len <= dst.len && src_offset + len <= src.len);
         let params = CopyParams {
             dst_offset: dst_offset as u32,
@@ -381,7 +417,13 @@ impl Device for Metal {
             len: len as u32,
         };
         let groups = len.div_ceil(THREADS);
-        self.dispatch(&self.kernels.copy, &[&dst.buf, &src.buf], &params, groups, THREADS);
+        self.dispatch(
+            &self.kernels.copy,
+            &[&dst.buf, &src.buf],
+            &params,
+            groups,
+            THREADS,
+        );
     }
 
     fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
@@ -391,7 +433,13 @@ impl Device for Metal {
             len: src.len as u32,
         };
         let groups = src.len.div_ceil(THREADS);
-        self.dispatch(&self.kernels.store_halves, &[&cache.buf, &src.buf], &params, groups, THREADS);
+        self.dispatch(
+            &self.kernels.store_halves,
+            &[&cache.buf, &src.buf],
+            &params,
+            groups,
+            THREADS,
+        );
     }
 
     fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
@@ -404,7 +452,13 @@ impl Device for Metal {
         assert!(data.len() <= cache.len);
         // The pending commands may use what the cache holds now.
         self.flush();
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), cache.buf.contents().as_ptr().cast(), data.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                cache.buf.contents().as_ptr().cast(),
+                data.len(),
+            )
+        };
     }
 
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
@@ -422,35 +476,79 @@ impl Device for Metal {
         // batch of tokens is worth unpacking the ternary weights once for
         // several.
         let (kernel, per_group) = if w.ternary && n > 1 {
-            (&self.kernels.matmul_ternary_batch, self.matmul_rows * TERNARY_ROWS)
+            (
+                &self.kernels.matmul_ternary_batch,
+                self.matmul_rows * TERNARY_ROWS,
+            )
         } else if w.ternary {
-            (&self.kernels.matmul_ternary, self.matmul_rows * TERNARY_ROWS)
+            (
+                &self.kernels.matmul_ternary,
+                self.matmul_rows * TERNARY_ROWS,
+            )
         } else {
             (&self.kernels.matmul_bf16, self.matmul_rows)
         };
-        self.dispatch(kernel, &[&out.buf, &w.buf, &x.buf], &params, rows.div_ceil(per_group), THREADS);
+        self.dispatch(
+            kernel,
+            &[&out.buf, &w.buf, &x.buf],
+            &params,
+            rows.div_ceil(per_group),
+            THREADS,
+        );
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
         assert_eq!(x.len, y.len);
         let params = LenParams { len: x.len as u32 };
-        self.dispatch(&self.kernels.add, &[&x.buf, &y.buf], &params, x.len.div_ceil(THREADS), THREADS);
+        self.dispatch(
+            &self.kernels.add,
+            &[&x.buf, &y.buf],
+            &params,
+            x.len.div_ceil(THREADS),
+            THREADS,
+        );
     }
 
     fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
         let dim = weight.len;
         assert_eq!(x.len % dim, 0);
-        let params = RmsnormParams { dim: dim as u32, eps };
-        self.dispatch(&self.kernels.rmsnorm, &[&x.buf, &weight.buf], &params, x.len / dim, THREADS);
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
+        self.dispatch(
+            &self.kernels.rmsnorm,
+            &[&x.buf, &weight.buf],
+            &params,
+            x.len / dim,
+            THREADS,
+        );
     }
 
     fn l2norm(&self, x: &mut Buffer, dim: usize, eps: f32) {
         assert_eq!(x.len % dim, 0);
-        let params = RmsnormParams { dim: dim as u32, eps };
-        self.dispatch(&self.kernels.l2norm, &[&x.buf], &params, x.len / dim, THREADS);
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
+        self.dispatch(
+            &self.kernels.l2norm,
+            &[&x.buf],
+            &params,
+            x.len / dim,
+            THREADS,
+        );
     }
 
-    fn rope(&self, x: &mut Buffer, table: &Buffer, pos: usize, n_heads: usize, head_dim: usize, rot_dim: usize) {
+    fn rope(
+        &self,
+        x: &mut Buffer,
+        table: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rot_dim: usize,
+    ) {
         let n = x.len / (n_heads * head_dim);
         assert_eq!(x.len, n * n_heads * head_dim);
         assert!(rot_dim <= head_dim && rot_dim.is_multiple_of(2));
@@ -462,7 +560,13 @@ impl Device for Metal {
             n: n as u32,
         };
         let groups = (n * n_heads * rot_dim / 2).div_ceil(THREADS);
-        self.dispatch(&self.kernels.rope, &[&x.buf, &table.buf], &params, groups, THREADS);
+        self.dispatch(
+            &self.kernels.rope,
+            &[&x.buf, &table.buf],
+            &params,
+            groups,
+            THREADS,
+        );
     }
 
     fn attention(
@@ -483,7 +587,10 @@ impl Device for Metal {
         // Every token's heads get a row of scores as long as the last token
         // attends over, as many tokens to a dispatch as the scores fit.
         let stride = pos + n;
-        assert!(n_heads * stride <= SCORES, "attention over {stride} positions needs more scores than {SCORES}");
+        assert!(
+            n_heads * stride <= SCORES,
+            "attention over {stride} positions needs more scores than {SCORES}"
+        );
         let per_dispatch = SCORES / (n_heads * stride);
         for first in (0..n).step_by(per_dispatch) {
             let params = AttentionParams {
@@ -506,16 +613,30 @@ impl Device for Metal {
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {
         assert_eq!(gate.len, up.len);
-        let params = LenParams { len: gate.len as u32 };
+        let params = LenParams {
+            len: gate.len as u32,
+        };
         let groups = gate.len.div_ceil(THREADS);
-        self.dispatch(&self.kernels.silu_mul, &[&gate.buf, &up.buf], &params, groups, THREADS);
+        self.dispatch(
+            &self.kernels.silu_mul,
+            &[&gate.buf, &up.buf],
+            &params,
+            groups,
+            THREADS,
+        );
     }
 
     fn sigmoid_mul(&self, x: &mut Buffer, gate: &Buffer) {
         assert_eq!(x.len, gate.len);
         let params = LenParams { len: x.len as u32 };
         let groups = x.len.div_ceil(THREADS);
-        self.dispatch(&self.kernels.sigmoid_mul, &[&x.buf, &gate.buf], &params, groups, THREADS);
+        self.dispatch(
+            &self.kernels.sigmoid_mul,
+            &[&x.buf, &gate.buf],
+            &params,
+            groups,
+            THREADS,
+        );
     }
 
     fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
@@ -525,15 +646,37 @@ impl Device for Metal {
             width: width as u32,
             inverse: inverse as u32,
         };
-        self.dispatch(&self.kernels.hadamard, &[&x.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
+        self.dispatch(
+            &self.kernels.hadamard,
+            &[&x.buf, &signs.buf],
+            &params,
+            x.len / HADAMARD_BLOCK,
+            THREADS,
+        );
     }
 
-    fn rmsnorm_hadamard(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, signs: &Buffer, eps: f32) {
+    fn rmsnorm_hadamard(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        weight: &Buffer,
+        signs: &Buffer,
+        eps: f32,
+    ) {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
-        let params = RmsnormParams { dim: width as u32, eps };
-        self.dispatch(&self.kernels.rmsnorm_hadamard, &[&out.buf, &x.buf, &weight.buf, &signs.buf], &params, x.len / HADAMARD_BLOCK, THREADS);
+        let params = RmsnormParams {
+            dim: width as u32,
+            eps,
+        };
+        self.dispatch(
+            &self.kernels.rmsnorm_hadamard,
+            &[&out.buf, &x.buf, &weight.buf, &signs.buf],
+            &params,
+            x.len / HADAMARD_BLOCK,
+            THREADS,
+        );
     }
 
     fn conv(
@@ -558,8 +701,22 @@ impl Device for Metal {
             q_dim: q_dim as u32,
             k_dim: k_dim as u32,
         };
-        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [&q.buf, &k.buf, &v.buf, &state_out.buf, &x.buf, &state.buf, &weight.buf];
-        self.dispatch(&self.kernels.conv, &buffers, &params, (n * channels).div_ceil(THREADS), THREADS);
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
+            &q.buf,
+            &k.buf,
+            &v.buf,
+            &state_out.buf,
+            &x.buf,
+            &state.buf,
+            &weight.buf,
+        ];
+        self.dispatch(
+            &self.kernels.conv,
+            &buffers,
+            &params,
+            (n * channels).div_ceil(THREADS),
+            THREADS,
+        );
     }
 
     fn delta_net(
@@ -587,8 +744,16 @@ impl Device for Metal {
             n_v_heads: n_v_heads as u32,
             head_dim: head_dim as u32,
         };
-        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [&out.buf, &q.buf, &k.buf, &v.buf, &gates.buf, &decay.buf, &state.buf];
-        self.dispatch(&self.kernels.delta_net, &buffers, &params, n_v_heads, THREADS);
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
+            &out.buf, &q.buf, &k.buf, &v.buf, &gates.buf, &decay.buf, &state.buf,
+        ];
+        self.dispatch(
+            &self.kernels.delta_net,
+            &buffers,
+            &params,
+            n_v_heads,
+            THREADS,
+        );
     }
 }
 

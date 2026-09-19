@@ -72,21 +72,61 @@ mod tests {
     #[test]
     fn runs_the_tool_named() {
         let mut tools = Tools::new();
-        assert_eq!(tools.run(&call(r#"{"name": "bash", "arguments": {"command": "echo hi"}}"#)), "hi\n[exit code 0]");
-        let read = tools.run(&call(r#"{"name": "read", "arguments": {"path": "Cargo.toml"}}"#));
+        assert_eq!(
+            tools.run(&call(
+                r#"{"name": "bash", "arguments": {"command": "echo hi"}}"#
+            )),
+            "hi\n[exit code 0]"
+        );
+        let read = tools.run(&call(
+            r#"{"name": "read", "arguments": {"path": "Cargo.toml"}}"#,
+        ));
         assert!(read.starts_with("1\t[package]\n"), "{read}");
-        assert!(tools.run(&call(r#"{"name": "rm", "arguments": {}}"#)).starts_with("error: unknown tool"));
-        assert!(tools.run(&call(r#"{"name": "bash", "arguments": {}}"#)).starts_with("error: bash needs"));
-        assert!(tools.run(&call(r#"{"name": "read", "arguments": {}}"#)).starts_with("error: read needs"));
+        assert!(
+            tools
+                .run(&call(r#"{"name": "rm", "arguments": {}}"#))
+                .starts_with("error: unknown tool")
+        );
+        assert!(
+            tools
+                .run(&call(r#"{"name": "bash", "arguments": {}}"#))
+                .starts_with("error: bash needs")
+        );
+        assert!(
+            tools
+                .run(&call(r#"{"name": "read", "arguments": {}}"#))
+                .starts_with("error: read needs")
+        );
     }
 
     #[test]
     fn describes_calls() {
-        assert_eq!(describe(&call(r#"{"name": "bash", "arguments": {"command": "ls -l"}}"#)), "ls -l");
-        assert_eq!(describe(&call(r#"{"name": "read", "arguments": {"path": "a.rs"}}"#)), "a.rs");
-        assert_eq!(describe(&call(r#"{"name": "read", "arguments": {"path": "a.rs", "start": 201}}"#)), "a.rs from line 201");
-        assert_eq!(describe(&call("<function=read>\n<parameter=path>\na.rs\n</parameter>\n<parameter=start>\n201\n</parameter>\n</function>")), "a.rs from line 201");
-        assert_eq!(describe(&call(r#"{"name": "other", "arguments": {"x": 1}}"#)), r#"{"x":1}"#);
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "bash", "arguments": {"command": "ls -l"}}"#
+            )),
+            "ls -l"
+        );
+        assert_eq!(
+            describe(&call(r#"{"name": "read", "arguments": {"path": "a.rs"}}"#)),
+            "a.rs"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": 201}}"#
+            )),
+            "a.rs from line 201"
+        );
+        assert_eq!(
+            describe(&call(
+                "<function=read>\n<parameter=path>\na.rs\n</parameter>\n<parameter=start>\n201\n</parameter>\n</function>"
+            )),
+            "a.rs from line 201"
+        );
+        assert_eq!(
+            describe(&call(r#"{"name": "other", "arguments": {"x": 1}}"#)),
+            r#"{"x":1}"#
+        );
     }
 
     #[test]
