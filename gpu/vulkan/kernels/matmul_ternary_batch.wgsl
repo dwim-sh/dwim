@@ -1,9 +1,15 @@
 // out[t][r] = w[r] · x[t] for ternary weights and a batch of tokens: as
-// `matmul_ternary.wgsl`, but taking the tokens four at a time, so that a
-// block is unpacked once per four tokens rather than once per token. A
-// last, shorter group of tokens has zero activations for the ones it
-// lacks, and costs the same. The weights are stored block-major, as
-// `matmul_ternary.wgsl` describes.
+// `matmul_ternary.wgsl`, one workgroup per eight rows in eight groups of
+// eight threads, each group taking every eighth block and each thread a
+// word of it, looked up byte by byte in the table of trits, but for eight
+// tokens at once, with their activations already half floats packed two
+// tokens to a word by `pack_halves.wgsl`, which halves what a workgroup
+// reads; the products are summed in single precision, which keeps a batch
+// as close to the CPU as the tile kernel, where summing them as halves
+// would not. A batch of more than eight tokens takes a row of the grid
+// per eight, each reading the weights once for its eight, which is what
+// makes a batch cheaper than decoding its tokens one by one; a batch of
+// many goes through `matmul_ternary_tile.wgsl` instead.
 
 struct Params {
     rows: u32,
@@ -12,45 +18,55 @@ struct Params {
     // Workgroups per row of the dispatch grid, for matrices with more rows
     // than one dimension of the grid allows.
     stride: u32,
-    // Column splits, which only the tile kernel takes.
-    splits: u32,
 }
 
 var<immediate> p: Params;
 
 @group(0) @binding(0) var<storage, read_write> out: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<u32>;
-@group(0) @binding(2) var<storage, read> x: array<vec4<f32>>;
+// The activations as `pack_halves.wgsl` lays them out: a group of eight
+// tokens' four pairs of each element as one vector, a group after another.
+@group(0) @binding(2) var<storage, read> x: array<vec4<u32>>;
 
-// Rows per workgroup, and tokens taken at once.
+// Threads, rows and tokens per workgroup.
+const THREADS: u32 = 64u;
 const ROWS: u32 = 8u;
-const TOKENS: u32 = 4u;
+const TOKENS: u32 = 8u;
 
 // Words per block: 28 bytes.
 const WORDS: u32 = 7u;
 
-var<workgroup> partial: array<f32, 32>;
+// Each subgroup's sums of the rows and tokens, for the workgroup to add up.
+var<workgroup> partial: array<f32, 4u * ROWS * TOKENS>;
 
-// The four bytes of a word as two pairs in 16-bit halves, so that tripling
-// them does not carry between bytes.
-struct Split {
-    even: u32,
-    odd: u32,
+// The trits of each byte value, as `matmul_ternary.wgsl` builds them.
+var<workgroup> table: array<vec4<u32>, 256>;
+
+fn build(lid: u32) {
+    for (var v = lid; v < 256u; v += THREADS) {
+        var q = v;
+        var t: array<f32, 5>;
+        for (var n = 0u; n < 5u; n++) {
+            t[n] = f32((q * 3u) >> 8u) - 1.0;
+            q = (q * 3u) & 0xffu;
+        }
+        table[v] = vec4(pack2x16float(vec2(t[0], t[1])), pack2x16float(vec2(t[2], t[3])), pack2x16float(vec2(t[4], 0.0)), 0u);
+    }
 }
 
-fn split(word: u32) -> Split {
-    return Split(word & 0x00ff00ffu, (word >> 8u) & 0x00ff00ffu);
+// The element of a block that trit `n` of byte `i` of word `j` belongs to.
+fn element(j: u32, i: u32, n: u32) -> u32 {
+    if j < 4u {
+        return 4u * j + i + 16u * n;
+    } else if j < 6u {
+        return 80u + 4u * (j - 4u) + i + 8u * n;
+    }
+    return 120u + i + 2u * n;
 }
 
-// Peels the most significant trit off each of the four bytes, as 0, 1, or
-// 2, in the bytes' order: one more than the weight, which is taken off the
-// sum at the end.
-fn peel(s: ptr<function, Split>) -> vec4<f32> {
-    let even = (*s).even * 3u;
-    let odd = (*s).odd * 3u;
-    (*s).even = even & 0x00ff00ffu;
-    (*s).odd = odd & 0x00ff00ffu;
-    return vec4(f32((even >> 8u) & 0xffu), f32((odd >> 8u) & 0xffu), f32(even >> 24u), f32(odd >> 24u));
+// The four pairs of tokens of an element.
+fn pairs(v: vec4<u32>) -> array<vec2<f32>, 4> {
+    return array(unpack2x16float(v.x), unpack2x16float(v.y), unpack2x16float(v.z), unpack2x16float(v.w));
 }
 
 @compute @workgroup_size(64)
@@ -61,100 +77,100 @@ fn main(
     @builtin(num_subgroups) nsg: u32,
     @builtin(subgroup_invocation_id) sinv: u32,
 ) {
-    let r0 = (wg.y * p.stride + wg.x) * ROWS;
+    let token_groups = (p.n + TOKENS - 1u) / TOKENS;
+    let r0 = ((wg.y / token_groups) * p.stride + wg.x) * ROWS;
+    let t0 = (wg.y % token_groups) * TOKENS;
+    // The group's packed activations.
+    let xbase = (wg.y % token_groups) * p.cols;
     let blocks = p.cols / 128u;
+    let groups = THREADS / 8u;
     let group = lid / 8u;
     let j = lid % 8u;
-    // Tokens go four at a time, so that a block is unpacked once for the
-    // four; a last, shorter group has zero activations for the tokens it
-    // lacks.
-    for (var t0 = 0u; t0 < p.n; t0 += TOKENS) {
-        var acc: array<array<f32, TOKENS>, ROWS>;
-        for (var b = group; b < blocks; b += 8u) {
-            // The activations of the word's elements: five vectors, at
-            // stride four for the first four words, two for the next two,
-            // and one for the last.
-            var xs: array<array<vec4<f32>, 5>, TOKENS>;
-            var xsum: array<f32, TOKENS>;
-            for (var k = 0u; k < TOKENS; k++) {
-                if t0 + k < p.n {
-                    let xbase = ((t0 + k) * p.cols + b * 128u) / 4u;
-                    if j < 4u {
-                        for (var n = 0u; n < 5u; n++) {
-                            xs[k][n] = x[xbase + j + 4u * n];
-                            xsum[k] += dot(xs[k][n], vec4(1.0));
-                        }
-                    } else if j < 6u {
-                        for (var n = 0u; n < 5u; n++) {
-                            xs[k][n] = x[xbase + 20u + (j - 4u) + 2u * n];
-                            xsum[k] += dot(xs[k][n], vec4(1.0));
-                        }
-                    } else if j == 6u {
-                        xs[k][0] = x[xbase + 30u];
-                        xs[k][1] = x[xbase + 31u];
-                        xsum[k] = dot(xs[k][0] + xs[k][1], vec4(1.0));
-                    }
-                }
-            }
-            // Word j of the block of each row, multiplied into the four
-            // tokens' activations, less the trits' offset, times the
-            // block's scale.
-            for (var r = 0u; r < ROWS; r++) {
-                if r0 + r >= p.rows {
-                    continue;
-                }
-                let wbase = (b * p.rows + r0 + r) * WORDS;
-                var sum: array<f32, TOKENS>;
-                for (var k = 0u; k < TOKENS; k++) {
-                    sum[k] = -xsum[k];
-                }
-                if j < 6u {
-                    // Words 0 to 3 hold elements 4j + i + 16n in byte
-                    // 4j + i, and words 4 and 5 elements 80 + 4(j - 4) + i
-                    // + 8n.
-                    var s = split(w[wbase + j]);
-                    for (var n = 0u; n < 5u; n++) {
-                        let trits = peel(&s);
-                        for (var k = 0u; k < TOKENS; k++) {
-                            sum[k] += dot(trits, xs[k][n]);
-                        }
-                    }
-                } else if j == 6u {
-                    // The low two bytes of the last word: byte 24 + i holds
-                    // elements 120 + i + 2n, so each round of the two gives
-                    // half a vector.
-                    var s = split(w[wbase + 6u] & 0xffffu);
-                    for (var n = 0u; n < 2u; n++) {
-                        let a = peel(&s);
-                        let c = peel(&s);
-                        let trits = vec4(a.x, a.y, c.x, c.y);
-                        for (var k = 0u; k < TOKENS; k++) {
-                            sum[k] += dot(trits, xs[k][n]);
-                        }
-                    }
-                }
-                let d = unpack2x16float(w[wbase + 6u]).y;
-                for (var k = 0u; k < TOKENS; k++) {
-                    acc[r][k] += d * sum[k];
-                }
+    build(lid);
+    workgroupBarrier();
+    // The totals over the blocks, a row's tokens each, in single precision.
+    var acc: array<array<f32, TOKENS>, ROWS>;
+    for (var b = group; b < blocks; b += groups) {
+        // The activations of the word's elements: byte i's trit n goes with
+        // element(j, i, n), whose four pairs of tokens are one vector.
+        var xs: array<array<array<vec2<f32>, 4>, 4>, 5>;
+        for (var n = 0u; n < 5u; n++) {
+            for (var i = 0u; i < 4u; i++) {
+                xs[n][i] = pairs(x[xbase + b * 128u + element(min(j, 6u), i, n)]);
             }
         }
-        for (var k = 0u; k < TOKENS; k++) {
-            for (var r = 0u; r < ROWS; r++) {
-                let s = subgroupAdd(acc[r][k]);
-                if sinv == 0u {
-                    partial[sid * ROWS + r] = s;
+        // The words of all eight rows first, so that their loads are in
+        // flight together. A row past the matrix reads the last row
+        // instead, in bounds, and its sum goes nowhere. The scale is in
+        // the last word, which the group's seventh lane has.
+        var words: array<u32, ROWS>;
+        var scales: array<f32, ROWS>;
+        for (var r = 0u; r < ROWS; r++) {
+            let wbase = (b * p.rows + min(r0 + r, p.rows - 1u)) * WORDS;
+            words[r] = w[wbase + min(j, 6u)];
+        }
+        for (var r = 0u; r < ROWS; r++) {
+            scales[r] = unpack2x16float(subgroupShuffle(words[r], (sinv & ~7u) + 6u)).y;
+        }
+        for (var r = 0u; r < ROWS; r++) {
+            let word = words[r];
+            // The block's products for the row, a pair of tokens to a sum.
+            var sum: array<vec2<f32>, 4>;
+            if j < 6u {
+                for (var i = 0u; i < 4u; i++) {
+                    let e = table[(word >> (8u * i)) & 0xffu];
+                    let t01 = unpack2x16float(e.x);
+                    let t23 = unpack2x16float(e.y);
+                    let t4 = unpack2x16float(e.z).x;
+                    let trits = array(t01.x, t01.y, t23.x, t23.y, t4);
+                    for (var n = 0u; n < 5u; n++) {
+                        let t = vec2<f32>(trits[n]);
+                        for (var q = 0u; q < 4u; q++) {
+                            sum[q] = fma(t, xs[n][i][q], sum[q]);
+                        }
+                    }
+                }
+            } else if j == 6u {
+                // The low two bytes of the last word hold four trits each.
+                for (var i = 0u; i < 2u; i++) {
+                    let e = table[(word >> (8u * i)) & 0xffu];
+                    let t01 = unpack2x16float(e.x);
+                    let t23 = unpack2x16float(e.y);
+                    let trits = array(t01.x, t01.y, t23.x, t23.y);
+                    for (var n = 0u; n < 4u; n++) {
+                        let t = vec2<f32>(trits[n]);
+                        for (var q = 0u; q < 4u; q++) {
+                            sum[q] = fma(t, xs[n][i][q], sum[q]);
+                        }
+                    }
                 }
             }
-            workgroupBarrier();
-            if lid < ROWS && r0 + lid < p.rows && t0 + k < p.n {
-                var total = 0.0;
-                for (var i = 0u; i < nsg; i++) {
-                    total += partial[i * ROWS + lid];
-                }
-                out[(t0 + k) * p.rows + r0 + lid] = total;
+            for (var q = 0u; q < 4u; q++) {
+                acc[r][2u * q] += scales[r] * sum[q].x;
+                acc[r][2u * q + 1u] += scales[r] * sum[q].y;
             }
-            workgroupBarrier();
+        }
+    }
+    // The groups covered every block between them: each subgroup sums its
+    // lanes, and the workgroup the subgroups.
+    for (var r = 0u; r < ROWS; r++) {
+        for (var t = 0u; t < TOKENS; t++) {
+            let s = subgroupAdd(acc[r][t]);
+            if sinv == 0u {
+                partial[(sid * ROWS + r) * TOKENS + t] = s;
+            }
+        }
+    }
+    workgroupBarrier();
+    if lid < ROWS * TOKENS {
+        let r = lid / TOKENS;
+        let t = lid % TOKENS;
+        if r0 + r < p.rows && t0 + t < p.n {
+            var total = 0.0;
+            for (var i = 0u; i < nsg; i++) {
+                total += partial[(i * ROWS + r) * TOKENS + t];
+            }
+            out[(t0 + t) * p.rows + r0 + r] = total;
         }
     }
 }

@@ -26,8 +26,9 @@ use crate::{
 const STAGING: usize = 64 << 20;
 
 /// Rows of ternary weights one workgroup of the single-token and batch
-/// matmul kernels takes.
+/// matmul kernels takes, and tokens one of the batch kernel takes at once.
 const TERNARY_ROWS: usize = 8;
+const TERNARY_TOKENS: usize = 8;
 /// Rows and tokens of a tile of `matmul_ternary_tile.wgsl`; a batch of at
 /// least half a tile's tokens goes through it.
 const TERNARY_TILE_ROWS: usize = 64;
@@ -41,8 +42,9 @@ const TILE_WORKGROUPS: usize = 80;
 const TILE_SPLITS: usize = 8;
 /// Tokens a workgroup of the bf16 matmul kernel takes at once.
 const BF16_TOKENS: usize = 8;
-/// Most words of packed activations a batch through the tile kernel has,
-/// two tokens to a word: the size of the buffer they are packed into.
+/// Most words of packed activations a batch through the batch or the tile
+/// kernel has, two tokens to a word: the size of the buffer they are
+/// packed into.
 const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
@@ -148,7 +150,7 @@ pub struct Vulkan {
     memory_types: vk::PhysicalDeviceMemoryProperties,
     staging: [Mapped; 2],
     partials: vk::Buffer,
-    /// A batch's activations as half floats, for the tile kernel.
+    /// A batch's activations as half floats, for the batch and tile kernels.
     packed: vk::Buffer,
     max_groups: u32,
     name: String,
@@ -686,6 +688,9 @@ struct DeltaNetParams {
 struct PackParams {
     n: u32,
     cols: u32,
+    /// Pairs of tokens laid out together by column: the four of a group of
+    /// eight tokens for the batch kernel, or all of them for the tile kernel.
+    group: u32,
 }
 
 #[repr(C)]
@@ -829,15 +834,19 @@ impl Device for Vulkan {
         // per tile of rows and tokens, the row tiles across the grid and
         // down it as wide as the GPU allows, and each row of the grid
         // repeated for every tile of tokens.
-        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
-            let pairs = n.div_ceil(2).next_multiple_of(4);
-            assert!(pairs * cols <= PACKED, "a batch of {n} tokens of {cols} is more than the tile kernel packs");
+        let pairs = n.div_ceil(2).next_multiple_of(4);
+        let pack = |group: usize| {
+            assert!(pairs * cols <= PACKED, "a batch of {n} tokens of {cols} is more than the kernels pack");
             let params = PackParams {
                 n: n as u32,
                 cols: cols as u32,
+                group: group as u32,
             };
             let groups = (cols.div_ceil(256) as u32, pairs as u32);
             self.dispatch(self.kernels.pack_halves, &[self.packed, x.buf], &params, groups);
+        };
+        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+            pack(pairs);
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
             let tiles = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
@@ -863,22 +872,26 @@ impl Device for Vulkan {
             }
             return;
         }
-        // One workgroup per row, or per eight rows of ternary weights, in a
-        // grid as wide as the GPU allows. A few tokens are worth unpacking
-        // the ternary weights once for several.
-        let (kernel, per_group) = if w.ternary && n > 1 {
-            (self.kernels.matmul_ternary_batch, TERNARY_ROWS)
+        // One workgroup per row of bf16 weights, or per eight rows of
+        // ternary weights, in a grid as wide as the GPU allows, and the
+        // tokens eight at a time, each group of them a row of the grid. A
+        // few tokens through ternary weights are worth unpacking the
+        // weights once for eight, and go as half floats packed a group of
+        // eight tokens together.
+        let batch = w.ternary && n > 1;
+        if batch {
+            pack(TERNARY_TOKENS / 2);
+        }
+        let (kernel, per_group, tokens, x) = if batch {
+            (self.kernels.matmul_ternary_batch, TERNARY_ROWS, TERNARY_TOKENS, self.packed)
         } else if w.ternary {
-            (self.kernels.matmul_ternary, TERNARY_ROWS)
+            (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
         } else {
-            (self.kernels.matmul, 1)
+            (self.kernels.matmul, 1, BF16_TOKENS, x.buf)
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
-        // The bf16 kernel takes the tokens eight at a time, each group of
-        // them a row of the grid.
-        let token_groups = if w.ternary { 1 } else { n.div_ceil(BF16_TOKENS) };
-        let groups = (width as u32, (count.div_ceil(width) * token_groups) as u32);
+        let groups = (width as u32, (count.div_ceil(width) * n.div_ceil(tokens)) as u32);
         let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
@@ -886,7 +899,7 @@ impl Device for Vulkan {
             stride: width as u32,
             splits: 1,
         };
-        self.dispatch(kernel, &[out.buf, w.buf, x.buf], &params, groups);
+        self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
