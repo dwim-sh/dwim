@@ -64,17 +64,6 @@ pub fn boxed(content: Line, columns: usize) -> Line {
     line
 }
 
-/// `left` and `right` at either end of a line `columns` wide, or just `left`
-/// if both don't fit.
-pub fn spread(mut left: Line, right: Line, columns: usize) -> Line {
-    let gap = columns.saturating_sub(width(&left) + width(&right));
-    if gap >= 2 {
-        left.push(span(" ".repeat(gap)));
-        left.extend(right);
-    }
-    left
-}
-
 /// A styled piece of text.
 pub fn span(text: impl Into<String>) -> StyledContent<String> {
     StyledContent::new(Default::default(), text.into())
