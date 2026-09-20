@@ -26,16 +26,25 @@ fn main() {
         let source = fs::read_to_string(&path).unwrap();
         let module = wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}: {}", path.display(), e.emit_to_string(&source)));
-        // Barriers sit after loops whose trip counts differ per thread, which
-        // the uniformity analysis is stricter about than the hardware.
-        let flags = ValidationFlags::all() - ValidationFlags::CONTROL_FLOW_UNIFORMITY;
-        let info = Validator::new(flags, Capabilities::all())
+        // Every check naga has, uniformity included. Its uniformity analysis
+        // rejects a derivative, a texture sample, or a call to a function
+        // that contains a barrier under a condition that differs between
+        // invocations; it does not look at a bare barrier, so it accepts a
+        // barrier after a loop whose trip count differs per invocation, as
+        // several kernels have, and would also accept one inside a divergent
+        // `if`, which none has: the kernels are read for that by hand.
+        let info = Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .unwrap_or_else(|e| panic!("{}: {}", path.display(), e.emit_to_string(&source)));
         let options = spv::Options {
             lang_version: (1, 3),
             flags: spv::WriterFlags::empty(),
+            // Every kernel writes its workgroup memory before it reads it,
+            // and function-scope variables are zeroed by naga regardless.
             zero_initialize_workgroup_memory: spv::ZeroInitializeWorkgroupMemoryMode::None,
+            // Every loop's bound is a constant, a push constant the host
+            // checks, or a builtin that is at least one, so none needs the
+            // counter this would add to each iteration.
             force_loop_bounding: false,
             ..Default::default()
         };
