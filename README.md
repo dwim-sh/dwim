@@ -37,16 +37,13 @@ Either way, the model (about 6 GB) is downloaded on first use.
 
 ## Features
 
-- **A real coding agent.** A shell where the model runs commands, reads their
-  output, and keeps going until the task is done. It follows your project's
-  `AGENTS.md`.
-- **A 27B model in 6 GB.** Bonsai 2 27B, PrismML's ternary version of
-  Qwen3.8-27B: every weight is -1, 0, or 1, so it fits on a laptop GPU.
-- **Its own inference engine.** No llama.cpp. Metal on macOS, Vulkan
-  everywhere else, and a CPU reference the GPU kernels are tested against.
-- **No sandboxing.** `dwim` assumes it is already running in a sandbox, such
-  as a container or a VM, and does no sandboxing of its own: the model runs
-  the commands it wants, without asking.
+- **Fully local coding agent.** Runs commands, reads their output, and keeps
+  going.
+- **Bonsai 2 27B model.** Qwen3.8-27B compressed to 6 GB with ternary
+  weights.
+- **Fast local inference.** Metal on macOS, Vulkan on Linux.
+- **No sandbox.** Expects to run inside one. Commands run without
+  confirmation.
 
 ## Getting started
 
