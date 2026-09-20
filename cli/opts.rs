@@ -13,7 +13,7 @@ pub struct Opts {
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
 
-    /// tokens of conversation the model has room for (default: 32768)
+    /// tokens of conversation the model has room for (default: 16384)
     #[argh(option, default = "models::DEFAULT_CONTEXT")]
     pub context: usize,
 
