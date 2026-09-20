@@ -18,7 +18,7 @@ pub const DEFAULT: &str = "bonsai-2-27b";
 
 /// Tokens of conversation a model has room for unless the command line says
 /// otherwise.
-pub const DEFAULT_CONTEXT: usize = 32768;
+pub const DEFAULT_CONTEXT: usize = 16384;
 
 /// Models `dwim` knows how to fetch.
 pub const MODELS: &[Model] = &[Model {
