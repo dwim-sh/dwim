@@ -620,9 +620,12 @@ impl App {
 
         // The line of the reply still being generated, and the status. The
         // message a reply is to, or a tool's output, already ends in a blank
-        // line.
+        // line. An empty reply has no line yet: after its thought, the model
+        // writes blank lines, or a tool call, which is shown only once it is
+        // complete, and a bullet alone would stand for either.
         if matches!(self.status, Status::Generating { .. })
             && (self.segment == Segment::Text || self.thinking)
+            && !self.reply.is_empty()
         {
             let lines = tui::wrap(&self.reply, self.reply_width);
             let segment = self.segment;
