@@ -249,10 +249,20 @@ impl Vulkan {
                 );
             }
 
-            let family = instance
-                .get_physical_device_queue_family_properties(physical)
-                .iter()
-                .position(|family| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            // A compute-only queue family when there is one: the graphics
+            // family is the display's, on the same hardware ring, so a
+            // kernel that hangs there takes the display with it and gets the
+            // graphics ring's shorter timeout, and its commands wait behind
+            // the compositor's.
+            let families = instance.get_physical_device_queue_family_properties(physical);
+            let compute = |flags: vk::QueueFlags| {
+                families.iter().position(|family| {
+                    family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                        && !family.queue_flags.intersects(flags)
+                })
+            };
+            let family = compute(vk::QueueFlags::GRAPHICS)
+                .or_else(|| compute(vk::QueueFlags::empty()))
                 .ok_or("no compute queue")? as u32;
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
