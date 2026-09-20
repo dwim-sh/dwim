@@ -44,6 +44,9 @@ Either way, the model (about 6 GB) is downloaded on first use.
   Qwen3.8-27B: every weight is -1, 0, or 1, so it fits on a laptop GPU.
 - **Its own inference engine.** No llama.cpp. Metal on macOS, Vulkan
   everywhere else, and a CPU reference the GPU kernels are tested against.
+- **No sandboxing.** `dwim` assumes it is already running in a sandbox, such
+  as a container or a VM, and does no sandboxing of its own: the model runs
+  the commands it wants, without asking.
 
 ## Getting started
 
