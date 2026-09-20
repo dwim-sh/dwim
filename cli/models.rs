@@ -6,7 +6,7 @@ use std::{
     time::SystemTime,
 };
 
-use dwim_gpu::Device;
+use dwim_gpu::{Device, Gpu};
 use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
 
 /// Saved states kept, newest first: a state is a few hundred megabytes,
@@ -69,6 +69,19 @@ impl Model {
     pub fn open(&self, dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
         Ok(Arc::new(Gguf::open(&dir.join(self.weights))?))
     }
+}
+
+/// Opens the GPU, and names it: drivers append their own name in
+/// parentheses, and the GPU's is enough.
+pub fn gpu() -> Result<(Gpu, String), Box<dyn Error>> {
+    let gpu = Gpu::new()?;
+    let name = gpu
+        .name()
+        .split(" (")
+        .next()
+        .unwrap_or(gpu.name())
+        .to_string();
+    Ok((gpu, name))
 }
 
 /// Loads the model onto `device`, with room for `context` tokens of

@@ -408,6 +408,51 @@ impl<M: LanguageModel> Harness<M> {
         self.transcript.iter().map(|(turn, _)| turn)
     }
 
+    /// The whole exchanges of the transcript: its turns up to the last
+    /// reply of text alone, which is where a conversation is taken up
+    /// from again by [`resume`](Self::resume) when the model is lost in
+    /// the middle of a turn, and the message of that turn sent again.
+    pub fn exchanges(&self) -> Vec<Turn> {
+        let end = self
+            .transcript
+            .iter()
+            .rposition(|(turn, _)| matches!(turn, Turn::Reply { calls, .. } if calls.is_empty()))
+            .map_or(0, |i| i + 1);
+        self.transcript[..end]
+            .iter()
+            .map(|(turn, _)| turn.clone())
+            .collect()
+    }
+
+    /// An agent as [`new`](Self::new) gives, taking a conversation up from
+    /// `turns`, the [`exchanges`](Self::exchanges) of another agent's
+    /// transcript, which it reads into `chat`. Where the agent is goes
+    /// ahead of the first message, as it did the first time, unless that
+    /// is the note turn of a compaction, which says.
+    pub fn resume(
+        chat: Chat<M>,
+        dir: &Path,
+        restart: impl FnMut(&mut Chat<M>) -> Result<(), Box<dyn Error>> + 'static,
+        turns: Vec<Turn>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut this = Self::new(chat, dir, restart)?;
+        let Some(first) = turns.first() else {
+            return Ok(this);
+        };
+        let mut fed = turns.clone();
+        if let Turn::User(message) = first
+            && !message.contains(NOTE_HEAD)
+            && let Some(ahead) = this.environment.take()
+        {
+            fed[0] = Turn::User(format!("{ahead}\n\n{message}"));
+        }
+        this.chat.replay(&fed, |_, _| {})?;
+        for turn in turns {
+            this.record(turn)?;
+        }
+        Ok(this)
+    }
+
     /// Sends a message from the user, with where the agent is ahead of the
     /// first one, reporting the reply and any tool calls it makes to
     /// `on_event`. The turn ends early if `on_event` breaks. A reply
@@ -717,6 +762,22 @@ mod tests {
         Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap()
     }
 
+    impl Event<'_> {
+        /// The event's name, for a test to compare.
+        fn name(&self) -> &'static str {
+            match self {
+                Event::Thought(_) => "thought",
+                Event::Text(_) => "text",
+                Event::Call { .. } => "call",
+                Event::Output(_) => "output",
+                Event::Cut => "cut",
+                Event::Compacting => "compacting",
+                Event::Note(_) => "note",
+                Event::Compacted { .. } => "compacted",
+            }
+        }
+    }
+
     /// The names of the events of a turn, and the note it wrote.
     fn send(harness: &mut Harness<Scripted>, message: &str) -> (Vec<&'static str>, String) {
         let mut events = Vec::new();
@@ -849,6 +910,91 @@ mod tests {
             }
         }
         assert_eq!(compactions, 1);
+    }
+
+    #[test]
+    fn resumes_from_the_whole_exchanges() {
+        // Two whole exchanges, the first with a tool call, then a reply
+        // that calls a tool: as far as a transcript gets before the model
+        // is lost while answering the tool's result.
+        let scripts = [
+            reply(10, true),
+            reply(10, false),
+            reply(10, false),
+            reply(10, true),
+        ];
+        let mut lost = harness(&scripts, 8000, "");
+        send(&mut lost, "first");
+        send(&mut lost, "second");
+        let mut interrupted = Vec::new();
+        lost.send("third", |event| {
+            interrupted.push(event.name());
+            if matches!(event, Event::Output(_)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            lost.transcript().count(),
+            8,
+            "{:?}",
+            lost.transcript().collect::<Vec<_>>()
+        );
+        let exchanges = lost.exchanges();
+        assert_eq!(exchanges.len(), 6);
+        assert!(matches!(&exchanges[0], Turn::User(message) if message == "first"));
+        assert!(matches!(&exchanges[5], Turn::Reply { calls, .. } if calls.is_empty()));
+
+        // A fresh agent takes the conversation up from them: it has fed the
+        // model where it is ahead of the first message, then the exchanges
+        // as they were, and its transcript is theirs, so the next message
+        // goes on from there.
+        let scripts = [reply(10, false)];
+        let tokenizer = Tokenizer::tiny();
+        let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+        let model = Scripted::new(&tokenizer, &scripts, 8000);
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut resumed = Harness::resume(
+            chat,
+            dir,
+            |chat| chat.system("Be brief.", |_, _| {}),
+            exchanges.clone(),
+        )
+        .unwrap();
+        assert_eq!(resumed.transcript().cloned().collect::<Vec<_>>(), exchanges);
+        let fed = &resumed.chat.model().fed;
+        let expected = Tokenizer::tiny()
+            .encode_with_special(&format!(
+                "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{}\n\nfirst<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                environment(dir)
+            ))
+            .unwrap();
+        assert_eq!(&fed[..expected.len()], expected);
+        assert_eq!(resumed.tokens(), fed.len());
+        let (events, _) = send(&mut resumed, "third");
+        assert_eq!(events, ["thought", "text"]);
+        assert!(
+            matches!(resumed.transcript().nth(6), Some(Turn::User(message)) if message == "third")
+        );
+
+        // Nothing to take up from, the fresh agent is as new.
+        let tokenizer = Tokenizer::tiny();
+        let model = Scripted::new(&tokenizer, &[], 8000);
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let empty = Harness::resume(
+            chat,
+            dir,
+            |chat| chat.system("Be brief.", |_, _| {}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(empty.transcript().count(), 0);
+        assert!(empty.environment.is_some());
     }
 
     #[test]

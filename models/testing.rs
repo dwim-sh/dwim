@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{LanguageModel, Tokenizer};
+use crate::{LanguageModel, Result, Tokenizer};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
@@ -84,7 +84,7 @@ impl Scripted {
 }
 
 impl LanguageModel for Scripted {
-    fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+    fn forward(&mut self, tokens: &[u32], pos: usize) -> Result<Vec<f32>> {
         assert_eq!(
             pos,
             self.fed.len(),
@@ -119,7 +119,7 @@ impl LanguageModel for Scripted {
         };
         let mut logits = vec![0.0; self.vocab];
         logits[next as usize] = 1.0;
-        logits
+        Ok(logits)
     }
 
     fn reset(&mut self) {

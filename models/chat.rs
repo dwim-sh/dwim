@@ -565,7 +565,7 @@ impl<M: LanguageModel> Chat<M> {
             return Err("the conversation no longer fits in the context window".into());
         }
         let start = Instant::now();
-        let logits = self.model.forward(tokens, self.len);
+        let logits = self.model.forward(tokens, self.len)?;
         let tally = match kind {
             Kind::Prompt => &mut self.stats.prompt,
             Kind::Thought => &mut self.stats.thought,
