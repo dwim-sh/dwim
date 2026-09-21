@@ -54,9 +54,23 @@ const SUMS_MIN_ROWS: usize = 2048;
 const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
-/// submitted.
+/// submitted: the defaults, which `DWIM_RING` and `DWIM_SUBMIT_EVERY` in the
+/// environment override, to try the rate of submission without a rebuild.
 const RING: usize = 4;
 const SUBMIT_EVERY: usize = 128;
+
+/// A whole number of at least one from the environment variable `name`, or
+/// `default` if it is not set.
+fn setting(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    value
+        .to_str()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| format!("{name} must be a whole number of at least 1, not {value:?}").into())
+}
 
 /// Positions one workgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -162,6 +176,8 @@ pub struct Vulkan {
     packed: vk::Buffer,
     max_groups: u32,
     name: String,
+    /// Kernels recorded into a command buffer before it is submitted.
+    submit_every: usize,
     /// Every buffer and its memory, freed when the device is dropped.
     allocations: Mutex<Vec<(vk::Buffer, vk::DeviceMemory)>>,
     ring: Mutex<Ring>,
@@ -174,7 +190,7 @@ struct Ring {
     /// Whether it is open with commands not yet submitted.
     recording: bool,
     /// Which command buffers are submitted and not yet waited for.
-    in_flight: [bool; RING],
+    in_flight: Vec<bool>,
     /// Kernels recorded into the current command buffer.
     recorded: usize,
     /// The command buffer of the ring whose submission reads each staging
@@ -190,6 +206,9 @@ unsafe impl Send for Vulkan {}
 impl Vulkan {
     /// Opens the first GPU Vulkan finds, preferring a discrete one.
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        let ring = setting("DWIM_RING", RING)?;
+        let submit_every = setting("DWIM_SUBMIT_EVERY", SUBMIT_EVERY)?;
+        eprintln!("vulkan: ring={ring} submit_every={submit_every}");
         unsafe {
             let entry = ash::Entry::load()?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
@@ -291,10 +310,10 @@ impl Vulkan {
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(RING as u32),
+                    .command_buffer_count(ring as u32),
             )?;
-            let mut fences = Vec::with_capacity(RING);
-            for _ in 0..RING {
+            let mut fences = Vec::with_capacity(ring);
+            for _ in 0..ring {
                 fences.push(device.create_fence(&vk::FenceCreateInfo::default(), None)?);
             }
 
@@ -402,11 +421,12 @@ impl Vulkan {
                 packed: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
                 name,
+                submit_every,
                 allocations: Mutex::new(Vec::new()),
                 ring: Mutex::new(Ring {
                     current: 0,
                     recording: false,
-                    in_flight: [false; RING],
+                    in_flight: vec![false; ring],
                     recorded: 0,
                     staging_slot: [None; 2],
                     staging_next: 0,
@@ -568,14 +588,14 @@ impl Vulkan {
         }
         ring.in_flight[i] = true;
         ring.recording = false;
-        ring.current = (i + 1) % RING;
+        ring.current = (i + 1) % self.cmds.len();
     }
 
     /// Submits everything recorded and waits for all of it to finish.
     fn flush(&self) {
         self.submit();
         let mut ring = self.ring.lock().unwrap();
-        for i in 0..RING {
+        for i in 0..self.cmds.len() {
             if ring.in_flight[i] {
                 self.wait(&mut ring, i);
             }
@@ -636,7 +656,7 @@ impl Vulkan {
             ring.recorded += 1;
             ring.recorded
         };
-        if recorded >= SUBMIT_EVERY {
+        if recorded >= self.submit_every {
             self.submit();
         }
     }
