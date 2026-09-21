@@ -55,9 +55,15 @@ const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
 /// submitted: the defaults, which `DWIM_RING` and `DWIM_SUBMIT_EVERY` in the
-/// environment override, to try the rate of submission without a rebuild.
-const RING: usize = 4;
-const SUBMIT_EVERY: usize = 128;
+/// environment override. One and one: every kernel goes in a command buffer
+/// of its own that is waited for before the next is recorded, so no two
+/// kernels are on the GPU at once and no buffer is written while the GPU
+/// reads it. Four and 128 let the GPU run while the CPU records, and
+/// corrupt a result about once per 480 tokens on an RX 5700 XT, then hang
+/// it; serialized, the same kernels ran 14,194 tokens without a wrong bit.
+/// The rate goes back up when the ordering fault behind that is found.
+const RING: usize = 1;
+const SUBMIT_EVERY: usize = 1;
 
 /// A whole number of at least one from the environment variable `name`, or
 /// `default` if it is not set.
@@ -208,7 +214,6 @@ impl Vulkan {
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let ring = setting("DWIM_RING", RING)?;
         let submit_every = setting("DWIM_SUBMIT_EVERY", SUBMIT_EVERY)?;
-        eprintln!("vulkan: ring={ring} submit_every={submit_every}");
         unsafe {
             let entry = ash::Entry::load()?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
