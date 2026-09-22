@@ -14,9 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim_gpu::{Cpu, Gpu};
+use dwim_gpu::{Cpu, DeviceLost};
 use dwim_harness::{self as harness, Harness};
-use dwim_models::{Chat, Gguf, Tokenizer};
+use dwim_models::{Chat, Gguf, LanguageModel, Tokenizer, Turn};
 
 use crate::{fetch, models, opts::Device};
 
@@ -43,18 +43,14 @@ pub fn once(
     })?;
     let gguf = model.open(&dir)?;
     let (report, loading) = match device {
-        Device::Cpu => answer(gguf, Cpu, model, "the CPU", context, prompt)?,
-        Device::Gpu => {
-            let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let device = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
-            answer(gguf, gpu, model, &device, context, prompt)?
-        }
+        Device::Cpu => answer(
+            gguf,
+            || Ok((Cpu, "the CPU".to_string())),
+            model,
+            context,
+            prompt,
+        )?,
+        Device::Gpu => answer(gguf, models::gpu, model, context, prompt)?,
     };
     if stats {
         for line in report.report(loading, started.elapsed()) {
@@ -64,41 +60,65 @@ pub fn once(
     Ok(())
 }
 
-/// Loads `name` onto `device`, with room for `context` tokens, and answers
-/// `prompt` with it, returning where the time went and how long the
-/// loading took.
+/// Loads `which` onto the device `open` gives, named, with room for
+/// `context` tokens, and answers `prompt` with it, returning where the
+/// time went and how long the loading took. If the GPU is lost under the
+/// model in the middle of the turn, as when the driver resets it after a
+/// hang, the model is loaded again onto a device opened anew, the
+/// conversation taken up from its whole exchanges, and the turn started
+/// over.
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
-    device: D,
+    mut open: impl FnMut() -> Result<(D, String), Box<dyn Error>>,
     which: &'static models::Model,
-    on: &str,
     context: usize,
     prompt: &str,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let name = which.name;
     let mut progress = Progress::new();
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let sampler = models::sampler(&gguf);
-    let loading = Instant::now();
-    let model = models::load(gguf, device, context, |done, total| {
-        progress.report(format!("loading {name} on {on}"), done, total);
-    })?;
-    let loading = loading.elapsed();
-    let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
     let system = harness::system_prompt(&cwd);
-    models::start(&mut chat, which, &system, |read, total| {
-        progress.report("reading the system prompt".to_string(), read, total);
-    })?;
+    let mut loading = Duration::ZERO;
+    let mut load = |turns: Vec<Turn>| -> Result<Harness<Box<dyn LanguageModel>>, Box<dyn Error>> {
+        let (device, on) = open()?;
+        let tokenizer = Tokenizer::from_gguf(&gguf)?;
+        let sampler = models::sampler(&gguf);
+        let started = Instant::now();
+        let model = models::load(gguf.clone(), device, context, |done, total| {
+            progress.report(format!("loading {name} on {on}"), done, total);
+        })?;
+        loading += started.elapsed();
+        let mut chat = Chat::new(model, tokenizer, sampler)?;
+        models::start(&mut chat, which, &system, |read, total| {
+            progress.report("reading the system prompt".to_string(), read, total);
+        })?;
+        let system = system.clone();
+        Harness::resume(
+            chat,
+            &cwd,
+            move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ()),
+            turns,
+        )
+    };
+    let mut harness = load(Vec::new())?;
 
     let mut printer = Printer::default();
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
-    })?;
-    harness.send(prompt, |event| {
+    let mut result = harness.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())
-    })?;
+    });
+    if result.as_ref().is_err_and(|e| e.is::<DeviceLost>()) {
+        printer.end_thought();
+        eprintln!("[the GPU was lost: loading the model again to start over]");
+        let turns = harness.exchanges();
+        drop(harness);
+        harness = load(turns)?;
+        result = harness.send(prompt, |event| {
+            printer.print(event);
+            ControlFlow::Continue(())
+        });
+    }
+    result?;
     Ok((harness.stats(), loading))
 }
 

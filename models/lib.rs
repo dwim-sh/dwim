@@ -10,7 +10,7 @@ pub mod testing;
 mod tokenizer;
 
 pub use chat::{Chat, Chunk, Stats, Tally, ToolCall, Turn};
-pub use dwim_gpu::{Device, Tensor, ternary};
+pub use dwim_gpu::{Device, DeviceLost, Tensor, ternary};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
@@ -34,8 +34,9 @@ pub trait LanguageModel {
     }
 
     /// Runs `tokens`, the first at position `pos`, through the model, and
-    /// returns the logits for the token that follows the last of them.
-    fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
+    /// returns the logits for the token that follows the last of them; or
+    /// [`DeviceLost`] once the device the model runs on is lost.
+    fn forward(&mut self, tokens: &[u32], pos: usize) -> Result<Vec<f32>>;
 
     /// Forgets the sequence so far, so that the next tokens start at
     /// position 0.
@@ -54,7 +55,7 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
         (**self).restore(state)
     }
 
-    fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+    fn forward(&mut self, tokens: &[u32], pos: usize) -> Result<Vec<f32>> {
         (**self).forward(tokens, pos)
     }
 

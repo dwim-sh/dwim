@@ -7,7 +7,15 @@
 //! first kernels of a forward pass while the CPU records the rest. Reading
 //! a buffer back waits for everything submitted.
 
-use std::{error::Error, io::Cursor, slice, sync::Mutex};
+use std::{
+    error::Error,
+    io::Cursor,
+    slice,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use ash::{
     khr::{push_descriptor, shader_float16_int8},
@@ -165,6 +173,9 @@ pub struct Vulkan {
     /// Every buffer and its memory, freed when the device is dropped.
     allocations: Mutex<Vec<(vk::Buffer, vk::DeviceMemory)>>,
     ring: Mutex<Ring>,
+    /// Whether the device has been lost: a wait or a submission said so,
+    /// and nothing is recorded or submitted since.
+    lost: AtomicBool,
 }
 
 /// Where recording and submission stand in the ring of command buffers.
@@ -411,6 +422,7 @@ impl Vulkan {
                     staging_slot: [None; 2],
                     staging_next: 0,
                 }),
+                lost: AtomicBool::new(false),
             };
             gpu.staging = [gpu.map(STAGING)?, gpu.map(STAGING)?];
             gpu.partials = gpu
@@ -487,9 +499,23 @@ impl Vulkan {
             .0
     }
 
+    /// Whether a call to the device, `what`, went through. It did not once
+    /// the device is lost, which is remembered; any other failure is a bug.
+    fn check(&self, result: Result<(), vk::Result>, what: &str) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                self.lost.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
+
     /// The command buffer open for recording: the current one of the ring,
-    /// begun if it is not open, once the GPU is done with it.
-    fn cmd(&self) -> vk::CommandBuffer {
+    /// begun if it is not open, once the GPU is done with it. None once
+    /// the device is lost: nothing is recorded for it after that.
+    fn cmd(&self) -> Option<vk::CommandBuffer> {
         let mut ring = self.ring.lock().unwrap();
         let current = ring.current;
         let cmd = self.cmds[current];
@@ -497,32 +523,38 @@ impl Vulkan {
             if ring.in_flight[current] {
                 self.wait(&mut ring, current);
             }
-            unsafe {
+            if self.lost() {
+                return None;
+            }
+            let begun = unsafe {
                 self.device
                     .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                    .unwrap();
-                self.device
-                    .begin_command_buffer(
-                        cmd,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .unwrap();
+                    .and_then(|()| {
+                        self.device.begin_command_buffer(
+                            cmd,
+                            &vk::CommandBufferBeginInfo::default()
+                                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                        )
+                    })
+            };
+            if !self.check(begun, "opening a command buffer") {
+                return None;
             }
             ring.recording = true;
             ring.recorded = 0;
         }
-        cmd
+        Some(cmd)
     }
 
-    /// Waits for the GPU to finish command buffer `i` of the ring.
+    /// Waits for the GPU to finish command buffer `i` of the ring, or
+    /// finds the device lost, after which nothing is waited for again.
     fn wait(&self, ring: &mut Ring, i: usize) {
-        unsafe {
+        let done = unsafe {
             self.device
                 .wait_for_fences(&[self.fences[i]], true, u64::MAX)
-                .unwrap();
-            self.device.reset_fences(&[self.fences[i]]).unwrap();
-        }
+                .and_then(|()| self.device.reset_fences(&[self.fences[i]]))
+        };
+        self.check(done, "waiting for the GPU");
         ring.in_flight[i] = false;
     }
 
@@ -558,15 +590,15 @@ impl Vulkan {
             return;
         }
         let i = ring.current;
-        unsafe {
-            self.device.end_command_buffer(self.cmds[i]).unwrap();
-            let cmds = [self.cmds[i]];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            self.device
-                .queue_submit(self.queue, &[submit], self.fences[i])
-                .unwrap();
-        }
-        ring.in_flight[i] = true;
+        let submitted = unsafe {
+            self.device.end_command_buffer(self.cmds[i]).and_then(|()| {
+                let cmds = [self.cmds[i]];
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                self.device
+                    .queue_submit(self.queue, &[submit], self.fences[i])
+            })
+        };
+        ring.in_flight[i] = self.check(submitted, "submitting to the GPU");
         ring.recording = false;
         ring.current = (i + 1) % RING;
     }
@@ -592,7 +624,9 @@ impl Vulkan {
         params: &P,
         groups: (u32, u32),
     ) {
-        let cmd = self.cmd();
+        let Some(cmd) = self.cmd() else {
+            return;
+        };
         // A kernel binds at most eight buffers; a thousand dispatches a token
         // is worth not allocating for.
         assert!(buffers.len() <= 8);
@@ -673,7 +707,9 @@ impl Vulkan {
             unsafe {
                 std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.staging[which].ptr, chunk.len())
             };
-            let cmd = self.cmd();
+            let Some(cmd) = self.cmd() else {
+                return;
+            };
             let region = vk::BufferCopy::default()
                 .dst_offset((offset + i * STAGING) as u64)
                 .size(chunk.len() as u64);
@@ -692,11 +728,13 @@ impl Vulkan {
 
     /// Copies bytes from a device buffer to the host, through staging: the
     /// copy is recorded behind whatever is pending, and everything is
-    /// submitted together.
+    /// submitted together. Leaves `data` as it is once the device is lost.
     fn download_bytes(&self, src: vk::Buffer, data: &mut [u8]) {
         for (i, chunk) in data.chunks_mut(STAGING).enumerate() {
             unsafe {
-                let cmd = self.cmd();
+                let Some(cmd) = self.cmd() else {
+                    return;
+                };
                 let region = vk::BufferCopy::default()
                     .src_offset((i * STAGING) as u64)
                     .size(chunk.len() as u64);
@@ -704,6 +742,9 @@ impl Vulkan {
                     .cmd_copy_buffer(cmd, src, self.staging[0].buf, &[region]);
                 self.barrier(cmd);
                 self.flush();
+                if self.lost() {
+                    return;
+                }
                 std::ptr::copy_nonoverlapping(self.staging[0].ptr, chunk.as_mut_ptr(), chunk.len());
             }
         }
@@ -825,6 +866,10 @@ impl Device for Vulkan {
     type Weight = Weight;
     type Cache = Cache;
 
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+
     fn upload(&self, tensor: Tensor) -> Weight {
         match tensor {
             Tensor::Bf16 { shape, data } => {
@@ -861,17 +906,19 @@ impl Device for Vulkan {
 
     fn alloc(&self, len: usize) -> Buffer {
         let buf = self.device_buffer(len * 4);
-        let cmd = self.cmd();
-        unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
-        self.barrier(cmd);
+        if let Some(cmd) = self.cmd() {
+            unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
+            self.barrier(cmd);
+        }
         Buffer { buf, len, cap: len }
     }
 
     fn alloc_cache(&self, len: usize) -> Cache {
         let buf = self.device_buffer(len.div_ceil(2) * 4);
-        let cmd = self.cmd();
-        unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
-        self.barrier(cmd);
+        if let Some(cmd) = self.cmd() {
+            unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
+            self.barrier(cmd);
+        }
         Cache { buf, len }
     }
 
@@ -907,7 +954,9 @@ impl Device for Vulkan {
         len: usize,
     ) {
         assert!(dst_offset + len <= dst.len && src_offset + len <= src.len);
-        let cmd = self.cmd();
+        let Some(cmd) = self.cmd() else {
+            return;
+        };
         let region = vk::BufferCopy::default()
             .src_offset((src_offset * 4) as u64)
             .dst_offset((dst_offset * 4) as u64)

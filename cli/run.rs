@@ -20,9 +20,9 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim_gpu::{Cpu, Gpu};
+use dwim_gpu::{Cpu, DeviceLost};
 use dwim_harness::{self as harness, Harness};
-use dwim_models::{Chat, Gguf, Tokenizer};
+use dwim_models::{Chat, Gguf, LanguageModel, Tokenizer, Turn};
 
 use crate::{
     fetch::{self, Progress},
@@ -151,6 +151,9 @@ enum Reply {
     },
     /// Something to tell the user, in place of a reply.
     Notice(String),
+    /// The GPU was lost under the model in the middle of the turn: the
+    /// model is loaded again, and the turn started over.
+    Lost,
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
@@ -175,74 +178,99 @@ fn work(
     })?;
     let gguf = model.open(dir)?;
     match device {
-        Device::Cpu => {
-            let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(gguf, Cpu, model, context, requests, replies, stop)
-        }
-        Device::Gpu => {
-            let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let name = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
-            let _ = replies.send(Reply::Device(name));
-            serve(gguf, gpu, model, context, requests, replies, stop)
-        }
+        Device::Cpu => serve(
+            gguf,
+            || Ok((Cpu, "cpu".to_string())),
+            model,
+            context,
+            requests,
+            replies,
+            stop,
+        ),
+        Device::Gpu => serve(gguf, models::gpu, model, context, requests, replies, stop),
     }
 }
 
-/// Loads the model and answers messages until the UI hangs up.
+/// Loads the model onto the device `open` gives, named, and answers
+/// messages until the UI hangs up. If the GPU is lost under the model in
+/// the middle of a turn, as when the driver resets it after a hang, the
+/// model is loaded again onto a device opened anew, the conversation
+/// taken up from its whole exchanges, and the turn started over.
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
-    device: D,
+    mut open: impl FnMut() -> Result<(D, String), Box<dyn Error>>,
     which: &'static models::Model,
     context: usize,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let sampler = models::sampler(&gguf);
-    let model = models::load(gguf, device, context, |done, total| {
-        let _ = replies.send(Reply::Loading { done, total });
-    })?;
-    let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
     let system = harness::system_prompt(&cwd);
-    models::start(&mut chat, which, &system, |read, total| {
-        let _ = replies.send(Reply::Prompting { read, total });
-    })?;
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
-    })?;
+    let mut load = |turns: Vec<Turn>| -> Result<Harness<Box<dyn LanguageModel>>, Box<dyn Error>> {
+        let (device, name) = open()?;
+        let _ = replies.send(Reply::Device(name));
+        let tokenizer = Tokenizer::from_gguf(&gguf)?;
+        let sampler = models::sampler(&gguf);
+        let model = models::load(gguf.clone(), device, context, |done, total| {
+            let _ = replies.send(Reply::Loading { done, total });
+        })?;
+        let mut chat = Chat::new(model, tokenizer, sampler)?;
+        models::start(&mut chat, which, &system, |read, total| {
+            let _ = replies.send(Reply::Prompting { read, total });
+        })?;
+        let system = system.clone();
+        Harness::resume(
+            chat,
+            &cwd,
+            move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ()),
+            turns,
+        )
+    };
+    let mut harness = load(Vec::new())?;
     let _ = replies.send(Reply::Ready);
 
     for request in requests {
-        let on_event = |event: harness::Event| {
-            let _ = replies.send(reply(event));
-            if stop.load(Ordering::Relaxed) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        };
-        let result = match request {
-            Request::Message(message) => harness.send(&message, on_event),
-            Request::Compact => harness.compact(on_event).map(|compacted| {
-                if !compacted && !stop.load(Ordering::Relaxed) {
-                    let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
-                }
-            }),
-        };
+        let mut result = answer(&mut harness, &request, replies, stop);
+        if result.as_ref().is_err_and(|e| e.is::<DeviceLost>()) {
+            let _ = replies.send(Reply::Lost);
+            let turns = harness.exchanges();
+            drop(harness);
+            harness = load(turns)?;
+            result = answer(&mut harness, &request, replies, stop);
+        }
         if let Err(e) = result {
             let _ = replies.send(Reply::Error(e.to_string()));
         }
         let _ = replies.send(Reply::Done(harness.stats()));
     }
     Ok(())
+}
+
+/// Answers one request from the UI, reporting each event of the turn to
+/// it, until the turn is over or the UI stops it.
+fn answer<M: LanguageModel>(
+    harness: &mut Harness<M>,
+    request: &Request,
+    replies: &Sender<Reply>,
+    stop: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
+    let on_event = |event: harness::Event| {
+        let _ = replies.send(reply(event));
+        if stop.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    match request {
+        Request::Message(message) => harness.send(message, on_event),
+        Request::Compact => harness.compact(on_event).map(|compacted| {
+            if !compacted && !stop.load(Ordering::Relaxed) {
+                let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
+            }
+        }),
+    }
 }
 
 /// What the model thread reports for an event of a turn.
@@ -593,6 +621,14 @@ impl App {
                     self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
                 }
                 self.status = Status::Idle;
+            }
+            Reply::Lost => {
+                self.finish();
+                self.lines.push(vec![
+                    span("● ").dark_grey(),
+                    span("The GPU was lost. Loading the model again to start over…").dark_grey(),
+                ]);
+                self.lines.push(Line::new());
             }
             Reply::Notice(text) => {
                 self.finish();

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use dwim_gpu::{CONV_KERNEL, HADAMARD_BLOCK};
 
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
+use crate::{Device, DeviceLost, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -722,7 +722,7 @@ impl<D: Device> LanguageModel for Model<D> {
 
     /// Adds the tokens to the model's state. Tokens run through the model
     /// in batches of up to [`BATCH`].
-    fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+    fn forward(&mut self, tokens: &[u32], pos: usize) -> Result<Vec<f32>> {
         assert!(!tokens.is_empty(), "no tokens to run");
         assert!(
             pos + tokens.len() <= self.state.max_len,
@@ -732,7 +732,11 @@ impl<D: Device> LanguageModel for Model<D> {
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
             logits = self.forward_batch(batch, pos + i * BATCH);
         }
-        logits
+        // A lost device computes nothing: the logits would be zeros.
+        if self.device.lost() {
+            return Err(DeviceLost.into());
+        }
+        Ok(logits)
     }
 
     /// Zeroes the linear layers' states, as they were before any token.
@@ -1108,10 +1112,10 @@ mod tests {
         let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
         // A batch of several tokens, then one more, then a batch of many,
         // each carrying the state.
-        let first = model.forward(&[3, 17, 42, 7, 9], 0);
-        let second = model.forward(&[11], 5);
+        let first = model.forward(&[3, 17, 42, 7, 9], 0).unwrap();
+        let second = model.forward(&[11], 5).unwrap();
         let many: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
-        let third = model.forward(&many, 6);
+        let third = model.forward(&many, 6).unwrap();
         [first, second, third]
     }
 
@@ -1126,12 +1130,12 @@ mod tests {
         // first's saved state: the same logits, since the state holds the
         // caches exactly.
         let mut whole = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
-        whole.forward(&[3, 17, 42, 7, 9], 0);
+        whole.forward(&[3, 17, 42, 7, 9], 0).unwrap();
         let state = whole.save(5).unwrap();
-        let want = whole.forward(&[11, 2], 5);
+        let want = whole.forward(&[11, 2], 5).unwrap();
         let mut resumed = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
         assert_eq!(resumed.restore(&state).unwrap(), 5);
-        assert_eq!(resumed.forward(&[11, 2], 5), want);
+        assert_eq!(resumed.forward(&[11, 2], 5).unwrap(), want);
         assert!(resumed.restore(&state[..100]).is_err());
 
         // Reset, the model is as it was when loaded: the same logits for
@@ -1139,10 +1143,11 @@ mod tests {
         // the linear layers' states behind.
         let fresh = Model::load(gguf, Cpu, 64, |_, _| {})
             .unwrap()
-            .forward(&[3, 17, 42, 7, 9], 0);
-        assert_ne!(whole.forward(&[3, 17, 42, 7, 9], 7), fresh);
+            .forward(&[3, 17, 42, 7, 9], 0)
+            .unwrap();
+        assert_ne!(whole.forward(&[3, 17, 42, 7, 9], 7).unwrap(), fresh);
         whole.reset();
-        assert_eq!(whole.forward(&[3, 17, 42, 7, 9], 0), fresh);
+        assert_eq!(whole.forward(&[3, 17, 42, 7, 9], 0).unwrap(), fresh);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1196,7 +1201,7 @@ mod tests {
         let decode = 16;
         let mut text = Vec::new();
         let start = std::time::Instant::now();
-        let mut logits = model.forward(&tokens, 0);
+        let mut logits = model.forward(&tokens, 0).unwrap();
         eprintln!(
             "prompt: {:.1} tok/s",
             tokens.len() as f32 / start.elapsed().as_secs_f32()
@@ -1208,7 +1213,9 @@ mod tests {
                 .unwrap() as u32;
             text.extend_from_slice(tokenizer.decode(next));
             tokens.push(next);
-            logits = model.forward(&tokens[tokens.len() - 1..], tokens.len() - 1);
+            logits = model
+                .forward(&tokens[tokens.len() - 1..], tokens.len() - 1)
+                .unwrap();
         }
         eprintln!(
             "decode: {:.1} tok/s over {decode} tokens",
@@ -1225,7 +1232,7 @@ mod tests {
         let mut long = tokenizer.encode(&passage).unwrap();
         long.truncate(model.max_len() - tokens.len());
         let start = std::time::Instant::now();
-        model.forward(&long, tokens.len());
+        model.forward(&long, tokens.len()).unwrap();
         eprintln!(
             "long prompt: {:.1} tok/s over {} tokens",
             long.len() as f32 / start.elapsed().as_secs_f32(),

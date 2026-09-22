@@ -3,6 +3,8 @@
 //! `metal` and [`vulkan`] devices run the same operations on a GPU with
 //! hand-written compute kernels.
 
+use std::{error::Error, fmt};
+
 #[cfg(test)]
 #[macro_use]
 mod tests;
@@ -46,6 +48,21 @@ impl Tensor {
     }
 }
 
+/// The error a model gives once the device it runs on is lost: the GPU was
+/// reset under it, as the driver does after a hang, so what it held is gone
+/// and what it computed since is nothing. Nothing on the device can be used
+/// again; the model has to be loaded again on one opened anew.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceLost;
+
+impl fmt::Display for DeviceLost {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the GPU was lost")
+    }
+}
+
+impl Error for DeviceLost {}
+
 /// The operations a transformer's forward pass is built from.
 ///
 /// A device owns the memory the model computes in: weights are uploaded to it
@@ -61,6 +78,14 @@ pub trait Device {
     /// A key or value cache in device memory: activations stored as IEEE
     /// half-precision floats, for half the memory attention reads.
     type Cache;
+
+    /// Whether the device has been lost: the GPU was reset under it, as
+    /// the driver does after a hang. Operations on a lost device do
+    /// nothing, and reading from it gives zeros; a model on it gives
+    /// [`DeviceLost`] instead of running.
+    fn lost(&self) -> bool {
+        false
+    }
 
     /// Copies a weight matrix into device memory.
     fn upload(&self, tensor: Tensor) -> Self::Weight;
