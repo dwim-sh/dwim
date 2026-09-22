@@ -111,6 +111,37 @@ struct Kernels {
 }
 
 impl Kernels {
+    /// The bindings a kernel writes, as bits: the first, and for a few
+    /// kernels a partials, state, or cache binding too.
+    fn written(&self, pipeline: vk::Pipeline) -> u32 {
+        if pipeline == self.attention {
+            0b1_0001
+        } else if pipeline == self.delta_net {
+            0b100_0001
+        } else if pipeline == self.conv {
+            0b1111
+        } else if pipeline == self.matmul_ternary_tile || pipeline == self.matmul_ternary_sums {
+            0b1001
+        } else {
+            0b1
+        }
+    }
+
+    /// Whether a kernel is a matrix product, which waits for the kernel
+    /// before it to have reached the end of the pipe when a buffer it binds
+    /// was written since the last such wait: see `Vulkan::events`.
+    fn matmul(&self, pipeline: vk::Pipeline) -> bool {
+        [
+            self.matmul_bf16,
+            self.matmul_ternary,
+            self.matmul_ternary_batch,
+            self.matmul_ternary_tile,
+            self.matmul_ternary_tile_reduce,
+            self.matmul_ternary_sums,
+        ]
+        .contains(&pipeline)
+    }
+
     fn all(&self) -> [vk::Pipeline; 20] {
         [
             self.matmul_bf16,
@@ -152,6 +183,21 @@ pub struct Vulkan {
     pool: vk::CommandPool,
     cmds: Vec<vk::CommandBuffer>,
     fences: Vec<vk::Fence>,
+    /// Set, waited for on the GPU, and reset before a matrix product that
+    /// binds a buffer written since the last such wait: everything recorded
+    /// before it has then reached the end of the pipe before the product
+    /// starts. A pipeline barrier between two kernels is not enough on
+    /// Navi 10 under RADV: the model's kernels on fixed data gave a
+    /// different result about once in 500 steps with a barrier after every
+    /// kernel, whatever the queue, the ring depth, or the number of kernels
+    /// a submission, and none in 14,000 steps with a fence after every
+    /// kernel, and the kernel that went wrong was the single-token ternary
+    /// matmul; the event is the fence's wait for the end of the pipe
+    /// without the round trip to the CPU, before the kernels that were seen
+    /// to need it. The reset comes after the wait has passed, when the
+    /// set's write is known to have landed, and is the command processor's
+    /// own write, so that the next wait never sees an earlier set.
+    event: vk::Event,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     kernels: Kernels,
@@ -177,6 +223,8 @@ struct Ring {
     in_flight: [bool; RING],
     /// Kernels recorded into the current command buffer.
     recorded: usize,
+    /// Buffers written since the last wait, by kernels and copies.
+    written: Vec<vk::Buffer>,
     /// The command buffer of the ring whose submission reads each staging
     /// buffer, if one may still be running, and which buffer the next
     /// upload fills.
@@ -297,6 +345,7 @@ impl Vulkan {
             for _ in 0..RING {
                 fences.push(device.create_fence(&vk::FenceCreateInfo::default(), None)?);
             }
+            let event = device.create_event(&vk::EventCreateInfo::default(), None)?;
 
             // Every kernel binds up to eight storage buffers, pushed with each
             // dispatch, and takes its sizes as push constants.
@@ -384,6 +433,7 @@ impl Vulkan {
                 pool,
                 cmds,
                 fences,
+                event,
                 set_layout,
                 layout,
                 kernels,
@@ -408,6 +458,7 @@ impl Vulkan {
                     recording: false,
                     in_flight: [false; RING],
                     recorded: 0,
+                    written: Vec::new(),
                     staging_slot: [None; 2],
                     staging_next: 0,
                 }),
@@ -526,8 +577,9 @@ impl Vulkan {
         ring.in_flight[i] = false;
     }
 
-    /// Makes everything recorded so far visible to everything recorded next.
-    fn barrier(&self, cmd: vk::CommandBuffer) {
+    /// The stages kernels and copies run in, and the dependency that makes
+    /// what they wrote visible to what runs next.
+    fn dependency() -> (vk::PipelineStageFlags, vk::MemoryBarrier<'static>) {
         let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
@@ -537,6 +589,12 @@ impl Vulkan {
                     | vk::AccessFlags::TRANSFER_READ
                     | vk::AccessFlags::TRANSFER_WRITE,
             );
+        (stages, barrier)
+    }
+
+    /// Makes everything recorded so far visible to everything recorded next.
+    fn barrier(&self, cmd: vk::CommandBuffer) {
+        let (stages, barrier) = Self::dependency();
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cmd,
@@ -548,6 +606,49 @@ impl Vulkan {
                 &[],
             );
         }
+    }
+
+    /// Before a matrix product that binds a buffer written since the last
+    /// wait, waits, on the GPU, for everything recorded so far to have
+    /// reached the end of the pipe, and notes what the kernel about to be
+    /// recorded, bound to `buffers`, writes.
+    fn wait_for_writes(
+        &self,
+        cmd: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+        buffers: &[vk::Buffer],
+    ) {
+        let mut ring = self.ring.lock().unwrap();
+        if self.kernels.matmul(pipeline) && buffers.iter().any(|buf| ring.written.contains(buf)) {
+            let (stages, barrier) = Self::dependency();
+            unsafe {
+                self.device
+                    .cmd_set_event(cmd, self.event, vk::PipelineStageFlags::ALL_COMMANDS);
+                self.device.cmd_wait_events(
+                    cmd,
+                    &[self.event],
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    stages,
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+                self.device
+                    .cmd_reset_event(cmd, self.event, vk::PipelineStageFlags::TOP_OF_PIPE);
+            }
+            ring.written.clear();
+        }
+        let written = self.kernels.written(pipeline);
+        for (i, &buf) in buffers.iter().enumerate() {
+            if written >> i & 1 == 1 {
+                ring.written.push(buf);
+            }
+        }
+    }
+
+    /// Notes a buffer a copy or a fill writes: see `wait_for_writes`.
+    fn wrote(&self, buf: vk::Buffer) {
+        self.ring.lock().unwrap().written.push(buf);
     }
 
     /// Submits what is recorded, without waiting, and moves on to the next
@@ -593,6 +694,7 @@ impl Vulkan {
         groups: (u32, u32),
     ) {
         let cmd = self.cmd();
+        self.wait_for_writes(cmd, pipeline, buffers);
         // A kernel binds at most eight buffers; a thousand dispatches a token
         // is worth not allocating for.
         assert!(buffers.len() <= 8);
@@ -682,6 +784,7 @@ impl Vulkan {
                     .cmd_copy_buffer(cmd, self.staging[which].buf, dst, &[region])
             };
             self.barrier(cmd);
+            self.wrote(dst);
             let slot = self.ring.lock().unwrap().current;
             self.submit();
             let mut ring = self.ring.lock().unwrap();
@@ -717,6 +820,7 @@ impl Drop for Vulkan {
             for &fence in &self.fences {
                 self.device.destroy_fence(fence, None);
             }
+            self.device.destroy_event(self.event, None);
             for pipeline in self.kernels.all() {
                 self.device.destroy_pipeline(pipeline, None);
             }
@@ -864,6 +968,7 @@ impl Device for Vulkan {
         let cmd = self.cmd();
         unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
         self.barrier(cmd);
+        self.wrote(buf);
         Buffer { buf, len, cap: len }
     }
 
@@ -872,6 +977,7 @@ impl Device for Vulkan {
         let cmd = self.cmd();
         unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
         self.barrier(cmd);
+        self.wrote(buf);
         Cache { buf, len }
     }
 
@@ -917,6 +1023,7 @@ impl Device for Vulkan {
                 .cmd_copy_buffer(cmd, src.buf, dst.buf, &[region])
         };
         self.barrier(cmd);
+        self.wrote(dst.buf);
     }
 
     fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
