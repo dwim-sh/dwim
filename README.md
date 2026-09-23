@@ -42,8 +42,10 @@ Either way, the model (about 6 GB) is downloaded on first use.
 - **Bonsai 2 27B model.** Qwen3.8-27B compressed to 6 GB with ternary
   weights.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
-- **No sandbox.** Expects to run inside one. Commands run without
-  confirmation.
+- **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
+  a container or a virtual machine, and does not confine the model itself.
+  Commands run without confirmation and without a time limit, until they
+  finish.
 
 ## Getting started
 
