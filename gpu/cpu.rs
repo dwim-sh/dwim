@@ -4,15 +4,23 @@
 use rayon::prelude::*;
 
 use crate::{
-    CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, sigmoid, softplus, ternary, to_f16,
+    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quantize, sigmoid,
+    softplus, ternary,
 };
 
 pub struct Cpu;
 
+/// A cache of activations in blocks of [`CACHE_BLOCK`] 8-bit integers, and
+/// the blocks' scales as f16 bits.
+pub struct Cache {
+    quants: Vec<i8>,
+    scales: Vec<u16>,
+}
+
 impl Device for Cpu {
     type Buffer = Vec<f32>;
     type Weight = Tensor;
-    type Cache = Vec<u16>;
+    type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Tensor {
         tensor
@@ -22,8 +30,12 @@ impl Device for Cpu {
         vec![0.0; len]
     }
 
-    fn alloc_cache(&self, len: usize) -> Vec<u16> {
-        vec![0; len]
+    fn alloc_cache(&self, len: usize) -> Cache {
+        assert!(len.is_multiple_of(CACHE_BLOCK));
+        Cache {
+            quants: vec![0; len],
+            scales: vec![0; len / CACHE_BLOCK],
+        }
     }
 
     fn resize(&self, buf: &mut Vec<f32>, len: usize) {
@@ -54,18 +66,36 @@ impl Device for Cpu {
         dst[dst_offset..][..len].copy_from_slice(&src[src_offset..][..len]);
     }
 
-    fn store(&self, cache: &mut Vec<u16>, offset: usize, src: &Vec<f32>) {
-        for (c, &x) in cache[offset..][..src.len()].iter_mut().zip(src) {
-            *c = to_f16(x);
+    fn store(&self, cache: &mut Cache, offset: usize, src: &Vec<f32>) {
+        assert!(offset.is_multiple_of(CACHE_BLOCK) && src.len().is_multiple_of(CACHE_BLOCK));
+        let quants = cache.quants[offset..][..src.len()].chunks_exact_mut(CACHE_BLOCK);
+        let scales = &mut cache.scales[offset / CACHE_BLOCK..];
+        for ((quants, scale), block) in quants.zip(scales).zip(src.chunks_exact(CACHE_BLOCK)) {
+            let (bits, q) = quantize(block);
+            quants.copy_from_slice(&q);
+            *scale = bits;
         }
     }
 
-    fn read_cache(&self, cache: &Vec<u16>, len: usize) -> Vec<u16> {
-        cache[..len].to_vec()
+    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u8> {
+        assert!(len.is_multiple_of(CACHE_BLOCK));
+        let quants = cache.quants[..len].iter().map(|&q| q as u8);
+        let scales = cache.scales[..len / CACHE_BLOCK]
+            .iter()
+            .flat_map(|s| s.to_le_bytes());
+        quants.chain(scales).collect()
     }
 
-    fn write_cache(&self, cache: &mut Vec<u16>, data: &[u16]) {
-        cache[..data.len()].copy_from_slice(data);
+    fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
+        let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
+        assert_eq!(data.len(), crate::cache_bytes(len));
+        let (quants, scales) = data.split_at(len);
+        for (q, &b) in cache.quants[..len].iter_mut().zip(quants) {
+            *q = b as i8;
+        }
+        for (s, b) in cache.scales.iter_mut().zip(scales.chunks_exact(2)) {
+            *s = u16::from_le_bytes([b[0], b[1]]);
+        }
     }
 
     fn matmul(&self, out: &mut Vec<f32>, w: &Tensor, x: &Vec<f32>) {
@@ -154,8 +184,8 @@ impl Device for Cpu {
         &self,
         out: &mut Vec<f32>,
         q: &Vec<f32>,
-        k_cache: &Vec<u16>,
-        v_cache: &Vec<u16>,
+        k_cache: &Cache,
+        v_cache: &Cache,
         pos: usize,
         n_heads: usize,
         head_dim: usize,
@@ -165,6 +195,7 @@ impl Device for Cpu {
         // and value head.
         let group = n_heads / n_kv_heads;
         let kv_dim = n_kv_heads * head_dim;
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK));
         let scale = 1.0 / (head_dim as f32).sqrt();
         out.par_chunks_exact_mut(head_dim)
             .zip(q.par_chunks_exact(head_dim))
@@ -175,13 +206,12 @@ impl Device for Cpu {
                 let len = pos + token + 1;
                 let kv = head / group * head_dim;
                 let mut scores: Vec<f32> = (0..len)
-                    .map(|t| scale * dot_f16(q, &k_cache[t * kv_dim + kv..][..head_dim]))
+                    .map(|t| scale * dot_q8(q, k_cache, t * kv_dim + kv))
                     .collect();
                 softmax(&mut scores);
                 out.fill(0.0);
                 for (t, &score) in scores.iter().enumerate() {
-                    let v = &v_cache[t * kv_dim + kv..][..head_dim];
-                    add_scaled_f16(out, score, v);
+                    add_scaled_q8(out, score, v_cache, t * kv_dim + kv);
                 }
             });
     }
@@ -393,59 +423,31 @@ pub fn dot(w: &[u16], x: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + rest
 }
 
-/// Dot product of f32 activations with f16 ones, in eight independent sums
-/// like [`dot`].
-fn dot_f16(a: &[f32], b: &[u16]) -> f32 {
-    let mut acc = [0.0f32; 8];
-    for (a, b) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        let b = from_f16_8(b.try_into().unwrap());
-        for i in 0..8 {
-            acc[i] += a[i] * b[i];
-        }
-    }
-    let done = a.len() / 8 * 8;
-    let rest: f32 = a[done..]
-        .iter()
-        .zip(&b[done..])
-        .map(|(a, &b)| a * from_f16(b))
-        .sum();
-    acc.iter().sum::<f32>() + rest
+/// Dot product of f32 activations with those of a cache from `offset` on,
+/// a block at a time.
+fn dot_q8(a: &[f32], cache: &Cache, offset: usize) -> f32 {
+    let quants = cache.quants[offset..][..a.len()].chunks_exact(CACHE_BLOCK);
+    let scales = &cache.scales[offset / CACHE_BLOCK..];
+    a.chunks_exact(CACHE_BLOCK)
+        .zip(quants)
+        .zip(scales)
+        .map(|((a, q), &s)| {
+            let dot: f32 = a.iter().zip(q).map(|(a, &q)| a * q as f32).sum();
+            dot * from_f16(s)
+        })
+        .sum()
 }
 
-/// `out += scale * x` for f16 activations `x`.
-fn add_scaled_f16(out: &mut [f32], scale: f32, x: &[u16]) {
-    for (out, x) in out.chunks_exact_mut(8).zip(x.chunks_exact(8)) {
-        let x = from_f16_8(x.try_into().unwrap());
-        for i in 0..8 {
-            out[i] += scale * x[i];
+/// `out += scale * x` for the activations `x` of a cache from `offset` on.
+fn add_scaled_q8(out: &mut [f32], scale: f32, cache: &Cache, offset: usize) {
+    let quants = cache.quants[offset..][..out.len()].chunks_exact(CACHE_BLOCK);
+    let scales = &cache.scales[offset / CACHE_BLOCK..];
+    for ((out, q), &s) in out.chunks_exact_mut(CACHE_BLOCK).zip(quants).zip(scales) {
+        let scale = scale * from_f16(s);
+        for (o, &q) in out.iter_mut().zip(q) {
+            *o += scale * q as f32;
         }
     }
-    let done = out.len() / 8 * 8;
-    for (o, &x) in out[done..].iter_mut().zip(&x[done..]) {
-        *o += scale * from_f16(x);
-    }
-}
-
-/// Converts eight f16 activations to f32 with NEON, whose conversion is many
-/// times faster than one that goes a value at a time.
-#[cfg(all(target_arch = "aarch64", target_feature = "fp16"))]
-fn from_f16_8(bits: &[u16; 8]) -> [f32; 8] {
-    use std::arch::aarch64::{float16x4_t, uint16x4_t, vcvt_f32_f16, vld1_u16, vst1q_f32};
-
-    let mut out = [0.0; 8];
-    for i in [0, 4] {
-        unsafe {
-            let half = std::mem::transmute::<uint16x4_t, float16x4_t>(vld1_u16(bits[i..].as_ptr()));
-            vst1q_f32(out[i..].as_mut_ptr(), vcvt_f32_f16(half));
-        }
-    }
-    out
-}
-
-/// Converts eight f16 activations to f32.
-#[cfg(not(all(target_arch = "aarch64", target_feature = "fp16")))]
-fn from_f16_8(bits: &[u16; 8]) -> [f32; 8] {
-    bits.map(from_f16)
 }
 
 fn softmax(x: &mut [f32]) {
@@ -462,8 +464,8 @@ fn softmax(x: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{from_f16_8, walsh_hadamard};
-    use crate::{F16_MAX, from_f16, to_f16};
+    use super::walsh_hadamard;
+    use crate::{CACHE_BLOCK, F16_MAX, from_f16, quantize, to_f16};
 
     #[test]
     fn f16_round_trips_what_it_can_represent() {
@@ -491,17 +493,28 @@ mod tests {
     }
 
     #[test]
-    fn f16_converts_the_same_eight_at_a_time() {
-        let finite: Vec<u16> = (0..=u16::MAX)
-            .filter(|bits| bits & 0x7c00 != 0x7c00)
-            .collect();
-        for bits in finite.chunks_exact(8) {
-            let bits: &[u16; 8] = bits.try_into().unwrap();
-            assert_eq!(
-                from_f16_8(bits).map(f32::to_bits),
-                bits.map(|b| from_f16(b).to_bits())
-            );
+    fn quantize_rounds_to_the_nearest_multiple_of_the_scale() {
+        // A largest magnitude of 127 makes the scale exactly one, and the
+        // halves ties, which go away from zero.
+        let mut block = [0.0; CACHE_BLOCK];
+        block[..8].copy_from_slice(&[127.0, 0.5, 1.5, -2.5, 0.49, -0.51, 126.6, -0.0]);
+        let (scale, q) = quantize(&block);
+        assert_eq!(from_f16(scale), 1.0);
+        assert_eq!(q[..8], [127, 1, 2, -3, 0, -1, 127, 0]);
+
+        // The largest magnitude is 127 multiples of the scale, or as near
+        // as the scale rounded to f16 comes, and never more.
+        let block: Vec<f32> = (0..CACHE_BLOCK).map(|i| (i as f32 - 13.3) * 0.37).collect();
+        let (scale, q) = quantize(&block);
+        let d = from_f16(scale);
+        for (&x, &q) in block.iter().zip(&q) {
+            assert!((x - q as f32 * d).abs() <= d / 2.0, "{x} as {q} of {d}");
         }
+        assert_eq!(q.iter().map(|q| q.unsigned_abs()).max(), Some(127));
+
+        assert_eq!(quantize(&[0.0; CACHE_BLOCK]), (0, [0; CACHE_BLOCK]));
+        let (scale, q) = quantize(&[-1e8; CACHE_BLOCK]);
+        assert_eq!((from_f16(scale), q), (F16_MAX, [-127; CACHE_BLOCK]));
     }
 
     #[test]

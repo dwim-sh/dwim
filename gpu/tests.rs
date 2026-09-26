@@ -1,6 +1,6 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::{CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, ternary};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, ternary};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -16,7 +16,7 @@ macro_rules! check_against_cpu {
             l2norm_matches_cpu,
             rope_matches_cpu,
             attention_matches_cpu,
-            store_rounds_like_cpu,
+            store_quantizes_like_cpu,
             cache_round_trips,
             elementwise_match_cpu,
             hadamard_matches_cpu,
@@ -567,11 +567,11 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     // The last attends over more positions than one dispatch has scores
     // for, all its tokens at once.
     let cases = [
-        (4, 8, 2, 3, 5),
+        (4, 32, 2, 3, 5),
         (16, 128, 8, 2, 300),
         (2, 128, 1, 1, 0),
         (24, 256, 4, 3, 1000),
-        (3, 24, 1, 2, 9),
+        (3, 96, 1, 2, 9),
         (16, 128, 4, 64, 32704),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos) in cases {
@@ -594,63 +594,60 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         );
         let mut out = gpu.alloc(want.len());
         gpu.attention(&mut out, &q, &k, &v, pos, n_heads, head_dim, n_kv_heads);
-        // Within a couple of half-precision ulps: a driver whose `store`
-        // truncates rather than rounds (Mesa's `pack2x16float` does) puts
-        // slightly different keys and values in the cache, which
-        // `store_rounds_like_cpu` reports on its own.
-        close(&gpu.read(&out), &want, 3e-3);
+        // The caches hold the same bits, which `store_quantizes_like_cpu`
+        // checks; only the order of the sums differs.
+        close(&gpu.read(&out), &want, 1e-4);
     }
 }
 
-pub fn store_rounds_like_cpu<D: Device>(gpu: &D) {
-    // Attention over a single position weighs its value by exactly one, so
-    // it reads back what the value cache holds.
-    let head_dim = 128;
-    let mut v = Rng(9).floats(head_dim);
-    let edges = [
-        1e6,
-        -1e6,
-        65504.0,
-        65520.0,
-        1.0 + 2.0f32.powi(-11),
-        1.0 + 3.0 * 2.0f32.powi(-11),
-        0.1,
-        1e-9,
-        -3e-7,
-        2.0f32.powi(-14) * 0.99999,
-        -0.0,
+pub fn store_quantizes_like_cpu<D: Device>(gpu: &D) {
+    // Random blocks, and blocks at the edges: ties between multiples of the
+    // scale, magnitudes past what an f16 scale reaches, scales that are
+    // subnormal f16s or round to zero, and a block of zeros.
+    let mut data = Rng(9).floats(64 * CACHE_BLOCK);
+    let edges: [&[f32]; 7] = [
+        &[127.0, 0.5, 1.5, -2.5, 126.5, -0.0, 3.5000002, -3.4999998],
+        &[1e6, -1e6, 65504.0, 65520.0, 0.1],
+        &[1e-3, -3e-7, 2e-4, 1e-9],
+        &[1e-6, 7e-7, -3e-7],
+        &[1e-9, -1e-12],
+        &[0.0],
+        &[0.3, 0.3 / 127.0 * 64.5, -0.3 / 127.0 * 0.5],
     ];
-    v[..edges.len()].copy_from_slice(&edges);
-    let q = vec![0.0; head_dim];
-    let mut want = vec![0.0; head_dim];
-    let cpu_v = cache(&Cpu, &v, 0);
-    Cpu.attention(&mut want, &q, &cpu_v, &cpu_v, 0, 1, head_dim, 1);
-    let gpu_v = cache(gpu, &v, 0);
-    let mut out = gpu.alloc(head_dim);
-    gpu.attention(
-        &mut out,
-        &buffer(gpu, &q),
-        &gpu_v,
-        &gpu_v,
-        0,
-        1,
-        head_dim,
-        1,
-    );
-    assert_eq!(gpu.read(&out), want);
+    for (block, edge) in data.chunks_exact_mut(CACHE_BLOCK).zip(edges) {
+        block.fill(0.0);
+        block[..edge.len()].copy_from_slice(edge);
+    }
+    let len = data.len();
+    // Split at an odd block, so that a store starts part way into what a
+    // device may keep together.
+    let split = 11 * CACHE_BLOCK;
+    let want = Cpu.read_cache(&cache(&Cpu, &data, split), len);
+    assert_eq!(gpu.read_cache(&cache(gpu, &data, split), len), want);
 }
 
 pub fn cache_round_trips<D: Device>(gpu: &D) {
-    let data = Rng(10).floats(1002);
-    let mut c = cache(gpu, &data, 300);
-    let want: Vec<u16> = data.iter().map(|&v| crate::to_f16(v)).collect();
-    assert_eq!(gpu.read_cache(&c, 1002), want);
-    assert_eq!(gpu.read_cache(&c, 7), want[..7]);
-    let bits: Vec<u16> = (0..500).map(|i| i as u16 * 3).collect();
-    gpu.write_cache(&mut c, &bits);
-    let mut expect = want.clone();
-    expect[..500].copy_from_slice(&bits);
-    assert_eq!(gpu.read_cache(&c, 1002), expect);
+    let len = 32 * CACHE_BLOCK;
+    let data = Rng(10).floats(len);
+    let mut c = cache(gpu, &data, 7 * CACHE_BLOCK);
+    let blocks: Vec<_> = data
+        .chunks_exact(CACHE_BLOCK)
+        .map(crate::quantize)
+        .collect();
+    let bytes = |blocks: &[(u16, [i8; CACHE_BLOCK])]| -> Vec<u8> {
+        let quants = blocks.iter().flat_map(|(_, q)| q.map(|q| q as u8));
+        let scales = blocks.iter().flat_map(|(s, _)| s.to_le_bytes());
+        quants.chain(scales).collect()
+    };
+    assert_eq!(gpu.read_cache(&c, len), bytes(&blocks));
+    assert_eq!(gpu.read_cache(&c, 3 * CACHE_BLOCK), bytes(&blocks[..3]));
+    let mut written = blocks.clone();
+    for (i, (scale, q)) in written[..13].iter_mut().enumerate() {
+        *scale = i as u16 * 3;
+        *q = std::array::from_fn(|j| (i * 7 + j) as i8);
+    }
+    gpu.write_cache(&mut c, &bytes(&written[..13]));
+    assert_eq!(gpu.read_cache(&c, len), bytes(&written));
 }
 
 pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
