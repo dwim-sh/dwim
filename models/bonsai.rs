@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use dwim_gpu::{CONV_KERNEL, HADAMARD_BLOCK};
+use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
 use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
 
@@ -87,6 +87,9 @@ impl Config {
         }
         if !config.v_heads.is_multiple_of(config.k_heads) {
             return Err("value heads are not a multiple of key heads".into());
+        }
+        if !config.head_dim.is_multiple_of(CACHE_BLOCK) {
+            return Err("the attention heads are not whole blocks of the caches".into());
         }
         for (key, want) in [
             (
@@ -617,12 +620,12 @@ fn untile<T: Clone>(data: &[T], n_k: usize, n_v: usize, per_head: usize) -> Vec<
 
 /// The first bytes of a saved state, and its layout's version.
 const STATE_MAGIC: &[u8; 8] = b"dwimstat";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 impl<D: Device> LanguageModel for Model<D> {
     /// The state after `len` positions: a header of the layout's version and
     /// the model's dimensions, then each attention layer's keys and values
-    /// for the positions, then each linear layer's convolution state and
+    /// for the positions as the caches hold them, then each linear layer's convolution state and
     /// recurrent state.
     fn save(&self, len: usize) -> Option<Vec<u8>> {
         let (c, d, s) = (&self.config, &self.device, &self.state);
@@ -641,11 +644,7 @@ impl<D: Device> LanguageModel for Model<D> {
             out.extend_from_slice(&(value as u64).to_le_bytes());
         }
         for cache in s.k_cache.iter().chain(&s.v_cache) {
-            out.extend(
-                d.read_cache(cache, len * kv_dim)
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes()),
-            );
+            out.extend(d.read_cache(cache, len * kv_dim));
         }
         for slot in 0..s.ssm_state.len() {
             // The convolution reads the batch before from one buffer of the
@@ -697,11 +696,7 @@ impl<D: Device> LanguageModel for Model<D> {
             );
         }
         for cache in s.k_cache.iter_mut().chain(&mut s.v_cache) {
-            let halves: Vec<u16> = take(len * kv_dim * 2)?
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect();
-            d.write_cache(cache, &halves);
+            d.write_cache(cache, take(cache_bytes(len * kv_dim))?);
         }
         for slot in 0..s.ssm_state.len() {
             let [conv, _] = &mut s.conv_state[slot];
@@ -756,7 +751,7 @@ impl<D: Device> LanguageModel for Model<D> {
 
 /// Buffers the forward pass computes in, with room for a batch of
 /// [`BATCH`] tokens; the key/value caches of the attention layers, holding
-/// every position seen so far in half precision; the convolution and
+/// every position seen so far in 8-bit blocks; the convolution and
 /// recurrent states of the linear attention layers; and the rotary position
 /// embedding table for every position there is room for.
 struct State<D: Device> {

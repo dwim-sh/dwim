@@ -1,5 +1,5 @@
-// Causal attention over f16 caches, two half-precision floats to a word:
-// one workgroup per (token, key/value head, chunk of 128 positions), for
+// Causal attention over 8-bit caches, four integers to a word and a scale
+// per block of 32 as a half-precision float, two to a word: one workgroup per (token, key/value head, chunk of 128 positions), for
 // every query head that shares the key/value head, so that the caches are
 // read once for the group and a long context spreads over the GPU. A
 // subgroup scores one position at a time, its lanes each taking a few
@@ -26,11 +26,40 @@ var<immediate> p: Params;
 
 @group(0) @binding(0) var<storage, read_write> out: array<f32>;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
-@group(0) @binding(2) var<storage, read> k_cache: array<u32>;
-@group(0) @binding(3) var<storage, read> v_cache: array<u32>;
-@group(0) @binding(4) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(2) var<storage, read> k_quants: array<u32>;
+@group(0) @binding(3) var<storage, read> k_scales: array<u32>;
+@group(0) @binding(4) var<storage, read> v_quants: array<u32>;
+@group(0) @binding(5) var<storage, read> v_scales: array<u32>;
+@group(0) @binding(6) var<storage, read_write> partials: array<f32>;
 
 const CHUNK: u32 = 128u;
+
+// Activations to a block of the caches, which share a scale.
+const BLOCK: u32 = 32u;
+
+// The four 8-bit integers of a word, lowest first, as floats.
+fn bytes(w: u32) -> vec4<f32> {
+    let shifted = vec4(w << 24u, w << 16u, w << 8u, w);
+    return vec4<f32>(bitcast<vec4<i32>>(shifted) >> vec4(24u));
+}
+
+// The scale of block `b` of a cache, from the word of scales that holds it.
+fn block_scale(scales: u32, b: u32) -> f32 {
+    return unpack2x16float(scales >> (16u * (b & 1u))).x;
+}
+
+// Four activations of the key cache from `i` on, or the first two.
+fn load_key(i: u32, two: bool) -> vec4<f32> {
+    let w = k_quants[i / 4u] >> (8u * (i % 4u));
+    let s = block_scale(k_scales[i / (2u * BLOCK)], i / BLOCK);
+    let k = bytes(w) * s;
+    return select(k, vec4(k.xy, 0.0, 0.0), two);
+}
+
+// The four activations of the value cache from `i` on.
+fn load_value(i: u32) -> vec4<f32> {
+    return bytes(v_quants[i / 4u]) * block_scale(v_scales[i / (2u * BLOCK)], i / BLOCK);
+}
 
 // Most query heads to a key/value head.
 const GROUP: u32 = 8u;
@@ -65,8 +94,8 @@ fn main(
     // The first query head of the group, for this token.
     let qbase = (t * p.n_heads + kvh * group) * p.head_dim;
 
-    // Each lane of a subgroup takes `per` elements of a key, two to a
-    // word, and keeps the queries' matching elements.
+    // Each lane of a subgroup takes `per` elements of a key, two or four,
+    // and keeps the queries' matching elements.
     let per = max(p.head_dim / ssize, 2u);
     let words = per / 2u;
     let in_head = sinv * per < p.head_dim;
@@ -80,13 +109,7 @@ fn main(
     for (var i = sid; i < count; i += nsg) {
         var key = vec4(0.0);
         if in_head {
-            let kbase = ((start + i) * kv_dim + kv) / 2u + sinv * words;
-            let lo = unpack2x16float(k_cache[kbase]);
-            key = vec4(lo, 0.0, 0.0);
-            if words > 1u {
-                let hi = unpack2x16float(k_cache[kbase + 1u]);
-                key = vec4(lo, hi);
-            }
+            key = load_key((start + i) * kv_dim + kv + sinv * per, words == 1u);
         }
         for (var g = 0u; g < group; g++) {
             let s = subgroupAdd(dot(query[g], key));
@@ -151,8 +174,7 @@ fn main(
     var acc: array<vec4<f32>, GROUP>;
     if lane < lanes {
         for (var i = lane; i < count; i += lanes) {
-            let vbase = ((start + i) * kv_dim + kv) / 2u + 2u * d;
-            let v = vec4(unpack2x16float(v_cache[vbase]), unpack2x16float(v_cache[vbase + 1u]));
+            let v = load_value((start + i) * kv_dim + kv + 4u * d);
             for (var g = 0u; g < group; g++) {
                 acc[g] += scores[g][i] * v;
             }

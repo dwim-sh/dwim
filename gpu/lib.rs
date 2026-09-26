@@ -31,6 +31,10 @@ pub const HADAMARD_BLOCK: usize = 1024;
 /// Taps of the causal convolution in linear attention.
 pub const CONV_KERNEL: usize = 4;
 
+/// Activations a block of a key or value cache holds: 8-bit integers
+/// sharing an f16 scale, as [`quantize`] makes them.
+pub const CACHE_BLOCK: usize = 32;
+
 /// A weight matrix on the host, of shape `[rows, cols]`: either raw bf16
 /// bits, or rows of ternary blocks.
 pub enum Tensor {
@@ -58,8 +62,9 @@ pub trait Device {
     type Buffer;
     /// A weight matrix in device memory, bf16 or ternary.
     type Weight;
-    /// A key or value cache in device memory: activations stored as IEEE
-    /// half-precision floats, for half the memory attention reads.
+    /// A key or value cache in device memory: activations stored in blocks
+    /// of [`CACHE_BLOCK`] as [`quantize`] makes them, 8.5 bits each, for
+    /// about half the memory of half-precision floats.
     type Cache;
 
     /// Copies a weight matrix into device memory.
@@ -68,7 +73,8 @@ pub trait Device {
     /// Allocates a zeroed buffer of `len` activations.
     fn alloc(&self, len: usize) -> Self::Buffer;
 
-    /// Allocates a zeroed cache of `len` activations.
+    /// Allocates a zeroed cache of `len` activations, a whole number of
+    /// blocks.
     fn alloc_cache(&self, len: usize) -> Self::Cache;
 
     /// Sets a buffer's length, up to the length it was allocated with, so
@@ -92,18 +98,19 @@ pub trait Device {
         len: usize,
     );
 
-    /// `cache[offset..][..src.len()] = f16(src)`: stores activations in a
-    /// cache, rounded to the nearest half-precision float, and clamped to the
-    /// largest finite one.
+    /// `cache[offset..][..src.len()] = src`: stores activations in a cache,
+    /// quantized a block at a time as [`quantize`] does. The offset and the
+    /// length are whole blocks.
     fn store(&self, cache: &mut Self::Cache, offset: usize, src: &Self::Buffer);
 
-    /// The first `len` activations of a cache, as the bits of the half-
-    /// precision floats they are stored as.
-    fn read_cache(&self, cache: &Self::Cache, len: usize) -> Vec<u16>;
+    /// The first `len` activations of a cache, a whole number of blocks, as
+    /// the bytes they are stored in: their 8-bit integers, then their
+    /// blocks' scales as little-endian f16 bits, [`cache_bytes`] in all.
+    fn read_cache(&self, cache: &Self::Cache, len: usize) -> Vec<u8>;
 
-    /// `cache[..data.len()] = data`: bits as [`read_cache`](Self::read_cache)
-    /// gives them.
-    fn write_cache(&self, cache: &mut Self::Cache, data: &[u16]);
+    /// Sets the first activations of a cache to `data`, bytes as
+    /// [`read_cache`](Self::read_cache) gives them.
+    fn write_cache(&self, cache: &mut Self::Cache, data: &[u8]);
 
     /// `out[t] = w · x[t]` for each row `x[t]` of `x`, for a weight matrix
     /// `w` of shape `[rows, cols]`: `x` holds `cols` activations per token,
@@ -262,6 +269,40 @@ pub fn to_f16(x: f32) -> u16 {
     let m = (a * f32::from_bits(((127 + 10 - e) as u32) << 23)).round_ties_even() as u32;
     let (e, m) = if m == 2048 { (e + 1, 1024) } else { (e, m) };
     sign | (((e + 15) as u16) << 10) | (m - 1024) as u16
+}
+
+/// Quantizes a block of [`CACHE_BLOCK`] activations as caches hold them: the
+/// scale is the largest magnitude over 127 rounded to f16, and each
+/// activation the nearest multiple of it, ties away from zero. Returns the
+/// scale's bits and the multiples. Every device gets the same bits: the
+/// multiples are settled by comparing with the midpoints between them,
+/// which are exact in f32, so a division that is not correctly rounded, as
+/// on a GPU, does not change them.
+pub fn quantize(block: &[f32]) -> (u16, [i8; CACHE_BLOCK]) {
+    assert_eq!(block.len(), CACHE_BLOCK);
+    let amax = block.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let bits = to_f16(amax * (1.0 / 127.0));
+    let d = from_f16(bits);
+    let mut q = [0; CACHE_BLOCK];
+    if d > 0.0 {
+        for (q, &x) in q.iter_mut().zip(block) {
+            let a = x.abs();
+            let mut n = (a / d).round().min(128.0);
+            if a >= (n + 0.5) * d {
+                n += 1.0;
+            } else if n > 0.0 && a < (n - 0.5) * d {
+                n -= 1.0;
+            }
+            *q = (n.min(127.0) as i8) * if x < 0.0 { -1 } else { 1 };
+        }
+    }
+    (bits, q)
+}
+
+/// The bytes a cache holds for `len` activations, a whole number of blocks.
+pub fn cache_bytes(len: usize) -> usize {
+    assert!(len.is_multiple_of(CACHE_BLOCK));
+    len + len / CACHE_BLOCK * 2
 }
 
 /// Converts the bits of a finite IEEE half-precision float to f32.
