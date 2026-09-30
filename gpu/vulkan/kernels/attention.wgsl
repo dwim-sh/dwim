@@ -2,9 +2,10 @@
 // one workgroup per (token, key/value head, chunk of 128 positions), for
 // every query head that shares the key/value head, so that the caches are
 // read once for the group and a long context spreads over the GPU. A
-// subgroup scores one position at a time, its lanes each taking a few
+// subgroup scores one position at a time, its lanes each taking four
 // elements of the key and adding their products up across the subgroup,
-// so that a key is read as one contiguous run; the scores are softmaxed
+// so that a key is read as one contiguous run, in as many rounds as the
+// head is wider than the subgroup takes at once; the scores are softmaxed
 // against the chunk's own maximum; then each thread takes four elements of
 // the head at every position of its lane and sums the values the scores
 // weigh, and the lanes' sums are added together. The chunk's maximum, sum
@@ -65,33 +66,37 @@ fn main(
     // The first query head of the group, for this token.
     let qbase = (t * p.n_heads + kvh * group) * p.head_dim;
 
-    // Each lane of a subgroup takes `per` elements of a key, two to a
-    // word, and keeps the queries' matching elements.
-    let per = max(p.head_dim / ssize, 2u);
-    let words = per / 2u;
-    let in_head = sinv * per < p.head_dim;
-    var query: array<vec4<f32>, GROUP>;
-    for (var g = 0u; g < group; g++) {
-        if in_head {
-            let base = qbase + g * p.head_dim + sinv * per;
-            query[g] = vec4(q[base], q[base + 1u], select(0.0, q[base + 2u], words > 1u), select(0.0, q[base + 3u], words > 1u));
-        }
-    }
-    for (var i = sid; i < count; i += nsg) {
-        var key = vec4(0.0);
-        if in_head {
-            let kbase = ((start + i) * kv_dim + kv) / 2u + sinv * words;
-            let lo = unpack2x16float(k_cache[kbase]);
-            key = vec4(lo, 0.0, 0.0);
-            if words > 1u {
-                let hi = unpack2x16float(k_cache[kbase + 1u]);
-                key = vec4(lo, hi);
+    // Each lane of a subgroup takes four elements of a key, the lanes side
+    // by side, and keeps the queries' matching elements; a head wider than
+    // the subgroup takes more than one round, each adding to the scores.
+    // A subgroup scores the same positions in every round.
+    let quads = p.head_dim / 4u;
+    let rounds = (quads + ssize - 1u) / ssize;
+    for (var r = 0u; r < rounds; r++) {
+        let d = r * ssize + sinv;
+        let in_head = d < quads;
+        var query: array<vec4<f32>, GROUP>;
+        for (var g = 0u; g < group; g++) {
+            if in_head {
+                let base = qbase + g * p.head_dim + 4u * d;
+                query[g] = vec4(q[base], q[base + 1u], q[base + 2u], q[base + 3u]);
             }
         }
-        for (var g = 0u; g < group; g++) {
-            let s = subgroupAdd(dot(query[g], key));
-            if sinv == 0u {
-                scores[g][i] = s * scale;
+        for (var i = sid; i < count; i += nsg) {
+            var key = vec4(0.0);
+            if in_head {
+                let kbase = ((start + i) * kv_dim + kv) / 2u + 2u * d;
+                key = vec4(unpack2x16float(k_cache[kbase]), unpack2x16float(k_cache[kbase + 1u]));
+            }
+            for (var g = 0u; g < group; g++) {
+                let s = subgroupAdd(dot(query[g], key)) * scale;
+                if sinv == 0u {
+                    if r == 0u {
+                        scores[g][i] = s;
+                    } else {
+                        scores[g][i] += s;
+                    }
+                }
             }
         }
     }
@@ -144,7 +149,6 @@ fn main(
     // Each thread takes four elements of the head at every position of its
     // lane, the lanes striding through the positions together, so that a
     // position's values are read as one run and weighed for every head.
-    let quads = p.head_dim / 4u;
     let lanes = 256u / quads;
     let d = lid % quads;
     let lane = lid / quads;
