@@ -127,6 +127,27 @@ impl Config {
         (layer + 1).is_multiple_of(self.full_attention_interval)
     }
 
+    /// Activations per token of each of the forward pass's per-token
+    /// buffers, in the order [`State`] has them.
+    fn widths(&self) -> [usize; 11] {
+        let q_dim = self.heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        let (k_dim, v_dim) = (self.k_dim(), self.v_dim());
+        [
+            self.hidden,
+            self.hidden,
+            self.hidden,
+            q_dim.max(k_dim),
+            q_dim,
+            kv_dim.max(k_dim),
+            kv_dim.max(v_dim),
+            q_dim.max(v_dim),
+            2 * k_dim + v_dim,
+            v_dim,
+            2 * self.v_heads,
+        ]
+    }
+
     /// Width of the linear attention's queries and keys per token, and of
     /// its values.
     /// Activations of a linear layer's convolution state: the tokens before
@@ -147,6 +168,38 @@ impl Config {
 
     fn v_dim(&self) -> usize {
         self.v_heads * self.state_dim
+    }
+}
+
+/// Device memory the model takes, in bytes: `fixed` for its weights,
+/// activations, and recurrent states, and `per_token` more for each token
+/// of context, for the key/value caches and the rotary position embedding
+/// table.
+#[derive(Clone, Copy, Debug)]
+pub struct Memory {
+    pub fixed: u64,
+    pub per_token: u64,
+}
+
+impl Memory {
+    /// The memory the model in `gguf` takes on a device.
+    pub fn of(gguf: &Gguf) -> Result<Self> {
+        let c = Config::load(gguf)?;
+        // Every tensor goes to the device but the embedding table, which
+        // stays in the file on the host.
+        let mut weights = 0;
+        for name in gguf.tensors().filter(|&name| name != "token_embd.weight") {
+            weights += gguf.info(name)?.size()?;
+        }
+        let attention = (0..c.layers).filter(|&i| c.is_attention(i)).count();
+        let linear = c.layers - attention;
+        let activations = BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab;
+        let states = linear * (2 * c.conv_width() + c.ssm_width());
+        let kv_dim = c.kv_heads * c.head_dim;
+        Ok(Self {
+            fixed: (weights + 4 * (activations + states)) as u64,
+            per_token: (2 * attention * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
+        })
     }
 }
 
@@ -787,28 +840,14 @@ struct State<D: Device> {
 impl<D: Device> State<D> {
     /// Allocates state for sequences of up to `max_len` tokens.
     fn new(c: &Config, d: &D, max_len: usize, caches: usize, slots: usize) -> Self {
-        let q_dim = c.heads * c.head_dim;
         let kv_dim = c.kv_heads * c.head_dim;
-        let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
-        let widths = [
-            c.hidden,
-            c.hidden,
-            c.hidden,
-            q_dim.max(k_dim),
-            q_dim,
-            kv_dim.max(k_dim),
-            kv_dim.max(v_dim),
-            q_dim.max(v_dim),
-            2 * k_dim + v_dim,
-            v_dim,
-            2 * c.v_heads,
-        ];
+        let widths = c.widths();
         let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] =
             widths.map(|width| d.alloc(BATCH * width));
         let table = rope_table(max_len, c.rot_dim, c.rope_theta);
         let mut rope = d.alloc(table.len());
         d.write(&mut rope, &table);
-        let conv_width = (CONV_KERNEL - 1) * (2 * k_dim + v_dim);
+        let conv_width = c.conv_width();
         Self {
             widths,
             x,

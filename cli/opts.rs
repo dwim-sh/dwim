@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use argh::FromArgs;
 
 use crate::models;
@@ -13,9 +15,10 @@ pub struct Opts {
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
 
-    /// tokens of conversation the model has room for (default: 16384)
-    #[argh(option, default = "models::DEFAULT_CONTEXT")]
-    pub context: usize,
+    /// tokens of conversation the model has room for (default: as many
+    /// as fit in the device's free memory)
+    #[argh(option)]
+    pub context: Option<usize>,
 
     /// print the version and exit
     #[argh(switch)]
@@ -28,6 +31,11 @@ pub struct Opts {
     /// show the model's thinking in the shell, which ctrl+o toggles
     #[argh(switch)]
     pub thinking: bool,
+
+    /// file to write the session's transcript to, as JSON Lines (default:
+    /// a new file under ~/.local/state/dwim/projects/)
+    #[argh(option)]
+    pub transcript: Option<PathBuf>,
 
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]

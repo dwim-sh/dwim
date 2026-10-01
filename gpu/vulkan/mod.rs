@@ -10,6 +10,7 @@
 use std::{error::Error, io::Cursor, slice, sync::Mutex};
 
 use ash::{
+    ext::memory_budget,
     khr::{push_descriptor, shader_float16_int8},
     vk,
 };
@@ -181,6 +182,7 @@ struct Mapped {
 pub struct Vulkan {
     _entry: ash::Entry,
     instance: ash::Instance,
+    physical: vk::PhysicalDevice,
     device: ash::Device,
     push: push_descriptor::Device,
     queue: vk::Queue,
@@ -206,6 +208,11 @@ pub struct Vulkan {
     layout: vk::PipelineLayout,
     kernels: Kernels,
     memory_types: vk::PhysicalDeviceMemoryProperties,
+    /// Whether the driver says how much of each heap is free, with
+    /// `VK_EXT_memory_budget`.
+    budget: bool,
+    /// Whether the GPU is integrated, its memory the host's.
+    integrated: bool,
     staging: [Mapped; 2],
     partials: vk::Buffer,
     /// A batch's activations as half floats, for the batch and tile kernels.
@@ -284,6 +291,9 @@ impl Vulkan {
                 .into());
             }
             let extensions = instance.enumerate_device_extension_properties(physical)?;
+            let budget = extensions
+                .iter()
+                .any(|ext| ext.extension_name_as_c_str() == Ok(memory_budget::NAME));
             for needed in [push_descriptor::NAME, shader_float16_int8::NAME] {
                 if !extensions
                     .iter()
@@ -431,6 +441,7 @@ impl Vulkan {
             let mut gpu = Self {
                 _entry: entry,
                 instance,
+                physical,
                 device,
                 push,
                 queue,
@@ -442,6 +453,8 @@ impl Vulkan {
                 layout,
                 kernels,
                 memory_types,
+                budget,
+                integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
                 staging: [
                     Mapped {
                         buf: vk::Buffer::null(),
@@ -932,6 +945,41 @@ impl Device for Vulkan {
     type Buffer = Buffer;
     type Weight = Weight;
     type Cache = Cache;
+
+    fn memory(&self) -> Option<u64> {
+        // The heap of the first device-local memory type, which `buffer`
+        // allocates from.
+        let types = &self.memory_types.memory_types[..self.memory_types.memory_type_count as usize];
+        let heap = types
+            .iter()
+            .find(|t| {
+                t.property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })?
+            .heap_index as usize;
+        let size = self.memory_types.memory_heaps[heap].size;
+        let mut free = size;
+        if self.budget {
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical, &mut props)
+            };
+            free = budget.heap_budget[heap].saturating_sub(budget.heap_usage[heap]);
+        }
+        // An integrated GPU's heap is the host's memory, which the host's
+        // programs use too, unless the firmware set aside more memory for
+        // the GPU than the host has for itself.
+        if self.integrated
+            && let Some(total) = crate::meminfo("MemTotal")
+            && size <= total
+            && let Some(available) = crate::meminfo("MemAvailable")
+        {
+            free = free.min(available);
+        }
+        Some(free)
+    }
 
     fn upload(&self, tensor: Tensor) -> Weight {
         match tensor {

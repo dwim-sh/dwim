@@ -328,6 +328,17 @@ impl Device for Metal {
     type Weight = Weight;
     type Cache = Cache;
 
+    fn memory(&self) -> Option<u64> {
+        // Metal's estimate of the most the GPU can use without hurting
+        // performance: with memory unified, a share of the host's.
+        let allocated = self.device.currentAllocatedSize() as u64;
+        Some(
+            self.device
+                .recommendedMaxWorkingSetSize()
+                .saturating_sub(allocated),
+        )
+    }
+
     fn upload(&self, tensor: Tensor) -> Weight {
         let (shape, bytes, ternary) = match &tensor {
             Tensor::Bf16 { shape, data } => {
