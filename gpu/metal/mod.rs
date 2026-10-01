@@ -20,7 +20,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use crate::{CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
 
 /// Most attention scores one dispatch of the attention kernel computes, one
 /// per head of each token for each position it attends to: the size of the
@@ -46,9 +46,11 @@ pub struct Buffer {
     cap: usize,
 }
 
-/// A cache of f16 activations in memory shared with the GPU.
+/// A cache of activations in memory shared with the GPU, in blocks of 8-bit
+/// integers, and the blocks' f16 scales.
 pub struct Cache {
-    buf: Object<dyn MTLBuffer>,
+    quants: Object<dyn MTLBuffer>,
+    scales: Object<dyn MTLBuffer>,
     len: usize,
 }
 
@@ -71,7 +73,7 @@ struct Kernels {
     silu_mul: Object<dyn MTLComputePipelineState>,
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
-    store_halves: Object<dyn MTLComputePipelineState>,
+    store_q8: Object<dyn MTLComputePipelineState>,
     hadamard: Object<dyn MTLComputePipelineState>,
     rmsnorm_hadamard: Object<dyn MTLComputePipelineState>,
     conv: Object<dyn MTLComputePipelineState>,
@@ -139,7 +141,7 @@ impl Metal {
             silu_mul: msl!("silu_mul"),
             sigmoid_mul: msl!("sigmoid_mul"),
             copy: msl!("copy"),
-            store_halves: msl!("store_halves"),
+            store_q8: msl!("store_q8"),
             hadamard: msl!("hadamard"),
             rmsnorm_hadamard: msl!("rmsnorm_hadamard"),
             conv: msl!("conv"),
@@ -367,8 +369,10 @@ impl Device for Metal {
     }
 
     fn alloc_cache(&self, len: usize) -> Cache {
+        assert!(len.is_multiple_of(CACHE_BLOCK));
         Cache {
-            buf: self.buffer(len * 2),
+            quants: self.buffer(len),
+            scales: self.buffer(len / CACHE_BLOCK * 2),
             len,
         }
     }
@@ -428,37 +432,47 @@ impl Device for Metal {
 
     fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
         assert!(offset + src.len <= cache.len);
+        assert!(offset.is_multiple_of(CACHE_BLOCK) && src.len.is_multiple_of(CACHE_BLOCK));
         let params = StoreParams {
             offset: offset as u32,
             len: src.len as u32,
         };
-        let groups = src.len.div_ceil(THREADS);
+        let groups = (src.len / CACHE_BLOCK).div_ceil(THREADS);
         self.dispatch(
-            &self.kernels.store_halves,
-            &[&cache.buf, &src.buf],
+            &self.kernels.store_q8,
+            &[&cache.quants, &cache.scales, &src.buf],
             &params,
             groups,
             THREADS,
         );
     }
 
-    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
-        assert!(len <= cache.len);
+    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u8> {
+        assert!(len <= cache.len && len.is_multiple_of(CACHE_BLOCK));
         self.flush();
-        unsafe { slice::from_raw_parts(cache.buf.contents().as_ptr().cast::<u16>(), len).to_vec() }
+        let bytes = |buf: &Object<dyn MTLBuffer>, len: usize| unsafe {
+            slice::from_raw_parts(buf.contents().as_ptr().cast::<u8>(), len)
+        };
+        let mut out = bytes(&cache.quants, len).to_vec();
+        out.extend_from_slice(bytes(&cache.scales, len / CACHE_BLOCK * 2));
+        out
     }
 
-    fn write_cache(&self, cache: &mut Cache, data: &[u16]) {
-        assert!(data.len() <= cache.len);
+    fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
+        let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
+        assert!(len <= cache.len && data.len() == crate::cache_bytes(len));
+        let (quants, scales) = data.split_at(len);
         // The pending commands may use what the cache holds now.
         self.flush();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                cache.buf.contents().as_ptr().cast(),
-                data.len(),
-            )
-        };
+        for (buf, data) in [(&cache.quants, quants), (&cache.scales, scales)] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buf.contents().as_ptr().cast(),
+                    data.len(),
+                )
+            };
+        }
     }
 
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
@@ -583,7 +597,7 @@ impl Device for Metal {
         let n = q.len / (n_heads * head_dim);
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(4) && head_dim <= ATTENTION_THREADS);
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= ATTENTION_THREADS);
         // Every token's heads get a row of scores as long as the last token
         // attends over, as many tokens to a dispatch as the scores fit.
         let stride = pos + n;
@@ -603,7 +617,15 @@ impl Device for Metal {
             };
             self.dispatch(
                 &self.kernels.attention,
-                &[&out.buf, &q.buf, &k_cache.buf, &v_cache.buf, &self.scores],
+                &[
+                    &out.buf,
+                    &q.buf,
+                    &k_cache.quants,
+                    &k_cache.scales,
+                    &v_cache.quants,
+                    &v_cache.scales,
+                    &self.scores,
+                ],
                 &params,
                 per_dispatch.min(n - first) * n_heads,
                 ATTENTION_THREADS,

@@ -16,7 +16,7 @@ use ash::{
 use rayon::prelude::*;
 
 use crate::{
-    CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor,
+    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor,
     ternary::{BLOCK, BLOCK_BYTES},
 };
 
@@ -74,9 +74,11 @@ pub struct Buffer {
     cap: usize,
 }
 
-/// A cache of f16 activations in device memory, two to a 32-bit word.
+/// A cache of activations in device memory, in blocks of 8-bit integers
+/// four to a 32-bit word, and the blocks' f16 scales two to a word.
 pub struct Cache {
-    buf: vk::Buffer,
+    quants: vk::Buffer,
+    scales: vk::Buffer,
     len: usize,
 }
 
@@ -103,7 +105,7 @@ struct Kernels {
     attention_combine: vk::Pipeline,
     silu_mul: vk::Pipeline,
     sigmoid_mul: vk::Pipeline,
-    store_halves: vk::Pipeline,
+    store_q8: vk::Pipeline,
     hadamard: vk::Pipeline,
     rmsnorm_hadamard: vk::Pipeline,
     conv: vk::Pipeline,
@@ -112,10 +114,12 @@ struct Kernels {
 
 impl Kernels {
     /// The bindings a kernel writes, as bits: the first, and for a few
-    /// kernels a partials, state, or cache binding too.
+    /// kernels a partials, state, scales, or cache binding too.
     fn written(&self, pipeline: vk::Pipeline) -> u32 {
         if pipeline == self.attention {
-            0b1_0001
+            0b100_0001
+        } else if pipeline == self.store_q8 {
+            0b11
         } else if pipeline == self.delta_net {
             0b100_0001
         } else if pipeline == self.conv {
@@ -159,7 +163,7 @@ impl Kernels {
             self.attention_combine,
             self.silu_mul,
             self.sigmoid_mul,
-            self.store_halves,
+            self.store_q8,
             self.hadamard,
             self.rmsnorm_hadamard,
             self.conv,
@@ -417,7 +421,7 @@ impl Vulkan {
                 attention_combine: spv!("attention_combine"),
                 silu_mul: spv!("silu_mul"),
                 sigmoid_mul: spv!("sigmoid_mul"),
-                store_halves: spv!("store_halves"),
+                store_q8: spv!("store_q8"),
                 hadamard: spv!("hadamard"),
                 rmsnorm_hadamard: spv!("rmsnorm_hadamard"),
                 conv: spv!("conv"),
@@ -973,12 +977,21 @@ impl Device for Vulkan {
     }
 
     fn alloc_cache(&self, len: usize) -> Cache {
-        let buf = self.device_buffer(len.div_ceil(2) * 4);
+        assert!(len.is_multiple_of(CACHE_BLOCK));
+        let quants = self.device_buffer(len);
+        let scales = self.device_buffer((len / CACHE_BLOCK).div_ceil(2) * 4);
         let cmd = self.cmd();
-        unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
+        for buf in [quants, scales] {
+            unsafe { self.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) };
+        }
         self.barrier(cmd);
-        self.wrote(buf);
-        Cache { buf, len }
+        self.wrote(quants);
+        self.wrote(scales);
+        Cache {
+            quants,
+            scales,
+            len,
+        }
     }
 
     fn resize(&self, buf: &mut Buffer, len: usize) {
@@ -1028,33 +1041,38 @@ impl Device for Vulkan {
 
     fn store(&self, cache: &mut Cache, offset: usize, src: &Buffer) {
         assert!(offset + src.len <= cache.len);
-        // The kernel packs whole words of two activations.
-        assert!(offset.is_multiple_of(2) && src.len.is_multiple_of(2));
+        assert!(offset.is_multiple_of(CACHE_BLOCK) && src.len.is_multiple_of(CACHE_BLOCK));
         let params = StoreParams {
             offset: offset as u32,
             len: src.len as u32,
         };
-        let groups = self.groups(src.len / 2, 256);
+        // A thread for each word of scales the blocks have.
+        let (first, blocks) = (offset / CACHE_BLOCK, src.len / CACHE_BLOCK);
+        let words = (first + blocks).div_ceil(2) - first / 2;
+        let groups = self.groups(words, 64);
         self.dispatch(
-            self.kernels.store_halves,
-            &[cache.buf, src.buf],
+            self.kernels.store_q8,
+            &[cache.quants, cache.scales, src.buf],
             &params,
             groups,
         );
     }
 
-    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u16> {
+    fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u8> {
         assert!(len <= cache.len);
-        let mut out = vec![0u16; len];
-        let bytes = unsafe { slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len * 2) };
-        self.download_bytes(cache.buf, bytes);
+        let mut out = vec![0; crate::cache_bytes(len)];
+        let (quants, scales) = out.split_at_mut(len);
+        self.download_bytes(cache.quants, quants);
+        self.download_bytes(cache.scales, scales);
         out
     }
 
-    fn write_cache(&self, cache: &mut Cache, data: &[u16]) {
-        assert!(data.len() <= cache.len);
-        let bytes = unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
-        self.upload_bytes(cache.buf, 0, bytes);
+    fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
+        let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
+        assert!(len <= cache.len && data.len() == crate::cache_bytes(len));
+        let (quants, scales) = data.split_at(len);
+        self.upload_bytes(cache.quants, 0, quants);
+        self.upload_bytes(cache.scales, 0, scales);
     }
 
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
@@ -1274,7 +1292,7 @@ impl Device for Vulkan {
         let n = q.len / (n_heads * head_dim);
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(4) && head_dim <= 256);
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= 256);
         assert!(
             n_heads / n_kv_heads <= 8,
             "the kernel holds up to eight query heads per key/value head"
@@ -1302,7 +1320,15 @@ impl Device for Vulkan {
             let groups = self.groups(tokens * n_kv_heads * chunks, 1);
             self.dispatch(
                 self.kernels.attention,
-                &[out.buf, q.buf, k_cache.buf, v_cache.buf, self.partials],
+                &[
+                    out.buf,
+                    q.buf,
+                    k_cache.quants,
+                    k_cache.scales,
+                    v_cache.quants,
+                    v_cache.scales,
+                    self.partials,
+                ],
                 &params,
                 groups,
             );
