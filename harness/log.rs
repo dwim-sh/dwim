@@ -5,23 +5,28 @@
 //!
 //! Each record is written whole as it happens, so a session that is killed
 //! leaves all of it up to then. Streamed text, a thought, a reply's text, or
-//! a note, is gathered into one record, written when something else
-//! happens. Writing is best effort: once a write fails, the rest of the
-//! session goes unrecorded rather than stopping the agent.
+//! a note, is gathered into one record, written when it starts and written
+//! over in place as it grows, at least once a second, so a session that is
+//! killed while the model is writing loses at most the last second of it.
+//! Writing is best effort: once a write fails, the rest of the session goes
+//! unrecorded rather than stopping the agent.
 
 use std::{
     fmt::Display,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::date;
+
+/// Longest the streamed text being gathered goes without being written.
+const REWRITE: Duration = Duration::from_secs(1);
 
 /// A record as written: what kind it is and when, then its own fields.
 #[derive(Serialize)]
@@ -38,8 +43,19 @@ pub struct Log {
     file: Option<File>,
     path: Option<PathBuf>,
     start: Instant,
-    /// The streamed text being gathered: its kind and the text so far.
-    pending: Option<(&'static str, String)>,
+    /// The streamed text being gathered.
+    pending: Option<Pending>,
+}
+
+/// Streamed text being gathered into a record, which is already in the file
+/// as of when it was last written.
+struct Pending {
+    kind: &'static str,
+    text: String,
+    /// Where in the file the record starts.
+    at: u64,
+    /// When the record was last written.
+    written: Instant,
 }
 
 impl Log {
@@ -115,12 +131,30 @@ impl Log {
     /// `note`.
     pub fn stream(&mut self, kind: &'static str, piece: &str) {
         match &mut self.pending {
-            Some((pending, text)) if *pending == kind => text.push_str(piece),
+            Some(pending) if pending.kind == kind => {
+                pending.text.push_str(piece);
+                if pending.written.elapsed() < REWRITE {
+                    return;
+                }
+            }
             _ => {
                 self.flush();
-                self.pending = Some((kind, piece.to_string()));
+                let Some(file) = &mut self.file else {
+                    return;
+                };
+                let Ok(at) = file.stream_position() else {
+                    self.file = None;
+                    return;
+                };
+                self.pending = Some(Pending {
+                    kind,
+                    text: piece.to_string(),
+                    at,
+                    written: Instant::now(),
+                });
             }
         }
+        self.rewrite();
     }
 
     /// Records the end of a reply: the calls it made as written, whether it
@@ -193,10 +227,31 @@ impl Log {
         self.put(kind, fields);
     }
 
-    /// Writes the streamed text gathered so far, if there is any.
+    /// Writes the streamed text gathered so far, if there is any, and
+    /// starts the next record after it.
     fn flush(&mut self) {
-        if let Some((kind, text)) = self.pending.take() {
-            self.put(kind, json!({ "text": text }));
+        self.rewrite();
+        self.pending = None;
+    }
+
+    /// Writes the record of the streamed text being gathered over the one
+    /// written before, which is the last line in the file.
+    fn rewrite(&mut self) {
+        let Some(pending) = &mut self.pending else {
+            return;
+        };
+        let Some(file) = &mut self.file else {
+            return;
+        };
+        pending.written = Instant::now();
+        let line = line(self.start, pending.kind, json!({ "text": pending.text }));
+        let at = pending.at;
+        let written = file
+            .seek(SeekFrom::Start(at))
+            .and_then(|_| file.write_all(line.as_bytes()))
+            .and_then(|()| file.set_len(at + line.len() as u64));
+        if written.is_err() {
+            self.file = None;
         }
     }
 
@@ -205,14 +260,10 @@ impl Log {
         let Some(file) = &mut self.file else {
             return;
         };
-        let record = Record {
-            kind,
-            time: round(self.start.elapsed().as_secs_f64()),
-            fields,
-        };
-        let mut line = serde_json::to_string(&record).unwrap_or_default();
-        line.push('\n');
-        if file.write_all(line.as_bytes()).is_err() {
+        if file
+            .write_all(line(self.start, kind, fields).as_bytes())
+            .is_err()
+        {
             self.file = None;
         }
     }
@@ -223,6 +274,18 @@ impl Drop for Log {
     fn drop(&mut self) {
         self.flush();
     }
+}
+
+/// A record as a line of JSON, timed from `start`.
+fn line(start: Instant, kind: &str, fields: Value) -> String {
+    let record = Record {
+        kind,
+        time: round(start.elapsed().as_secs_f64()),
+        fields,
+    };
+    let mut line = serde_json::to_string(&record).unwrap_or_default();
+    line.push('\n');
+    line
 }
 
 /// The date and the time of day now, in UTC.
@@ -240,4 +303,47 @@ fn now() -> (String, String) {
 /// Seconds to the millisecond.
 fn round(seconds: f64) -> f64 {
     (seconds * 1000.0).round() / 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, mem};
+
+    use super::*;
+
+    fn records(path: &Path) -> Vec<(String, String)> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                let field = |name: &str| record[name].as_str().unwrap_or_default().to_string();
+                (field("type"), field("text") + &field("detail"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keeps_streamed_text_of_a_killed_session() {
+        let path = env::temp_dir().join(format!("dwim-log-test-{}.jsonl", process::id()));
+        let mut log = Log::create(&path).unwrap();
+        log.stream("thought", "Let me ");
+        assert_eq!(records(&path), [("thought".into(), "Let me ".into())]);
+        log.stream("thought", "look.");
+        log.call("bash", "ls");
+        log.stream("text", "Here");
+        log.pending.as_mut().unwrap().written -= REWRITE;
+        log.stream("text", " it is.");
+        // Killed: nothing more is written.
+        mem::forget(log);
+        assert_eq!(
+            records(&path),
+            [
+                ("thought".into(), "Let me look.".into()),
+                ("call".into(), "ls".into()),
+                ("text".into(), "Here it is.".into()),
+            ]
+        );
+        fs::remove_file(&path).unwrap();
+    }
 }
