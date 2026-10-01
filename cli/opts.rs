@@ -13,9 +13,10 @@ pub struct Opts {
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
 
-    /// tokens of conversation the model has room for (default: 16384)
-    #[argh(option, default = "models::DEFAULT_CONTEXT")]
-    pub context: usize,
+    /// tokens of conversation the model has room for (default: as many
+    /// as fit in the device's free memory)
+    #[argh(option)]
+    pub context: Option<usize>,
 
     /// print the version and exit
     #[argh(switch)]

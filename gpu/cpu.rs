@@ -22,6 +22,11 @@ impl Device for Cpu {
     type Weight = Tensor;
     type Cache = Cache;
 
+    fn memory(&self) -> Option<u64> {
+        // What the host can give without swapping, which Linux estimates.
+        crate::meminfo("MemAvailable")
+    }
+
     fn upload(&self, tensor: Tensor) -> Tensor {
         tensor
     }

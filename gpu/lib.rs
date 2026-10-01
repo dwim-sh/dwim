@@ -67,6 +67,11 @@ pub trait Device {
     /// about half the memory of half-precision floats.
     type Cache;
 
+    /// Bytes of memory free on the device for a model, if it can tell:
+    /// what it can allocate without taking memory others are using. On a
+    /// GPU that shares the host's memory, that is the host's memory free.
+    fn memory(&self) -> Option<u64>;
+
     /// Copies a weight matrix into device memory.
     fn upload(&self, tensor: Tensor) -> Self::Weight;
 
@@ -303,6 +308,17 @@ pub fn quantize(block: &[f32]) -> (u16, [i8; CACHE_BLOCK]) {
 pub fn cache_bytes(len: usize) -> usize {
     assert!(len.is_multiple_of(CACHE_BLOCK));
     len + len / CACHE_BLOCK * 2
+}
+
+/// A field of `/proc/meminfo`, in bytes: the host's memory as Linux
+/// counts it.
+fn meminfo(field: &str) -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))?;
+    let kb: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some(kb << 10)
 }
 
 /// Converts the bits of a finite IEEE half-precision float to f32.

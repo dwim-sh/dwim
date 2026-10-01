@@ -40,7 +40,7 @@ const TICK: Duration = Duration::from_millis(80);
 pub fn run(
     name: &str,
     device: Device,
-    context: usize,
+    context: Option<usize>,
     thinking: bool,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
@@ -165,7 +165,7 @@ fn work(
     model: &'static models::Model,
     dir: &Path,
     device: Device,
-    context: usize,
+    context: Option<usize>,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -199,14 +199,16 @@ fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     which: &'static models::Model,
-    context: usize,
+    context: Option<usize>,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
-    let model = models::load(gguf, device, context, |done, total| {
+    let size = models::size(&gguf, &device, context)?;
+    let _ = replies.send(Reply::Notice(models::describe(&size)));
+    let model = models::load(gguf, device, size.context, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;

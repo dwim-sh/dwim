@@ -6,8 +6,10 @@ use std::{
     time::SystemTime,
 };
 
-use dwim_gpu::Device;
+use dwim_gpu::{Cpu, Device, Gpu};
 use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+
+use crate::{fetch, opts};
 
 /// Saved states kept, newest first: a state is a few hundred megabytes,
 /// and the system prompt changes with the project's `AGENTS.md`.
@@ -16,9 +18,18 @@ const STATES_KEPT: usize = 4;
 /// Model used when none is named on the command line.
 pub const DEFAULT: &str = "bonsai-2-27b";
 
-/// Tokens of conversation a model has room for unless the command line says
-/// otherwise.
-pub const DEFAULT_CONTEXT: usize = 16384;
+/// Tokens of conversation a model has room for when the device cannot
+/// tell how much memory it has free, and the command line does not say.
+const DEFAULT_CONTEXT: usize = 16384;
+
+/// Fewest tokens of conversation the model is given room for when it
+/// fits it to the memory free: room for the system prompt and a few turns.
+const MIN_CONTEXT: usize = 4096;
+
+/// Memory left free besides what the model takes, when its context is
+/// fitted to the memory free: for the device's scratch buffers, the
+/// driver, and whatever else starts in the meantime.
+const HEADROOM: u64 = 256 << 20;
 
 /// Models `dwim` knows how to fetch.
 pub const MODELS: &[Model] = &[Model {
@@ -71,6 +82,39 @@ impl Model {
     }
 }
 
+/// Tokens of conversation the model has room for, and the device memory
+/// it takes with them.
+pub struct Size {
+    pub context: usize,
+    pub bytes: u64,
+}
+
+/// The size of the model on `device`, with room for `context` tokens of
+/// conversation, or as many as fit in the memory it has free.
+pub fn size<D: Device>(
+    gguf: &Gguf,
+    device: &D,
+    context: Option<usize>,
+) -> Result<Size, Box<dyn Error>> {
+    // Past the positions the model was trained on, its attention degrades.
+    let trained = bonsai::Config::load(gguf)?.context_length;
+    let memory = bonsai::Memory::of(gguf)?;
+    let context = match context {
+        Some(context) => context,
+        None => fit(&memory, device, trained),
+    };
+    if context == 0 || context > trained {
+        return Err(format!(
+            "a context of {context} tokens is outside the 1 to {trained} the model was trained for"
+        )
+        .into());
+    }
+    Ok(Size {
+        context,
+        bytes: memory.fixed + memory.per_token * context as u64,
+    })
+}
+
 /// Loads the model onto `device`, with room for `context` tokens of
 /// conversation, reporting how many of its tensors are loaded, out of how
 /// many, as it goes.
@@ -80,14 +124,6 @@ pub fn load<D: Device + 'static>(
     context: usize,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
-    // Past the positions the model was trained on, its attention degrades.
-    let trained = bonsai::Config::load(&gguf)?.context_length;
-    if context == 0 || context > trained {
-        return Err(format!(
-            "a context of {context} tokens is outside the 1 to {trained} the model was trained for"
-        )
-        .into());
-    }
     Ok(Box::new(bonsai::Model::load(
         gguf,
         device,
@@ -96,8 +132,42 @@ pub fn load<D: Device + 'static>(
     )?))
 }
 
-/// The sampler for the model, with the settings its file recommends where
-/// it has them.
+/// Tokens of conversation that fit in the memory `device` has free,
+/// beside a model of `memory` and some headroom: a whole number of
+/// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
+fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize {
+    let Some(free) = device.memory() else {
+        return DEFAULT_CONTEXT.min(trained);
+    };
+    let room = free.saturating_sub(memory.fixed + HEADROOM) / memory.per_token;
+    let tokens = (room as usize).min(trained) / 1024 * 1024;
+    tokens.max(MIN_CONTEXT).min(trained)
+}
+
+/// The size of the model on `device` with the context it gets by
+/// default, if the model is downloaded and the device opens.
+pub fn default_size(device: opts::Device) -> Option<Size> {
+    let (model, dir) = fetch::locate(DEFAULT).ok()?;
+    if !dir.join(model.weights).exists() {
+        return None;
+    }
+    let gguf = model.open(&dir).ok()?;
+    match device {
+        opts::Device::Cpu => size(&gguf, &Cpu, None).ok(),
+        opts::Device::Gpu => size(&gguf, &Gpu::new().ok()?, None).ok(),
+    }
+}
+
+/// `size` as words: the tokens of context and the memory they take, in
+/// gigabytes.
+pub fn describe(size: &Size) -> String {
+    format!(
+        "{} tokens of context, {:.2} GB of memory",
+        size.context,
+        size.bytes as f64 / 1e9
+    )
+}
+
 /// Opens the conversation with the system prompt: from the state saved by
 /// an earlier run of the same model with the same prompt, if there is one
 /// and it fits, and otherwise by reading the prompt, reporting progress as
@@ -161,6 +231,8 @@ fn prune(dir: &Path) {
     }
 }
 
+/// The sampler for the model, with the settings its file recommends where
+/// it has them.
 pub fn sampler(gguf: &Gguf) -> Sampler {
     let number = |key: &str, default: f32| {
         gguf.f32(&format!("general.sampling.{key}"))
