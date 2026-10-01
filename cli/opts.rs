@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use argh::FromArgs;
 
 use crate::models;
@@ -29,6 +31,11 @@ pub struct Opts {
     /// show the model's thinking in the shell, which ctrl+o toggles
     #[argh(switch)]
     pub thinking: bool,
+
+    /// file to write the session's transcript to, as JSON Lines (default:
+    /// a new file under ~/.local/state/dwim/projects/)
+    #[argh(option)]
+    pub transcript: Option<PathBuf>,
 
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
