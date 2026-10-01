@@ -54,11 +54,14 @@ const MAX_FILES: usize = 50;
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
 /// Most tokens of a thought: past them, the model tends to go over what it
-/// has already found again and again instead of acting on it.
-const THOUGHT: usize = 2048;
+/// has already found again and again instead of acting on it, and what it
+/// finds in a long thought comes early in it.
+const THOUGHT: usize = 768;
 
-/// What ends a thought that runs to `THOUGHT` tokens, in the model's voice.
-const ENOUGH: &str = "I have thought about this long enough. Next I will take the likeliest cause I have found and check it with a tool, or reply.";
+/// What ends a thought that runs to `THOUGHT` tokens, in the model's voice:
+/// it commits the model to saying which cause it checks and checking it
+/// with one call, rather than to calling a tool to look around.
+const ENOUGH: &str = "I have thought about this long enough. Next I will say in one sentence which cause I am checking and what would rule it out, then make the one call that checks it, or reply.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -944,6 +947,8 @@ mod tests {
         let max_len = 8000;
         let scripts: Vec<String> = (0..8).map(|_| reply(1800, false)).collect();
         let mut harness = harness(&scripts, max_len, "Task: go on.");
+        // The thoughts run past the cap on purpose, to fill the context.
+        harness.chat.limit_thoughts(usize::MAX, "");
         for i in 0..3 {
             let (events, _) = send(&mut harness, &format!("message {i}"));
             assert_eq!(events, ["thought", "text"], "{i}");
@@ -983,6 +988,8 @@ mod tests {
         let mut scripts = vec![reply(100, true), reply(100, false)];
         scripts.extend((0..8).map(|_| reply(1800, false)));
         let mut harness = harness(&scripts, 8000, "Task: go on.");
+        // The thoughts run past the cap on purpose, to fill the context.
+        harness.chat.limit_thoughts(usize::MAX, "");
         let path = std::env::temp_dir().join(format!("dwim-log-{}.jsonl", std::process::id()));
         harness.keep_log(Log::create(&path).unwrap(), "tiny", "Be brief.");
         for i in 0..5 {
