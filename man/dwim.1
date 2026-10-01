@@ -68,6 +68,14 @@ Show the model's thinking in the shell from the start, as
 .B Ctrl\-O
 does.
 .TP
+.BI \-\-transcript " file"
+Write the session's transcript to
+.I file
+instead of a new file under
+.IR ~/.local/state/dwim/projects/ .
+.B /dev/null
+keeps none.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -124,6 +132,53 @@ since where the agent is, the files there, the branch and the date go with
 the first message instead, and the newest four states are kept. On macOS the
 directory is
 .I ~/Library/Caches/dwim/states/
+instead.
+.TP
+.I ~/.local/state/dwim/projects/
+A transcript of each session, unless
+.B \-\-transcript
+names another file, readable by the user alone. Transcripts are kept in a
+folder for each working directory, named by its path with everything but
+letters and digits made a dash, such as
+.IR \-home\-user\-src\-dwim/ ,
+and out of the agent's sight there; each is named by when the session
+started (in UTC) and the process ID, such as
+.IR 2026-10-01T093012-4242.jsonl .
+It is JSON Lines: a record for each thing that happens, each with its
+.B type
+and the
+.B time
+in seconds since the session started.
+.B start
+has the model, the directory, the context, and the system prompt;
+.B user
+a message, what went ahead of it, and the tokens in the context before it;
+.BR thought ,
+.BR text ,
+and
+.B note
+what the model thought, replied, and wrote to go on from after a
+compaction;
+.B reply
+the end of a reply, with the calls it made, whether it was stopped short,
+the tokens it read, thought, and replied, and the tokens in the context
+after it;
+.B call
+and
+.B output
+a tool call and what it returned, with the seconds it ran;
+.B compacting
+and
+.B compacted
+a compaction, with the tokens before and after; and
+.B error
+and
+.B interrupted
+a turn that ended early.
+Each record is written as it happens, so a session that is killed leaves
+its transcript up to then. Transcripts are not removed. On macOS the
+directory is
+.I ~/Library/Application Support/dwim/projects/
 instead.
 .TP
 .I $TMPDIR/dwim-<pid>-<n>/

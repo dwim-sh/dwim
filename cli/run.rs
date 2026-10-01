@@ -21,7 +21,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim_gpu::{Cpu, Gpu};
-use dwim_harness::{self as harness, Harness};
+use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{
@@ -36,12 +36,14 @@ use crate::{
 const TICK: Duration = Duration::from_millis(80);
 
 /// Runs the shell until the user quits, showing the model's thinking if
-/// `thinking` is set, or once ctrl+o is pressed.
+/// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
+/// of the session in `log`.
 pub fn run(
     name: &str,
     device: Device,
     context: Option<usize>,
     thinking: bool,
+    log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
@@ -57,6 +59,7 @@ pub fn run(
                 &dir,
                 device,
                 context,
+                log,
                 requests_rx,
                 &replies_tx,
                 &stop,
@@ -160,12 +163,14 @@ enum Reply {
 }
 
 /// Fetches the model if needed, then loads it and answers messages until
-/// the UI hangs up.
+/// the UI hangs up, keeping a transcript in `log`.
+#[allow(clippy::too_many_arguments)]
 fn work(
     model: &'static models::Model,
     dir: &Path,
     device: Device,
     context: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -177,7 +182,7 @@ fn work(
     match device {
         Device::Cpu => {
             let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(gguf, Cpu, model, context, requests, replies, stop)
+            serve(gguf, Cpu, model, context, log, requests, replies, stop)
         }
         Device::Gpu => {
             let gpu = Gpu::new()?;
@@ -189,17 +194,20 @@ fn work(
                 .unwrap_or(gpu.name())
                 .to_string();
             let _ = replies.send(Reply::Device(name));
-            serve(gguf, gpu, model, context, requests, replies, stop)
+            serve(gguf, gpu, model, context, log, requests, replies, stop)
         }
     }
 }
 
-/// Loads the model and answers messages until the UI hangs up.
+/// Loads the model and answers messages until the UI hangs up, keeping a
+/// transcript in `log`.
+#[allow(clippy::too_many_arguments)]
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     which: &'static models::Model,
     context: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -217,9 +225,14 @@ fn serve<D: dwim_gpu::Device + 'static>(
     models::start(&mut chat, which, &system, |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    if let Some(path) = log.path() {
+        let _ = replies.send(Reply::Notice(format!("Transcript in {}", path.display())));
+    }
+    let mut harness = Harness::new(chat, &cwd, {
+        let system = system.clone();
+        move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
+    harness.keep_log(log, which.name, &system);
     let _ = replies.send(Reply::Ready);
 
     for request in requests {
