@@ -21,7 +21,7 @@ The model thinks by default (its template opens `<think>` for it), calls tools a
 
 ## Building
 
-`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `dwim/models/` under the user's cache directory (`~/Library/Caches` on macOS, `~/.cache` elsewhere) on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 34 KB per token of context for the key/value caches, which hold keys and values as 8-bit integers in blocks of 32 sharing an f16 scale.
+`cargo build` needs nothing beyond Rust: the Vulkan kernels are compiled by `naga` in `gpu/build.rs`, and Metal compiles its own at runtime. Running on the GPU needs Metal on macOS, and a Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights are fetched into `dwim/models/` under the user's cache directory (`~/Library/Caches` on macOS, `~/.cache` elsewhere) on first use (a resumable 6 GB download) and need about 6 GB of device memory plus 34 KB per token of context for the key/value caches, which hold keys and values as 8-bit integers in blocks of 32 sharing an f16 scale. Unless `--context` says otherwise, the context is as many tokens as fit in the memory the device has free (`Device::memory`: a Vulkan heap's budget from `VK_EXT_memory_budget`, no more than the host's `MemAvailable` on an integrated GPU; Metal's recommended working set; the host's available memory on the CPU) besides the model (`bonsai::Memory`) and 256 MB of headroom, up to the length the model was trained for.
 
 ## Verifying
 

@@ -26,7 +26,7 @@ use crate::{fetch, models, opts::Device};
 pub fn once(
     name: &str,
     device: Device,
-    context: usize,
+    context: Option<usize>,
     prompt: &str,
     stats: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -64,15 +64,15 @@ pub fn once(
     Ok(())
 }
 
-/// Loads `name` onto `device`, with room for `context` tokens, and answers
-/// `prompt` with it, returning where the time went and how long the
-/// loading took.
+/// Loads `name` onto `device`, with room for `context` tokens (or as many
+/// as fit), says how much memory that takes, and answers `prompt` with it,
+/// returning where the time went and how long the loading took.
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     which: &'static models::Model,
     on: &str,
-    context: usize,
+    context: Option<usize>,
     prompt: &str,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let name = which.name;
@@ -80,7 +80,9 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
     let loading = Instant::now();
-    let model = models::load(gguf, device, context, |done, total| {
+    let size = models::size(&gguf, &device, context)?;
+    eprintln!("{}", models::describe(&size));
+    let model = models::load(gguf, device, size.context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
     let loading = loading.elapsed();
