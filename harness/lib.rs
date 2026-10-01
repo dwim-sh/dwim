@@ -45,6 +45,13 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
+/// Most tokens of a thought: past them, the model tends to go over what it
+/// has already found again and again instead of acting on it.
+const THOUGHT: usize = 2048;
+
+/// What ends a thought that runs to `THOUGHT` tokens, in the model's voice.
+const ENOUGH: &str = "I have thought about this long enough. Next I will act on what I found: check it with a tool, or reply.";
+
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
 const HIGH_WATER: (usize, usize) = (4, 5);
@@ -378,6 +385,7 @@ impl<M: LanguageModel> Harness<M> {
         let note_tokens = (chat.capacity() / 64).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
         let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
         chat.reserve(reserve);
+        chat.limit_thoughts(THOUGHT, ENOUGH);
         Ok(Self {
             chat,
             tools: Tools::new(),
