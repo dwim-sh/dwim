@@ -85,7 +85,6 @@ fn main(
     @builtin(subgroup_id) sid: u32,
     @builtin(num_subgroups) nsg: u32,
     @builtin(subgroup_invocation_id) sinv: u32,
-    @builtin(subgroup_size) ssize: u32,
 ) {
     let c = wg.x % p.chunks;
     let tk = wg.x / p.chunks;
@@ -107,11 +106,14 @@ fn main(
     // Each lane of a subgroup takes four elements of a key, the lanes side
     // by side, and keeps the queries' matching elements; a head wider than
     // the subgroup takes more than one round, each adding to the scores.
-    // A subgroup scores the same positions in every round.
+    // A subgroup scores the same positions in every round. The lanes are
+    // counted rather than taken from `subgroup_size`, which is only the most
+    // a subgroup holds: llvmpipe reports 32 and fills subgroups with 16.
     let quads = p.head_dim / 4u;
-    let rounds = (quads + ssize - 1u) / ssize;
+    let width = subgroupAdd(1u);
+    let rounds = (quads + width - 1u) / width;
     for (var r = 0u; r < rounds; r++) {
-        let d = r * ssize + sinv;
+        let d = r * width + sinv;
         let in_head = d < quads;
         var query: array<vec4<f32>, GROUP>;
         for (var g = 0u; g < group; g++) {
