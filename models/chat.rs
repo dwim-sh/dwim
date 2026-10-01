@@ -49,7 +49,9 @@ pub struct Chat<M: LanguageModel> {
     /// Whether the last reply was stopped short for room.
     cut: bool,
     /// Most tokens a thought may run to, and what closes it there.
-    thought_limit: Option<(usize, String)>,
+    thought_limit: Option<ThoughtLimit>,
+    /// Whether the last reply's thought was ended at its limit.
+    thought_ended: bool,
     /// Tokens it takes to end a reply, at most.
     ending: usize,
     im_start: u32,
@@ -94,6 +96,15 @@ impl Tally {
             0.0
         }
     }
+}
+
+/// Where a thought is ended, and what is written in the model's voice
+/// there: `closing` at the end of the thought, and `opening` at the start
+/// of the text after it, for the model to finish.
+struct ThoughtLimit {
+    tokens: usize,
+    closing: String,
+    opening: String,
 }
 
 /// What tokens fed to the model count as.
@@ -197,6 +208,7 @@ impl<M: LanguageModel> Chat<M> {
             reserve: 0,
             cut: false,
             thought_limit: None,
+            thought_ended: false,
             stats: Stats::default(),
         })
     }
@@ -282,10 +294,20 @@ impl<M: LanguageModel> Chat<M> {
     }
 
     /// Ends a thought that runs to `tokens`: `closing` is written into it
-    /// as the model's own, and the thought is closed, so that the model
-    /// goes on to act or reply instead of thinking in circles.
-    pub fn limit_thoughts(&mut self, tokens: usize, closing: &str) {
-        self.thought_limit = Some((tokens, closing.to_string()));
+    /// as the model's own, the thought is closed, and the text after it
+    /// starts with `opening` for the model to finish, so that the model
+    /// goes on to act instead of thinking in circles.
+    pub fn limit_thoughts(&mut self, tokens: usize, closing: &str, opening: &str) {
+        self.thought_limit = Some(ThoughtLimit {
+            tokens,
+            closing: closing.to_string(),
+            opening: opening.to_string(),
+        });
+    }
+
+    /// Whether the last reply's thought was ended at its limit.
+    pub fn thought_ended(&self) -> bool {
+        self.thought_ended
     }
 
     /// Whether the last reply was stopped short because the context was
@@ -478,6 +500,7 @@ impl<M: LanguageModel> Chat<M> {
         let mut answering = false;
         let mut interrupted = false;
         self.cut = false;
+        self.thought_ended = false;
         loop {
             if !self.room(self.ending, self.reserve) {
                 // The reply is stopped short, as if interrupted: what it
@@ -487,22 +510,33 @@ impl<M: LanguageModel> Chat<M> {
                 interrupted = true;
                 break;
             }
-            if let Some((limit, closing)) = &self.thought_limit
+            if let Some(limit) = &self.thought_limit
                 && thinking
-                && thought >= *limit
+                && thought >= limit.tokens
             {
-                let closing = format!("\n\n{closing}\n");
+                let closing = format!("\n\n{}\n", limit.closing);
+                let opening = limit.opening.clone();
                 let mut tokens = self.tokenizer.encode(&closing)?;
                 tokens.push(self.think_end);
                 tokens.extend(self.tokenizer.encode("\n\n")?);
+                let thought_tokens = tokens.len();
+                tokens.extend(self.tokenizer.encode(&opening)?);
                 if !self.room(self.ending + tokens.len(), self.reserve) {
                     self.cut = true;
                     interrupted = true;
                     break;
                 }
-                let flow = on_chunk(Chunk::Thought(&closing));
-                logits = self.feed(&tokens, Kind::Thought)?;
                 thinking = false;
+                self.thought_ended = true;
+                let mut flow = on_chunk(Chunk::Thought(&closing));
+                logits = self.feed(&tokens[..thought_tokens], Kind::Thought)?;
+                if !opening.is_empty() {
+                    replied |= !opening.trim().is_empty();
+                    if flow.is_continue() {
+                        flow = on_chunk(Chunk::Text(&opening));
+                    }
+                    logits = self.feed(&tokens[thought_tokens..], Kind::Answer)?;
+                }
                 if flow.is_break() {
                     interrupted = true;
                     break;
@@ -974,23 +1008,27 @@ mod tests {
     fn ends_a_thought_at_its_limit() {
         let mut chat = chat(&["One two three four five.\n</think>\n\nDone."]);
         let limit = chat.tokenizer.encode("One two").unwrap().len();
-        chat.limit_thoughts(limit, "Enough.");
+        chat.limit_thoughts(limit, "Enough.", "So");
         let mut thoughts = String::new();
+        let mut reply = String::new();
         chat.send("go", |chunk| {
-            if let Chunk::Thought(text) = chunk {
-                thoughts.push_str(text);
+            match chunk {
+                Chunk::Thought(text) => thoughts.push_str(text),
+                Chunk::Text(text) => reply.push_str(text),
             }
             ControlFlow::Continue(())
         })
         .unwrap();
+        assert!(chat.thought_ended());
         assert_eq!(thoughts, "One two\n\nEnough.\n");
+        assert!(reply.starts_with("So"), "{reply:?}");
         let closed = chat
             .tokenizer
-            .encode_with_special("<think>\nOne two\n\nEnough.\n</think>\n\n")
+            .encode_with_special("<think>\nOne two\n\nEnough.\n</think>\n\nSo")
             .unwrap();
         assert!(
             chat.model.fed.windows(closed.len()).any(|w| w == closed),
-            "the thought is closed after the limit"
+            "the thought is closed after the limit, and the text opened"
         );
         assert_eq!(
             chat.stats().thought.tokens,
@@ -1000,6 +1038,7 @@ mod tests {
                     .encode_with_special("<think>\n")
                     .unwrap()
                     .len()
+                - chat.tokenizer.encode("So").unwrap().len()
         );
     }
 
