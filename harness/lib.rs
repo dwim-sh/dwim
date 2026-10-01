@@ -69,6 +69,15 @@ const ENOUGH: &str =
 /// checks it.
 const CHECK: &str = "Next I will check whether";
 
+/// What follows the results of the call made after a thought was ended at
+/// `THOUGHT` tokens, around the sentence the model began with `CHECK`: a
+/// rule far back in the system prompt is easily lost, and the results are
+/// where the model reads next.
+const VERDICT: (&str, &str) = (
+    "\n\nReminder: you said \"",
+    "\" Before anything else, say whether these results confirm that or rule it out.",
+);
+
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
 const HIGH_WATER: (usize, usize) = (4, 5);
@@ -542,6 +551,13 @@ impl<M: LanguageModel> Harness<M> {
             let cut = self.chat.cut();
             self.log
                 .reply(&calls, cut, self.chat.tokens(), &before, &self.chat.stats());
+            // The check the model said it is making, if it was made to say.
+            let check = self
+                .chat
+                .thought_ended()
+                .then(|| text.trim().lines().next().unwrap_or(""))
+                .filter(|line| line.starts_with(CHECK))
+                .map(str::to_string);
             self.record(input)?;
             self.record(Turn::Reply {
                 text,
@@ -583,6 +599,12 @@ impl<M: LanguageModel> Harness<M> {
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
+                };
+                let output = match &check {
+                    Some(check) if outputs.len() + 1 == calls.len() => {
+                        format!("{output}{}{check}{}", VERDICT.0, VERDICT.1)
+                    }
+                    _ => output,
                 };
                 self.log.output(&output, seconds);
                 if on_event(Event::Output(&output)).is_break() {
@@ -1164,6 +1186,38 @@ mod tests {
         assert_eq!(lines[5], "tools         2 calls     0.5 s");
         assert_eq!(lines[6], "other                     1.5 s");
         assert_eq!(lines[7], "total                    60.0 s");
+    }
+
+    #[test]
+    fn reminds_of_the_check_after_a_long_thought() {
+        // The first thought runs past the cap: the text after it opens with
+        // the check, and the call's results end with a reminder of it.
+        let scripts = [reply(THOUGHT + 100, true), reply(10, false)];
+        let mut long = harness(&scripts, 8000, "");
+        let (events, _) = send(&mut long, "go");
+        assert_eq!(
+            events,
+            ["thought", "text", "call", "output", "thought", "text"]
+        );
+        let turns: Vec<&Turn> = long.transcript().collect();
+        let Turn::Reply { text, .. } = turns[1] else {
+            panic!()
+        };
+        assert!(text.starts_with(CHECK), "{text:?}");
+        let Turn::Results(outputs) = turns[2] else {
+            panic!()
+        };
+        let check = text.lines().next().unwrap();
+        assert!(outputs[0].ends_with(&format!("{}{check}{}", VERDICT.0, VERDICT.1)));
+        // A thought within the cap leaves the results alone.
+        let scripts = [reply(10, true), reply(10, false)];
+        let mut short = harness(&scripts, 8000, "");
+        send(&mut short, "go");
+        let turns: Vec<&Turn> = short.transcript().collect();
+        let Turn::Results(outputs) = turns[2] else {
+            panic!()
+        };
+        assert!(!outputs[0].contains(VERDICT.0));
     }
 
     #[test]
