@@ -21,7 +21,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim_gpu::{Cpu, Gpu};
-use dwim_harness::{self as harness, Harness};
+use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{
@@ -36,13 +36,15 @@ use crate::{
 const TICK: Duration = Duration::from_millis(80);
 
 /// Runs the shell until the user quits, showing the model's thinking if
-/// `thinking` is set, or once ctrl+o is pressed.
+/// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
+/// of the session in `log`.
 pub fn run(
     name: &str,
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     thinking: bool,
+    log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
@@ -59,6 +61,7 @@ pub fn run(
                 device,
                 context,
                 thinking_budget,
+                log,
                 requests_rx,
                 &replies_tx,
                 &stop,
@@ -174,7 +177,7 @@ enum Reply {
 }
 
 /// Fetches the model if needed, then loads it and answers messages until
-/// the UI hangs up.
+/// the UI hangs up, keeping a transcript in `log`.
 #[allow(clippy::too_many_arguments)]
 fn work(
     model: &'static models::Model,
@@ -182,6 +185,7 @@ fn work(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -196,9 +200,11 @@ fn work(
             serve(
                 gguf,
                 Cpu,
+                "cpu",
                 model,
                 context,
                 thinking_budget,
+                log,
                 requests,
                 replies,
                 stop,
@@ -213,13 +219,15 @@ fn work(
                 .next()
                 .unwrap_or(gpu.name())
                 .to_string();
-            let _ = replies.send(Reply::Device(name));
+            let _ = replies.send(Reply::Device(name.clone()));
             serve(
                 gguf,
                 gpu,
+                &name,
                 model,
                 context,
                 thinking_budget,
+                log,
                 requests,
                 replies,
                 stop,
@@ -228,14 +236,17 @@ fn work(
     }
 }
 
-/// Loads the model and answers messages until the UI hangs up.
+/// Loads the model onto `device`, which is called `on`, and answers
+/// messages until the UI hangs up, keeping a transcript in `log`.
 #[allow(clippy::too_many_arguments)]
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
+    on: &str,
     which: &'static models::Model,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -253,10 +264,15 @@ fn serve<D: dwim_gpu::Device + 'static>(
     models::start(&mut chat, which, &system, |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    if let Some(path) = log.path() {
+        let _ = replies.send(Reply::Notice(format!("Transcript in {}", path.display())));
+    }
+    let mut harness = Harness::new(chat, &cwd, {
+        let system = system.clone();
+        move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    harness.keep_log(log, which.name, on, &system);
     let _ = replies.send(Reply::Ready);
 
     for request in requests {

@@ -5,6 +5,8 @@ pub struct Sampler {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// What the random numbers it samples with started from.
+    pub seed: u64,
     rng: Rng,
 }
 
@@ -14,6 +16,7 @@ impl Sampler {
             temperature,
             top_k,
             top_p,
+            seed,
             rng: Rng(seed.max(1)),
         }
     }

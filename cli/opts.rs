@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use argh::FromArgs;
 
 use crate::models;
@@ -34,6 +36,11 @@ pub struct Opts {
     /// (default: 2048; 0 for no limit)
     #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
     pub thinking_budget: usize,
+
+    /// file to write the session's transcript to, as JSON Lines (default:
+    /// a new file under ~/.local/state/dwim/projects/)
+    #[argh(option)]
+    pub transcript: Option<PathBuf>,
 
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]

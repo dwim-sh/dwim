@@ -48,6 +48,8 @@ pub struct Chat<M: LanguageModel> {
     reserve: usize,
     /// Whether the last reply was stopped short for room.
     cut: bool,
+    /// Whether the last reply's thought was ended at the limit.
+    thought_ended: bool,
     /// Most tokens a thought may run to, and what closes it there.
     thought_limit: Option<(usize, String)>,
     /// Tokens it takes to end a reply, at most.
@@ -196,6 +198,7 @@ impl<M: LanguageModel> Chat<M> {
             len: 0,
             reserve: 0,
             cut: false,
+            thought_ended: false,
             thought_limit: None,
             stats: Stats::default(),
         })
@@ -269,6 +272,11 @@ impl<M: LanguageModel> Chat<M> {
         &self.model
     }
 
+    /// The sampler the model's tokens are picked with.
+    pub fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
     /// Number of tokens the conversation has room for in all.
     pub fn capacity(&self) -> usize {
         self.model.max_len()
@@ -292,6 +300,12 @@ impl<M: LanguageModel> Chat<M> {
     /// full, but for the reserve.
     pub fn cut(&self) -> bool {
         self.cut
+    }
+
+    /// Whether the last reply's thought was ended at the limit
+    /// [`Chat::limit_thoughts`] sets, rather than by the model.
+    pub fn thought_ended(&self) -> bool {
+        self.thought_ended
     }
 
     /// Whether a reply may go on: whether there is room for one more token
@@ -478,6 +492,7 @@ impl<M: LanguageModel> Chat<M> {
         let mut answering = false;
         let mut interrupted = false;
         self.cut = false;
+        self.thought_ended = false;
         loop {
             if !self.room(self.ending, self.reserve) {
                 // The reply is stopped short, as if interrupted: what it
@@ -503,6 +518,7 @@ impl<M: LanguageModel> Chat<M> {
                 let flow = on_chunk(Chunk::Thought(&closing));
                 logits = self.feed(&tokens, Kind::Thought)?;
                 thinking = false;
+                self.thought_ended = true;
                 if flow.is_break() {
                     interrupted = true;
                     break;
@@ -984,6 +1000,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(thoughts, "One two\n\nEnough.\n");
+        assert!(chat.thought_ended());
         let closed = chat
             .tokenizer
             .encode_with_special("<think>\nOne two\n\nEnough.\n</think>\n\n")
