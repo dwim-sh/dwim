@@ -100,7 +100,6 @@ impl LanguageModel for Scripted {
         // up only once the sampling starts: a prompt read in batches may
         // end a batch at an opening it goes on past.
         if tokens.len() > 1 {
-            self.saying.clear();
             self.pending = if self.fed.ends_with(&self.unthinking) {
                 Some(true)
             } else if self.fed.ends_with(&self.opening) {
@@ -108,6 +107,11 @@ impl LanguageModel for Scripted {
             } else {
                 None
             };
+            // Tokens the chat writes into a reply, rather than a prompt,
+            // leave the rest of the reply to be said.
+            if self.pending.is_some() {
+                self.saying.clear();
+            }
         } else if let Some(unthinking) = self.pending.take() {
             self.saying = self.script(unthinking).into();
             // The batch's logits already said the first token.
