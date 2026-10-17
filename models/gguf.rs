@@ -252,6 +252,11 @@ impl Gguf {
         self.meta.get(key)
     }
 
+    /// The metadata's keys.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.meta.keys().map(String::as_str)
+    }
+
     fn need(&self, key: &str) -> Result<&Value> {
         self.meta
             .get(key)

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table, ternary};
+use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -90,6 +90,26 @@ impl Config {
         }
         if !config.head_dim.is_multiple_of(CACHE_BLOCK) {
             return Err("the attention heads are not whole blocks of the caches".into());
+        }
+        if key("attention.value_length")? as usize != config.head_dim {
+            return Err("the attention values are not as wide as the keys".into());
+        }
+        // What llama.cpp reads for other models of the architecture, and
+        // this one does not implement: layers predicting further tokens,
+        // a list of linear layers in place of the interval, and scaled
+        // rotary positions.
+        if gguf.get(&format!("{arch}.nextn_predict_layers")).is_some()
+            || gguf
+                .get(&format!("{arch}.attention.recurrent_layers"))
+                .is_some()
+            || gguf
+                .keys()
+                .any(|k| k.starts_with(&format!("{arch}.rope.scaling.")))
+        {
+            return Err("the model has parts that are not implemented".into());
+        }
+        if gguf.info("token_embd.weight")?.dtype != PTQ1_0 {
+            return Err("the embedding table is not ternary".into());
         }
         for (key, want) in [
             (
@@ -387,6 +407,9 @@ impl<D: Device> Model<D> {
         let mut at = 0;
         for width in widths {
             let width = width.as_i64().ok_or("invalid sign width")? as usize;
+            if signs.iter().any(|(w, _)| *w == width) {
+                return Err(format!("two sets of rotation signs {width} wide").into());
+            }
             let values: Vec<f32> = values
                 .get(at..at + width)
                 .ok_or("too few rotation signs")?
@@ -400,6 +423,9 @@ impl<D: Device> Model<D> {
             device.write(&mut buf, &values);
             signs.push((width, buf));
             at += width;
+        }
+        if at != values.len() {
+            return Err("more rotation signs than their widths take".into());
         }
         for width in [c.hidden, c.v_dim(), c.heads * c.head_dim, c.intermediate] {
             if !signs.iter().any(|(w, _)| *w == width) {
@@ -1066,6 +1092,7 @@ mod tests {
             ("qwen35.attention.head_count", n(heads)),
             ("qwen35.attention.head_count_kv", n(kv_heads)),
             ("qwen35.attention.key_length", n(head_dim)),
+            ("qwen35.attention.value_length", n(head_dim)),
             ("qwen35.rope.dimension_count", n(rot_dim)),
             ("qwen35.rope.freq_base", Value::F32(10000.0)),
             ("qwen35.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
