@@ -311,6 +311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwim-difftest"
+version = "0.0.3"
+dependencies = [
+ "dirs",
+ "dwim-gpu",
+ "dwim-models",
+]
+
+[[package]]
 name = "dwim-gpu"
 version = "0.0.3"
 dependencies = [

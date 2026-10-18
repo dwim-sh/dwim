@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "gpu", "harness", "models", "tools"]
+members = ["cli", "gpu", "harness", "models", "testing/difftest", "tools"]
 resolver = "3"
 
 [workspace.package]
