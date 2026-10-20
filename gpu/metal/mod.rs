@@ -2,8 +2,10 @@
 //! kernel in `kernels/`, in the Metal Shading Language, compiled for the GPU
 //! when the device opens.
 //!
-//! As with Vulkan, operations are encoded into one command buffer as they
-//! are called and committed together the first time something is read back.
+//! As with Vulkan, operations are encoded into a command buffer as they are
+//! called, and committed every so many of them without waiting, so that the
+//! GPU works on the first kernels of a forward pass while the CPU encodes
+//! the rest; reading a buffer back waits for everything committed.
 //! Buffers live in memory the CPU shares with the GPU, so reading and
 //! writing them needs no staging, only waiting for the commands before.
 
@@ -15,23 +17,62 @@ use objc2::{
 };
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
 
-/// Most attention scores one dispatch of the attention kernel computes, one
-/// per head of each token for each position it attends to: the size of the
-/// scores buffer. Longer batches are dispatched a few tokens at a time.
-const SCORES: usize = 16 << 20;
+/// Positions one threadgroup of the attention kernel takes.
+const CHUNK: usize = 128;
 
-/// Threads in a threadgroup of every kernel but attention's.
+/// Fewest tokens that go through the flash attention kernel, the positions
+/// and the rows (a token's query head each) a threadgroup of it takes.
+const FLASH_TOKENS: usize = 2;
+const FLASH_CHUNK: usize = 512;
+const FLASH_ROWS: usize = 32;
+
+/// Kernels encoded into a command buffer before it is committed, without
+/// waiting, so that the GPU works on the first kernels of a forward pass
+/// while the CPU encodes the rest.
+const SUBMIT_EVERY: usize = 128;
+
+/// Threads in a threadgroup of every kernel but the matmuls' and
+/// attention's.
 const THREADS: usize = 256;
 
-/// Rows of ternary weights one SIMD group of the matmul kernel takes.
-const TERNARY_ROWS: usize = 8;
+/// Threads in a threadgroup of the kernels on the matrix units: the tile
+/// kernels and flash attention, four SIMD groups.
+const MATRIX_THREADS: usize = 128;
+
+/// Threads of a threadgroup of the sums kernel, the rows each takes, and
+/// the threadgroups it splits a matrix's blocks to reach.
+const SUMS_THREADS: usize = 256;
+const SUMS_PER: usize = 4;
+const SUMS_GROUPS: usize = 40;
+/// Most tokens that go through the sums kernel rather than the tile kernel:
+/// the threadgroups of a few tokens read the weights from the cache one
+/// after another, so that eight cost about what a tile of them does.
+const SUMS_TOKENS: usize = 8;
+
+/// Most floats of partial results the split matmul kernels or the attention
+/// kernel write, a chunk's maximum, sum, and weighted values per head of
+/// each token for attention: the size of the partials buffer. Longer
+/// batches of attention are dispatched a few tokens at a time.
+const PARTIALS: usize = 16 << 20;
+
+/// Rows of a tile of the tile kernel, and the most half floats a batch
+/// through it packs its activations into: the size of the buffer.
+const TILE_ROWS: usize = 64;
+const PACKED: usize = 4 << 20;
+
+/// Tokens a SIMD group of the bf16 matmul kernel takes at once.
+const BF16_TOKENS: usize = 8;
+
+/// Rows and tokens of a tile of the kernel on the matrix accelerators.
+const MMA_ROWS: usize = 64;
+const MMA_TOKENS: usize = 64;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
@@ -63,13 +104,21 @@ pub struct Weight {
 
 struct Kernels {
     matmul_bf16: Object<dyn MTLComputePipelineState>,
-    matmul_ternary: Object<dyn MTLComputePipelineState>,
-    matmul_ternary_batch: Object<dyn MTLComputePipelineState>,
+    matmul_ternary_sums: Object<dyn MTLComputePipelineState>,
+    matmul_ternary_reduce: Object<dyn MTLComputePipelineState>,
+    /// The tile kernel on the matrix accelerators, where the GPU has them.
+    matmul_ternary_mma: Option<Object<dyn MTLComputePipelineState>>,
+    /// The tile kernel for tiles of 16, 32 and 64 tokens.
+    matmul_ternary_tile: [Object<dyn MTLComputePipelineState>; 3],
+    pack_halves: Object<dyn MTLComputePipelineState>,
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
     l2norm: Object<dyn MTLComputePipelineState>,
     rope: Object<dyn MTLComputePipelineState>,
     attention: Object<dyn MTLComputePipelineState>,
+    attention_combine: Object<dyn MTLComputePipelineState>,
+    /// The flash attention kernel for heads of 128 and of 256.
+    attention_flash: [Object<dyn MTLComputePipelineState>; 2],
     silu_mul: Object<dyn MTLComputePipelineState>,
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
@@ -84,17 +133,24 @@ struct Kernels {
 struct Pending {
     cmd: Object<dyn MTLCommandBuffer>,
     encoder: Object<dyn MTLComputeCommandEncoder>,
+    /// Kernels encoded into it.
+    dispatched: usize,
 }
 
 pub struct Metal {
     device: Object<dyn MTLDevice>,
     queue: Object<dyn MTLCommandQueue>,
     kernels: Kernels,
-    scores: Object<dyn MTLBuffer>,
-    /// Rows of the weights each matmul threadgroup takes: one per SIMD group.
+    partials: Object<dyn MTLBuffer>,
+    /// A batch's activations as half floats, for the tile kernels.
+    packed: Object<dyn MTLBuffer>,
+    /// Rows of the bf16 weights each threadgroup of their matmul takes: one
+    /// per SIMD group.
     matmul_rows: usize,
     name: String,
     pending: RefCell<Option<Pending>>,
+    /// Command buffers committed and not yet waited for, in order.
+    committed: RefCell<Vec<Object<dyn MTLCommandBuffer>>>,
 }
 
 // Commands are only encoded from whichever thread owns the device.
@@ -107,11 +163,12 @@ impl Metal {
         let name = device.name().to_string();
         let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
 
-        let kernel = |name: &str,
-                      source: &str|
+        let compile = |name: &str,
+                       source: &str,
+                       options: Option<&MTLCompileOptions>|
          -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
             let library = device
-                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+                .newLibraryWithSource_options_error(&NSString::from_str(source), options)
                 .map_err(|e| format!("{name}.metal: {}", e.localizedDescription()))?;
             let function = library
                 .newFunctionWithName(&NSString::from_str(name))
@@ -124,20 +181,60 @@ impl Metal {
             }
             Ok(pipeline)
         };
+        let kernel = |name: &str, source: &str| compile(name, source, None);
         macro_rules! msl {
             ($name:literal) => {
                 kernel($name, include_str!(concat!("kernels/", $name, ".metal")))?
             };
+            // A kernel compiled with the definitions given ahead of it.
+            ($name:literal, $($define:literal = $value:expr),+) => {
+                kernel(
+                    $name,
+                    &format!(
+                        concat!($("#define ", $define, " {}\n"),+, "{}"),
+                        $($value),+,
+                        include_str!(concat!("kernels/", $name, ".metal"))
+                    ),
+                )?
+            };
         }
+        // The matrix accelerators of an Apple GPU of the tenth family, which
+        // Metal 4's tensor operations run on; a GPU without them takes the
+        // tile kernel instead.
+        // A system whose compiler lacks them takes it too.
+        let matmul_ternary_mma = if device.supportsFamily(MTLGPUFamily::Apple10) {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let source = include_str!("kernels/matmul_ternary_mma.metal");
+            compile("matmul_ternary_mma", source, Some(&metal4)).ok()
+        } else {
+            None
+        };
         let kernels = Kernels {
             matmul_bf16: msl!("matmul_bf16"),
-            matmul_ternary: msl!("matmul_ternary"),
-            matmul_ternary_batch: msl!("matmul_ternary_batch"),
+            matmul_ternary_sums: msl!(
+                "matmul_ternary_sums",
+                "THREADS" = SUMS_THREADS,
+                "PER" = SUMS_PER
+            ),
+            matmul_ternary_reduce: msl!("matmul_ternary_reduce"),
+            matmul_ternary_tile: [
+                msl!("matmul_ternary_tile", "TOKENS" = 16),
+                msl!("matmul_ternary_tile", "TOKENS" = 32),
+                msl!("matmul_ternary_tile", "TOKENS" = 64),
+            ],
+            matmul_ternary_mma,
+            pack_halves: msl!("pack_halves"),
             add: msl!("add"),
             rmsnorm: msl!("rmsnorm"),
             l2norm: msl!("l2norm"),
             rope: msl!("rope"),
             attention: msl!("attention"),
+            attention_combine: msl!("attention_combine"),
+            attention_flash: [
+                msl!("attention_flash", "DIM" = 128),
+                msl!("attention_flash", "DIM" = 256),
+            ],
             silu_mul: msl!("silu_mul"),
             sigmoid_mul: msl!("sigmoid_mul"),
             copy: msl!("copy"),
@@ -148,17 +245,22 @@ impl Metal {
             delta_net: msl!("delta_net"),
         };
         let matmul_rows = THREADS / kernels.matmul_bf16.threadExecutionWidth();
-        let scores = device
-            .newBufferWithLength_options(SCORES * 4, MTLResourceOptions::StorageModePrivate)
+        let partials = device
+            .newBufferWithLength_options(PARTIALS * 4, MTLResourceOptions::StorageModePrivate)
+            .ok_or("out of GPU memory")?;
+        let packed = device
+            .newBufferWithLength_options(PACKED * 2, MTLResourceOptions::StorageModePrivate)
             .ok_or("out of GPU memory")?;
         Ok(Self {
             device,
             queue,
             kernels,
-            scores,
+            partials,
+            packed,
             matmul_rows,
             name,
             pending: RefCell::new(None),
+            committed: RefCell::new(Vec::new()),
         })
     }
 
@@ -185,8 +287,22 @@ impl Metal {
         groups: usize,
         threads: usize,
     ) {
+        self.dispatch_grid(kernel, buffers, params, (groups, 1), threads);
+    }
+
+    /// Encodes a kernel as `dispatch` does, over a grid of threadgroups
+    /// two deep.
+    fn dispatch_grid<P: Copy>(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        params: &P,
+        groups: (usize, usize),
+        threads: usize,
+    ) {
         let mut pending = self.pending.borrow_mut();
-        let encoder = &pending.get_or_insert_with(|| self.begin()).encoder;
+        let current = pending.get_or_insert_with(|| self.begin());
+        let encoder = &current.encoder;
         encoder.setComputePipelineState(kernel);
         unsafe {
             for (i, &buf) in buffers.iter().enumerate() {
@@ -198,12 +314,42 @@ impl Metal {
                 buffers.len(),
             );
         }
-        let size = |width| MTLSize {
+        let size = |width, height| MTLSize {
             width,
-            height: 1,
+            height,
             depth: 1,
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
+        encoder
+            .dispatchThreadgroups_threadsPerThreadgroup(size(groups.0, groups.1), size(threads, 1));
+        // Enough encoded for the GPU to get going on while the rest is.
+        current.dispatched += 1;
+        if current.dispatched >= SUBMIT_EVERY {
+            let Pending { cmd, encoder, .. } = pending.take().unwrap();
+            encoder.endEncoding();
+            cmd.commit();
+            self.committed.borrow_mut().push(cmd);
+        }
+    }
+
+    /// Packs the `n` tokens of `cols` activations of `x` as half floats, with
+    /// zeros for the tokens up to `padded`, for the tile kernels.
+    fn pack(&self, x: &Buffer, n: usize, cols: usize, padded: usize) {
+        assert!(
+            padded * cols <= PACKED,
+            "a batch of {n} tokens of {cols} is more than the kernels pack"
+        );
+        let pack = PackParams {
+            n: n as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+        };
+        self.dispatch(
+            &self.kernels.pack_halves,
+            &[&self.packed, &x.buf],
+            &pack,
+            (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
     }
 
     /// Opens a command buffer to encode into. Its compute encoder runs each
@@ -216,20 +362,27 @@ impl Metal {
             let encoder = cmd
                 .computeCommandEncoder()
                 .expect("no Metal compute encoder");
-            Pending { cmd, encoder }
+            Pending {
+                cmd,
+                encoder,
+                dispatched: 0,
+            }
         })
     }
 
     /// Commits everything encoded and waits for it to finish.
     fn flush(&self) {
-        let Some(Pending { cmd, encoder }) = self.pending.borrow_mut().take() else {
-            return;
-        };
-        encoder.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        if let Some(e) = cmd.error() {
-            panic!("GPU commands failed: {}", e.localizedDescription());
+        let mut committed = self.committed.borrow_mut();
+        if let Some(Pending { cmd, encoder, .. }) = self.pending.borrow_mut().take() {
+            encoder.endEncoding();
+            cmd.commit();
+            committed.push(cmd);
+        }
+        for cmd in committed.drain(..) {
+            cmd.waitUntilCompleted();
+            if let Some(e) = cmd.error() {
+                panic!("GPU commands failed: {}", e.localizedDescription());
+            }
         }
     }
 }
@@ -247,6 +400,16 @@ struct MatmulParams {
     rows: u32,
     cols: u32,
     n: u32,
+    /// Splits of the columns, for the kernels that take them.
+    splits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PackParams {
+    n: u32,
+    cols: u32,
+    padded: u32,
 }
 
 #[repr(C)]
@@ -299,7 +462,11 @@ struct AttentionParams {
     n_kv_heads: u32,
     pos: u32,
     first: u32,
-    stride: u32,
+    chunks: u32,
+    /// Positions to a chunk.
+    chunk: u32,
+    /// Tokens the dispatch covers, for the flash kernel.
+    tokens: u32,
 }
 
 #[repr(C)]
@@ -340,6 +507,9 @@ impl Device for Metal {
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
+        // Ternary blocks go block-major, so that the rows a SIMD group
+        // takes read adjacent blocks.
+        let block_major;
         let (shape, bytes, ternary) = match &tensor {
             Tensor::Bf16 { shape, data } => {
                 assert!(
@@ -352,7 +522,8 @@ impl Device for Metal {
             }
             Tensor::Ternary { shape, data } => {
                 assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
-                (shape, data.as_slice(), true)
+                block_major = crate::ternary::block_major(data, shape[0], shape[1]);
+                (shape, block_major.as_slice(), true)
             }
         };
         let buf = unsafe {
@@ -492,32 +663,85 @@ impl Device for Metal {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
-        let params = MatmulParams {
+        let mut params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
             n: n as u32,
+            splits: 1,
         };
-        // Each SIMD group takes one row, or eight rows of ternary weights. A
-        // batch of tokens is worth unpacking the ternary weights once for
-        // several.
-        let (kernel, per_group) = if w.ternary && n > 1 {
-            (
-                &self.kernels.matmul_ternary_batch,
-                self.matmul_rows * TERNARY_ROWS,
-            )
-        } else if w.ternary {
-            (
-                &self.kernels.matmul_ternary,
-                self.matmul_rows * TERNARY_ROWS,
-            )
-        } else {
-            (&self.kernels.matmul_bf16, self.matmul_rows)
-        };
-        self.dispatch(
-            kernel,
+        // A token or a few through ternary weights look each byte up in
+        // tables of their activations' sums, each token reading the weights
+        // for itself, with the blocks of a matrix of few rows split among
+        // threadgroups whose partial sums are added up after.
+        if w.ternary && n <= SUMS_TOKENS {
+            let tiles = rows.div_ceil(SUMS_THREADS * SUMS_PER);
+            let splits = (SUMS_GROUPS / tiles).clamp(1, cols / 128);
+            let splits = if splits * n * rows <= PARTIALS {
+                splits
+            } else {
+                1
+            };
+            params.splits = splits as u32;
+            self.dispatch_grid(
+                &self.kernels.matmul_ternary_sums,
+                &[&out.buf, &w.buf, &x.buf, &self.partials],
+                &params,
+                (tiles * splits, n),
+                SUMS_THREADS,
+            );
+            if splits > 1 {
+                self.dispatch(
+                    &self.kernels.matmul_ternary_reduce,
+                    &[&out.buf, &self.partials],
+                    &params,
+                    (n * rows).div_ceil(THREADS),
+                    THREADS,
+                );
+            }
+            return;
+        }
+        // A batch through ternary weights is a tiled matrix product on the
+        // SIMD groups' matrix units, over the activations packed as half
+        // floats: a threadgroup per tile of rows and tokens.
+        if w.ternary
+            && let Some(kernel) = &self.kernels.matmul_ternary_mma
+        {
+            let padded = n.next_multiple_of(MMA_TOKENS);
+            self.pack(x, n, cols, padded);
+            self.dispatch_grid(
+                kernel,
+                &[&out.buf, &w.buf, &self.packed],
+                &params,
+                (rows.div_ceil(MMA_ROWS), padded / MMA_TOKENS),
+                MATRIX_THREADS,
+            );
+            return;
+        }
+        if w.ternary {
+            // The smallest tile that takes the batch, or the largest.
+            let which = match n {
+                ..=16 => 0,
+                17..=32 => 1,
+                _ => 2,
+            };
+            let tile_tokens = 16 << which;
+            let padded = n.next_multiple_of(tile_tokens);
+            self.pack(x, n, cols, padded);
+            self.dispatch_grid(
+                &self.kernels.matmul_ternary_tile[which],
+                &[&out.buf, &w.buf, &self.packed],
+                &params,
+                (rows.div_ceil(TILE_ROWS), padded / tile_tokens),
+                MATRIX_THREADS,
+            );
+            return;
+        }
+        // Each SIMD group takes one row of bf16 weights for eight tokens.
+        self.dispatch_grid(
+            &self.kernels.matmul_bf16,
             &[&out.buf, &w.buf, &x.buf],
             &params,
-            rows.div_ceil(per_group),
+            (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
             THREADS,
         );
     }
@@ -537,6 +761,10 @@ impl Device for Metal {
     fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
         let dim = weight.len;
         assert_eq!(x.len % dim, 0);
+        assert!(
+            dim.is_multiple_of(4) && dim <= 8192,
+            "the kernel takes rows of up to 8192 in fours"
+        );
         let params = RmsnormParams {
             dim: dim as u32,
             eps,
@@ -609,38 +837,76 @@ impl Device for Metal {
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
         assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= ATTENTION_THREADS);
-        // Every token's heads get a row of scores as long as the last token
-        // attends over, as many tokens to a dispatch as the scores fit.
-        let stride = pos + n;
         assert!(
-            n_heads * stride <= SCORES,
-            "attention over {stride} positions needs more scores than {SCORES}"
+            n_heads / n_kv_heads <= 8,
+            "the kernel holds up to eight query heads per key/value head"
         );
-        let per_dispatch = SCORES / (n_heads * stride);
+        // A batch of tokens goes through the flash kernel, on the matrix
+        // units, where the head is one it is compiled for.
+        let flash = match head_dim {
+            128 if n >= FLASH_TOKENS => Some(&self.kernels.attention_flash[0]),
+            256 if n >= FLASH_TOKENS => Some(&self.kernels.attention_flash[1]),
+            _ => None,
+        };
+        let chunk = if flash.is_some() { FLASH_CHUNK } else { CHUNK };
+        // Every token's heads get as many chunks as the last token attends
+        // over, as many tokens to a dispatch as the partials fit.
+        let chunks = (pos + n).div_ceil(chunk);
+        let per_token = n_heads * chunks * (head_dim + 2);
+        assert!(
+            per_token <= PARTIALS,
+            "attention over {} positions needs more partials than {PARTIALS}",
+            pos + n
+        );
+        let per_dispatch = PARTIALS / per_token;
         for first in (0..n).step_by(per_dispatch) {
+            let tokens = per_dispatch.min(n - first);
             let params = AttentionParams {
                 n_heads: n_heads as u32,
                 head_dim: head_dim as u32,
                 n_kv_heads: n_kv_heads as u32,
                 pos: pos as u32,
                 first: first as u32,
-                stride: stride as u32,
+                chunks: chunks as u32,
+                chunk: chunk as u32,
+                tokens: tokens as u32,
             };
-            self.dispatch(
-                &self.kernels.attention,
-                &[
-                    &out.buf,
-                    &q.buf,
-                    &k_cache.quants,
-                    &k_cache.scales,
-                    &v_cache.quants,
-                    &v_cache.scales,
-                    &self.scores,
-                ],
-                &params,
-                per_dispatch.min(n - first) * n_heads,
-                ATTENTION_THREADS,
-            );
+            let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
+                &out.buf,
+                &q.buf,
+                &k_cache.quants,
+                &k_cache.scales,
+                &v_cache.quants,
+                &v_cache.scales,
+                &self.partials,
+            ];
+            if let Some(kernel) = flash {
+                let rows = tokens * (n_heads / n_kv_heads);
+                self.dispatch_grid(
+                    kernel,
+                    &buffers,
+                    &params,
+                    (rows.div_ceil(FLASH_ROWS), n_kv_heads * chunks),
+                    MATRIX_THREADS,
+                );
+            } else {
+                self.dispatch(
+                    &self.kernels.attention,
+                    &buffers,
+                    &params,
+                    tokens * n_kv_heads * chunks,
+                    ATTENTION_THREADS,
+                );
+            }
+            if chunks > 1 {
+                self.dispatch(
+                    &self.kernels.attention_combine,
+                    &[&out.buf, &self.partials],
+                    &params,
+                    tokens * n_heads,
+                    ATTENTION_THREADS,
+                );
+            }
         }
     }
 
@@ -699,6 +965,7 @@ impl Device for Metal {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
+        assert!(width <= 8192, "the kernel takes rows of up to 8192");
         let params = RmsnormParams {
             dim: width as u32,
             eps,
@@ -793,4 +1060,54 @@ impl Device for Metal {
 #[cfg(test)]
 mod tests {
     check_against_cpu!(super::Metal::new());
+
+    /// Checks the tile kernel a GPU without matrix accelerators takes, on
+    /// one that has them too.
+    #[test]
+    fn ternary_matmul_without_accelerators_matches_cpu() {
+        match super::Metal::new() {
+            Ok(mut gpu) => {
+                gpu.kernels.matmul_ternary_mma = None;
+                crate::tests::ternary_matmul_matches_cpu(&gpu);
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the ternary matmul on the model's shapes; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn ternary_matmul_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the kernels at the model's shapes, for one token and for a
+    /// batch of 64; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kernel_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => {
+                for n in [1, 64] {
+                    eprintln!("batch of {n}:");
+                    crate::tests::kernel_speed(&gpu, n);
+                }
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the cost of a dispatch; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dispatch_overhead() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::tests::dispatch_overhead(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
 }
