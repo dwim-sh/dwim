@@ -33,9 +33,24 @@ fn main() {
     // A prompt on the command line is a one-off: answer it and exit, with
     // nothing on standard output but the reply. Without one, open the shell.
     let prompt = opts.prompt.join(" ");
+    // A budget of zero is no limit.
+    let thinking_budget = (opts.thinking_budget > 0).then_some(opts.thinking_budget);
     let result = check_memory().and_then(|()| match prompt.trim() {
-        "" => run::run(&opts.model, opts.device, opts.context, opts.thinking),
-        prompt => once::once(&opts.model, opts.device, opts.context, prompt, opts.stats),
+        "" => run::run(
+            &opts.model,
+            opts.device,
+            opts.context,
+            thinking_budget,
+            opts.thinking,
+        ),
+        prompt => once::once(
+            &opts.model,
+            opts.device,
+            opts.context,
+            thinking_budget,
+            prompt,
+            opts.stats,
+        ),
     });
     if let Err(e) = result {
         eprintln!("error: {e}");

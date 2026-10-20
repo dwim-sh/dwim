@@ -41,6 +41,7 @@ pub fn run(
     name: &str,
     device: Device,
     context: Option<usize>,
+    thinking_budget: Option<usize>,
     thinking: bool,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
@@ -57,6 +58,7 @@ pub fn run(
                 &dir,
                 device,
                 context,
+                thinking_budget,
                 requests_rx,
                 &replies_tx,
                 &stop,
@@ -88,6 +90,7 @@ pub fn run(
         committed: 0,
         interrupted: false,
         thinking,
+        thinking_budget,
         lines: Vec::new(),
         requests,
         replies,
@@ -101,12 +104,23 @@ pub fn run(
     result
 }
 
+/// How the thinking budget reads once set.
+fn budget_notice(tokens: Option<usize>) -> String {
+    match tokens {
+        Some(tokens) => format!("Thinking budget: {tokens} tokens"),
+        None => "Thinking budget: none".to_string(),
+    }
+}
+
 /// What the shell asks of the model thread.
 enum Request {
     /// A message from the user.
     Message(String),
     /// Compact the conversation now, as the `/compact` command asks.
     Compact,
+    /// Limit a thought to this many tokens, or lift the limit, as the
+    /// `/thinking-budget` command asks.
+    ThinkingBudget(Option<usize>),
 }
 
 /// What the model thread reports back.
@@ -161,11 +175,13 @@ enum Reply {
 
 /// Fetches the model if needed, then loads it and answers messages until
 /// the UI hangs up.
+#[allow(clippy::too_many_arguments)]
 fn work(
     model: &'static models::Model,
     dir: &Path,
     device: Device,
     context: Option<usize>,
+    thinking_budget: Option<usize>,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -177,7 +193,16 @@ fn work(
     match device {
         Device::Cpu => {
             let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(gguf, Cpu, model, context, requests, replies, stop)
+            serve(
+                gguf,
+                Cpu,
+                model,
+                context,
+                thinking_budget,
+                requests,
+                replies,
+                stop,
+            )
         }
         Device::Gpu => {
             let gpu = Gpu::new()?;
@@ -189,17 +214,28 @@ fn work(
                 .unwrap_or(gpu.name())
                 .to_string();
             let _ = replies.send(Reply::Device(name));
-            serve(gguf, gpu, model, context, requests, replies, stop)
+            serve(
+                gguf,
+                gpu,
+                model,
+                context,
+                thinking_budget,
+                requests,
+                replies,
+                stop,
+            )
         }
     }
 }
 
 /// Loads the model and answers messages until the UI hangs up.
+#[allow(clippy::too_many_arguments)]
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     which: &'static models::Model,
     context: Option<usize>,
+    thinking_budget: Option<usize>,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -220,6 +256,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     let mut harness = Harness::new(chat, &cwd, move |chat| {
         models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
+    harness.set_thinking_budget(thinking_budget);
     let _ = replies.send(Reply::Ready);
 
     for request in requests {
@@ -238,6 +275,11 @@ fn serve<D: dwim_gpu::Device + 'static>(
                     let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
                 }
             }),
+            Request::ThinkingBudget(tokens) => {
+                harness.set_thinking_budget(tokens);
+                let _ = replies.send(Reply::Notice(budget_notice(tokens)));
+                Ok(())
+            }
         };
         if let Err(e) = result {
             let _ = replies.send(Reply::Error(e.to_string()));
@@ -332,6 +374,8 @@ struct App {
     /// thought is kept but none of it is printed, so showing it prints
     /// all of it so far.
     thinking: bool,
+    /// Most tokens of a thought, if they are limited, as last set.
+    thinking_budget: Option<usize>,
     /// Lines waiting to be printed above the live region.
     lines: Vec<Line>,
     requests: Sender<Request>,
@@ -485,6 +529,18 @@ impl App {
 
         let request = match message.strip_prefix('/') {
             Some("compact") => Request::Compact,
+            Some(command) if command.starts_with("thinking-budget ") => {
+                match command["thinking-budget ".len()..].trim().parse::<usize>() {
+                    Ok(tokens) => {
+                        self.thinking_budget = (tokens > 0).then_some(tokens);
+                        Request::ThinkingBudget(self.thinking_budget)
+                    }
+                    Err(_) => {
+                        self.command(command);
+                        return;
+                    }
+                }
+            }
             Some(command) => {
                 self.command(command);
                 return;
@@ -685,6 +741,13 @@ impl App {
         let (columns, _) = self.screen.size();
         let lines = match command.trim() {
             "model" => models_listing(&self.model),
+            "thinking-budget" => vec![vec![span(format!(
+                "● {}",
+                budget_notice(self.thinking_budget)
+            ))]],
+            command if command.starts_with("thinking-budget ") => vec![vec![span(
+                "● /thinking-budget takes a number of tokens, or 0 for no limit",
+            )]],
             "stats" => {
                 let report = self.stats.report(self.loading, self.started.elapsed());
                 report
