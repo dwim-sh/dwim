@@ -34,9 +34,21 @@ Device to run the model on:
 .BR cpu .
 .TP
 .BI \-\-context " tokens"
-Maximum conversation length in tokens (default: 16384).
+Maximum conversation length in tokens.
 Cannot exceed the model's supported context length.
 Larger values reserve more memory on the selected device at startup.
+.B \-\-help
+shows the default on this machine, and
+.B dwim
+says how many tokens it gives the model, and how much memory that takes,
+before it loads it.
+By default, as many as fit in the memory the device has free besides the
+model and 256 MB to spare, in thousands, and no fewer than 4096:
+a GPU's free memory as its driver reports it, which for a GPU that shares
+the host's memory is no more than the host has available; on a Mac, as
+much as Metal recommends the GPU use; and on the CPU, the host's
+available memory.
+Where the device cannot tell, 16384.
 The conversation is compacted before it outgrows the window: when a
 message or a command's output would take it past four fifths, the agent
 writes itself a note of the task, what it found, what it did and what is
@@ -55,6 +67,14 @@ time and rate of each; and the tools run.
 Show the model's thinking in the shell from the start, as
 .B Ctrl\-O
 does.
+.TP
+.BI \-\-transcript " file"
+Write the session's transcript to
+.I file
+instead of a new file under
+.IR ~/.local/state/dwim/projects/ .
+.B /dev/null
+keeps none.
 .TP
 .B \-\-version
 Print the version and exit.
@@ -112,6 +132,54 @@ since where the agent is, the files there, the branch and the date go with
 the first message instead, and the newest four states are kept. On macOS the
 directory is
 .I ~/Library/Caches/dwim/states/
+instead.
+.TP
+.I ~/.local/state/dwim/projects/
+A transcript of each session, unless
+.B \-\-transcript
+names another file, readable by the user alone. Transcripts are kept in a
+folder for each working directory, named by its path with everything but
+letters and digits made a dash, such as
+.IR \-home\-user\-src\-dwim/ ,
+and out of the agent's sight there; each is named by when the session
+started (in UTC) and the process ID, such as
+.IR 2026-10-01T093012-4242.jsonl .
+It is JSON Lines: a record for each thing that happens, each with its
+.B type
+and the
+.B time
+in seconds since the session started.
+.B start
+has the model, the directory, the context, and the system prompt;
+.B user
+a message, what went ahead of it, and the tokens in the context before it;
+.BR thought ,
+.BR text ,
+and
+.B note
+what the model thought, replied, and wrote to go on from after a
+compaction;
+.B reply
+the end of a reply, with the calls it made, whether it was stopped short,
+the tokens it read, thought, and replied, and the tokens in the context
+after it;
+.B call
+and
+.B output
+a tool call and what it returned, with the seconds it ran;
+.B compacting
+and
+.B compacted
+a compaction, with the tokens before and after; and
+.B error
+and
+.B interrupted
+a turn that ended early.
+Each record is written as it happens, and a thought, text, or note as it
+streams, at least once a second, so a session that is killed leaves its
+transcript up to then. Transcripts are not removed. On macOS the
+directory is
+.I ~/Library/Application Support/dwim/projects/
 instead.
 .TP
 .I $TMPDIR/dwim-<pid>-<n>/

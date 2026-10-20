@@ -54,10 +54,11 @@ def solve(row, args, dwim, repos, work):
     """Runs `dwim` over one instance, and returns the patch it leaves behind."""
     clone = checkout(row["repo"], row["base_commit"], repos)
     log = work / f"{row['instance_id']}.log"
+    transcript = work / f"{row['instance_id']}.jsonl"
     try:
         with open(log, "w") as output:
             subprocess.run(
-                [dwim, "--model", args.model, row["problem_statement"]],
+                [dwim, "--model", args.model, "--transcript", str(transcript), row["problem_statement"]],
                 cwd=clone,
                 stdout=output,
                 stderr=output,
@@ -87,7 +88,7 @@ def run(args, predictions):
         for i, row in enumerate(rows, 1):
             print(f"[{i}/{len(rows)}] {row['instance_id']}", file=sys.stderr)
             patch = solve(row, args, dwim, repos, work)
-            print(f"  {len(patch)} bytes of patch, log in {work}", file=sys.stderr)
+            print(f"  {len(patch)} bytes of patch, log and transcript in {work}", file=sys.stderr)
             prediction = {
                 "instance_id": row["instance_id"],
                 "model_name_or_path": f"dwim-{args.model}",

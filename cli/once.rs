@@ -15,20 +15,22 @@ use std::{
 };
 
 use dwim_gpu::{Cpu, Gpu};
-use dwim_harness::{self as harness, Harness};
+use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{fetch, models, opts::Device};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
-/// once it replies with text alone; then reports where the time went, if
+/// once it replies with text alone, keeping a transcript of it in `log`;
+/// then reports where the time went, if
 /// `stats` asks for it.
 pub fn once(
     name: &str,
     device: Device,
-    context: usize,
+    context: Option<usize>,
     prompt: &str,
     stats: bool,
+    log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let (model, dir) = fetch::locate(name)?;
@@ -43,7 +45,7 @@ pub fn once(
     })?;
     let gguf = model.open(&dir)?;
     let (report, loading) = match device {
-        Device::Cpu => answer(gguf, Cpu, model, "the CPU", context, prompt)?,
+        Device::Cpu => answer(gguf, Cpu, model, "the CPU", context, prompt, log)?,
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
@@ -53,7 +55,7 @@ pub fn once(
                 .next()
                 .unwrap_or(gpu.name())
                 .to_string();
-            answer(gguf, gpu, model, &device, context, prompt)?
+            answer(gguf, gpu, model, &device, context, prompt, log)?
         }
     };
     if stats {
@@ -64,23 +66,26 @@ pub fn once(
     Ok(())
 }
 
-/// Loads `name` onto `device`, with room for `context` tokens, and answers
-/// `prompt` with it, returning where the time went and how long the
-/// loading took.
+/// Loads `name` onto `device`, with room for `context` tokens (or as many
+/// as fit), says how much memory that takes, and answers `prompt` with it,
+/// keeping a transcript in `log`, returning where the time went and how long the loading took.
 fn answer<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     which: &'static models::Model,
     on: &str,
-    context: usize,
+    context: Option<usize>,
     prompt: &str,
+    log: Log,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let name = which.name;
     let mut progress = Progress::new();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
     let loading = Instant::now();
-    let model = models::load(gguf, device, context, |done, total| {
+    let size = models::size(&gguf, &device, context)?;
+    eprintln!("{}", models::describe(&size));
+    let model = models::load(gguf, device, size.context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
     let loading = loading.elapsed();
@@ -92,9 +97,14 @@ fn answer<D: dwim_gpu::Device + 'static>(
     })?;
 
     let mut printer = Printer::default();
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    if let Some(path) = log.path() {
+        eprintln!("transcript in {}", path.display());
+    }
+    let mut harness = Harness::new(chat, &cwd, {
+        let system = system.clone();
+        move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
+    harness.keep_log(log, name, &system);
     harness.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())
