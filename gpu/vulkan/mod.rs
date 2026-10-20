@@ -13,12 +13,8 @@ use ash::{
     khr::{push_descriptor, shader_float16_int8},
     vk,
 };
-use rayon::prelude::*;
 
-use crate::{
-    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor,
-    ternary::{BLOCK, BLOCK_BYTES},
-};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
@@ -955,7 +951,7 @@ impl Device for Vulkan {
             }
             Tensor::Ternary { shape, data } => {
                 assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
-                let data = block_major(&data, shape[0], shape[1]);
+                let data = crate::ternary::block_major(&data, shape[0], shape[1]);
                 let buf = self.device_buffer(data.len());
                 self.upload_bytes(buf, 0, &data);
                 Weight {
@@ -1470,28 +1466,6 @@ impl Device for Vulkan {
             self.groups(n_v_heads, 1),
         );
     }
-}
-
-/// Reorders rows of ternary blocks into block-major order: every row's
-/// first block, then every row's second, and so on, so that the lanes of a
-/// kernel that take consecutive rows read consecutive blocks. Eight blocks
-/// of a row are read together, for the cache's sake.
-fn block_major(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
-    let blocks = cols / BLOCK;
-    let mut out = vec![0u8; data.len()];
-    out.par_chunks_mut(8 * rows * BLOCK_BYTES)
-        .enumerate()
-        .for_each(|(i, chunk)| {
-            let b0 = i * 8;
-            let count = chunk.len() / (rows * BLOCK_BYTES);
-            for r in 0..rows {
-                let src = &data[(r * blocks + b0) * BLOCK_BYTES..][..count * BLOCK_BYTES];
-                for (j, block) in src.chunks_exact(BLOCK_BYTES).enumerate() {
-                    chunk[(j * rows + r) * BLOCK_BYTES..][..BLOCK_BYTES].copy_from_slice(block);
-                }
-            }
-        });
-    out
 }
 
 /// The bytes of a plain struct of 32-bit fields, as push constants.

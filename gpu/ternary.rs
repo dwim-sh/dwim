@@ -12,6 +12,8 @@
 //! byte `24 + m` of the last two holds elements `120 + m + 2n`, where `n`
 //! counts the trits of the byte from the most significant.
 
+use rayon::prelude::*;
+
 /// Weights per block.
 pub const BLOCK: usize = 128;
 
@@ -112,6 +114,28 @@ pub fn dot(row: &[u8], x: &[f32]) -> f32 {
         acc += d * sum.iter().sum::<f32>();
     }
     acc
+}
+
+/// Reorders rows of ternary blocks into block-major order: every row's
+/// first block, then every row's second, and so on, so that the lanes of a
+/// kernel that take consecutive rows read consecutive blocks. Eight blocks
+/// of a row are read together, for the cache's sake.
+pub fn block_major(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let blocks = cols / BLOCK;
+    let mut out = vec![0u8; data.len()];
+    out.par_chunks_mut(8 * rows * BLOCK_BYTES)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let b0 = i * 8;
+            let count = chunk.len() / (rows * BLOCK_BYTES);
+            for r in 0..rows {
+                let src = &data[(r * blocks + b0) * BLOCK_BYTES..][..count * BLOCK_BYTES];
+                for (j, block) in src.chunks_exact(BLOCK_BYTES).enumerate() {
+                    chunk[(j * rows + r) * BLOCK_BYTES..][..BLOCK_BYTES].copy_from_slice(block);
+                }
+            }
+        });
+    out
 }
 
 #[cfg(test)]
