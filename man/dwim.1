@@ -68,6 +68,15 @@ Show the model's thinking in the shell from the start, as
 .B Ctrl\-O
 does.
 .TP
+.BI \-\-thinking\-budget " tokens"
+Most tokens the model may think before it is made to act (default: 2048;
+0 for no limit).
+A thought that runs to the budget is ended with a sentence in the model's
+own voice, as the model's makers end one, and the model goes on to run a
+command or reply from what it has thought so far: left to itself, it
+tends to go over what it has found again and again instead of acting on
+it.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -92,6 +101,11 @@ does.
 .B /compact
 Compact the conversation now, as happens on its own when it nears the
 end of the context window.
+.TP
+.BI /thinking\-budget " tokens"
+Set the most tokens the model may think before it is made to act, as
+.B \-\-thinking\-budget
+does, with 0 for no limit; alone, show it.
 .PP
 The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O

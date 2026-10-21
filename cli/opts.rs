@@ -30,6 +30,11 @@ pub struct Opts {
     #[argh(switch)]
     pub thinking: bool,
 
+    /// most tokens the model may think before it is made to act
+    /// (default: 2048; 0 for no limit)
+    #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
+    pub thinking_budget: usize,
+
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,

@@ -27,6 +27,7 @@ pub fn once(
     name: &str,
     device: Device,
     context: Option<usize>,
+    thinking_budget: Option<usize>,
     prompt: &str,
     stats: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -43,7 +44,15 @@ pub fn once(
     })?;
     let gguf = model.open(&dir)?;
     let (report, loading) = match device {
-        Device::Cpu => answer(gguf, Cpu, model, "the CPU", context, prompt)?,
+        Device::Cpu => answer(
+            gguf,
+            Cpu,
+            model,
+            "the CPU",
+            context,
+            thinking_budget,
+            prompt,
+        )?,
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
@@ -53,7 +62,7 @@ pub fn once(
                 .next()
                 .unwrap_or(gpu.name())
                 .to_string();
-            answer(gguf, gpu, model, &device, context, prompt)?
+            answer(gguf, gpu, model, &device, context, thinking_budget, prompt)?
         }
     };
     if stats {
@@ -73,6 +82,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     which: &'static models::Model,
     on: &str,
     context: Option<usize>,
+    thinking_budget: Option<usize>,
     prompt: &str,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let name = which.name;
@@ -97,6 +107,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let mut harness = Harness::new(chat, &cwd, move |chat| {
         models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
+    harness.set_thinking_budget(thinking_budget);
     harness.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())

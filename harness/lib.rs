@@ -45,6 +45,15 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
+/// Most tokens the model may think before it is made to act, unless the
+/// budget is set otherwise: the thinking budget.
+pub const THINKING_BUDGET: usize = 2048;
+
+/// What ends a thought that runs to the thinking budget, in the model's
+/// voice, as Qwen3's own thinking budget ends one: the model then goes on
+/// to call a tool or reply from what it has thought so far.
+const BUDGET_CLOSING: &str = "Considering the limited time by the user, I have to give the solution based on the thinking directly now.";
+
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
 const HIGH_WATER: (usize, usize) = (4, 5);
@@ -291,6 +300,8 @@ pub struct Harness<M: LanguageModel> {
     /// Tokens kept free past every reply: room for the note prompt and
     /// the note.
     reserve: usize,
+    /// Most tokens of a thought, if they are limited.
+    thinking_budget: Option<usize>,
 }
 
 /// Where a conversation's time has gone: the model's, by what it was
@@ -374,6 +385,7 @@ impl<M: LanguageModel> Harness<M> {
         let note_tokens = (chat.capacity() / 64).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
         let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
         chat.reserve(reserve);
+        chat.limit_thoughts(THINKING_BUDGET, BUDGET_CLOSING);
         Ok(Self {
             chat,
             tools: Tools::new(),
@@ -385,7 +397,22 @@ impl<M: LanguageModel> Harness<M> {
             restart: Box::new(restart),
             note_tokens,
             reserve,
+            thinking_budget: Some(THINKING_BUDGET),
         })
+    }
+
+    /// Limits a thought to `tokens`, or lifts the limit: a thought that
+    /// runs to the budget is ended with a closing in the model's voice,
+    /// and the model goes on to act on what it has thought so far.
+    pub fn set_thinking_budget(&mut self, tokens: Option<usize>) {
+        self.chat
+            .limit_thoughts(tokens.unwrap_or(usize::MAX), BUDGET_CLOSING);
+        self.thinking_budget = tokens;
+    }
+
+    /// Most tokens of a thought, if they are limited.
+    pub fn thinking_budget(&self) -> Option<usize> {
+        self.thinking_budget
     }
 
     /// Where the conversation's time has gone so far.
@@ -889,6 +916,62 @@ mod tests {
                 .any(|turn| matches!(turn, Turn::User(message) if message == "message 3"))
         );
         assert!(harness.tokens() <= max_len - harness.reserve);
+    }
+
+    #[test]
+    fn ends_a_thought_at_the_thinking_budget() {
+        // A thought of 1000 tokens, under a budget of 100, is ended there
+        // with the closing, and the reply goes on to its call and its text.
+        let scripts = [reply(1000, true), reply(1000, false)];
+        let mut limited = harness(&scripts, 8000, "");
+        assert_eq!(limited.thinking_budget(), Some(THINKING_BUDGET));
+        limited.set_thinking_budget(Some(100));
+        let mut thought = String::new();
+        let mut events = Vec::new();
+        limited
+            .send("go", |event| {
+                events.push(match event {
+                    Event::Thought(text) => {
+                        thought.push_str(text);
+                        "thought"
+                    }
+                    Event::Text(_) => "text",
+                    Event::Call { .. } => "call",
+                    Event::Output(_) => "output",
+                    _ => "other",
+                });
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        events.dedup();
+        assert_eq!(
+            events,
+            ["thought", "text", "call", "output", "thought", "text"]
+        );
+        assert!(thought.contains(BUDGET_CLOSING), "{thought}");
+        assert!(thought.len() < 1000, "{}", thought.len());
+        let turns: Vec<&Turn> = limited.transcript().collect();
+        assert!(
+            matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim().ends_with("Ok.")),
+            "{:?}",
+            turns.last()
+        );
+
+        // Lifted, the budget lets a thought run.
+        let scripts = [reply(1000, false)];
+        let mut free = harness(&scripts, 8000, "");
+        free.set_thinking_budget(None);
+        assert_eq!(free.thinking_budget(), None);
+        let mut thought = String::new();
+        free.send("go", |event| {
+            if let Event::Thought(text) = event {
+                thought.push_str(text);
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert!(!thought.contains(BUDGET_CLOSING));
+        assert!(thought.len() >= 1000);
     }
 
     #[test]
