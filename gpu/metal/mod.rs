@@ -22,7 +22,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, quant};
 
 /// Positions one threadgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -95,11 +95,22 @@ pub struct Cache {
     len: usize,
 }
 
-/// A weight matrix in memory shared with the GPU, bf16 or ternary.
+/// A weight matrix in memory shared with the GPU: its weights, and for
+/// the block-quantized formats their scales in a buffer of their own.
 pub struct Weight {
     buf: Object<dyn MTLBuffer>,
+    scales: Option<Object<dyn MTLBuffer>>,
     shape: Vec<usize>,
-    ternary: bool,
+    format: Format,
+}
+
+/// The formats weights come in, as [`Tensor`] has them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Bf16,
+    Ternary,
+    Q4_0,
+    Q8_0,
 }
 
 struct Kernels {
@@ -111,6 +122,8 @@ struct Kernels {
     /// The tile kernel for tiles of 16, 32 and 64 tokens.
     matmul_ternary_tile: [Object<dyn MTLComputePipelineState>; 3],
     pack_halves: Object<dyn MTLComputePipelineState>,
+    matmul_q4_0: Object<dyn MTLComputePipelineState>,
+    matmul_q8_0: Object<dyn MTLComputePipelineState>,
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
     l2norm: Object<dyn MTLComputePipelineState>,
@@ -225,6 +238,8 @@ impl Metal {
             ],
             matmul_ternary_mma,
             pack_halves: msl!("pack_halves"),
+            matmul_q4_0: msl!("matmul_q4_0"),
+            matmul_q8_0: msl!("matmul_q8_0"),
             add: msl!("add"),
             rmsnorm: msl!("rmsnorm"),
             l2norm: msl!("l2norm"),
@@ -496,26 +511,7 @@ impl Device for Metal {
     type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
-        // Ternary blocks go block-major, so that the rows a SIMD group
-        // takes read adjacent blocks.
-        let block_major;
-        let (shape, bytes, ternary) = match &tensor {
-            Tensor::Bf16 { shape, data } => {
-                assert!(
-                    data.len().is_multiple_of(8),
-                    "weights must come in multiples of eight"
-                );
-                let bytes =
-                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
-                (shape, bytes, false)
-            }
-            Tensor::Ternary { shape, data } => {
-                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
-                block_major = crate::ternary::block_major(data, shape[0], shape[1]);
-                (shape, block_major.as_slice(), true)
-            }
-        };
-        let buf = unsafe {
+        let with_bytes = |bytes: &[u8]| unsafe {
             self.device
                 .newBufferWithBytes_length_options(
                     NonNull::from(bytes).cast(),
@@ -524,10 +520,59 @@ impl Device for Metal {
                 )
                 .expect("out of GPU memory")
         };
+        // The bytes of a vector of plain integers, in memory order.
+        fn bytes<T>(data: &[T]) -> &[u8] {
+            unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), size_of_val(data)) }
+        }
+        let (shape, buf, scales, format) = match &tensor {
+            Tensor::Bf16 { shape, data } => {
+                assert!(
+                    data.len().is_multiple_of(8),
+                    "weights must come in multiples of eight"
+                );
+                (shape, with_bytes(bytes(data)), None, Format::Bf16)
+            }
+            Tensor::Ternary { shape, data } => {
+                // Block-major, so that the rows a SIMD group takes read
+                // adjacent blocks.
+                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
+                let data = crate::ternary::block_major(data, shape[0], shape[1]);
+                (shape, with_bytes(&data), None, Format::Ternary)
+            }
+            Tensor::Q4_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                (
+                    shape,
+                    with_bytes(quants),
+                    Some(with_bytes(bytes(scales))),
+                    Format::Q4_0,
+                )
+            }
+            Tensor::Q8_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1]);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                (
+                    shape,
+                    with_bytes(bytes(quants)),
+                    Some(with_bytes(bytes(scales))),
+                    Format::Q8_0,
+                )
+            }
+        };
         Weight {
             buf,
+            scales,
             shape: shape.clone(),
-            ternary,
+            format,
         }
     }
 
@@ -662,7 +707,7 @@ impl Device for Metal {
         // tables of their activations' sums, each token reading the weights
         // for itself, with the blocks of a matrix of few rows split among
         // threadgroups whose partial sums are added up after.
-        if w.ternary && n <= SUMS_TOKENS {
+        if w.format == Format::Ternary && n <= SUMS_TOKENS {
             let tiles = rows.div_ceil(SUMS_THREADS * SUMS_PER);
             let splits = (SUMS_GROUPS / tiles).clamp(1, cols / 128);
             let splits = if splits * n * rows <= PARTIALS {
@@ -692,7 +737,7 @@ impl Device for Metal {
         // A batch through ternary weights is a tiled matrix product on the
         // SIMD groups' matrix units, over the activations packed as half
         // floats: a threadgroup per tile of rows and tokens.
-        if w.ternary
+        if w.format == Format::Ternary
             && let Some(kernel) = &self.kernels.matmul_ternary_mma
         {
             let padded = n.next_multiple_of(MMA_TOKENS);
@@ -706,7 +751,7 @@ impl Device for Metal {
             );
             return;
         }
-        if w.ternary {
+        if w.format == Format::Ternary {
             // The smallest tile that takes the batch, or the largest.
             let which = match n {
                 ..=16 => 0,
@@ -726,11 +771,32 @@ impl Device for Metal {
             return;
         }
         // Each SIMD group takes one row of bf16 weights for eight tokens.
-        self.dispatch_grid(
-            &self.kernels.matmul_bf16,
-            &[&out.buf, &w.buf, &x.buf],
+        if w.format == Format::Bf16 {
+            self.dispatch_grid(
+                &self.kernels.matmul_bf16,
+                &[&out.buf, &w.buf, &x.buf],
+                &params,
+                (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
+                THREADS,
+            );
+            return;
+        }
+        // Each SIMD group takes one row of block-quantized weights, the
+        // tokens eight at a time, with the scales bound after the quants.
+        let kernel = match w.format {
+            Format::Q4_0 => &self.kernels.matmul_q4_0,
+            Format::Q8_0 => &self.kernels.matmul_q8_0,
+            Format::Bf16 | Format::Ternary => unreachable!(),
+        };
+        let scales = w
+            .scales
+            .as_ref()
+            .expect("block-quantized weights have scales");
+        self.dispatch(
+            kernel,
+            &[&out.buf, &w.buf, scales, &x.buf],
             &params,
-            (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
+            rows.div_ceil(self.matmul_rows),
             THREADS,
         );
     }

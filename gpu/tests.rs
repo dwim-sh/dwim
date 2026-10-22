@@ -1,6 +1,6 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, ternary};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, quant, ternary};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -12,6 +12,8 @@ macro_rules! check_against_cpu {
             alloc_is_zeroed_and_copy_moves_ranges,
             matmul_matches_cpu,
             ternary_matmul_matches_cpu,
+            q4_0_matmul_matches_cpu,
+            q8_0_matmul_matches_cpu,
             rmsnorm_matches_cpu,
             l2norm_matches_cpu,
             rope_matches_cpu,
@@ -76,6 +78,40 @@ impl Rng {
             data,
         }
     }
+
+    fn q4_0(&mut self, shape: &[usize]) -> Tensor {
+        let (rows, cols) = (shape[0], shape[1]);
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols / 2]);
+        for (scales, quants) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols / 2))
+        {
+            quant::quantize_q4_0_row(&self.floats(cols), scales, quants);
+        }
+        Tensor::Q4_0 {
+            shape: shape.to_vec(),
+            scales,
+            quants,
+        }
+    }
+
+    fn q8_0(&mut self, shape: &[usize]) -> Tensor {
+        let (rows, cols) = (shape[0], shape[1]);
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols]);
+        for (scales, quants) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols))
+        {
+            quant::quantize_q8_0_row(&self.floats(cols), scales, quants);
+        }
+        Tensor::Q8_0 {
+            shape: shape.to_vec(),
+            scales,
+            quants,
+        }
+    }
 }
 
 fn clone(t: &Tensor) -> Tensor {
@@ -87,6 +123,24 @@ fn clone(t: &Tensor) -> Tensor {
         Tensor::Ternary { shape, data } => Tensor::Ternary {
             shape: shape.clone(),
             data: data.clone(),
+        },
+        Tensor::Q4_0 {
+            shape,
+            scales,
+            quants,
+        } => Tensor::Q4_0 {
+            shape: shape.clone(),
+            scales: scales.clone(),
+            quants: quants.clone(),
+        },
+        Tensor::Q8_0 {
+            shape,
+            scales,
+            quants,
+        } => Tensor::Q8_0 {
+            shape: shape.clone(),
+            scales: scales.clone(),
+            quants: quants.clone(),
         },
     }
 }
@@ -150,6 +204,41 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
         gpu.matmul(&mut out, &weight, &x);
         close(&gpu.read(&out), &want, 1e-4);
     }
+}
+
+/// Single tokens and batches, at the edges of the groups of eight tokens
+/// the kernels take and at the model's shapes, through `quantized`
+/// matrices.
+fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usize]) -> Tensor) {
+    for (rows, cols, n) in [
+        (1, 32, 1),
+        (200, 5120, 1),
+        (70_000, 32, 2),
+        (77, 1056, 3),
+        (200, 5120, 8),
+        (64, 160, 9),
+        (1030, 1152, 33),
+        (2500, 5120, 64),
+    ] {
+        let w = quantized(&[rows, cols]);
+        let x = Rng(rows as u64 + n as u64).floats(n * cols);
+        let mut want = vec![0.0; n * rows];
+        Cpu.matmul(&mut want, &clone(&w), &x);
+        let weight = gpu.upload(w);
+        let mut out = gpu.alloc(n * rows);
+        gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
+        close(&gpu.read(&out), &want, 1e-4);
+    }
+}
+
+pub fn q4_0_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(40);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape));
+}
+
+pub fn q8_0_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(80);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape));
 }
 
 pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {

@@ -4,8 +4,8 @@
 use rayon::prelude::*;
 
 use crate::{
-    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quantize, sigmoid,
-    softplus, ternary,
+    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quant, quantize,
+    sigmoid, softplus, ternary,
 };
 
 pub struct Cpu;
@@ -121,6 +121,20 @@ impl Device for Cpu {
                 .par_chunks_exact_mut(n)
                 .zip(data.par_chunks_exact(ternary::row_bytes(cols)))
                 .for_each(|(results, row)| row_dot(results, &|x| ternary::dot(row, x))),
+            Tensor::Q4_0 { scales, quants, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(scales.par_chunks_exact(quant::blocks(cols)))
+                .zip(quants.par_chunks_exact(cols / 2))
+                .for_each(|((results, scales), quants)| {
+                    row_dot(results, &|x| quant::dot_q4_0(scales, quants, x))
+                }),
+            Tensor::Q8_0 { scales, quants, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(scales.par_chunks_exact(quant::blocks(cols)))
+                .zip(quants.par_chunks_exact(cols))
+                .for_each(|((results, scales), quants)| {
+                    row_dot(results, &|x| quant::dot_q8_0(scales, quants, x))
+                }),
         }
         for (r, results) in by_row.chunks_exact(n).enumerate() {
             for (t, &result) in results.iter().enumerate() {
@@ -465,7 +479,86 @@ fn softmax(x: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::walsh_hadamard;
-    use crate::{CACHE_BLOCK, F16_MAX, from_f16, quantize, to_f16};
+    use crate::{CACHE_BLOCK, F16_MAX, Tensor, from_f16, quant, quantize, ternary, to_f16};
+
+    /// Values in [-1, 1) from a seed.
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selecting_rows_and_column_groups_reorders_every_format() {
+        let (rows, cols) = (3, 256);
+        let w = values(rows * cols, 5);
+        let mut tensors = vec![Tensor::Bf16 {
+            shape: vec![rows, cols],
+            data: w.iter().map(|v| (v.to_bits() >> 16) as u16).collect(),
+        }];
+        let mut data = vec![0; rows * ternary::row_bytes(cols)];
+        for (row, w) in data
+            .chunks_exact_mut(ternary::row_bytes(cols))
+            .zip(w.chunks_exact(cols))
+        {
+            ternary::quantize_row(w, row);
+        }
+        tensors.push(Tensor::Ternary {
+            shape: vec![rows, cols],
+            data,
+        });
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols / 2]);
+        for ((scales, quants), w) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols / 2))
+            .zip(w.chunks_exact(cols))
+        {
+            quant::quantize_q4_0_row(w, scales, quants);
+        }
+        tensors.push(Tensor::Q4_0 {
+            shape: vec![rows, cols],
+            scales,
+            quants,
+        });
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols]);
+        for ((scales, quants), w) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols))
+            .zip(w.chunks_exact(cols))
+        {
+            quant::quantize_q8_0_row(w, scales, quants);
+        }
+        tensors.push(Tensor::Q8_0 {
+            shape: vec![rows, cols],
+            scales,
+            quants,
+        });
+        for t in &tensors {
+            let whole = t.dequantize();
+            // Rows 2, 0 and 2 again; then the second half of the columns
+            // before the first.
+            let picked = t.select_rows(&[2, 0, 2]);
+            assert_eq!(picked.shape(), [3, cols]);
+            let got = picked.dequantize();
+            for (i, r) in [2, 0, 2].into_iter().enumerate() {
+                assert_eq!(got[i * cols..][..cols], whole[r * cols..][..cols]);
+            }
+            let swapped = t.select_column_groups(128, &[1, 0]);
+            assert_eq!(swapped.shape(), [rows, cols]);
+            let got = swapped.dequantize();
+            for r in 0..rows {
+                assert_eq!(got[r * cols..][..128], whole[r * cols + 128..][..128]);
+                assert_eq!(got[r * cols + 128..][..128], whole[r * cols..][..128]);
+            }
+        }
+    }
 
     #[test]
     fn f16_round_trips_what_it_can_represent() {

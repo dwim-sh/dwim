@@ -14,7 +14,7 @@ use ash::{
     vk,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, quant};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
@@ -78,11 +78,22 @@ pub struct Cache {
     len: usize,
 }
 
-/// A weight matrix in device memory, bf16 or ternary.
+/// A weight matrix in device memory: its weights, and for the
+/// block-quantized formats their scales in a buffer of their own.
 pub struct Weight {
     buf: vk::Buffer,
+    scales: vk::Buffer,
     shape: Vec<usize>,
-    ternary: bool,
+    format: Format,
+}
+
+/// The formats weights come in, as [`Tensor`] has them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Bf16,
+    Ternary,
+    Q4_0,
+    Q8_0,
 }
 
 struct Kernels {
@@ -92,6 +103,8 @@ struct Kernels {
     matmul_ternary_tile: vk::Pipeline,
     matmul_ternary_tile_reduce: vk::Pipeline,
     matmul_ternary_sums: vk::Pipeline,
+    matmul_q4_0: vk::Pipeline,
+    matmul_q8_0: vk::Pipeline,
     pack_halves: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
@@ -138,11 +151,13 @@ impl Kernels {
             self.matmul_ternary_tile,
             self.matmul_ternary_tile_reduce,
             self.matmul_ternary_sums,
+            self.matmul_q4_0,
+            self.matmul_q8_0,
         ]
         .contains(&pipeline)
     }
 
-    fn all(&self) -> [vk::Pipeline; 20] {
+    fn all(&self) -> [vk::Pipeline; 22] {
         [
             self.matmul_bf16,
             self.matmul_ternary,
@@ -150,6 +165,8 @@ impl Kernels {
             self.matmul_ternary_tile,
             self.matmul_ternary_tile_reduce,
             self.matmul_ternary_sums,
+            self.matmul_q4_0,
+            self.matmul_q8_0,
             self.pack_halves,
             self.add,
             self.rmsnorm,
@@ -408,6 +425,8 @@ impl Vulkan {
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
                 matmul_ternary_tile_reduce: spv!("matmul_ternary_tile_reduce"),
                 matmul_ternary_sums: spv!("matmul_ternary_sums"),
+                matmul_q4_0: spv!("matmul_q4_0"),
+                matmul_q8_0: spv!("matmul_q8_0"),
                 pack_halves: spv!("pack_halves"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
@@ -930,34 +949,67 @@ impl Device for Vulkan {
     type Cache = Cache;
 
     fn upload(&self, tensor: Tensor) -> Weight {
+        // The bytes of a vector of plain integers, in memory order: the
+        // kernels take the low half of a word as the first of its 16-bit
+        // weights or scales, as little-endian does.
+        fn bytes<T>(data: &[T]) -> &[u8] {
+            unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), size_of_val(data)) }
+        }
+        let with_bytes = |bytes: &[u8]| {
+            // A whole number of words, for the kernels' arrays of them.
+            let buf = self.device_buffer(bytes.len().next_multiple_of(4));
+            self.upload_bytes(buf, 0, bytes);
+            buf
+        };
         match tensor {
             Tensor::Bf16 { shape, data } => {
                 assert!(
                     data.len().is_multiple_of(8),
                     "weights must come in multiples of eight"
                 );
-                let buf = self.device_buffer(data.len() * 2);
-                // bf16 bits, two to a 32-bit word, in memory order: the
-                // kernels take the low half of a word as the first weight,
-                // as little-endian does.
-                let bytes =
-                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
-                self.upload_bytes(buf, 0, bytes);
                 Weight {
-                    buf,
+                    buf: with_bytes(bytes(&data)),
+                    scales: vk::Buffer::null(),
                     shape,
-                    ternary: false,
+                    format: Format::Bf16,
                 }
             }
             Tensor::Ternary { shape, data } => {
                 assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
                 let data = crate::ternary::block_major(&data, shape[0], shape[1]);
-                let buf = self.device_buffer(data.len());
-                self.upload_bytes(buf, 0, &data);
                 Weight {
-                    buf,
+                    buf: with_bytes(&data),
+                    scales: vk::Buffer::null(),
                     shape,
-                    ternary: true,
+                    format: Format::Ternary,
+                }
+            }
+            Tensor::Q4_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                Weight {
+                    buf: with_bytes(&quants),
+                    scales: with_bytes(bytes(&scales)),
+                    shape,
+                    format: Format::Q4_0,
+                }
+            }
+            Tensor::Q8_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1]);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                Weight {
+                    buf: with_bytes(bytes(&quants)),
+                    scales: with_bytes(bytes(&scales)),
+                    shape,
+                    format: Format::Q8_0,
                 }
             }
         }
@@ -1101,7 +1153,8 @@ impl Device for Vulkan {
                 groups,
             );
         };
-        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+        let ternary = w.format == Format::Ternary;
+        if ternary && n >= TERNARY_TILE_TOKENS / 2 {
             pack(pairs);
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
@@ -1151,7 +1204,7 @@ impl Device for Vulkan {
         // tables of its activations' sums, a workgroup per 1024 rows, with
         // the blocks of a matrix of few rows split among workgroups whose
         // partial sums are added up after.
-        if w.ternary && n == 1 && rows >= SUMS_MIN_ROWS {
+        if ternary && n == 1 && rows >= SUMS_MIN_ROWS {
             let blocks = cols / 128;
             let tiles = rows.div_ceil(SUMS_ROWS);
             let splits = (SUMS_WORKGROUPS / tiles).clamp(1, blocks);
@@ -1185,27 +1238,28 @@ impl Device for Vulkan {
             }
             return;
         }
-        // One workgroup per row of bf16 weights, or per eight rows of
-        // ternary weights, in a grid as wide as the GPU allows, and the
-        // tokens eight at a time, each group of them a row of the grid. A
-        // few tokens through ternary weights are worth unpacking the
-        // weights once for eight, and go as half floats packed a group of
-        // eight tokens together.
-        let batch = w.ternary && n > 1;
+        // One workgroup per row of bf16 or block-quantized weights, or per
+        // eight rows of ternary weights, in a grid as wide as the GPU
+        // allows, and the tokens eight at a time, each group of them a row
+        // of the grid. A few tokens through ternary weights are worth
+        // unpacking the weights once for eight, and go as half floats
+        // packed a group of eight tokens together. The block-quantized
+        // kernels bind the scales after the quants.
+        let batch = ternary && n > 1;
         if batch {
             pack(TERNARY_TOKENS / 2);
         }
-        let (kernel, per_group, tokens, x) = if batch {
-            (
+        let (kernel, per_group, tokens, x) = match w.format {
+            Format::Ternary if batch => (
                 self.kernels.matmul_ternary_batch,
                 TERNARY_ROWS,
                 TERNARY_TOKENS,
                 self.packed,
-            )
-        } else if w.ternary {
-            (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
-        } else {
-            (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf)
+            ),
+            Format::Ternary => (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf),
+            Format::Bf16 => (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf),
+            Format::Q4_0 => (self.kernels.matmul_q4_0, 1, BF16_TOKENS, x.buf),
+            Format::Q8_0 => (self.kernels.matmul_q8_0, 1, BF16_TOKENS, x.buf),
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
@@ -1220,7 +1274,11 @@ impl Device for Vulkan {
             stride: width as u32,
             splits: 1,
         };
-        self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
+        if w.scales == vk::Buffer::null() {
+            self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
+        } else {
+            self.dispatch(kernel, &[out.buf, w.buf, w.scales, x], &params, groups);
+        }
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {

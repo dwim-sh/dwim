@@ -10,6 +10,7 @@ mod tests;
 pub mod cpu;
 #[cfg(target_vendor = "apple")]
 pub mod metal;
+pub mod quant;
 pub mod ternary;
 pub mod vulkan;
 
@@ -35,18 +36,153 @@ pub const CONV_KERNEL: usize = 4;
 /// sharing an f16 scale, as [`quantize`] makes them.
 pub const CACHE_BLOCK: usize = 32;
 
-/// A weight matrix on the host, of shape `[rows, cols]`: either raw bf16
-/// bits, or rows of ternary blocks.
+/// A weight matrix on the host, of shape `[rows, cols]`: raw bf16 bits, rows
+/// of ternary blocks, or rows of 4-bit or 8-bit blocks with their scales
+/// apart, as [`quant`] lays them out.
 pub enum Tensor {
-    Bf16 { shape: Vec<usize>, data: Vec<u16> },
-    Ternary { shape: Vec<usize>, data: Vec<u8> },
+    Bf16 {
+        shape: Vec<usize>,
+        data: Vec<u16>,
+    },
+    Ternary {
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    },
+    Q4_0 {
+        shape: Vec<usize>,
+        scales: Vec<u16>,
+        quants: Vec<u8>,
+    },
+    Q8_0 {
+        shape: Vec<usize>,
+        scales: Vec<u16>,
+        quants: Vec<i8>,
+    },
 }
 
 impl Tensor {
     pub fn shape(&self) -> &[usize] {
         match self {
-            Tensor::Bf16 { shape, .. } | Tensor::Ternary { shape, .. } => shape,
+            Tensor::Bf16 { shape, .. }
+            | Tensor::Ternary { shape, .. }
+            | Tensor::Q4_0 { shape, .. }
+            | Tensor::Q8_0 { shape, .. } => shape,
         }
+    }
+
+    /// The matrix made of the given rows of this one, in the given order: a
+    /// row may be taken more than once or not at all.
+    pub fn select_rows(&self, rows: &[usize]) -> Tensor {
+        let cols = self.shape()[1];
+        let shape = vec![rows.len(), cols];
+        fn take<T: Copy>(data: &[T], per_row: usize, rows: &[usize]) -> Vec<T> {
+            let mut out = Vec::with_capacity(rows.len() * per_row);
+            for &r in rows {
+                out.extend_from_slice(&data[r * per_row..][..per_row]);
+            }
+            out
+        }
+        match self {
+            Tensor::Bf16 { data, .. } => Tensor::Bf16 {
+                shape,
+                data: take(data, cols, rows),
+            },
+            Tensor::Ternary { data, .. } => Tensor::Ternary {
+                shape,
+                data: take(data, ternary::row_bytes(cols), rows),
+            },
+            Tensor::Q4_0 { scales, quants, .. } => Tensor::Q4_0 {
+                shape,
+                scales: take(scales, quant::blocks(cols), rows),
+                quants: take(quants, cols / 2, rows),
+            },
+            Tensor::Q8_0 { scales, quants, .. } => Tensor::Q8_0 {
+                shape,
+                scales: take(scales, quant::blocks(cols), rows),
+                quants: take(quants, cols, rows),
+            },
+        }
+    }
+
+    /// The matrix with its columns taken in groups of `width`, in the given
+    /// order of groups: a group may be taken more than once or not at all.
+    /// The groups must be whole blocks of the format.
+    pub fn select_column_groups(&self, width: usize, groups: &[usize]) -> Tensor {
+        let (rows, cols) = (self.shape()[0], self.shape()[1]);
+        assert!(cols.is_multiple_of(width));
+        let shape = vec![rows, groups.len() * width];
+        // Takes groups of `per_group` elements out of each row of
+        // `per_row`.
+        fn take<T: Copy>(data: &[T], per_row: usize, per_group: usize, groups: &[usize]) -> Vec<T> {
+            let mut out = Vec::with_capacity(data.len() / per_row * groups.len() * per_group);
+            for row in data.chunks_exact(per_row) {
+                for &g in groups {
+                    out.extend_from_slice(&row[g * per_group..][..per_group]);
+                }
+            }
+            out
+        }
+        match self {
+            Tensor::Bf16 { data, .. } => Tensor::Bf16 {
+                shape,
+                data: take(data, cols, width, groups),
+            },
+            Tensor::Ternary { data, .. } => Tensor::Ternary {
+                shape,
+                data: take(
+                    data,
+                    ternary::row_bytes(cols),
+                    ternary::row_bytes(width),
+                    groups,
+                ),
+            },
+            Tensor::Q4_0 { scales, quants, .. } => Tensor::Q4_0 {
+                shape,
+                scales: take(scales, quant::blocks(cols), quant::blocks(width), groups),
+                quants: take(quants, cols / 2, width / 2, groups),
+            },
+            Tensor::Q8_0 { scales, quants, .. } => Tensor::Q8_0 {
+                shape,
+                scales: take(scales, quant::blocks(cols), quant::blocks(width), groups),
+                quants: take(quants, cols, width, groups),
+            },
+        }
+    }
+
+    /// The weights, reconstructed, row by row.
+    pub fn dequantize(&self) -> Vec<f32> {
+        let (rows, cols) = (self.shape()[0], self.shape()[1]);
+        let mut out = vec![0.0; rows * cols];
+        for (r, out) in out.chunks_exact_mut(cols).enumerate() {
+            match self {
+                Tensor::Bf16 { data, .. } => {
+                    for (o, &w) in out.iter_mut().zip(&data[r * cols..][..cols]) {
+                        *o = bf16(w);
+                    }
+                }
+                Tensor::Ternary { data, .. } => {
+                    let row = ternary::row_bytes(cols);
+                    ternary::dequantize_row(&data[r * row..][..row], out);
+                }
+                Tensor::Q4_0 { scales, quants, .. } => {
+                    let blocks = quant::blocks(cols);
+                    quant::dequantize_q4_0_row(
+                        &scales[r * blocks..][..blocks],
+                        &quants[r * cols / 2..][..cols / 2],
+                        out,
+                    );
+                }
+                Tensor::Q8_0 { scales, quants, .. } => {
+                    let blocks = quant::blocks(cols);
+                    quant::dequantize_q8_0_row(
+                        &scales[r * blocks..][..blocks],
+                        &quants[r * cols..][..cols],
+                        out,
+                    );
+                }
+            }
+        }
+        out
     }
 }
 
@@ -60,7 +196,7 @@ pub trait Device {
     /// on rows of activations, one per token, take a buffer's length as a
     /// whole number of rows.
     type Buffer;
-    /// A weight matrix in device memory, bf16 or ternary.
+    /// A weight matrix in device memory, in any of [`Tensor`]'s formats.
     type Weight;
     /// A key or value cache in device memory: activations stored in blocks
     /// of [`CACHE_BLOCK`] as [`quantize`] makes them, 8.5 bits each, for
