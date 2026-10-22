@@ -1,7 +1,10 @@
 // Rotates each 1024-element block of every row of x by the normalized
 // Walsh-Hadamard transform, multiplying by the signs before it (the forward
-// rotation) or after it (the inverse): one threadgroup per block, which it
-// transforms in shared memory as ten rounds of butterflies.
+// rotation) or after it (the inverse): one threadgroup of 256 per block.
+// Each thread holds four consecutive elements: the first two rounds of
+// butterflies are between them, the next five between lanes of a SIMD group
+// by shuffles, and the last three between threads through shared memory,
+// each in one of two arrays in turn so that a round needs one barrier.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -12,42 +15,48 @@ struct Params {
 };
 
 constant uint BLOCK = 1024;
+constant uint THREADS = 256;
+
+// The Walsh-Hadamard transform of the block whose elements 4lid to 4lid + 3
+// are `e`, unnormalized.
+static float4 butterfly(float4 e, uint lid, uint lane, threadgroup float4* v) {
+    e = float4(e.x + e.y, e.x - e.y, e.z + e.w, e.z - e.w);
+    e = float4(e.x + e.z, e.y + e.w, e.x - e.z, e.y - e.w);
+    // Elements 4s apart are in the lanes s apart.
+    for (ushort s = 1; s < 32; s <<= 1) {
+        float4 o = simd_shuffle_xor(e, s);
+        e = (lane & s) == 0 ? e + o : o - e;
+    }
+    uint side = 0;
+    for (uint s = 32; s < THREADS; s <<= 1) {
+        v[side + lid] = e;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 o = v[side + (lid ^ s)];
+        e = (lid & s) == 0 ? e + o : o - e;
+        side = THREADS - side;
+    }
+    return e;
+}
 
 kernel void hadamard(
-    device float* x [[buffer(0)]],
-    const device float* signs [[buffer(1)]],
+    device float4* x [[buffer(0)]],
+    const device float4* signs [[buffer(1)]],
     constant Params& p [[buffer(2)]],
     uint group [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
-    uint threads [[threads_per_threadgroup]])
+    uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float v[1024];
+    threadgroup float4 v[2 * THREADS];
     uint blocks = p.width / BLOCK;
-    uint base = (group / blocks) * p.width + (group % blocks) * BLOCK;
-    uint sbase = (group % blocks) * BLOCK;
-    for (uint i = lid; i < BLOCK; i += threads) {
-        float e = x[base + i];
-        if (p.inverse == 0) {
-            e *= signs[sbase + i];
-        }
-        v[i] = e;
+    uint base = ((group / blocks) * p.width + (group % blocks) * BLOCK) / 4 + lid;
+    uint sbase = (group % blocks) * BLOCK / 4 + lid;
+    float4 e = x[base];
+    if (p.inverse == 0) {
+        e *= signs[sbase];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint h = 1; h < BLOCK; h <<= 1) {
-        for (uint pair = lid; pair < BLOCK / 2; pair += threads) {
-            uint i = (pair / h) * 2 * h + (pair % h);
-            float a = v[i];
-            float b = v[i + h];
-            v[i] = a + b;
-            v[i + h] = a - b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    e = butterfly(e, lid, lane, v) * (1.0f / 32.0f);
+    if (p.inverse != 0) {
+        e *= signs[sbase];
     }
-    for (uint i = lid; i < BLOCK; i += threads) {
-        float e = v[i] * (1.0f / 32.0f);
-        if (p.inverse != 0) {
-            e *= signs[sbase + i];
-        }
-        x[base + i] = e;
-    }
+    x[base] = e;
 }
