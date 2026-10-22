@@ -80,7 +80,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
     let loading = Instant::now();
-    let model = models::load(gguf, device, context, |done, total| {
+    let model = models::load(which, gguf, device, context, |done, total| {
         progress.report(format!("loading {name} on {on}"), done, total);
     })?;
     let loading = loading.elapsed();

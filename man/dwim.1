@@ -24,8 +24,13 @@ and their output go to standard error.
 .SH OPTIONS
 .TP
 .BI \-\-model " model"
-Model to run (default:
-.BR bonsai\-2\-27b ).
+Model to run:
+.B bonsai\-2\-27b
+(default), Qwen3.8-27B made ternary by PrismML, 6 GB; or
+.BR qwen3.8\-27b ,
+Qwen3.8-27B at four bits, 16 GB, which
+.B dwim
+fetches but cannot run yet.
 .TP
 .BI \-\-device " device"
 Device to run the model on:

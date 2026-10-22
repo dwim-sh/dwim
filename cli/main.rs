@@ -5,6 +5,7 @@ mod opts;
 mod run;
 mod tui;
 
+use models::Model;
 use opts::Opts;
 
 fn main() {
@@ -17,25 +18,23 @@ fn main() {
     // A prompt on the command line is a one-off: answer it and exit, with
     // nothing on standard output but the reply. Without one, open the shell.
     let prompt = opts.prompt.join(" ");
-    let result = check_memory().and_then(|()| match prompt.trim() {
-        "" => run::run(&opts.model, opts.device, opts.context, opts.thinking),
-        prompt => once::once(&opts.model, opts.device, opts.context, prompt, opts.stats),
-    });
+    let result = fetch::locate(&opts.model)
+        .and_then(|(model, _)| check_memory(model))
+        .and_then(|()| match prompt.trim() {
+            "" => run::run(&opts.model, opts.device, opts.context, opts.thinking),
+            prompt => once::once(&opts.model, opts.device, opts.context, prompt, opts.stats),
+        });
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-/// Memory a Mac needs to run the model: its CPU and GPU share it, and the
-/// weights alone take 6 GB of it.
-#[cfg(target_os = "macos")]
-const MIN_MEMORY: u64 = 16 << 30;
-
 /// Refuses to go on, before any weights are downloaded, on a Mac with too
-/// little memory to run the model.
+/// little memory to run `model`: its CPU and GPU share the memory, so the
+/// model needs all of what it takes from it.
 #[cfg(target_os = "macos")]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
+fn check_memory(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
     let mut memory: u64 = 0;
     let mut len = size_of::<u64>();
     let ret = unsafe {
@@ -54,9 +53,11 @@ fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if memory < MIN_MEMORY {
+    if memory < model.memory {
         return Err(format!(
-            "dwim requires 16 GiB or more DRAM on a Mac, and this one has {} GiB",
+            "{} requires {} GiB or more DRAM on a Mac, and this one has {} GiB",
+            model.name,
+            model.memory >> 30,
             memory >> 30
         )
         .into());
@@ -65,6 +66,6 @@ fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
+fn check_memory(_model: &Model) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

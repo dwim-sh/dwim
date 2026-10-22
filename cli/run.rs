@@ -206,7 +206,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
-    let model = models::load(gguf, device, context, |done, total| {
+    let model = models::load(which, gguf, device, context, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
@@ -864,8 +864,9 @@ fn tilde(path: &Path) -> String {
     }
 }
 
-/// The models `dwim` knows, where their weights are kept, and how much of
-/// each is there, for the `/model` command. The one running is marked.
+/// The models `dwim` knows, what each is, where it comes from and where its
+/// weights are kept, and how much of each is there, for the `/model`
+/// command. The one running is marked.
 fn models_listing(running: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
@@ -873,7 +874,7 @@ fn models_listing(running: &str) -> Vec<Line> {
         let mut line = vec![
             span(bullet),
             span(model.name).bold(),
-            span(format!("  {}", model.repo)),
+            span(format!("  {}", model.about)),
         ];
         if model.name == running {
             line.push(span("  running").dark_grey());
@@ -891,7 +892,9 @@ fn models_listing(running: &str) -> Vec<Line> {
             }
             None => "no cache directory".to_string(),
         };
-        lines.push(vec![span(format!("  {location}")).dark_grey()]);
+        lines.push(vec![
+            span(format!("  {} · {location}", model.repo)).dark_grey(),
+        ]);
     }
     lines
 }

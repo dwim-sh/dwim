@@ -14,11 +14,14 @@ A coding agent harness in Rust.
 * `man/`: `dwim.1`, the manual page: the options, the shell's commands and keys, and the files it reads.
 * `third_party/`: reference implementations studied for design, not built.
 
-## Model
+## Models
 
-The one model is `bonsai-2-27b`: PrismML's Ternary Bonsai 2 27B, Qwen3.8-27B with its matrices made ternary (`{-1, 0, 1}` with an f16 scale per 128 weights, 5.95 GB as shipped in the `PTQ1_0` GGUF packing). It is a hybrid: 64 layers of which every fourth is full attention (24 query heads, 4 key/value heads, 256 wide, the first 64 elements rotated by RoPE) and the rest Gated DeltaNet linear attention (16 key heads and 48 value heads of 128, a causal convolution of 4 taps, and a 128×128 recurrent state per value head). The matrices are stored in a rotated basis: activations are rotated by a blockwise (1024) Walsh-Hadamard transform with fixed signs before every ternary matmul, and the embedding table's rows are rotated back after lookup. The file stores the linear-attention value heads in llama.cpp's tiled head order; `bonsai.rs` puts them back into the checkpoint's grouped order when loading. The whole model runs on the device; only the embedding lookup is on the CPU.
+Both models are Qwen3.8-27B, a hybrid: 64 layers of which every fourth is full attention (24 query heads, 4 key/value heads, 256 wide, the first 64 elements rotated by RoPE) and the rest Gated DeltaNet linear attention (16 key heads and 48 value heads of 128, a causal convolution of 4 taps, and a 128×128 recurrent state per value head). They differ in their weights, and `cli/models.rs` names each model's family, which picks the implementation that runs it.
 
-The model thinks by default (its template opens `<think>` for it), calls tools as `<tool_call><function=bash>…`, and samples at temperature 1.0, top-k 20, top-p 0.95 as the file recommends. Its own chat template puts the tools at the top of the system prompt, which the harness follows.
+* `bonsai-2-27b`, the default, is PrismML's Ternary Bonsai 2 27B: the matrices made ternary (`{-1, 0, 1}` with an f16 scale per 128 weights, 5.95 GB as shipped in the `PTQ1_0` GGUF packing). The matrices are stored in a rotated basis: activations are rotated by a blockwise (1024) Walsh-Hadamard transform with fixed signs before every ternary matmul, and the embedding table's rows are rotated back after lookup. The file stores the linear-attention value heads in llama.cpp's tiled head order; `bonsai.rs` puts them back into the checkpoint's grouped order when loading. The whole model runs on the device; only the embedding lookup is on the CPU.
+* `qwen3.8-27b` is the model as Qwen released it, in bartowski's Q4_0 GGUF conversion (16.3 GB), since Qwen ships no GGUF: most matrices in 4-bit blocks of 32 with an f16 scale, the first eight layers' down projections as Q4_1, the linear-attention output projections as Q8_0, the output projection and eight query projections as Q6_K, and the norms and the small linear-attention tensors as f32, with no rotation. The file has a 65th layer that predicts a further token (`nextn_predict_layers`) and a `recurrent_layers` list, both of which the Bonsai loader refuses. It is fetched, but not run yet.
+
+Both think by default (the template opens `<think>` for them), call tools as `<tool_call><function=bash>…`, and sample at temperature 1.0, top-k 20, top-p 0.95 as their files recommend. Their chat template puts the tools at the top of the system prompt, which the harness follows.
 
 ## Building
 
