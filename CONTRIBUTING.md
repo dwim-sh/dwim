@@ -15,8 +15,9 @@ Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
 driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 
 The weights are downloaded on first use into `~/Library/Caches/dwim/models`
-on macOS, and `~/.cache/dwim/models` elsewhere. Bonsai 2 27B, the one model,
-is a 6 GB file; an interrupted download resumes on the next run.
+on macOS, and `~/.cache/dwim/models` elsewhere. Bonsai 2 27B, the default
+model, is a 6 GB file, and Qwen3.8-27B (`--model qwen3.8-27b`) a 16 GB one;
+an interrupted download resumes on the next run.
 
 ## Running
 
@@ -43,16 +44,16 @@ CI runs these with the toolchain `rust-toolchain.toml` pins, which `rustup`
 picks up here too.
 
 `cargo test -p dwim-gpu` skips a backend whose GPU is not available, so it
-passes on a machine with no GPU without having checked anything. With the
+passes on a machine with no GPU without having checked anything. With a
 model in the cache, `cargo test -p dwim-models real_model -- --ignored
---nocapture` completes a prompt with it and reports the speed, and
-`cargo run -p dwim-difftest` checks the GPU against the CPU with it, on a
-few prompts run in pieces of different sizes and on their continuations
-run a token at a time. The CPU's side is
-recorded into `target/difftest/` on the first run, which takes minutes, and
-again only when the CPU's or the model's code changes; after that a run
-takes seconds. `--repeat <n>` runs the GPU's side again, for mistakes it
-makes only now and then.
+--nocapture` completes a prompt with each model it finds there and reports
+the speed, and `cargo run -p dwim-difftest` checks the GPU against the CPU
+with Bonsai (`-- --model qwen3.8-27b` for Qwen), on a few prompts run in
+pieces of different sizes and on their continuations run a token at a
+time. The CPU's side is recorded into `target/difftest/` on the first run,
+which takes minutes, and again only when the CPU's or the model's code
+changes; after that a run takes seconds. `--repeat <n>` runs the GPU's
+side again, for mistakes it makes only now and then.
 
 Run the agent before calling a change done. The model is easy to break in
 ways tests don't catch, such as replies that end with nothing to show, so

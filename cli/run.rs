@@ -206,7 +206,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
-    let model = models::load(which, gguf, device, context, |done, total| {
+    let model = models::load(gguf, device, context, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;

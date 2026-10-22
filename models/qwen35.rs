@@ -1,27 +1,32 @@
-//! Bonsai 2 27B: PrismML's ternary compression of Qwen3.8-27B, a hybrid
+//! Qwen3.8-27B, the `qwen35` architecture of llama.cpp's files: a hybrid
 //! transformer in which every fourth layer is full attention and the rest
 //! are Gated DeltaNet linear attention, written as a sequence of operations
-//! on a [`Device`].
+//! on a [`Device`]. It runs the model as Qwen released it, from a file
+//! quantized as llama.cpp does, and Bonsai 2 27B, PrismML's ternary
+//! compression of it; the two differ only in their weights, which the
+//! loader takes in whichever format the file has them.
 //!
-//! The matrices are ternary in a rotated basis: the activations a matrix
-//! multiplies are first rotated by a blockwise Hadamard transform with fixed
-//! signs, whose inverse was folded into the weights, and the embedding table
-//! holds rotated rows that are rotated back after lookup. The small
-//! recurrent-state tensors of linear attention and the norms are kept in
-//! higher precision and take unrotated activations.
+//! Bonsai's matrices are ternary in a rotated basis: the activations a
+//! matrix multiplies are first rotated by a blockwise Hadamard transform
+//! with fixed signs, whose inverse was folded into the weights, and the
+//! embedding table holds rotated rows that are rotated back after lookup.
+//! The small recurrent-state tensors of linear attention and the norms are
+//! kept in higher precision and take unrotated activations. A file without
+//! the rotation's metadata is run without it.
 //!
 //! The file stores the value heads of linear attention in the order
 //! llama.cpp's kernels want, in which value head `h` shares key head
 //! `h % n_k`; they are put back into the checkpoint's order, in which value
 //! head `h` shares key head `h / (n_v / n_k)`, as the loader reads them. The
 //! output projection was rotated in the checkpoint's order and is left as
-//! it is.
+//! it is. A file may end with a layer that predicts a further token, which
+//! llama.cpp leaves out too.
 
 use std::sync::Arc;
 
 use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
+use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -53,6 +58,25 @@ pub struct Config {
     pub vocab: usize,
     /// Positions the model was trained for.
     pub context_length: usize,
+    /// The rotation of the activations into the basis the weights are
+    /// stored in, if the weights are rotated.
+    pub rotation: Option<Rotation>,
+    /// Whether the linear attention output projection's columns are in the
+    /// checkpoint's grouped order of value heads, as a rotated file keeps
+    /// them, rather than the tiled order llama.cpp's converter puts them
+    /// in otherwise.
+    pub out_grouped: bool,
+}
+
+/// The blockwise Hadamard rotation PrismML folds into Bonsai's weights:
+/// the signs it multiplies activations of each width by, and which weights
+/// take rotated activations.
+#[derive(Debug)]
+pub struct Rotation {
+    /// The signs, by the width of the activations they apply to.
+    pub signs: Vec<(usize, Vec<f32>)>,
+    /// The rotated weights, by name, sorted.
+    pub weights: Vec<String>,
 }
 
 impl Config {
@@ -62,10 +86,20 @@ impl Config {
             return Err(format!("the '{arch}' architecture is not supported").into());
         }
         let key = |name: &str| gguf.u32(&format!("{arch}.{name}"));
+        // The last blocks of a file may predict further tokens, which this
+        // model does not do: they are left out, as llama.cpp leaves them.
+        let nextn = gguf
+            .get(&format!("{arch}.nextn_predict_layers"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as usize;
+        let blocks = key("block_count")? as usize;
+        if nextn >= blocks {
+            return Err("every layer of the model predicts further tokens".into());
+        }
         let config = Self {
             hidden: key("embedding_length")? as usize,
             intermediate: key("feed_forward_length")? as usize,
-            layers: key("block_count")? as usize,
+            layers: blocks - nextn,
             heads: key("attention.head_count")? as usize,
             kv_heads: key("attention.head_count_kv")? as usize,
             head_dim: key("attention.key_length")? as usize,
@@ -78,6 +112,11 @@ impl Config {
             eps: gguf.f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))?,
             vocab: gguf.info("token_embd.weight")?.dims[1],
             context_length: key("context_length")? as usize,
+            rotation: Rotation::load(gguf)?,
+            out_grouped: gguf
+                .get("prism.hadamard.gdn_v_grouped")
+                .and_then(|v| v.as_bool())
+                == Some(true),
         };
         if key("ssm.conv_kernel")? as usize != CONV_KERNEL {
             return Err("the convolution kernel is not four wide".into());
@@ -94,50 +133,27 @@ impl Config {
         if key("attention.value_length")? as usize != config.head_dim {
             return Err("the attention values are not as wide as the keys".into());
         }
-        // What llama.cpp reads for other models of the architecture, and
-        // this one does not implement: layers predicting further tokens,
-        // a list of linear layers in place of the interval, and scaled
-        // rotary positions.
-        if gguf.get(&format!("{arch}.nextn_predict_layers")).is_some()
-            || gguf
-                .get(&format!("{arch}.attention.recurrent_layers"))
-                .is_some()
-            || gguf
-                .keys()
-                .any(|k| k.starts_with(&format!("{arch}.rope.scaling.")))
-        {
-            return Err("the model has parts that are not implemented".into());
-        }
-        if gguf.info("token_embd.weight")?.dtype != PTQ1_0 {
-            return Err("the embedding table is not ternary".into());
-        }
-        for (key, want) in [
-            (
-                "prism.hadamard.transform",
-                "normalized-sylvester-walsh-hadamard",
-            ),
-            ("prism.hadamard.axis", "input-last-dimension"),
-            ("prism.hadamard.sign_mode", "explicit"),
-        ] {
-            let got = gguf.str(key)?;
-            if got != want {
-                return Err(format!("{key} is '{got}', not '{want}'").into());
+        // A file may say which layers are linear attention outright: it
+        // must agree with the interval. Scaled rotary positions, which
+        // llama.cpp reads for other models of the architecture, are not
+        // implemented.
+        if let Some(recurrent) = gguf.get(&format!("{arch}.attention.recurrent_layers")) {
+            let recurrent = match recurrent {
+                crate::gguf::Value::Array(values) => values,
+                _ => return Err("the list of linear layers is not a list".into()),
+            };
+            if recurrent.len() < config.layers
+                || (0..config.layers)
+                    .any(|i| recurrent[i].as_bool() != Some(!config.is_attention(i)))
+            {
+                return Err("the linear layers are not every layer but each fourth".into());
             }
         }
-        if gguf.u32("prism.hadamard.version")? != 1
-            || gguf.u32("prism.hadamard.block_size")? as usize != HADAMARD_BLOCK
-        {
-            return Err("the weights are rotated in a way the model does not implement".into());
-        }
         if gguf
-            .get("prism.hadamard.gdn_v_grouped")
-            .and_then(|v| v.as_bool())
-            != Some(true)
+            .keys()
+            .any(|k| k.starts_with(&format!("{arch}.rope.scaling.")))
         {
-            return Err(
-                "the linear attention output projection is not in the checkpoint's head order"
-                    .into(),
-            );
+            return Err("scaled rotary positions are not implemented".into());
         }
         Ok(config)
     }
@@ -170,6 +186,86 @@ impl Config {
     }
 }
 
+impl Rotation {
+    /// Reads the rotation from the file's metadata, if the weights are
+    /// rotated, refusing one the model does not implement.
+    fn load(gguf: &Gguf) -> Result<Option<Self>> {
+        if gguf.get("prism.hadamard.version").is_none() {
+            if gguf.keys().any(|k| k.starts_with("prism.hadamard.")) {
+                return Err("the weights are rotated, but the rotation has no version".into());
+            }
+            return Ok(None);
+        }
+        for (key, want) in [
+            (
+                "prism.hadamard.transform",
+                "normalized-sylvester-walsh-hadamard",
+            ),
+            ("prism.hadamard.axis", "input-last-dimension"),
+            ("prism.hadamard.sign_mode", "explicit"),
+        ] {
+            let got = gguf.str(key)?;
+            if got != want {
+                return Err(format!("{key} is '{got}', not '{want}'").into());
+            }
+        }
+        if gguf.u32("prism.hadamard.version")? != 1
+            || gguf.u32("prism.hadamard.block_size")? as usize != HADAMARD_BLOCK
+        {
+            return Err("the weights are rotated in a way the model does not implement".into());
+        }
+        if gguf
+            .get("prism.hadamard.gdn_v_grouped")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        {
+            return Err(
+                "the linear attention output projection is not in the checkpoint's head order"
+                    .into(),
+            );
+        }
+        let mut weights: Vec<String> = gguf
+            .array("prism.hadamard.weight_names")?
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or("invalid weight name"))
+            .collect::<std::result::Result<_, _>>()?;
+        weights.sort();
+        let inverse: Vec<&str> = gguf
+            .array("prism.hadamard.inverse_weight_names")?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        if inverse != ["token_embd.weight"] {
+            return Err("the embedding table is not rotated as the model expects".into());
+        }
+        let widths = gguf.array("prism.hadamard.sign_widths")?;
+        let values = gguf.array("prism.hadamard.sign_values")?;
+        let mut signs: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut at = 0;
+        for width in widths {
+            let width = width.as_i64().ok_or("invalid sign width")? as usize;
+            if signs.iter().any(|(w, _)| *w == width) {
+                return Err(format!("two sets of rotation signs {width} wide").into());
+            }
+            let values: Vec<f32> = values
+                .get(at..at + width)
+                .ok_or("too few rotation signs")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            if !values.iter().all(|&s| s == 1.0 || s == -1.0) {
+                return Err("rotation signs must be 1 or -1".into());
+            }
+            signs.push((width, values));
+            at += width;
+        }
+        if at != values.len() {
+            return Err("more rotation signs than their widths take".into());
+        }
+        Ok(Some(Self { signs, weights }))
+    }
+}
+
 /// The model, with its weights on a device, and the state of a sequence.
 pub struct Model<D: Device> {
     pub config: Config,
@@ -182,8 +278,8 @@ pub struct Model<D: Device> {
     norm: D::Buffer,
     lm_head: D::Weight,
     /// The signs of the rotation, by the width of the activations they
-    /// apply to.
-    signs: Vec<(usize, D::Buffer)>,
+    /// apply to, if the weights are rotated.
+    signs: Option<Vec<(usize, D::Buffer)>>,
     state: State<D>,
 }
 
@@ -230,9 +326,9 @@ enum Mixer<D: Device> {
 
 impl<D: Device> Model<D> {
     /// Loads the model from its GGUF file, uploading its weights to
-    /// `device`, with state for sequences of up to `max_len` tokens, and
-    /// reporting how many of its tensors are loaded, out of how many, as it
-    /// goes.
+    /// `device`, with state for sequences of up to `max_len` tokens, which
+    /// may not be more than the model was trained for, and reporting how
+    /// many of its tensors are loaded, out of how many, as it goes.
     pub fn load(
         gguf: Arc<Gguf>,
         device: D,
@@ -240,6 +336,15 @@ impl<D: Device> Model<D> {
         on_progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
         let config = Config::load(&gguf)?;
+        // Past the positions the model was trained on, its attention
+        // degrades.
+        if max_len == 0 || max_len > config.context_length {
+            return Err(format!(
+                "a context of {max_len} tokens is outside the 1 to {} the model was trained for",
+                config.context_length
+            )
+            .into());
+        }
         let c = &config;
         let attention_layers = (0..c.layers).filter(|&i| c.is_attention(i)).count();
         let mut l = Loader {
@@ -262,30 +367,19 @@ impl<D: Device> Model<D> {
                 // The query projection puts each head's gate after its
                 // query: the rows are split into two matrices.
                 let name = format!("{p}.attn_q.weight");
-                let (q, gate) = match g.ternary(&name)? {
-                    Tensor::Ternary { shape, data } => {
-                        let head = c.head_dim * ternary::row_bytes(shape[1]);
-                        let (mut q, mut gate) = (
-                            Vec::with_capacity(data.len() / 2),
-                            Vec::with_capacity(data.len() / 2),
-                        );
-                        for h in data.chunks_exact(2 * head) {
-                            q.extend_from_slice(&h[..head]);
-                            gate.extend_from_slice(&h[head..]);
-                        }
-                        let shape = vec![shape[0] / 2, shape[1]];
-                        (
-                            Tensor::Ternary {
-                                shape: shape.clone(),
-                                data: q,
-                            },
-                            Tensor::Ternary { shape, data: gate },
-                        )
-                    }
-                    _ => unreachable!(),
+                let both = g.matrix(&name)?;
+                if both.shape()[0] != 2 * c.heads * c.head_dim {
+                    return Err(format!("{name} does not hold a gate for each query").into());
+                }
+                let rows = |first: usize| -> Vec<usize> {
+                    (0..c.heads)
+                        .flat_map(|h| {
+                            (0..c.head_dim).map(move |i| (2 * h + first) * c.head_dim + i)
+                        })
+                        .collect()
                 };
-                let q = l.rotated(&name, q);
-                let gate = l.device.upload(gate);
+                let q = l.rotated(&name, both.select_rows(&rows(0)));
+                let gate = l.device.upload(both.select_rows(&rows(1)));
                 caches += 1;
                 Mixer::Attention {
                     q,
@@ -299,53 +393,53 @@ impl<D: Device> Model<D> {
                 }
             } else {
                 // The value heads, and everything per value head, are put
-                // back into the checkpoint's order.
+                // back into the checkpoint's order: the rows of the value
+                // heads' matrices, and of the value part of the combined
+                // projection after its queries and keys.
+                let heads = untiled(c.k_heads, c.v_heads, c.state_dim);
                 let name = format!("{p}.attn_qkv.weight");
-                let qkv = match g.ternary(&name)? {
-                    Tensor::Ternary { shape, mut data } => {
-                        let row = ternary::row_bytes(shape[1]);
-                        let v = 2 * c.k_dim() * row;
-                        let untiled = untile(&data[v..], c.k_heads, c.v_heads, c.state_dim * row);
-                        data[v..].copy_from_slice(&untiled);
-                        Tensor::Ternary { shape, data }
-                    }
-                    _ => unreachable!(),
-                };
-                let qkv = l.rotated(&name, qkv);
+                let qkv = g.matrix(&name)?;
+                let rows: Vec<usize> = (0..2 * c.k_dim())
+                    .chain(heads.iter().map(|&r| 2 * c.k_dim() + r))
+                    .collect();
+                if qkv.shape()[0] != rows.len() {
+                    return Err(
+                        format!("{name} is not as tall as the queries, keys and values").into(),
+                    );
+                }
+                let qkv = l.rotated(&name, qkv.select_rows(&rows));
                 let name = format!("{p}.attn_gate.weight");
-                let z = match g.ternary(&name)? {
-                    Tensor::Ternary { shape, data } => Tensor::Ternary {
-                        data: untile(
-                            &data,
-                            c.k_heads,
-                            c.v_heads,
-                            c.state_dim * ternary::row_bytes(shape[1]),
-                        ),
-                        shape,
-                    },
-                    _ => unreachable!(),
-                };
-                let z = l.rotated(&name, z);
+                let z = l.rotated(&name, g.matrix(&name)?.select_rows(&heads));
+                // The decay and forget projections, a row per value head,
+                // as one bf16 matrix.
+                let heads = untiled(c.k_heads, c.v_heads, 1);
                 let ab = match (
-                    g.bf16(&format!("{p}.ssm_alpha.weight"))?,
-                    g.bf16(&format!("{p}.ssm_beta.weight"))?,
+                    g.matrix(&format!("{p}.ssm_alpha.weight"))?
+                        .select_rows(&heads),
+                    g.matrix(&format!("{p}.ssm_beta.weight"))?
+                        .select_rows(&heads),
                 ) {
                     (Tensor::Bf16 { shape, data: alpha }, Tensor::Bf16 { data: beta, .. }) => {
-                        let mut data = untile(&alpha, c.k_heads, c.v_heads, c.hidden);
-                        data.extend(untile(&beta, c.k_heads, c.v_heads, c.hidden));
+                        let mut data = alpha;
+                        data.extend(beta);
                         Tensor::Bf16 {
                             shape: vec![2 * shape[0], shape[1]],
                             data,
                         }
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(format!(
+                            "{p}: the decay and forget projections are not f32 or bf16"
+                        )
+                        .into());
+                    }
                 };
                 let ab = l.device.upload(ab);
                 l.tick();
                 let mut conv = g.f32s(&format!("{p}.ssm_conv1d.weight"))?;
                 let v = 2 * c.k_dim() * CONV_KERNEL;
-                let untiled = untile(&conv[v..], c.k_heads, c.v_heads, c.state_dim * CONV_KERNEL);
-                conv[v..].copy_from_slice(&untiled);
+                let grouped = untile(&conv[v..], c.k_heads, c.v_heads, c.state_dim * CONV_KERNEL);
+                conv[v..].copy_from_slice(&grouped);
                 let conv = l.buffer(conv);
                 let mut decay = untile(&g.f32s(&format!("{p}.ssm_a"))?, c.k_heads, c.v_heads, 1);
                 decay.extend(untile(
@@ -356,6 +450,17 @@ impl<D: Device> Model<D> {
                 ));
                 let decay = l.buffer(decay);
                 let norm = l.buffer(g.f32s(&format!("{p}.ssm_norm.weight"))?);
+                // The output projection takes the value heads' outputs in
+                // the checkpoint's order, or in the tiled order, in which
+                // case its columns are put back into the checkpoint's too.
+                let name = format!("{p}.ssm_out.weight");
+                let out = g.matrix(&name)?;
+                let out = if c.out_grouped {
+                    out
+                } else {
+                    out.select_column_groups(c.state_dim, &untiled(c.k_heads, c.v_heads, 1))
+                };
+                let out = l.rotated(&name, out);
                 slots += 1;
                 Mixer::Linear {
                     qkv,
@@ -364,7 +469,7 @@ impl<D: Device> Model<D> {
                     conv,
                     decay,
                     norm,
-                    out: l.weight(&format!("{p}.ssm_out.weight"))?,
+                    out,
                     slot: slots - 1,
                 }
             };
@@ -381,57 +486,36 @@ impl<D: Device> Model<D> {
         let norm = l.buffer(g.f32s("output_norm.weight")?);
         let lm_head = l.weight("output.weight")?;
 
-        // The file says which weights were rotated: they must be exactly the
-        // ones the forward pass rotates activations for.
-        let mut listed: Vec<String> = g
-            .array("prism.hadamard.weight_names")?
-            .iter()
-            .map(|v| v.as_str().map(str::to_string).ok_or("invalid weight name"))
-            .collect::<std::result::Result<_, _>>()?;
-        listed.sort();
-        l.rotated.sort();
-        if listed != l.rotated {
-            return Err("the rotated weights are not the ones the model expects".into());
-        }
-        let inverse: Vec<&str> = g
-            .array("prism.hadamard.inverse_weight_names")?
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        if inverse != ["token_embd.weight"] {
-            return Err("the embedding table is not rotated as the model expects".into());
-        }
-        let widths = g.array("prism.hadamard.sign_widths")?;
-        let values = g.array("prism.hadamard.sign_values")?;
-        let mut signs = Vec::new();
-        let mut at = 0;
-        for width in widths {
-            let width = width.as_i64().ok_or("invalid sign width")? as usize;
-            if signs.iter().any(|(w, _)| *w == width) {
-                return Err(format!("two sets of rotation signs {width} wide").into());
+        // A rotated file says which weights were rotated: they must be
+        // exactly the ones the forward pass rotates activations for, and
+        // the signs must cover every width it rotates.
+        let signs = match &config.rotation {
+            Some(rotation) => {
+                l.rotated.sort();
+                if rotation.weights != l.rotated {
+                    return Err("the rotated weights are not the ones the model expects".into());
+                }
+                for width in [c.hidden, c.v_dim(), c.heads * c.head_dim, c.intermediate] {
+                    if !rotation.signs.iter().any(|(w, _)| *w == width) {
+                        return Err(
+                            format!("no rotation signs for activations {width} wide").into()
+                        );
+                    }
+                }
+                Some(
+                    rotation
+                        .signs
+                        .iter()
+                        .map(|(width, values)| {
+                            let mut buf = device.alloc(*width);
+                            device.write(&mut buf, values);
+                            (*width, buf)
+                        })
+                        .collect(),
+                )
             }
-            let values: Vec<f32> = values
-                .get(at..at + width)
-                .ok_or("too few rotation signs")?
-                .iter()
-                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                .collect();
-            if !values.iter().all(|&s| s == 1.0 || s == -1.0) {
-                return Err("rotation signs must be 1 or -1".into());
-            }
-            let mut buf = device.alloc(width);
-            device.write(&mut buf, &values);
-            signs.push((width, buf));
-            at += width;
-        }
-        if at != values.len() {
-            return Err("more rotation signs than their widths take".into());
-        }
-        for width in [c.hidden, c.v_dim(), c.heads * c.head_dim, c.intermediate] {
-            if !signs.iter().any(|(w, _)| *w == width) {
-                return Err(format!("no rotation signs for activations {width} wide").into());
-            }
-        }
+            None => None,
+        };
 
         let state = State::new(&config, &device, max_len, caches, slots);
         Ok(Self {
@@ -455,30 +539,56 @@ impl<D: Device> Model<D> {
         let kv_dim = c.kv_heads * c.head_dim;
         s.batch(d, n);
 
-        // Embeddings are looked up on the CPU and rotated back on the device.
-        let table = self.gguf.bytes("token_embd.weight").expect("embeddings");
-        let row = ternary::row_bytes(c.hidden);
+        // Embeddings are looked up on the CPU and, if the table is rotated,
+        // rotated back on the device.
         let mut x = vec![0.0; n * c.hidden];
         for (x, &token) in x.chunks_exact_mut(c.hidden).zip(tokens) {
-            ternary::dequantize_row(&table[token as usize * row..][..row], x);
+            self.gguf
+                .row("token_embd.weight", token as usize, x)
+                .expect("checked at load");
         }
         d.write(&mut s.x, &x);
-        // The signs of the rotation for activations of each width.
+        // The signs of the rotation for activations of each width, if the
+        // weights are rotated.
         let signs = |width: usize| {
-            &self
-                .signs
-                .iter()
-                .find(|(w, _)| *w == width)
-                .expect("checked at load")
-                .1
+            self.signs.as_ref().map(|signs| {
+                &signs
+                    .iter()
+                    .find(|(w, _)| *w == width)
+                    .expect("checked at load")
+                    .1
+            })
         };
-        d.hadamard(&mut s.x, signs(c.hidden), true);
+        if let Some(signs) = signs(c.hidden) {
+            d.hadamard(&mut s.x, signs, true);
+        }
+        // `out = rmsnorm(x) * weight` for `rows` rows of `x`, as wide as
+        // `weight`, rotated if the weights are: what a matrix
+        // multiplication's input goes through.
+        let normalize =
+            |out: &mut D::Buffer, x: &D::Buffer, weight: &D::Buffer, rows: usize| match signs(
+                c.hidden,
+            ) {
+                Some(signs) => d.rmsnorm_hadamard(out, x, weight, signs, eps),
+                None => {
+                    d.copy(out, 0, x, 0, rows * c.hidden);
+                    d.rmsnorm(out, weight, eps);
+                }
+            };
+        // Rotates activations of `width` on their way out of a mixer or a
+        // network, if the weights are.
+        let rotate = |x: &mut D::Buffer, width: usize| {
+            if let Some(signs) = signs(width) {
+                d.hadamard(x, signs, false);
+            }
+        };
 
         for layer in &self.layers {
             // The token mixer, with its result added back into the
-            // residual stream. It sees the normalized activations rotated,
-            // and the recurrent-state projections see them as they are.
-            d.rmsnorm_hadamard(&mut s.xh, &s.x, &layer.attn_norm, signs(c.hidden), eps);
+            // residual stream. It sees the normalized activations, rotated
+            // if the weights are, and the recurrent-state projections see
+            // them as they are.
+            normalize(&mut s.xh, &s.x, &layer.attn_norm, n);
             match &layer.mixer {
                 Mixer::Attention {
                     q,
@@ -517,7 +627,7 @@ impl<D: Device> Model<D> {
                         c.kv_heads,
                     );
                     d.sigmoid_mul(&mut s.att, &s.gate);
-                    d.hadamard(&mut s.att, signs(q_dim), false);
+                    rotate(&mut s.att, q_dim);
                     d.matmul(&mut s.xb, o, &s.att);
                 }
                 Mixer::Linear {
@@ -562,18 +672,18 @@ impl<D: Device> Model<D> {
                     );
                     d.rmsnorm(&mut s.att, norm, eps);
                     d.silu_mul(&mut s.z, &s.att);
-                    d.hadamard(&mut s.z, signs(v_dim), false);
+                    rotate(&mut s.z, v_dim);
                     d.matmul(&mut s.xb, out, &s.z);
                 }
             }
             d.add(&mut s.x, &s.xb);
 
             // Feed-forward network, likewise added back.
-            d.rmsnorm_hadamard(&mut s.xh, &s.x, &layer.mlp_norm, signs(c.hidden), eps);
+            normalize(&mut s.xh, &s.x, &layer.mlp_norm, n);
             d.matmul(&mut s.up, &layer.gate, &s.xh);
             d.matmul(&mut s.gate_ffn, &layer.up, &s.xh);
             d.silu_mul(&mut s.up, &s.gate_ffn);
-            d.hadamard(&mut s.up, signs(c.intermediate), false);
+            rotate(&mut s.up, c.intermediate);
             d.matmul(&mut s.xb, &layer.down, &s.up);
             d.add(&mut s.x, &s.xb);
         }
@@ -583,7 +693,7 @@ impl<D: Device> Model<D> {
         d.resize(&mut s.xb, c.hidden);
         d.resize(&mut s.xh, c.hidden);
         d.copy(&mut s.xb, 0, &s.x, (n - 1) * c.hidden, c.hidden);
-        d.rmsnorm_hadamard(&mut s.xh, &s.xb, &self.norm, signs(c.hidden), eps);
+        normalize(&mut s.xh, &s.xb, &self.norm, 1);
         d.matmul(&mut s.logits, &self.lm_head, &s.xh);
         d.read(&s.logits)
     }
@@ -606,14 +716,15 @@ impl<D: Device, F: FnMut(usize, usize)> Loader<'_, D, F> {
         (self.on_progress)(self.done, self.total);
     }
 
-    /// Uploads a ternary matrix that takes rotated activations.
+    /// Uploads a matrix that takes rotated activations, if the weights are
+    /// rotated.
     fn weight(&mut self, name: &str) -> Result<D::Weight> {
-        let tensor = self.gguf.ternary(name)?;
+        let tensor = self.gguf.matrix(name)?;
         Ok(self.rotated(name, tensor))
     }
 
     /// Uploads a matrix, read from the named tensor, that takes rotated
-    /// activations.
+    /// activations if the weights are rotated.
     fn rotated(&mut self, name: &str, tensor: Tensor) -> D::Weight {
         self.rotated.push(name.to_string());
         let w = self.device.upload(tensor);
@@ -629,19 +740,28 @@ impl<D: Device, F: FnMut(usize, usize)> Loader<'_, D, F> {
     }
 }
 
+/// The elements of `n_v` heads of `per_head` elements each, in the
+/// checkpoint's grouped order, where head `h` shares key head
+/// `h / (n_v / n_k)`, as indices into the tiled order llama.cpp keeps the
+/// value heads in, where head `j` shares key head `j % n_k`.
+fn untiled(n_k: usize, n_v: usize, per_head: usize) -> Vec<usize> {
+    let rep = n_v / n_k;
+    (0..n_v)
+        .flat_map(|h| {
+            let j = (h % rep) * n_k + h / rep;
+            (0..per_head).map(move |i| j * per_head + i)
+        })
+        .collect()
+}
+
 /// Reorders `n_v` heads of `per_head` elements each from the tiled order
-/// llama.cpp keeps the value heads in, where head `j` shares key head
-/// `j % n_k`, into the checkpoint's grouped order, where head `h` shares
-/// key head `h / (n_v / n_k)`.
+/// into the checkpoint's grouped order, as [`untiled`] says.
 fn untile<T: Clone>(data: &[T], n_k: usize, n_v: usize, per_head: usize) -> Vec<T> {
     assert_eq!(data.len(), n_v * per_head);
-    let rep = n_v / n_k;
-    let mut out = Vec::with_capacity(data.len());
-    for h in 0..n_v {
-        let j = (h % rep) * n_k + h / rep;
-        out.extend_from_slice(&data[j * per_head..][..per_head]);
-    }
-    out
+    untiled(n_k, n_v, per_head)
+        .into_iter()
+        .map(|i| data[i].clone())
+        .collect()
 }
 
 /// The first bytes of a saved state, and its layout's version.
@@ -897,7 +1017,10 @@ impl<D: Device> State<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::{self, Value};
+    use crate::{
+        gguf::{self, Value},
+        quants, ternary,
+    };
     use dwim_gpu::{Cpu, Gpu};
     use std::path::Path;
 
@@ -932,11 +1055,28 @@ mod tests {
             }
             data
         }
+
+        /// A matrix in a block format as the file lays it out.
+        fn packed(&mut self, rows: usize, cols: usize, scale: f32, dtype: u32) -> Vec<u8> {
+            let mut data = Vec::new();
+            for _ in 0..rows {
+                let values: Vec<f32> = (0..cols).map(|_| self.next() * scale).collect();
+                data.extend(match dtype {
+                    gguf::Q4_0 => quants::pack_q4_0(&values),
+                    gguf::Q8_0 => quants::pack_q8_0(&values),
+                    _ => unreachable!(),
+                });
+            }
+            data
+        }
     }
 
     /// Writes a tiny random model in the file format, four layers of which
-    /// the last is full attention.
-    fn synthetic(path: &Path) {
+    /// the last is full attention: with ternary weights in a rotated basis
+    /// as Bonsai's file has them, or `quantized` as Qwen's file is, with
+    /// Q4_0 and Q8_0 weights, f32 decay projections, and a further layer
+    /// that predicts the next token.
+    fn synthetic(path: &Path, quantized: bool) {
         let (hidden, inter, layers, heads, kv_heads, head_dim, rot_dim) =
             (1024, 1024, 4, 4, 2, 256, 64);
         let (k_heads, v_heads, state_dim, vocab) = (2, 8, 128, 64);
@@ -949,16 +1089,19 @@ mod tests {
         let mut names = Vec::new();
         let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
         // Weights are small so that the activations stay sane through the
-        // layers; ternary scales are their largest magnitude.
+        // layers; ternary scales are their largest magnitude. The down and
+        // output projections of a quantized file are Q8_0, the rest Q4_0.
         let mut tern = |name: &str, rows: usize, cols: usize, names: &mut Vec<Value>| {
             names.push(Value::Str(name.to_string()));
             let scale = 1.0 / (cols as f32).sqrt();
-            tensors.push((
-                name.to_string(),
-                vec![cols, rows],
-                gguf::PTQ1_0,
-                rng.ternary(rows, cols, scale),
-            ));
+            let (dtype, data) = if !quantized {
+                (gguf::PTQ1_0, rng.ternary(rows, cols, scale))
+            } else if name.contains("ffn_down") || name.contains("ssm_out") {
+                (gguf::Q8_0, rng.packed(rows, cols, scale, gguf::Q8_0))
+            } else {
+                (gguf::Q4_0, rng.packed(rows, cols, scale, gguf::Q4_0))
+            };
+            tensors.push((name.to_string(), vec![cols, rows], dtype, data));
         };
         tern("output.weight", vocab, hidden, &mut names);
         for i in 0..layers {
@@ -1003,12 +1146,21 @@ mod tests {
             tern(&format!("{p}.ffn_down.weight"), hidden, inter, &mut names);
         }
         let mut rng = Rng(7);
-        tensors.push((
-            "token_embd.weight".into(),
-            vec![hidden, vocab],
-            gguf::PTQ1_0,
-            rng.ternary(vocab, hidden, 0.5),
-        ));
+        tensors.push(if quantized {
+            (
+                "token_embd.weight".into(),
+                vec![hidden, vocab],
+                gguf::Q4_0,
+                rng.packed(vocab, hidden, 0.5, gguf::Q4_0),
+            )
+        } else {
+            (
+                "token_embd.weight".into(),
+                vec![hidden, vocab],
+                gguf::PTQ1_0,
+                rng.ternary(vocab, hidden, 0.5),
+            )
+        });
         tensors.push((
             "output_norm.weight".into(),
             vec![hidden],
@@ -1043,18 +1195,23 @@ mod tests {
                     rng.floats(head_dim, 0.1, 1.0),
                 ));
             } else {
-                tensors.push((
-                    format!("{p}.ssm_alpha.weight"),
-                    vec![hidden, v_heads],
-                    gguf::BF16,
-                    rng.bf16(v_heads * hidden, 0.05),
-                ));
-                tensors.push((
-                    format!("{p}.ssm_beta.weight"),
-                    vec![hidden, v_heads],
-                    gguf::BF16,
-                    rng.bf16(v_heads * hidden, 0.05),
-                ));
+                for name in ["ssm_alpha", "ssm_beta"] {
+                    tensors.push(if quantized {
+                        (
+                            format!("{p}.{name}.weight"),
+                            vec![hidden, v_heads],
+                            gguf::F32,
+                            rng.floats(v_heads * hidden, 0.05, 0.0),
+                        )
+                    } else {
+                        (
+                            format!("{p}.{name}.weight"),
+                            vec![hidden, v_heads],
+                            gguf::BF16,
+                            rng.bf16(v_heads * hidden, 0.05),
+                        )
+                    });
+                }
                 let channels = 2 * k_dim + v_dim;
                 tensors.push((
                     format!("{p}.ssm_conv1d.weight"),
@@ -1083,9 +1240,12 @@ mod tests {
             }
         }
         let n = |v: usize| Value::U32(v as u32);
-        let meta = [
+        let mut meta = vec![
             ("general.architecture", Value::Str("qwen35".into())),
-            ("qwen35.block_count", n(layers)),
+            (
+                "qwen35.block_count",
+                n(if quantized { layers + 1 } else { layers }),
+            ),
             ("qwen35.context_length", n(256)),
             ("qwen35.embedding_length", n(hidden)),
             ("qwen35.feed_forward_length", n(inter)),
@@ -1102,26 +1262,40 @@ mod tests {
             ("qwen35.ssm.time_step_rank", n(v_heads)),
             ("qwen35.ssm.inner_size", n(v_dim)),
             ("qwen35.full_attention_interval", n(4)),
-            ("prism.hadamard.version", n(1)),
-            ("prism.hadamard.block_size", n(HADAMARD_BLOCK)),
-            (
-                "prism.hadamard.transform",
-                Value::Str("normalized-sylvester-walsh-hadamard".into()),
-            ),
-            (
-                "prism.hadamard.axis",
-                Value::Str("input-last-dimension".into()),
-            ),
-            ("prism.hadamard.sign_mode", Value::Str("explicit".into())),
-            ("prism.hadamard.weight_names", Value::Array(names)),
-            ("prism.hadamard.sign_widths", Value::Array(vec![n(hidden)])),
-            ("prism.hadamard.sign_values", Value::Array(signs)),
-            (
-                "prism.hadamard.inverse_weight_names",
-                Value::Array(vec![Value::Str("token_embd.weight".into())]),
-            ),
-            ("prism.hadamard.gdn_v_grouped", Value::Bool(true)),
         ];
+        if quantized {
+            // The last block predicts the next token, and has no tensors
+            // here since none are read; the file also lists which layers
+            // are linear.
+            meta.push(("qwen35.nextn_predict_layers", n(1)));
+            let recurrent = (0..layers + 1).map(|i| Value::Bool((i + 1) % 4 != 0 && i < layers));
+            meta.push((
+                "qwen35.attention.recurrent_layers",
+                Value::Array(recurrent.collect()),
+            ));
+        } else {
+            meta.extend([
+                ("prism.hadamard.version", n(1)),
+                ("prism.hadamard.block_size", n(HADAMARD_BLOCK)),
+                (
+                    "prism.hadamard.transform",
+                    Value::Str("normalized-sylvester-walsh-hadamard".into()),
+                ),
+                (
+                    "prism.hadamard.axis",
+                    Value::Str("input-last-dimension".into()),
+                ),
+                ("prism.hadamard.sign_mode", Value::Str("explicit".into())),
+                ("prism.hadamard.weight_names", Value::Array(names)),
+                ("prism.hadamard.sign_widths", Value::Array(vec![n(hidden)])),
+                ("prism.hadamard.sign_values", Value::Array(signs)),
+                (
+                    "prism.hadamard.inverse_weight_names",
+                    Value::Array(vec![Value::Str("token_embd.weight".into())]),
+                ),
+                ("prism.hadamard.gdn_v_grouped", Value::Bool(true)),
+            ]);
+        }
         gguf::write(path, &meta, &tensors).unwrap();
     }
 
@@ -1139,10 +1313,10 @@ mod tests {
 
     #[test]
     fn restores_a_saved_state() {
-        let dir = std::env::temp_dir().join(format!("dwim-bonsai-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dwim-qwen35-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.gguf");
-        synthetic(&path);
+        synthetic(&path, false);
         let gguf = Arc::new(Gguf::open(&path).unwrap());
         // A conversation of two batches, and one that takes up from the
         // first's saved state: the same logits, since the state holds the
@@ -1170,43 +1344,60 @@ mod tests {
 
     #[test]
     fn gpu_agrees_with_cpu() {
-        let dir = std::env::temp_dir().join(format!("dwim-bonsai-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("model.gguf");
-        synthetic(&path);
-        let cpu = run(&path, Cpu);
-        assert!(cpu[0].iter().all(|v| v.is_finite()));
-        assert!(cpu[0].iter().any(|&v| v != 0.0));
-        assert_ne!(cpu[0], cpu[1]);
-        if let Ok(gpu) = Gpu::new() {
-            let gpu = run(&path, gpu);
-            // The batch of many tokens may go through the GPU's tiled
-            // matmul, which sums in half precision.
-            for ((cpu, gpu), tolerance) in cpu.iter().zip(&gpu).zip([2e-3, 2e-3, 1e-2]) {
-                for (a, b) in cpu.iter().zip(gpu) {
-                    assert!((a - b).abs() <= tolerance * (1.0 + a.abs()), "{a} vs {b}");
+        for quantized in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "dwim-qwen35-{}-{}",
+                if quantized { "quantized" } else { "ternary" },
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("model.gguf");
+            synthetic(&path, quantized);
+            let cpu = run(&path, Cpu);
+            assert!(cpu[0].iter().all(|v| v.is_finite()));
+            assert!(cpu[0].iter().any(|&v| v != 0.0));
+            assert_ne!(cpu[0], cpu[1]);
+            if let Ok(gpu) = Gpu::new() {
+                let gpu = run(&path, gpu);
+                // The batch of many tokens may go through the GPU's tiled
+                // matmul, which sums in half precision.
+                for ((cpu, gpu), tolerance) in cpu.iter().zip(&gpu).zip([2e-3, 2e-3, 1e-2]) {
+                    for (a, b) in cpu.iter().zip(gpu) {
+                        assert!(
+                            (a - b).abs() <= tolerance * (1.0 + a.abs()),
+                            "quantized {quantized}: {a} vs {b}"
+                        );
+                    }
                 }
+            } else {
+                eprintln!("skipping the GPU comparison: no GPU");
             }
-        } else {
-            eprintln!("skipping the GPU comparison: no GPU");
+            std::fs::remove_dir_all(&dir).unwrap();
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Greedy completion of a prompt by the real model, if its file is in
+    /// Greedy completion of a prompt by each real model whose file is in
     /// the cache: run with `--ignored --nocapture` and compare with what
-    /// PrismML's llama.cpp says.
+    /// llama.cpp says.
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir()
-            .unwrap()
-            .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
-        if !path.exists() {
-            eprintln!("skipping: no model at {}", path.display());
-            return;
+        for file in [
+            "bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+            "qwen3.8-27b/Qwen3.8-27B-Q4_0.gguf",
+        ] {
+            let path = dirs::cache_dir().unwrap().join("dwim/models").join(file);
+            if !path.exists() {
+                eprintln!("skipping: no model at {}", path.display());
+                continue;
+            }
+            eprintln!("{file}");
+            real_model(&path);
         }
-        let gguf = Arc::new(Gguf::open(&path).unwrap());
+    }
+
+    fn real_model(path: &Path) {
+        let gguf = Arc::new(Gguf::open(path).unwrap());
         let tokenizer = crate::Tokenizer::from_gguf(&gguf).unwrap();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();

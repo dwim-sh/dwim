@@ -33,14 +33,16 @@ To install the latest development version:
 cargo install --git https://github.com/dwim-sh/dwim
 ```
 
-Either way, the model (about 6 GB) is downloaded on first use.
+Either way, the model (about 6 GB) is downloaded on first use. `dwim --model
+qwen3.8-27b` runs Qwen3.8-27B itself instead, at four bits (16 GB), on a
+machine with 32 GiB of memory or more.
 
 ## Features
 
 - **Fully local coding agent.** Runs commands, reads their output, and keeps
   going.
 - **Bonsai 2 27B model.** Qwen3.8-27B compressed to 6 GB with ternary
-  weights.
+  weights; or Qwen3.8-27B itself at four bits, 16 GB, for bigger machines.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.

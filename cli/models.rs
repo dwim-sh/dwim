@@ -7,7 +7,7 @@ use std::{
 };
 
 use dwim_gpu::Device;
-use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+use dwim_models::{Chat, Gguf, LanguageModel, Sampler};
 
 /// Saved states kept, newest first: a state is a few hundred megabytes,
 /// and the system prompt changes with the project's `AGENTS.md`.
@@ -25,7 +25,6 @@ pub const MODELS: &[Model] = &[
     Model {
         name: "bonsai-2-27b",
         about: "Qwen3.8-27B made ternary by PrismML, 6 GB",
-        family: Family::Bonsai,
         repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
         revision: "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
         files: &["LICENSE", "NOTICE.txt", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
@@ -41,7 +40,6 @@ pub const MODELS: &[Model] = &[
     Model {
         name: "qwen3.8-27b",
         about: "Qwen3.8-27B at four bits, 16 GB",
-        family: Family::Qwen,
         repo: "bartowski/Qwen3.8-27B-GGUF",
         revision: "87410e7b9a5c21e6ca70c0c9cc5237de909fe621",
         files: &["Qwen3.8-27B-Q4_0.gguf"],
@@ -58,8 +56,6 @@ pub struct Model {
     pub name: &'static str,
     /// What the model is, in a few words, for the `/model` listing.
     pub about: &'static str,
-    /// Which implementation runs it.
-    pub family: Family,
     pub repo: &'static str,
     pub revision: &'static str,
     /// The files fetched.
@@ -71,16 +67,6 @@ pub struct Model {
     /// to run the model: the weights, with room left for the caches, the
     /// activations, and everything else running.
     pub memory: u64,
-}
-
-/// The implementations of the models: the same Qwen3.8 hybrid of full
-/// and linear attention, in different weights.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    /// PrismML's ternary matrices in a rotated basis, in `bonsai.rs`.
-    Bonsai,
-    /// The matrices quantized as llama.cpp does, in 4- to 8-bit blocks.
-    Qwen,
 }
 
 impl Model {
@@ -110,44 +96,16 @@ impl Model {
     }
 }
 
-/// Loads `model`, whose weights are `gguf`, onto `device`, with room for
+/// Loads the model whose weights are `gguf` onto `device`, with room for
 /// `context` tokens of conversation, reporting how many of its tensors are
 /// loaded, out of how many, as it goes.
 pub fn load<D: Device + 'static>(
-    model: &Model,
     gguf: Arc<Gguf>,
     device: D,
     context: usize,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
-    match model.family {
-        Family::Bonsai => {
-            check_context(context, bonsai::Config::load(&gguf)?.context_length)?;
-            Ok(Box::new(bonsai::Model::load(
-                gguf,
-                device,
-                context,
-                on_progress,
-            )?))
-        }
-        Family::Qwen => Err(format!(
-            "{} is fetched, but running its weights is not implemented yet",
-            model.name
-        )
-        .into()),
-    }
-}
-
-/// Refuses a context longer than the `trained` positions the model was
-/// trained on, past which its attention degrades, or an empty one.
-fn check_context(context: usize, trained: usize) -> Result<(), Box<dyn Error>> {
-    if context == 0 || context > trained {
-        return Err(format!(
-            "a context of {context} tokens is outside the 1 to {trained} the model was trained for"
-        )
-        .into());
-    }
-    Ok(())
+    dwim_models::load(gguf, device, context, on_progress)
 }
 
 /// The sampler for the model, with the settings its file recommends where

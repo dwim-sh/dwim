@@ -1,13 +1,16 @@
-//! Language models: Bonsai, its tokenizer and weights, and a chat around
-//! it.
+//! Language models: Qwen3.8-27B and Bonsai, their tokenizer and weights,
+//! and a chat around them.
 
-pub mod bonsai;
 mod chat;
 pub mod gguf;
+pub mod quants;
+pub mod qwen35;
 mod sampler;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod tokenizer;
+
+use std::sync::Arc;
 
 pub use chat::{Chat, Chunk, Stats, Tally, ToolCall, Turn};
 pub use dwim_gpu::{Device, Tensor, ternary};
@@ -16,6 +19,26 @@ pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Loads the model a GGUF file holds, by its architecture, onto `device`,
+/// with state for sequences of up to `max_len` tokens, reporting how many
+/// of its tensors are loaded, out of how many, as it goes.
+pub fn load<D: Device + 'static>(
+    gguf: Arc<Gguf>,
+    device: D,
+    max_len: usize,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<Box<dyn LanguageModel>> {
+    match gguf.str("general.architecture")? {
+        "qwen35" => Ok(Box::new(qwen35::Model::load(
+            gguf,
+            device,
+            max_len,
+            on_progress,
+        )?)),
+        other => Err(format!("the '{other}' architecture is not supported").into()),
+    }
+}
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.
