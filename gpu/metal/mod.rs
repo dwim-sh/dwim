@@ -70,6 +70,15 @@ const PACKED: usize = 4 << 20;
 /// Tokens a SIMD group of the bf16 matmul kernel takes at once.
 const BF16_TOKENS: usize = 8;
 
+/// Most tokens that go through the block-quantized row kernels rather than
+/// their tile kernels: the row kernels read the weights once for eight
+/// tokens but are bound by their arithmetic past two, so that on an M5
+/// four tokens through them cost what a tile of 64 does; and the columns
+/// a step of the tile kernels takes, which a matrix must be a whole number
+/// of.
+const QUANT_TOKENS: usize = 4;
+const QUANT_COLS: usize = 128;
+
 /// Rows and tokens of a tile of the kernel on the matrix accelerators.
 const MMA_ROWS: usize = 64;
 const MMA_TOKENS: usize = 64;
@@ -113,6 +122,15 @@ enum Format {
     Q8_0,
 }
 
+/// The index of a block-quantized format's kernels in their arrays.
+fn quant_index(format: Format) -> usize {
+    match format {
+        Format::Q4_0 => 0,
+        Format::Q8_0 => 1,
+        Format::Bf16 | Format::Ternary => unreachable!("not block-quantized"),
+    }
+}
+
 struct Kernels {
     matmul_bf16: Object<dyn MTLComputePipelineState>,
     matmul_ternary_sums: Object<dyn MTLComputePipelineState>,
@@ -122,8 +140,13 @@ struct Kernels {
     /// The tile kernel for tiles of 16, 32 and 64 tokens.
     matmul_ternary_tile: [Object<dyn MTLComputePipelineState>; 3],
     pack_halves: Object<dyn MTLComputePipelineState>,
-    matmul_q4_0: Object<dyn MTLComputePipelineState>,
-    matmul_q8_0: Object<dyn MTLComputePipelineState>,
+    /// The row kernels for Q4_0 and Q8_0 weights, in that order, as
+    /// [`quant_index`] gives it; their tile kernels on the matrix
+    /// accelerators, where the GPU has them; and their tile kernels for
+    /// tiles of 16, 32 and 64 tokens.
+    matmul_quant: [Object<dyn MTLComputePipelineState>; 2],
+    matmul_quant_mma: [Option<Object<dyn MTLComputePipelineState>>; 2],
+    matmul_quant_tile: [[Object<dyn MTLComputePipelineState>; 3]; 2],
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
     l2norm: Object<dyn MTLComputePipelineState>,
@@ -215,14 +238,29 @@ impl Metal {
         // Metal 4's tensor operations run on; a GPU without them takes the
         // tile kernel instead.
         // A system whose compiler lacks them takes it too.
-        let matmul_ternary_mma = if device.supportsFamily(MTLGPUFamily::Apple10) {
-            let metal4 = MTLCompileOptions::new();
-            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let source = include_str!("kernels/matmul_ternary_mma.metal");
-            compile("matmul_ternary_mma", source, Some(&metal4)).ok()
-        } else {
-            None
+        let accelerators = device.supportsFamily(MTLGPUFamily::Apple10);
+        let metal4 = MTLCompileOptions::new();
+        metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        let mma = |name: &str, source: String| {
+            if accelerators {
+                compile(name, &source, Some(&metal4)).ok()
+            } else {
+                None
+            }
         };
+        let matmul_ternary_mma = mma(
+            "matmul_ternary_mma",
+            include_str!("kernels/matmul_ternary_mma.metal").to_string(),
+        );
+        let matmul_quant_mma = [4, 8].map(|bits| {
+            mma(
+                "matmul_quant_mma",
+                format!(
+                    "#define BITS {bits}\n{}",
+                    include_str!("kernels/matmul_quant_mma.metal")
+                ),
+            )
+        });
         let kernels = Kernels {
             matmul_bf16: msl!("matmul_bf16"),
             matmul_ternary_sums: msl!(
@@ -238,8 +276,20 @@ impl Metal {
             ],
             matmul_ternary_mma,
             pack_halves: msl!("pack_halves"),
-            matmul_q4_0: msl!("matmul_q4_0"),
-            matmul_q8_0: msl!("matmul_q8_0"),
+            matmul_quant: [msl!("matmul_q4_0"), msl!("matmul_q8_0")],
+            matmul_quant_mma,
+            matmul_quant_tile: [
+                [
+                    msl!("matmul_quant_tile", "BITS" = 4, "TOKENS" = 16),
+                    msl!("matmul_quant_tile", "BITS" = 4, "TOKENS" = 32),
+                    msl!("matmul_quant_tile", "BITS" = 4, "TOKENS" = 64),
+                ],
+                [
+                    msl!("matmul_quant_tile", "BITS" = 8, "TOKENS" = 16),
+                    msl!("matmul_quant_tile", "BITS" = 8, "TOKENS" = 32),
+                    msl!("matmul_quant_tile", "BITS" = 8, "TOKENS" = 64),
+                ],
+            ],
             add: msl!("add"),
             rmsnorm: msl!("rmsnorm"),
             l2norm: msl!("l2norm"),
@@ -781,19 +831,50 @@ impl Device for Metal {
             );
             return;
         }
-        // Each SIMD group takes one row of block-quantized weights, the
-        // tokens eight at a time, with the scales bound after the quants.
-        let kernel = match w.format {
-            Format::Q4_0 => &self.kernels.matmul_q4_0,
-            Format::Q8_0 => &self.kernels.matmul_q8_0,
-            Format::Bf16 | Format::Ternary => unreachable!(),
-        };
+        // The block-quantized kernels bind the scales after the quants.
+        let which = quant_index(w.format);
         let scales = w
             .scales
             .as_ref()
             .expect("block-quantized weights have scales");
+        // A batch through block-quantized weights is a tiled matrix product
+        // too, over the activations packed as half floats, where the matrix
+        // is a whole number of the steps the tile kernels take.
+        if n > QUANT_TOKENS && cols.is_multiple_of(QUANT_COLS) {
+            if let Some(kernel) = &self.kernels.matmul_quant_mma[which] {
+                let padded = n.next_multiple_of(MMA_TOKENS);
+                self.pack(x, n, cols, padded);
+                self.dispatch_grid(
+                    kernel,
+                    &[&out.buf, &w.buf, scales, &self.packed],
+                    &params,
+                    (rows.div_ceil(MMA_ROWS), padded / MMA_TOKENS),
+                    MATRIX_THREADS,
+                );
+                return;
+            }
+            // The smallest tile that takes the batch, or the largest.
+            let size = match n {
+                ..=16 => 0,
+                17..=32 => 1,
+                _ => 2,
+            };
+            let tile_tokens = 16 << size;
+            let padded = n.next_multiple_of(tile_tokens);
+            self.pack(x, n, cols, padded);
+            self.dispatch_grid(
+                &self.kernels.matmul_quant_tile[which][size],
+                &[&out.buf, &w.buf, scales, &self.packed],
+                &params,
+                (rows.div_ceil(TILE_ROWS), padded / tile_tokens),
+                MATRIX_THREADS,
+            );
+            return;
+        }
+        // Each SIMD group takes one row of block-quantized weights, the
+        // tokens eight at a time.
         self.dispatch(
-            kernel,
+            &self.kernels.matmul_quant[which],
             &[&out.buf, &w.buf, scales, &x.buf],
             &params,
             rows.div_ceil(self.matmul_rows),
@@ -1129,13 +1210,44 @@ mod tests {
         }
     }
 
-    /// Times the ternary matmul on the model's shapes; run with `--ignored
+    /// Checks the tile kernels for block-quantized weights likewise.
+    #[test]
+    fn quant_matmul_without_accelerators_matches_cpu() {
+        match super::Metal::new() {
+            Ok(mut gpu) => {
+                gpu.kernels.matmul_quant_mma = [None, None];
+                crate::tests::q4_0_matmul_matches_cpu(&gpu);
+                crate::tests::q8_0_matmul_matches_cpu(&gpu);
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the matmuls on the model's shapes; run with `--ignored
     /// --nocapture`.
     #[test]
     #[ignore]
     fn ternary_matmul_speed() {
         match super::Metal::new() {
             Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn q4_0_matmul_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::tests::q4_0_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn q8_0_matmul_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::tests::q8_0_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }

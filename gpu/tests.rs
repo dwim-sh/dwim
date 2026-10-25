@@ -206,9 +206,32 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
     }
 }
 
+/// Checks a batch's results against the CPU's as a device that multiplies a
+/// batch in half precision, as the tile kernels do, can meet them: to an
+/// error of a thousandth of the outputs' typical magnitude in root mean
+/// square and a hundredth at worst, which is a tenth of what eight-bit
+/// activations would cost.
+fn close_batch(got: &[f32], want: &[f32], what: &str) {
+    let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+    let (mut worst, mut sum) = (0.0f64, 0.0f64);
+    for (g, w) in got.iter().zip(want) {
+        let e = (g - w).abs() as f64;
+        worst = worst.max(e);
+        sum += e * e;
+    }
+    let rms = (sum / got.len() as f64).sqrt();
+    assert!(
+        rms <= 1e-3 * typical && worst <= 1e-2 * typical,
+        "{what}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
+    );
+}
+
 /// Single tokens and batches, at the edges of the groups of eight tokens
-/// the kernels take and at the model's shapes, through `quantized`
-/// matrices.
+/// the row kernels take, at the model's shapes, and at the edges of the
+/// tiles of the tile kernels, which a batch of more than a few tokens goes
+/// through where the matrix is a whole number of their steps of 128
+/// columns, through `quantized` matrices: a single token is held to the
+/// usual error, a batch to a batch's.
 fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usize]) -> Tensor) {
     for (rows, cols, n) in [
         (1, 32, 1),
@@ -217,7 +240,10 @@ fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usiz
         (77, 1056, 3),
         (200, 5120, 8),
         (64, 160, 9),
+        (64, 128, 16),
+        (100, 256, 47),
         (1030, 1152, 33),
+        (300, 1152, 130),
         (2500, 5120, 64),
     ] {
         let w = quantized(&[rows, cols]);
@@ -227,7 +253,12 @@ fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usiz
         let weight = gpu.upload(w);
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
-        close(&gpu.read(&out), &want, 1e-4);
+        let got = gpu.read(&out);
+        if n > 1 {
+            close_batch(&got, &want, &format!("{rows}x{cols} n={n}"));
+        } else {
+            close(&got, &want, 1e-4);
+        }
     }
 }
 
@@ -248,10 +279,8 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     // in one range; small batches; and batches of half a tile of tokens or
     // more at the edges of the tiles: a whole one, partial row and token
     // tiles, and the model's width. A device may multiply a batch in half
-    // precision, as the Vulkan batch kernels do, so a batch is held to an
-    // error of a thousandth of the outputs' typical magnitude in root mean
-    // square and a hundredth at worst, which is a tenth of what eight-bit
-    // activations would cost; a single token to the usual.
+    // precision, as the Vulkan batch kernels do, so a batch is held to a
+    // batch's error; a single token to the usual.
     for (rows, cols, n) in [
         (1, 128, 1),
         (200, 5120, 1),
@@ -277,19 +306,7 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
         gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
         let got = gpu.read(&out);
         if n >= 2 {
-            let typical =
-                (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
-            let (mut worst, mut sum) = (0.0f64, 0.0f64);
-            for (g, w) in got.iter().zip(&want) {
-                let e = (g - w).abs() as f64;
-                worst = worst.max(e);
-                sum += e * e;
-            }
-            let rms = (sum / got.len() as f64).sqrt();
-            assert!(
-                rms <= 1e-3 * typical && worst <= 1e-2 * typical,
-                "{rows}x{cols} n={n}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
-            );
+            close_batch(&got, &want, &format!("{rows}x{cols} n={n}"));
         } else {
             close(&got, &want, 1e-4);
         }
@@ -338,9 +355,36 @@ pub fn tile_error<D: Device>(gpu: &D) {
 /// tokens, and prints each batch's rate.
 pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
     let mut rng = Rng(21);
+    matmul_speed(gpu, &mut |shape| rng.ternary(shape), ternary::row_bytes);
+}
+
+/// Times the Q4_0 matmul likewise.
+pub fn q4_0_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(41);
+    matmul_speed(gpu, &mut |shape| rng.q4_0(shape), |cols| {
+        cols / 2 + 2 * quant::blocks(cols)
+    });
+}
+
+/// Times the Q8_0 matmul likewise.
+pub fn q8_0_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(81);
+    matmul_speed(gpu, &mut |shape| rng.q8_0(shape), |cols| {
+        cols + 2 * quant::blocks(cols)
+    });
+}
+
+/// Times a matmul through `quantized` matrices, whose rows take
+/// `row_bytes` of their columns, on the model's shapes.
+fn matmul_speed<D: Device>(
+    gpu: &D,
+    quantized: &mut dyn FnMut(&[usize]) -> Tensor,
+    row_bytes: impl Fn(usize) -> usize,
+) {
+    let mut rng = Rng(21);
     let (rows, cols) = (17408, 5120);
-    let weight = gpu.upload(rng.ternary(&[rows, cols]));
-    for n in [1, 4, 8, 16, 32, 64, 96, 128, 256] {
+    let weight = gpu.upload(quantized(&[rows, cols]));
+    for n in [1, 2, 4, 8, 12, 16, 32, 64, 96, 128, 256] {
         let x = buffer(gpu, &rng.floats(n * cols));
         let mut out = gpu.alloc(n * rows);
         // Warm up until the clocks are up.
@@ -366,7 +410,7 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
     // The model's other shapes, for a single token: the ones with fewer
     // rows take the other kernels.
     for (rows, cols) in [(5120, 17408), (6144, 5120), (10240, 5120), (1024, 5120)] {
-        let weight = gpu.upload(rng.ternary(&[rows, cols]));
+        let weight = gpu.upload(quantized(&[rows, cols]));
         let x = buffer(gpu, &rng.floats(cols));
         let mut out = gpu.alloc(rows);
         for _ in 0..2000 {
@@ -380,7 +424,7 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
         }
         gpu.read(&out);
         let each = start.elapsed().as_secs_f64() / runs as f64;
-        let bytes = rows * ternary::row_bytes(cols);
+        let bytes = rows * row_bytes(cols);
         eprintln!(
             "{rows}x{cols} n=1   {:8.3} ms  {:6.0} GB/s",
             each * 1e3,
