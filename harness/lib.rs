@@ -18,9 +18,10 @@
 //! next message or tool result would take the context past a high-water
 //! mark, it compacts the conversation: it has the model write a note to
 //! continue from, starts over from the system prompt, and reads back the
-//! note, the user's earlier messages, and the most recent exchanges, with
-//! the thoughts left out. A reply that runs out of room is stopped short
-//! and goes on after a compaction.
+//! note, the user's earlier messages, the pages it read of the files the
+//! note names, and the most recent exchanges, with the thoughts left out.
+//! A reply that runs out of room is stopped short and goes on after a
+//! compaction.
 //!
 //! Given a [`Log`], the harness keeps a transcript of the whole session in
 //! it, thoughts and compactions included, for finding out afterwards where
@@ -31,7 +32,7 @@ mod log;
 use std::{
     error::Error,
     fs,
-    ops::ControlFlow,
+    ops::{ControlFlow, Range},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -73,6 +74,11 @@ const TAIL: usize = 8;
 /// The share of the context that the user's earlier messages may take in
 /// the note turn after a compaction: a sixteenth.
 const MESSAGES: usize = 16;
+
+/// The share of the context that the pages the model read of the files the
+/// note names may take when they are read back after a compaction: a
+/// sixteenth.
+const PAGES: usize = 16;
 
 /// Most tokens of the note the model writes to continue from: a
 /// sixty-fourth of the context, within these bounds.
@@ -648,11 +654,12 @@ impl<M: LanguageModel> Harness<M> {
     /// Compacts the conversation to make room in the context: has the
     /// model write a note to go on from, reported as `Note` pieces, starts
     /// the conversation over from the system prompt, and reads back where
-    /// the agent is, the note, the user's earlier messages, and the most
-    /// recent exchanges without their thoughts. Returns whether it did: not when there is
-    /// nothing to compact yet, nor when `on_event` breaks while the note
-    /// is written, which leaves the conversation as it was but for the
-    /// note.
+    /// the agent is, the note, the user's earlier messages, the pages the
+    /// model read of the files the note names, and the most recent
+    /// exchanges without their thoughts. Returns whether it did: not when
+    /// there is nothing to compact yet, nor when `on_event` breaks while
+    /// the note is written, which leaves the conversation as it was but
+    /// for the note.
     pub fn compact(
         &mut self,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
@@ -698,21 +705,44 @@ impl<M: LanguageModel> Harness<M> {
         let capacity = self.chat.capacity();
         let start = tail(&self.transcript, capacity / TAIL);
         let messages = messages(&self.transcript[..start], capacity / MESSAGES);
-        let head = note_turn(
-            &environment(&self.dir),
-            &note,
-            &messages,
-            start < self.transcript.len(),
+        let mut pages = pages(&self.transcript, start, &note, capacity / PAGES);
+        let environment = environment(&self.dir);
+        let exchanges = start < self.transcript.len();
+        let head = |pages: bool| note_turn(&environment, &note, &messages, pages, exchanges);
+        let tokens = |range: Range<usize>| -> usize {
+            self.transcript[range]
+                .iter()
+                .map(|(_, tokens)| tokens)
+                .sum()
+        };
+
+        self.chat.clear();
+        (self.restart)(&mut self.chat)?;
+        // The pages go only as far as leaves the conversation under the
+        // high-water mark with the system prompt, the head turn, and the
+        // tail: the oldest go first.
+        let room = (capacity * HIGH_WATER.0 / HIGH_WATER.1).saturating_sub(
+            self.chat.tokens()
+                + self.chat.measure(&Turn::User(head(true)))?
+                + tokens(start..self.transcript.len()),
         );
+        while pages.iter().map(|&i| tokens(i..i + 2)).sum::<usize>() > room {
+            pages.remove(0);
+        }
+        let head = head(!pages.is_empty());
         let mut kept = vec![Turn::User(head.clone())];
+        for i in pages {
+            kept.extend(
+                self.transcript[i..i + 2]
+                    .iter()
+                    .map(|(turn, _)| turn.clone()),
+            );
+        }
         kept.extend(
             self.transcript[start..]
                 .iter()
                 .map(|(turn, _)| turn.clone()),
         );
-
-        self.chat.clear();
-        (self.restart)(&mut self.chat)?;
         self.chat.replay(&kept, |_, _| {})?;
         self.transcript.clear();
         for turn in kept {
@@ -782,10 +812,68 @@ fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
     kept
 }
 
+/// The exchanges among the turns before `start` in `transcript` that read
+/// a page of a file `note` names, as the indices of their replies, oldest
+/// first: each a reply with a `read` call among its calls, and the results
+/// that answer it. The newest that fit in `budget` tokens, leaving out
+/// one whose results the turns from `start` on, or a newer page, hold
+/// already.
+fn pages(transcript: &[(Turn, usize)], start: usize, note: &str, budget: usize) -> Vec<usize> {
+    let results = |i: usize| match &transcript[i].0 {
+        Turn::Results(outputs) => Some(outputs),
+        _ => None,
+    };
+    let mut seen: Vec<&Vec<String>> = (start..transcript.len()).filter_map(results).collect();
+    let mut kept = Vec::new();
+    let mut total = 0;
+    for i in (0..start.saturating_sub(1)).rev() {
+        let (Turn::Reply { calls, .. }, tokens) = &transcript[i] else {
+            continue;
+        };
+        let Some(outputs) = results(i + 1) else {
+            continue;
+        };
+        if !calls.iter().any(|call| reads_named(call, note)) || seen.contains(&outputs) {
+            continue;
+        }
+        let tokens = tokens + transcript[i + 1].1;
+        if total + tokens > budget {
+            break;
+        }
+        total += tokens;
+        seen.push(outputs);
+        kept.push(i);
+    }
+    kept.reverse();
+    kept
+}
+
+/// Whether `call`, the body of a tool call, reads a file `note` names: by
+/// the path as the call gives it, or by its last component.
+fn reads_named(call: &str, note: &str) -> bool {
+    let Ok(call) = ToolCall::parse(call) else {
+        return false;
+    };
+    if call.name != "read" {
+        return false;
+    }
+    let Some(path) = call.arguments.get("path").and_then(|path| path.as_str()) else {
+        return false;
+    };
+    let name = Path::new(path).file_name().and_then(|name| name.to_str());
+    !path.is_empty() && (note.contains(path) || name.is_some_and(|name| note.contains(name)))
+}
+
 /// The turn that opens a compacted conversation: where the agent is, the
-/// note, the user's earlier messages, and whether the most recent
-/// exchanges follow.
-fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) -> String {
+/// note, the user's earlier messages, and whether pages the model read
+/// earlier, and the most recent exchanges, follow.
+fn note_turn(
+    environment: &str,
+    note: &str,
+    messages: &[&str],
+    pages: bool,
+    exchanges: bool,
+) -> String {
     let note = note.trim();
     let mut text = format!(
         "{environment}\n\n{NOTE_HEAD}\n\n<note>\n{}\n</note>",
@@ -797,9 +885,12 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
             text.push_str(&format!("\n\n<message>\n{message}\n</message>"));
         }
     }
-    if exchanges {
-        text.push_str("\n\nThe most recent exchanges follow as they were.");
-    }
+    text.push_str(match (pages, exchanges) {
+        (true, true) => "\n\nPages you read earlier of files the note names follow as they were, and then the most recent exchanges.",
+        (true, false) => "\n\nPages you read earlier of files the note names follow as they were.",
+        (false, true) => "\n\nThe most recent exchanges follow as they were.",
+        (false, false) => "",
+    });
     text
 }
 
@@ -826,6 +917,42 @@ mod tests {
             "Ok."
         };
         format!("{}\n</think>\n\n{body}", "x".repeat(thought))
+    }
+
+    /// A reply after an empty thought that reads `path`.
+    fn read(path: &str) -> String {
+        format!(
+            "\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n{path}\n</parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    /// A directory of files of ten short lines each for the model to read,
+    /// removed when dropped.
+    struct Files(PathBuf);
+
+    impl Files {
+        fn new(names: &[&str]) -> Self {
+            static DIRS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("dwim-harness-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            for name in names {
+                let text: String = (1..=10).map(|i| format!("{name} line {i}\n")).collect();
+                fs::write(dir.join(name), text).unwrap();
+            }
+            Self(dir)
+        }
+
+        /// The path of the file `name`, as the model reads it.
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     /// A harness around a scripted model with room for `max_len` tokens,
@@ -1243,6 +1370,266 @@ mod tests {
             "the newest that fit"
         );
         assert_eq!(messages(&turns, 5), Vec::<&str>::new());
+    }
+
+    /// A harness with room for `max_len` tokens that has read the files
+    /// `read` in turn, one a message, and then run `filler` bash commands,
+    /// one a message, and says `note` when asked for one. Returns it with
+    /// its transcript.
+    fn after_reading(
+        files: &Files,
+        read: &[&str],
+        filler: usize,
+        max_len: usize,
+        note: &str,
+    ) -> (Harness<Scripted>, Vec<Turn>) {
+        let mut scripts = Vec::new();
+        for name in read {
+            scripts.push(self::read(&files.path(name)));
+            scripts.push(reply(0, false));
+        }
+        for _ in 0..filler {
+            scripts.push(reply(0, true));
+            scripts.push(reply(0, false));
+        }
+        let mut harness = harness(&scripts, max_len, note);
+        for i in 0..read.len() + filler {
+            let (events, _) = send(&mut harness, &format!("message {i}"));
+            assert_eq!(
+                events,
+                ["thought", "text", "call", "output", "thought", "text"]
+            );
+        }
+        let transcript: Vec<Turn> = harness.transcript().cloned().collect();
+        (harness, transcript)
+    }
+
+    /// The turns of `turns` that hold a page of `name`: results with its
+    /// first line.
+    fn pages_of<'a>(turns: &[&'a Turn], name: &str) -> Vec<&'a Turn> {
+        let line = format!("1\t{name} line 1\n");
+        turns
+            .iter()
+            .filter(|turn| matches!(turn, Turn::Results(outputs) if outputs.iter().any(|output| output.contains(&line))))
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn keeps_the_pages_the_note_names() {
+        // Two files read, then enough commands that neither read is in
+        // the tail; the note names one of them.
+        let files = Files::new(&["alpha.txt", "beta.txt"]);
+        let (mut harness, before) = after_reading(
+            &files,
+            &["alpha.txt", "beta.txt"],
+            20,
+            16000,
+            "Task: fix alpha.txt.\nNext: edit line 3 of alpha.txt.",
+        );
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::User(head) = turns[0] else { panic!() };
+        assert!(
+            head.ends_with("Pages you read earlier of files the note names follow as they were, and then the most recent exchanges."),
+            "{head}"
+        );
+        // The page comes as the exchange it came from: the reply that
+        // read it, and the results.
+        let Turn::Reply { calls, .. } = turns[1] else {
+            panic!("{:?}", turns[1])
+        };
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains(&files.path("alpha.txt")), "{}", calls[0]);
+        assert_eq!(pages_of(&turns[2..3], "alpha.txt").len(), 1);
+        assert_eq!(pages_of(&turns, "alpha.txt").len(), 1);
+        assert_eq!(pages_of(&turns, "beta.txt").len(), 0);
+        // The tail follows, as it was.
+        let tail = &turns[3..];
+        assert!(matches!(tail[0], Turn::Reply { .. }), "{:?}", tail[0]);
+        assert!(
+            before[before.len() - tail.len()..]
+                .iter()
+                .zip(tail)
+                .all(|(a, &b)| a == b)
+        );
+        assert_eq!(harness.tokens(), harness.chat.model().fed.len());
+        assert!(harness.tokens() <= 16000 * HIGH_WATER.0 / HIGH_WATER.1);
+    }
+
+    #[test]
+    fn keeps_a_page_in_the_tail_once() {
+        // The file read first is read again last, so that the tail holds
+        // its page already.
+        let files = Files::new(&["alpha.txt"]);
+        let mut scripts = vec![read(&files.path("alpha.txt")), reply(0, false)];
+        for _ in 0..20 {
+            scripts.push(reply(0, true));
+            scripts.push(reply(0, false));
+        }
+        scripts.push(read(&files.path("alpha.txt")));
+        scripts.push(reply(0, false));
+        let mut harness = harness(&scripts, 16000, "Next: edit alpha.txt.");
+        for i in 0..22 {
+            send(&mut harness, &format!("message {i}"));
+        }
+        let before: Vec<&Turn> = harness.transcript().collect();
+        assert_eq!(pages_of(&before, "alpha.txt").len(), 2);
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::User(head) = turns[0] else { panic!() };
+        assert!(
+            head.ends_with("The most recent exchanges follow as they were."),
+            "{head}"
+        );
+        assert_eq!(pages_of(&turns, "alpha.txt").len(), 1);
+        assert!(matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim() == "Ok."));
+    }
+
+    #[test]
+    fn keeps_the_newest_pages_that_fit() {
+        // Both files are named, but the pages' budget holds one page
+        // and not two: the newer is kept.
+        let files = Files::new(&["alpha.txt", "beta.txt"]);
+        let max_len = 8000;
+        let (mut harness, before) = after_reading(
+            &files,
+            &["alpha.txt", "beta.txt"],
+            10,
+            max_len,
+            "Next: edit alpha.txt and beta.txt.",
+        );
+        let page = |name: &str| {
+            let i = before
+                .iter()
+                .position(|turn| matches!(turn, Turn::Reply { calls, .. } if calls.iter().any(|call| call.contains(&files.path(name)))))
+                .unwrap();
+            harness.chat.measure(&before[i]).unwrap()
+                + harness.chat.measure(&before[i + 1]).unwrap()
+        };
+        let (alpha, beta) = (page("alpha.txt"), page("beta.txt"));
+        assert!(
+            beta <= max_len / PAGES && alpha + beta > max_len / PAGES,
+            "{alpha} {beta}"
+        );
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert_eq!(pages_of(&turns, "alpha.txt").len(), 0);
+        assert_eq!(pages_of(&turns, "beta.txt").len(), 1);
+        assert_eq!(pages_of(&turns[2..3], "beta.txt").len(), 1);
+    }
+
+    #[test]
+    fn reads_back_the_head_turn_then_the_pages_then_the_tail() {
+        let files = Files::new(&["alpha.txt", "beta.txt"]);
+        let (mut harness, before) = after_reading(
+            &files,
+            &["alpha.txt", "beta.txt"],
+            20,
+            16000,
+            "Next: edit alpha.txt, then beta.txt.",
+        );
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert!(matches!(turns[0], Turn::User(head) if head.starts_with("# Environment\n")));
+        // The pages, oldest first, each as its exchange.
+        for (i, name) in ["alpha.txt", "beta.txt"].iter().enumerate() {
+            let reply = turns[1 + 2 * i];
+            assert!(
+                matches!(reply, Turn::Reply { calls, .. } if calls.len() == 1 && calls[0].contains(&files.path(name))),
+                "{reply:?}"
+            );
+            assert_eq!(pages_of(&turns[2 + 2 * i..3 + 2 * i], name).len(), 1);
+        }
+        // Then the tail, whole exchanges from a reply, as it was.
+        let tail = &turns[5..];
+        assert!(matches!(tail[0], Turn::Reply { .. }));
+        let start = before.len() - tail.len();
+        assert!(before[start..].iter().zip(tail).all(|(a, &b)| a == b));
+        assert_eq!(pages_of(&turns, "alpha.txt").len(), 1);
+        assert_eq!(pages_of(&turns, "beta.txt").len(), 1);
+    }
+
+    #[test]
+    fn picks_the_pages_the_note_names() {
+        let user = |i: usize| (Turn::User(format!("message {i}")), 10);
+        let reply = |call: &str, n: usize| {
+            (
+                Turn::Reply {
+                    text: String::new(),
+                    calls: vec![call.to_string()],
+                },
+                n,
+            )
+        };
+        let text = || {
+            (
+                Turn::Reply {
+                    text: "Ok.".to_string(),
+                    calls: Vec::new(),
+                },
+                5,
+            )
+        };
+        let results = |output: &str, n: usize| (Turn::Results(vec![output.to_string()]), n);
+        let read_a = "<function=read>\n<parameter=path>\na.rs\n</parameter>\n</function>";
+        let read_b = r#"{"name": "read", "arguments": {"path": "src/b/lib.rs", "start": 201}}"#;
+        let grep_a =
+            "<function=bash>\n<parameter=command>\ngrep -n fn a.rs\n</parameter>\n</function>";
+        let transcript = vec![
+            user(1),
+            reply(read_a, 20), // 1
+            results("1\tfn a()", 100),
+            text(), // 3
+            user(2),
+            reply(read_b, 20), // 5
+            results("201\tfn b()", 100),
+            reply(grep_a, 20), // 7
+            results("3:fn a()", 50),
+            reply(read_a, 20), // 9
+            results("1\tfn a()", 100),
+            text(), // 11
+        ];
+        let all = transcript.len();
+        // The newest page of each file the note names, by the path as the
+        // call gave it or its last component.
+        assert_eq!(
+            pages(&transcript, all, "edit a.rs and lib.rs", 1000),
+            [5, 9]
+        );
+        assert_eq!(pages(&transcript, all, "edit src/b/lib.rs", 1000), [5]);
+        assert_eq!(pages(&transcript, all, "edit a.rs", 1000), [9]);
+        assert_eq!(
+            pages(&transcript, all, "edit c.rs", 1000),
+            Vec::<usize>::new()
+        );
+        assert_eq!(pages(&transcript, all, "", 1000), Vec::<usize>::new());
+        // Newest first, within the budget.
+        assert_eq!(pages(&transcript, all, "a.rs lib.rs", 239), [9]);
+        assert_eq!(pages(&transcript, all, "a.rs lib.rs", 240), [5, 9]);
+        assert_eq!(
+            pages(&transcript, all, "a.rs lib.rs", 119),
+            Vec::<usize>::new()
+        );
+        // A page the tail holds is not kept again, nor is a bash command's
+        // output a page.
+        assert_eq!(pages(&transcript, 9, "a.rs lib.rs", 1000), [5]);
+        assert_eq!(pages(&transcript, 7, "a.rs lib.rs", 1000), [5]);
+        assert_eq!(
+            pages(&transcript, 5, "a.rs lib.rs", 1000),
+            Vec::<usize>::new(),
+            "the tail holds a.rs's page already"
+        );
+        assert_eq!(
+            pages(&transcript, 0, "a.rs lib.rs", 1000),
+            Vec::<usize>::new()
+        );
+        assert!(!reads_named(grep_a, "a.rs"));
+        assert!(!reads_named(
+            "<function=read>\n<parameter=path>\n\n</parameter>\n</function>",
+            "a.rs"
+        ));
+        assert!(!reads_named("not a call", "a.rs"));
     }
 
     #[test]
