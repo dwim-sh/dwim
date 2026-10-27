@@ -156,10 +156,12 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
     // Single tokens through matrices of few rows and of the model's shapes,
     // whose blocks the Vulkan sums kernel splits among workgroups or takes
-    // in one range; small batches; and batches of half a tile of tokens or
-    // more at the edges of the tiles: a whole one, partial row and token
-    // tiles, and the model's width. A device may multiply a batch in half
-    // precision, as the Vulkan batch kernels do, so a batch is held to an
+    // in one range; small batches; batches short of the tiles of 16 and 32
+    // tokens a device may have for them; and batches of half a tile of
+    // tokens or more at the edges of the tiles: a whole one, partial row
+    // and token tiles, and the model's width. A device may multiply a
+    // batch in half precision, as the Vulkan batch kernels do, so a batch
+    // is held to an
     // error of a thousandth of the outputs' typical magnitude in root mean
     // square and a hundredth at worst, which is a tenth of what eight-bit
     // activations would cost; a single token to the usual.
@@ -174,6 +176,8 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
         (70_000, 128, 2),
         (200, 5120, 8),
         (64, 128, 16),
+        (100, 256, 12),
+        (1030, 1152, 24),
         (100, 256, 47),
         (1030, 1152, 33),
         (300, 1152, 130),
