@@ -205,13 +205,20 @@ impl Metal {
         }
         // The matrix accelerators of an Apple GPU of the tenth family, which
         // Metal 4's tensor operations run on; a GPU without them takes the
-        // tile kernel instead.
-        // A system whose compiler lacks them takes it too.
-        let matmul_ternary_mma = if device.supportsFamily(MTLGPUFamily::Apple10) {
+        // tile kernel instead, as does a system without Metal 4. Where both
+        // are there, the kernel must compile.
+        let matmul_ternary_mma = if device.supportsFamily(MTLGPUFamily::Apple10)
+            && device.supportsFamily(MTLGPUFamily::Metal4)
+        {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
             let source = include_str!("kernels/matmul_ternary_mma.metal");
-            compile("matmul_ternary_mma", MATRIX_THREADS, source, Some(&metal4)).ok()
+            Some(compile(
+                "matmul_ternary_mma",
+                MATRIX_THREADS,
+                source,
+                Some(&metal4),
+            )?)
         } else {
             None
         };
