@@ -17,7 +17,9 @@
 // buffer for `attention_combine.metal` to merge, or, when there is only one
 // chunk, straight to the output. A dispatch covers the tokens from `first`
 // on, `tokens` of them, with `chunks` chunks for each, the rows of 32 across
-// its grid and the key/value heads of each chunk down it.
+// its grid and the key/value heads of each chunk down it; CHUNK is the
+// positions the device defines ahead of this, which it passes
+// `attention_combine.metal` as `chunk`.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -37,7 +39,9 @@ struct Params {
 #define DIM 256
 #endif
 // Positions a threadgroup takes, and a round of them.
-constant uint CHUNK = 512;
+#ifndef CHUNK
+#define CHUNK 512
+#endif
 constant uint ROUND = 32;
 // Rows a SIMD group takes, and a threadgroup.
 constant uint ROWS = 8;

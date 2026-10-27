@@ -1,5 +1,5 @@
 // Causal attention over 8-bit caches, with a half-precision scale per block
-// of 32: one threadgroup per (token, key/value head, chunk of 128
+// of 32: one threadgroup per (token, key/value head, chunk of CHUNK
 // positions), for every query head that shares the key/value head, so that
 // the caches are read once for the group and a long context spreads over
 // the GPU. A SIMD group scores one position at a time, its lanes each taking
@@ -13,7 +13,8 @@
 // of exponentials, and weighted values go to the partials buffer for
 // `attention_combine.metal` to merge, or, when there is only one chunk,
 // straight to the output. A dispatch covers the tokens from `first` on,
-// with `chunks` chunks for each.
+// with `chunks` chunks for each, of the CHUNK positions the device defines
+// ahead of this, which it passes `attention_combine.metal` as `chunk`.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -28,7 +29,9 @@ struct Params {
     uint chunk;
 };
 
-constant uint CHUNK = 128;
+#ifndef CHUNK
+#define CHUNK 128
+#endif
 constant uint THREADS = 256;
 // Most query heads to a key/value head, and rounds of four elements to a
 // lane the widest head takes.
@@ -62,7 +65,7 @@ kernel void attention(
     if (start >= len) {
         return;
     }
-    uint count = min(CHUNK, len - start);
+    uint count = min(uint(CHUNK), len - start);
     uint group = p.n_heads / p.n_kv_heads;
     uint kv = kvh * p.head_dim;
     uint kv_dim = p.n_kv_heads * p.head_dim;

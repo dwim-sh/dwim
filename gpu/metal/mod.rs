@@ -242,11 +242,21 @@ impl Metal {
             rmsnorm: msl!("rmsnorm", THREADS),
             l2norm: msl!("l2norm", THREADS),
             rope: msl!("rope", THREADS),
-            attention: msl!("attention", ATTENTION_THREADS),
+            attention: msl!("attention", ATTENTION_THREADS, "CHUNK" = CHUNK),
             attention_combine: msl!("attention_combine", ATTENTION_THREADS),
             attention_flash: [
-                msl!("attention_flash", MATRIX_THREADS, "DIM" = 128),
-                msl!("attention_flash", MATRIX_THREADS, "DIM" = 256),
+                msl!(
+                    "attention_flash",
+                    MATRIX_THREADS,
+                    "DIM" = 128,
+                    "CHUNK" = FLASH_CHUNK
+                ),
+                msl!(
+                    "attention_flash",
+                    MATRIX_THREADS,
+                    "DIM" = 256,
+                    "CHUNK" = FLASH_CHUNK
+                ),
             ],
             silu_mul: msl!("silu_mul", THREADS),
             sigmoid_mul: msl!("sigmoid_mul", THREADS),
