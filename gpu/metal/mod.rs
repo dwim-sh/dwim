@@ -62,17 +62,15 @@ const SUMS_TOKENS: usize = 8;
 /// batches of attention are dispatched a few tokens at a time.
 const PARTIALS: usize = 16 << 20;
 
-/// Rows of a tile of the tile kernel, and the most half floats a batch
-/// through it packs its activations into: the size of the buffer.
+/// Rows of a tile of the tile kernels, the tokens of their three tiles,
+/// and the most half floats a batch through them packs its activations
+/// into: the size of the buffer.
 const TILE_ROWS: usize = 64;
+const TILE_TOKENS: [usize; 3] = [16, 32, 64];
 const PACKED: usize = 4 << 20;
 
 /// Tokens a SIMD group of the bf16 matmul kernel takes at once.
 const BF16_TOKENS: usize = 8;
-
-/// Rows and tokens of a tile of the kernel on the matrix accelerators.
-const MMA_ROWS: usize = 64;
-const MMA_TOKENS: usize = 64;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
@@ -106,9 +104,10 @@ struct Kernels {
     matmul_bf16: Object<dyn MTLComputePipelineState>,
     matmul_ternary_sums: Object<dyn MTLComputePipelineState>,
     matmul_ternary_reduce: Object<dyn MTLComputePipelineState>,
-    /// The tile kernel on the matrix accelerators, where the GPU has them.
-    matmul_ternary_mma: Option<Object<dyn MTLComputePipelineState>>,
-    /// The tile kernel for tiles of 16, 32 and 64 tokens.
+    /// The tile kernel on the matrix accelerators, where the GPU has them,
+    /// for tiles of 16, 32 and 64 tokens.
+    matmul_ternary_mma: Option<[Object<dyn MTLComputePipelineState>; 3]>,
+    /// The tile kernel on the SIMD groups' matrices, for the same tiles.
     matmul_ternary_tile: [Object<dyn MTLComputePipelineState>; 3],
     pack_halves: Object<dyn MTLComputePipelineState>,
     add: Object<dyn MTLComputePipelineState>,
@@ -221,13 +220,16 @@ impl Metal {
         {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            Some(compile(
-                "matmul_ternary_mma",
-                MATRIX_THREADS,
-                &[],
-                &[source!("trits"), source!("matmul_ternary_mma")],
-                Some(&metal4),
-            )?)
+            let mma = |tokens| {
+                compile(
+                    "matmul_ternary_mma",
+                    MATRIX_THREADS,
+                    &[("TOKENS", tokens)],
+                    &[source!("trits"), source!("matmul_ternary_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([mma(16)?, mma(32)?, mma(64)?])
         } else {
             None
         };
@@ -732,35 +734,25 @@ impl Device for Metal {
             }
             return;
         }
-        // A batch through ternary weights is a tiled matrix product on the
-        // SIMD groups' matrix units, over the activations packed as half
-        // floats: a threadgroup per tile of rows and tokens.
-        if w.ternary
-            && let Some(kernel) = &self.kernels.matmul_ternary_mma
-        {
-            let padded = n.next_multiple_of(MMA_TOKENS);
-            self.pack(x, n, cols, padded);
-            self.dispatch_grid(
-                kernel,
-                &[&out.buf, &w.buf, &self.packed],
-                &params,
-                (rows.div_ceil(MMA_ROWS), padded / MMA_TOKENS),
-                MATRIX_THREADS,
-            );
-            return;
-        }
+        // A batch through ternary weights is a tiled matrix product, on
+        // the matrix accelerators where the GPU has them and on the SIMD
+        // groups' matrix units elsewhere, over the activations packed as
+        // half floats: a threadgroup per tile of rows and tokens, the
+        // smallest tile that takes the batch, or the largest.
         if w.ternary {
-            // The smallest tile that takes the batch, or the largest.
-            let which = match n {
-                ..=16 => 0,
-                17..=32 => 1,
-                _ => 2,
-            };
-            let tile_tokens = 16 << which;
+            let which = TILE_TOKENS
+                .iter()
+                .position(|&tokens| n <= tokens)
+                .unwrap_or(TILE_TOKENS.len() - 1);
+            let tile_tokens = TILE_TOKENS[which];
             let padded = n.next_multiple_of(tile_tokens);
             self.pack(x, n, cols, padded);
+            let kernel = match &self.kernels.matmul_ternary_mma {
+                Some(mma) => &mma[which],
+                None => &self.kernels.matmul_ternary_tile[which],
+            };
             self.dispatch_grid(
-                &self.kernels.matmul_ternary_tile[which],
+                kernel,
                 &[&out.buf, &w.buf, &self.packed],
                 &params,
                 (rows.div_ceil(TILE_ROWS), padded / tile_tokens),

@@ -1,6 +1,7 @@
 // out[t][r] = w[r] · x[t] for ternary weights and a batch of tokens, as a
 // tiled matrix product on the GPU's matrix accelerators through Metal 4's
-// tensor operations. A threadgroup takes ROWS rows and 64 tokens. For each
+// tensor operations. A threadgroup takes ROWS rows and TOKENS tokens, 16,
+// 32 or 64 as the batch needs. For each
 // block of 128 columns it unpacks the rows' block once into threadgroup
 // memory, scaled and as half floats, which hold a scaled trit exactly, and
 // multiplies the tokens' activations, half floats laid out by
@@ -27,7 +28,9 @@ struct Params {
 
 // Rows and tokens of a tile, and columns of a block.
 constant uint ROWS = 64;
-constant uint TOKENS = 64;
+#ifndef TOKENS
+#define TOKENS 64
+#endif
 constant uint BLOCK = 128;
 constant uint THREADS = 128;
 // Half floats a row of the unpacked weights takes, padded so that the
