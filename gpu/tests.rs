@@ -12,6 +12,7 @@ macro_rules! check_against_cpu {
             alloc_is_zeroed_and_copy_moves_ranges,
             matmul_matches_cpu,
             ternary_matmul_matches_cpu,
+            ternary_matmul_follows_writes,
             rmsnorm_matches_cpu,
             l2norm_matches_cpu,
             rope_matches_cpu,
@@ -156,10 +157,12 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(14);
     // Single tokens through matrices of few rows and of the model's shapes,
     // whose blocks the Vulkan sums kernel splits among workgroups or takes
-    // in one range; small batches; and batches of half a tile of tokens or
-    // more at the edges of the tiles: a whole one, partial row and token
-    // tiles, and the model's width. A device may multiply a batch in half
-    // precision, as the Vulkan batch kernels do, so a batch is held to an
+    // in one range; small batches; batches short of the tiles of 16 and 32
+    // tokens a device may have for them; and batches of half a tile of
+    // tokens or more at the edges of the tiles: a whole one, partial row
+    // and token tiles, and the model's width. A device may multiply a
+    // batch in half precision, as the Vulkan batch kernels do, so a batch
+    // is held to an
     // error of a thousandth of the outputs' typical magnitude in root mean
     // square and a hundredth at worst, which is a tenth of what eight-bit
     // activations would cost; a single token to the usual.
@@ -174,6 +177,8 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
         (70_000, 128, 2),
         (200, 5120, 8),
         (64, 128, 16),
+        (100, 256, 12),
+        (1030, 1152, 24),
         (100, 256, 47),
         (1030, 1152, 33),
         (300, 1152, 130),
@@ -205,6 +210,54 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
             close(&got, &want, 1e-4);
         }
     }
+}
+
+/// A batch through ternary weights again after its activations change
+/// must see the change, whichever operation made it, and so must one from
+/// a buffer allocated where a freed one was: a device that keeps a batch's
+/// activations packed for its matmuls must know what it has packed.
+pub fn ternary_matmul_follows_writes<D: Device>(gpu: &D) {
+    let mut rng = Rng(16);
+    let (rows, cols, n) = (300, HADAMARD_BLOCK, 16);
+    let w = rng.ternary(&[rows, cols]);
+    let weight = gpu.upload(clone(&w));
+    let signs: Vec<f32> = (0..cols)
+        .map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 })
+        .collect();
+    let check = |x: &D::Buffer, want_x: &Vec<f32>| {
+        let mut want = vec![0.0; n * rows];
+        Cpu.matmul(&mut want, &clone(&w), want_x);
+        let mut out = gpu.alloc(n * rows);
+        gpu.matmul(&mut out, &weight, x);
+        let got = gpu.read(&out);
+        let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+        for (g, w) in got.iter().zip(&want) {
+            assert!(
+                ((g - w).abs() as f64) <= 1e-2 * typical,
+                "got {g}, want {w}, typical {typical:.2e}"
+            );
+        }
+    };
+    let mut want_x = rng.floats(n * cols);
+    let mut x = buffer(gpu, &want_x);
+    check(&x, &want_x);
+    let y = rng.floats(n * cols);
+    Cpu.add(&mut want_x, &y);
+    gpu.add(&mut x, &buffer(gpu, &y));
+    check(&x, &want_x);
+    Cpu.hadamard(&mut want_x, &signs, false);
+    gpu.hadamard(&mut x, &buffer(gpu, &signs), false);
+    check(&x, &want_x);
+    want_x[..cols].copy_from_slice(&y[..cols]);
+    gpu.copy(&mut x, 0, &buffer(gpu, &y), 0, cols);
+    check(&x, &want_x);
+    want_x = rng.floats(n * cols);
+    gpu.write(&mut x, &want_x);
+    check(&x, &want_x);
+    drop(x);
+    let want_x = rng.floats(n * cols);
+    let x = buffer(gpu, &want_x);
+    check(&x, &want_x);
 }
 
 /// Prints how far the tile kernel is from the CPU on a batch: the largest
@@ -564,10 +617,14 @@ pub fn rope_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
-    // Each case ends with the magnitude of the caches. The last attends
-    // over more positions than one dispatch has scores for, all its tokens
-    // at once; the two before it have caches small enough that their
-    // blocks' scales are subnormal f16s, which a driver may flush to zero.
+    // Each case ends with the magnitude of the caches. The last is the
+    // model's heads for a batch whose positions cross what a device may
+    // take in one piece; the one before it, with as many query heads to a
+    // key/value head as the kernels take, attends over more positions than
+    // one dispatch of either backend has partials for, so the batch goes
+    // through several; the two before that have caches small enough that
+    // their blocks' scales are subnormal f16s, which a driver may flush to
+    // zero.
     let cases = [
         (4, 32, 2, 3, 5, 1.0),
         (16, 128, 8, 2, 300, 1.0),
@@ -576,7 +633,8 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         (3, 96, 1, 2, 9, 1.0),
         (2, 128, 1, 1, 0, 1e-3),
         (24, 256, 4, 3, 1000, 1e-3),
-        (16, 128, 4, 64, 32704, 1.0),
+        (32, 128, 4, 64, 32704, 1.0),
+        (24, 256, 4, 64, 470, 1.0),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos, size) in cases {
         let kv_dim = n_kv_heads * head_dim;
