@@ -9,7 +9,12 @@
 //! Buffers live in memory the CPU shares with the GPU, so reading and
 //! writing them needs no staging, only waiting for the commands before.
 
-use std::{cell::RefCell, error::Error, ptr::NonNull, slice};
+use std::{
+    cell::{Cell, RefCell},
+    error::Error,
+    ptr::NonNull,
+    slice,
+};
 
 use objc2::{
     rc::{Retained, autoreleasepool},
@@ -83,6 +88,28 @@ pub struct Buffer {
     buf: Object<dyn MTLBuffer>,
     len: usize,
     cap: usize,
+    /// Which buffer this is, of all the device has allocated, and how many
+    /// times it has been written: together, what it holds.
+    id: u64,
+    version: u64,
+}
+
+impl Buffer {
+    /// Notes that the buffer is written by the operation being encoded.
+    fn touch(&mut self) {
+        self.version += 1;
+    }
+}
+
+/// What the packed activations are of: a buffer's contents, and the batch
+/// they were packed as.
+#[derive(Clone, Copy, PartialEq)]
+struct Packed {
+    id: u64,
+    version: u64,
+    n: usize,
+    cols: usize,
+    padded: usize,
 }
 
 /// A cache of activations in memory shared with the GPU, in blocks of 8-bit
@@ -141,8 +168,12 @@ pub struct Metal {
     queue: Object<dyn MTLCommandQueue>,
     kernels: Kernels,
     partials: Object<dyn MTLBuffer>,
-    /// A batch's activations as half floats, for the tile kernels.
+    /// A batch's activations as half floats, for the tile kernels, and
+    /// what they are of, so that the matmuls over one buffer pack it once.
     packed: Object<dyn MTLBuffer>,
+    packed_for: Cell<Option<Packed>>,
+    /// Buffers allocated so far, for their ids.
+    allocated: Cell<u64>,
     /// Rows of the bf16 weights each threadgroup of their matmul takes: one
     /// per SIMD group.
     matmul_rows: usize,
@@ -291,6 +322,8 @@ impl Metal {
             kernels,
             partials,
             packed,
+            packed_for: Cell::new(None),
+            allocated: Cell::new(0),
             matmul_rows,
             name,
             pending: RefCell::new(None),
@@ -366,12 +399,24 @@ impl Metal {
     }
 
     /// Packs the `n` tokens of `cols` activations of `x` as half floats, with
-    /// zeros for the tokens up to `padded`, for the tile kernels.
+    /// zeros for the tokens up to `padded`, for the tile kernels, unless
+    /// they are what is packed already.
     fn pack(&self, x: &Buffer, n: usize, cols: usize, padded: usize) {
         assert!(
             padded * cols <= PACKED,
             "a batch of {n} tokens of {cols} is more than the kernels pack"
         );
+        let packed = Packed {
+            id: x.id,
+            version: x.version,
+            n,
+            cols,
+            padded,
+        };
+        if self.packed_for.get() == Some(packed) {
+            return;
+        }
+        self.packed_for.set(Some(packed));
         let pack = PackParams {
             n: n as u32,
             cols: cols as u32,
@@ -577,10 +622,14 @@ impl Device for Metal {
     }
 
     fn alloc(&self, len: usize) -> Buffer {
+        let id = self.allocated.get();
+        self.allocated.set(id + 1);
         Buffer {
             buf: self.buffer(len * 4),
             len,
             cap: len,
+            id,
+            version: 0,
         }
     }
 
@@ -600,6 +649,7 @@ impl Device for Metal {
             buf.cap
         );
         buf.len = len;
+        buf.touch();
     }
 
     fn read(&self, buf: &Buffer) -> Vec<f32> {
@@ -611,6 +661,7 @@ impl Device for Metal {
 
     fn write(&self, buf: &mut Buffer, data: &[f32]) {
         assert_eq!(buf.len, data.len());
+        buf.touch();
         // The pending commands may use what the buffer holds now.
         self.flush();
         unsafe {
@@ -631,6 +682,7 @@ impl Device for Metal {
         len: usize,
     ) {
         assert!(dst_offset + len <= dst.len && src_offset + len <= src.len);
+        dst.touch();
         let params = CopyParams {
             dst_offset: dst_offset as u32,
             src_offset: src_offset as u32,
@@ -697,6 +749,7 @@ impl Device for Metal {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
+        out.touch();
         let mut params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
@@ -772,6 +825,7 @@ impl Device for Metal {
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
         assert_eq!(x.len, y.len);
+        x.touch();
         let params = LenParams { len: x.len as u32 };
         self.dispatch(
             &self.kernels.add,
@@ -789,6 +843,7 @@ impl Device for Metal {
             dim.is_multiple_of(4) && dim <= 8192,
             "the kernel takes rows of up to 8192 in fours"
         );
+        x.touch();
         let params = RmsnormParams {
             dim: dim as u32,
             eps,
@@ -804,6 +859,7 @@ impl Device for Metal {
 
     fn l2norm(&self, x: &mut Buffer, dim: usize, eps: f32) {
         assert_eq!(x.len % dim, 0);
+        x.touch();
         let params = RmsnormParams {
             dim: dim as u32,
             eps,
@@ -829,6 +885,7 @@ impl Device for Metal {
         let n = x.len / (n_heads * head_dim);
         assert_eq!(x.len, n * n_heads * head_dim);
         assert!(rot_dim <= head_dim && rot_dim.is_multiple_of(2));
+        x.touch();
         let params = RopeParams {
             n_heads: n_heads as u32,
             head_dim: head_dim as u32,
@@ -865,6 +922,7 @@ impl Device for Metal {
             n_heads / n_kv_heads <= 8,
             "the kernel holds up to eight query heads per key/value head"
         );
+        out.touch();
         // A batch of tokens goes through the flash kernel, on the matrix
         // units, where the head is one it is compiled for.
         let flash = match head_dim {
@@ -936,6 +994,7 @@ impl Device for Metal {
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {
         assert_eq!(gate.len, up.len);
+        gate.touch();
         let params = LenParams {
             len: gate.len as u32,
         };
@@ -951,6 +1010,7 @@ impl Device for Metal {
 
     fn sigmoid_mul(&self, x: &mut Buffer, gate: &Buffer) {
         assert_eq!(x.len, gate.len);
+        x.touch();
         let params = LenParams { len: x.len as u32 };
         let groups = x.len.div_ceil(THREADS);
         self.dispatch(
@@ -965,6 +1025,7 @@ impl Device for Metal {
     fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
         let width = signs.len;
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
+        x.touch();
         let params = HadamardParams {
             width: width as u32,
             inverse: inverse as u32,
@@ -990,6 +1051,7 @@ impl Device for Metal {
         assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
         assert!(out.len == x.len && weight.len == width);
         assert!(width <= 8192, "the kernel takes rows of up to 8192");
+        out.touch();
         let params = RmsnormParams {
             dim: width as u32,
             eps,
@@ -1019,6 +1081,9 @@ impl Device for Metal {
         assert!(state.len == (CONV_KERNEL - 1) * channels && state_out.len == state.len);
         let (q_dim, k_dim, v_dim) = (q.len / n, k.len / n, v.len / n);
         assert_eq!(q_dim + k_dim + v_dim, channels);
+        for buf in [&mut *q, &mut *k, &mut *v, &mut *state_out] {
+            buf.touch();
+        }
         let params = ConvParams {
             n: n as u32,
             channels: channels as u32,
@@ -1062,6 +1127,8 @@ impl Device for Metal {
         assert!(gates.len == n * 2 * n_v_heads && decay.len == 2 * n_v_heads);
         assert_eq!(state.len, n_v_heads * head_dim * head_dim);
         assert_eq!(head_dim, 128, "the kernel is written for 128-wide heads");
+        out.touch();
+        state.touch();
         let params = DeltaNetParams {
             n: n as u32,
             n_k_heads: n_k_heads as u32,

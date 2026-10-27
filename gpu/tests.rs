@@ -12,6 +12,7 @@ macro_rules! check_against_cpu {
             alloc_is_zeroed_and_copy_moves_ranges,
             matmul_matches_cpu,
             ternary_matmul_matches_cpu,
+            ternary_matmul_follows_writes,
             rmsnorm_matches_cpu,
             l2norm_matches_cpu,
             rope_matches_cpu,
@@ -209,6 +210,54 @@ pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
             close(&got, &want, 1e-4);
         }
     }
+}
+
+/// A batch through ternary weights again after its activations change
+/// must see the change, whichever operation made it, and so must one from
+/// a buffer allocated where a freed one was: a device that keeps a batch's
+/// activations packed for its matmuls must know what it has packed.
+pub fn ternary_matmul_follows_writes<D: Device>(gpu: &D) {
+    let mut rng = Rng(16);
+    let (rows, cols, n) = (300, HADAMARD_BLOCK, 16);
+    let w = rng.ternary(&[rows, cols]);
+    let weight = gpu.upload(clone(&w));
+    let signs: Vec<f32> = (0..cols)
+        .map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 })
+        .collect();
+    let check = |x: &D::Buffer, want_x: &Vec<f32>| {
+        let mut want = vec![0.0; n * rows];
+        Cpu.matmul(&mut want, &clone(&w), want_x);
+        let mut out = gpu.alloc(n * rows);
+        gpu.matmul(&mut out, &weight, x);
+        let got = gpu.read(&out);
+        let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+        for (g, w) in got.iter().zip(&want) {
+            assert!(
+                ((g - w).abs() as f64) <= 1e-2 * typical,
+                "got {g}, want {w}, typical {typical:.2e}"
+            );
+        }
+    };
+    let mut want_x = rng.floats(n * cols);
+    let mut x = buffer(gpu, &want_x);
+    check(&x, &want_x);
+    let y = rng.floats(n * cols);
+    Cpu.add(&mut want_x, &y);
+    gpu.add(&mut x, &buffer(gpu, &y));
+    check(&x, &want_x);
+    Cpu.hadamard(&mut want_x, &signs, false);
+    gpu.hadamard(&mut x, &buffer(gpu, &signs), false);
+    check(&x, &want_x);
+    want_x[..cols].copy_from_slice(&y[..cols]);
+    gpu.copy(&mut x, 0, &buffer(gpu, &y), 0, cols);
+    check(&x, &want_x);
+    want_x = rng.floats(n * cols);
+    gpu.write(&mut x, &want_x);
+    check(&x, &want_x);
+    drop(x);
+    let want_x = rng.floats(n * cols);
+    let x = buffer(gpu, &want_x);
+    check(&x, &want_x);
 }
 
 /// Prints how far the tile kernel is from the CPU on a batch: the largest
