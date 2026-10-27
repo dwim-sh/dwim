@@ -566,10 +566,12 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
     // Each case ends with the magnitude of the caches. The last is the
     // model's heads for a batch whose positions cross what a device may
-    // take in one piece; the one before it attends over more positions
-    // than one dispatch has scores for, all its tokens at once; the two
-    // before that have caches small enough that their
-    // blocks' scales are subnormal f16s, which a driver may flush to zero.
+    // take in one piece; the one before it, with as many query heads to a
+    // key/value head as the kernels take, attends over more positions than
+    // one dispatch of either backend has partials for, so the batch goes
+    // through several; the two before that have caches small enough that
+    // their blocks' scales are subnormal f16s, which a driver may flush to
+    // zero.
     let cases = [
         (4, 32, 2, 3, 5, 1.0),
         (16, 128, 8, 2, 300, 1.0),
@@ -578,7 +580,7 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         (3, 96, 1, 2, 9, 1.0),
         (2, 128, 1, 1, 0, 1e-3),
         (24, 256, 4, 3, 1000, 1e-3),
-        (16, 128, 4, 64, 32704, 1.0),
+        (32, 128, 4, 64, 32704, 1.0),
         (24, 256, 4, 64, 470, 1.0),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos, size) in cases {
