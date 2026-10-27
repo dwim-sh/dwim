@@ -9,7 +9,8 @@
 // they load straight from device memory, and sum the products in single
 // precision. The next block's words are fetched into registers before the
 // multiplies of the current one, so that their latency hides behind them.
-// Two threads unpack each row, a share of its words each. The weights are
+// Two threads unpack each row, a share of its words each, by
+// `trits.metal`, which the device puts ahead of this. The weights are
 // stored block-major, as `matmul_ternary_sums.metal` describes.
 
 #include <metal_stdlib>
@@ -33,29 +34,6 @@ constant uint RJ = 4;
 constant uint BLOCK = 128;
 // Half floats a row of the unpacked weights takes.
 constant uint STRIDE = 132;
-// Words per block: 28 bytes.
-constant uint WORDS = 7;
-
-// The four bytes of a word as two pairs in 16-bit halves, so that tripling
-// them does not carry between bytes.
-struct Split {
-    uint even;
-    uint odd;
-};
-
-static Split split(uint word) {
-    return Split { word & 0x00ff00ffu, (word >> 8) & 0x00ff00ffu };
-}
-
-// Peels the most significant trit off each of the four bytes, as -1, 0, or
-// 1, in the bytes' order.
-static half4 peel(thread Split& s) {
-    uint even = s.even * 3;
-    uint odd = s.odd * 3;
-    s.even = even & 0x00ff00ffu;
-    s.odd = odd & 0x00ff00ffu;
-    return half4(half((even >> 8) & 0xff), half((odd >> 8) & 0xff), half(even >> 24), half(odd >> 24)) - 1.0h;
-}
 
 // The words of a row the thread unpacks: the first three to the first
 // thread of the row, the rest to the second, and the last, which holds the

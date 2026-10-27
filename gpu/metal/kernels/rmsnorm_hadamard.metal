@@ -1,12 +1,10 @@
 // out = rotate(rmsnorm(x) * weight): one threadgroup of 256 per
 // 1024-element block of every row of x, which sums the squares of the whole
 // row, then normalizes, scales, and signs its block and transforms it as
-// `hadamard.metal` does: each thread holds four consecutive elements, the
-// first two rounds of butterflies are between them, the next five between
-// lanes of a SIMD group by shuffles, and the last three between threads
-// through shared memory. The row is read as vectors of four, a fixed number
-// per thread with the index clamped rather than the load skipped, so that
-// the loads go out together instead of one round trip after another.
+// `hadamard.metal` does, by `butterfly.metal`, which the device puts ahead
+// of this. The row is read as vectors of four, a fixed number per thread
+// with the index clamped rather than the load skipped, so that the loads go
+// out together instead of one round trip after another.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -16,31 +14,8 @@ struct Params {
     float eps;
 };
 
-constant uint BLOCK = 1024;
-constant uint THREADS = 256;
 // Vectors a thread reads of the row: rows of up to 8192 elements.
 constant uint PER_THREAD = 8;
-
-// The Walsh-Hadamard transform of the block whose elements 4lid to 4lid + 3
-// are `e`, unnormalized.
-static float4 butterfly(float4 e, uint lid, uint lane, threadgroup float4* v) {
-    e = float4(e.x + e.y, e.x - e.y, e.z + e.w, e.z - e.w);
-    e = float4(e.x + e.z, e.y + e.w, e.x - e.z, e.y - e.w);
-    // Elements 4s apart are in the lanes s apart.
-    for (ushort s = 1; s < 32; s <<= 1) {
-        float4 o = simd_shuffle_xor(e, s);
-        e = (lane & s) == 0 ? e + o : o - e;
-    }
-    uint side = 0;
-    for (uint s = 32; s < THREADS; s <<= 1) {
-        v[side + lid] = e;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float4 o = v[side + (lid ^ s)];
-        e = (lid & s) == 0 ? e + o : o - e;
-        side = THREADS - side;
-    }
-    return e;
-}
 
 kernel void rmsnorm_hadamard(
     device float4* out [[buffer(0)]],

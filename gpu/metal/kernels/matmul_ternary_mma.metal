@@ -10,7 +10,7 @@
 // fetched into registers before the multiplies of the current one, so that
 // their latency hides behind them. The unpacking is as in
 // `matmul_ternary_tile.metal`, whose kernel is the one for a GPU without
-// the accelerators.
+// the accelerators, by `trits.metal`, which the device puts ahead of this.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -30,35 +30,12 @@ constant uint ROWS = 64;
 constant uint TOKENS = 64;
 constant uint BLOCK = 128;
 constant uint THREADS = 128;
-// Words per block: 28 bytes.
-constant uint WORDS = 7;
 // Half floats a row of the unpacked weights takes, padded so that the
 // threads writing the same columns of different rows hit different banks.
 constant uint STRIDE = 132;
 // Threads that unpack a row, and the words each takes: the last, which
 // holds the scale, to all of them.
 constant uint PER_ROW = THREADS / ROWS;
-
-// The four bytes of a word as two pairs in 16-bit halves, so that tripling
-// them does not carry between bytes.
-struct Split {
-    uint even;
-    uint odd;
-};
-
-static Split split(uint word) {
-    return Split { word & 0x00ff00ffu, (word >> 8) & 0x00ff00ffu };
-}
-
-// Peels the most significant trit off each of the four bytes, as -1, 0, or
-// 1, in the bytes' order.
-static half4 peel(thread Split& s) {
-    uint even = s.even * 3;
-    uint odd = s.odd * 3;
-    s.even = even & 0x00ff00ffu;
-    s.odd = odd & 0x00ff00ffu;
-    return half4(half((even >> 8) & 0xff), half((odd >> 8) & 0xff), half(even >> 24), half(odd >> 24)) - 1.0h;
-}
 
 // Unpacks words `first` to `last` of a row's block into its row of the
 // unpacked weights: words 0 to 3 hold elements 4j + i + 16n in byte 4j + i,

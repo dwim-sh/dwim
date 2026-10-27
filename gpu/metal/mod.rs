@@ -163,15 +163,25 @@ impl Metal {
         let name = device.name().to_string();
         let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
 
-        // Compiles the kernel `name` from `source`, for threadgroups of
-        // `threads`, which the GPU must be able to run.
+        // Compiles the kernel `name` for threadgroups of `threads`, which
+        // the GPU must be able to run, from `defines` ahead of `parts`: the
+        // snippets it shares with other kernels, then its own source.
         let compile = |name: &str,
                        threads: usize,
-                       source: &str,
+                       defines: &[(&str, usize)],
+                       parts: &[&str],
                        options: Option<&MTLCompileOptions>|
          -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
+            let mut source = String::new();
+            for (define, value) in defines {
+                source.push_str(&format!("#define {define} {value}\n"));
+            }
+            for part in parts {
+                source.push_str(part);
+                source.push('\n');
+            }
             let library = device
-                .newLibraryWithSource_options_error(&NSString::from_str(source), options)
+                .newLibraryWithSource_options_error(&NSString::from_str(&source), options)
                 .map_err(|e| format!("{name}.metal: {}", e.localizedDescription()))?;
             let function = library
                 .newFunctionWithName(&NSString::from_str(name))
@@ -184,22 +194,21 @@ impl Metal {
             }
             Ok(pipeline)
         };
-        let kernel =
-            |name: &str, threads: usize, source: &str| compile(name, threads, source, None);
-        macro_rules! msl {
-            ($name:literal, $threads:expr) => {
-                kernel($name, $threads, include_str!(concat!("kernels/", $name, ".metal")))?
+        macro_rules! source {
+            ($name:literal) => {
+                include_str!(concat!("kernels/", $name, ".metal"))
             };
-            // A kernel compiled with the definitions given ahead of it.
-            ($name:literal, $threads:expr, $($define:literal = $value:expr),+) => {
-                kernel(
+        }
+        // A kernel from `kernels/`, with the definitions given after its
+        // threads ahead of it, and the snippets given after a semicolon.
+        macro_rules! msl {
+            ($name:literal, $threads:expr $(, $define:literal = $value:expr)* $(; $($snippet:literal),+)?) => {
+                compile(
                     $name,
                     $threads,
-                    &format!(
-                        concat!($("#define ", $define, " {}\n"),+, "{}"),
-                        $($value),+,
-                        include_str!(concat!("kernels/", $name, ".metal"))
-                    ),
+                    &[$(($define, $value)),*],
+                    &[$($(source!($snippet),)+)? source!($name)],
+                    None,
                 )?
             };
         }
@@ -212,11 +221,11 @@ impl Metal {
         {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let source = include_str!("kernels/matmul_ternary_mma.metal");
             Some(compile(
                 "matmul_ternary_mma",
                 MATRIX_THREADS,
-                source,
+                &[],
+                &[source!("trits"), source!("matmul_ternary_mma")],
                 Some(&metal4),
             )?)
         } else {
@@ -232,9 +241,9 @@ impl Metal {
             ),
             matmul_ternary_reduce: msl!("matmul_ternary_reduce", THREADS),
             matmul_ternary_tile: [
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 16),
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 32),
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 64),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 16; "trits"),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 32; "trits"),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 64; "trits"),
             ],
             matmul_ternary_mma,
             pack_halves: msl!("pack_halves", THREADS),
@@ -262,8 +271,8 @@ impl Metal {
             sigmoid_mul: msl!("sigmoid_mul", THREADS),
             copy: msl!("copy", THREADS),
             store_q8: msl!("store_q8", THREADS),
-            hadamard: msl!("hadamard", THREADS),
-            rmsnorm_hadamard: msl!("rmsnorm_hadamard", THREADS),
+            hadamard: msl!("hadamard", THREADS; "butterfly"),
+            rmsnorm_hadamard: msl!("rmsnorm_hadamard", THREADS; "butterfly"),
             conv: msl!("conv", THREADS),
             delta_net: msl!("delta_net", THREADS),
         };
