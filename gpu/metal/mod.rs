@@ -163,7 +163,10 @@ impl Metal {
         let name = device.name().to_string();
         let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
 
+        // Compiles the kernel `name` from `source`, for threadgroups of
+        // `threads`, which the GPU must be able to run.
         let compile = |name: &str,
+                       threads: usize,
                        source: &str,
                        options: Option<&MTLCompileOptions>|
          -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
@@ -176,20 +179,22 @@ impl Metal {
             let pipeline = device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
-            if pipeline.maxTotalThreadsPerThreadgroup() < THREADS {
-                return Err(format!("{name} can't run {THREADS} threads to a threadgroup").into());
+            if pipeline.maxTotalThreadsPerThreadgroup() < threads {
+                return Err(format!("{name} can't run {threads} threads to a threadgroup").into());
             }
             Ok(pipeline)
         };
-        let kernel = |name: &str, source: &str| compile(name, source, None);
+        let kernel =
+            |name: &str, threads: usize, source: &str| compile(name, threads, source, None);
         macro_rules! msl {
-            ($name:literal) => {
-                kernel($name, include_str!(concat!("kernels/", $name, ".metal")))?
+            ($name:literal, $threads:expr) => {
+                kernel($name, $threads, include_str!(concat!("kernels/", $name, ".metal")))?
             };
             // A kernel compiled with the definitions given ahead of it.
-            ($name:literal, $($define:literal = $value:expr),+) => {
+            ($name:literal, $threads:expr, $($define:literal = $value:expr),+) => {
                 kernel(
                     $name,
+                    $threads,
                     &format!(
                         concat!($("#define ", $define, " {}\n"),+, "{}"),
                         $($value),+,
@@ -206,43 +211,44 @@ impl Metal {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
             let source = include_str!("kernels/matmul_ternary_mma.metal");
-            compile("matmul_ternary_mma", source, Some(&metal4)).ok()
+            compile("matmul_ternary_mma", MATRIX_THREADS, source, Some(&metal4)).ok()
         } else {
             None
         };
         let kernels = Kernels {
-            matmul_bf16: msl!("matmul_bf16"),
+            matmul_bf16: msl!("matmul_bf16", THREADS),
             matmul_ternary_sums: msl!(
                 "matmul_ternary_sums",
+                SUMS_THREADS,
                 "THREADS" = SUMS_THREADS,
                 "PER" = SUMS_PER
             ),
-            matmul_ternary_reduce: msl!("matmul_ternary_reduce"),
+            matmul_ternary_reduce: msl!("matmul_ternary_reduce", THREADS),
             matmul_ternary_tile: [
-                msl!("matmul_ternary_tile", "TOKENS" = 16),
-                msl!("matmul_ternary_tile", "TOKENS" = 32),
-                msl!("matmul_ternary_tile", "TOKENS" = 64),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 16),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 32),
+                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 64),
             ],
             matmul_ternary_mma,
-            pack_halves: msl!("pack_halves"),
-            add: msl!("add"),
-            rmsnorm: msl!("rmsnorm"),
-            l2norm: msl!("l2norm"),
-            rope: msl!("rope"),
-            attention: msl!("attention"),
-            attention_combine: msl!("attention_combine"),
+            pack_halves: msl!("pack_halves", THREADS),
+            add: msl!("add", THREADS),
+            rmsnorm: msl!("rmsnorm", THREADS),
+            l2norm: msl!("l2norm", THREADS),
+            rope: msl!("rope", THREADS),
+            attention: msl!("attention", ATTENTION_THREADS),
+            attention_combine: msl!("attention_combine", ATTENTION_THREADS),
             attention_flash: [
-                msl!("attention_flash", "DIM" = 128),
-                msl!("attention_flash", "DIM" = 256),
+                msl!("attention_flash", MATRIX_THREADS, "DIM" = 128),
+                msl!("attention_flash", MATRIX_THREADS, "DIM" = 256),
             ],
-            silu_mul: msl!("silu_mul"),
-            sigmoid_mul: msl!("sigmoid_mul"),
-            copy: msl!("copy"),
-            store_q8: msl!("store_q8"),
-            hadamard: msl!("hadamard"),
-            rmsnorm_hadamard: msl!("rmsnorm_hadamard"),
-            conv: msl!("conv"),
-            delta_net: msl!("delta_net"),
+            silu_mul: msl!("silu_mul", THREADS),
+            sigmoid_mul: msl!("sigmoid_mul", THREADS),
+            copy: msl!("copy", THREADS),
+            store_q8: msl!("store_q8", THREADS),
+            hadamard: msl!("hadamard", THREADS),
+            rmsnorm_hadamard: msl!("rmsnorm_hadamard", THREADS),
+            conv: msl!("conv", THREADS),
+            delta_net: msl!("delta_net", THREADS),
         };
         let matmul_rows = THREADS / kernels.matmul_bf16.threadExecutionWidth();
         let partials = device
