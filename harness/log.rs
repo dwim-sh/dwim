@@ -24,7 +24,7 @@ use dwim_models::Sampler;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::date;
+use crate::{Stats, date};
 
 /// Longest the streamed text being gathered goes without being written.
 const REWRITE: Duration = Duration::from_secs(1);
@@ -251,6 +251,27 @@ impl Log {
         } else {
             self.flush();
         }
+    }
+
+    /// Records that the session finished, rather than being killed: the
+    /// tokens in the context, and where the session's time went, as the
+    /// tokens and seconds of each kind and the tool calls and their
+    /// seconds.
+    pub fn finish(&mut self, tokens: usize, stats: &Stats) {
+        let tally = |tally: &dwim_models::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
+        let model = &stats.model;
+        self.write(
+            "end",
+            json!({
+                "tokens": tokens,
+                "cached": tally(&model.cached),
+                "prompt": tally(&model.prompt),
+                "thought": tally(&model.thought),
+                "answer": tally(&model.answer),
+                "calls": stats.calls,
+                "tool_seconds": round(stats.tool_seconds),
+            }),
+        );
     }
 
     /// Writes a record, after the streamed text gathered before it.

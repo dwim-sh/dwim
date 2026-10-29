@@ -726,6 +726,14 @@ impl<M: LanguageModel> Harness<M> {
     }
 }
 
+impl<M: LanguageModel> Drop for Harness<M> {
+    /// Ends the transcript: the session finished.
+    fn drop(&mut self) {
+        let stats = self.stats();
+        self.log.finish(self.chat.tokens(), &stats);
+    }
+}
+
 /// Where the exchanges to read back after a compaction start in the
 /// transcript: the most recent whole exchanges that fit in `budget`
 /// tokens, each starting at a reply, and always the last reply, which any
@@ -1166,6 +1174,10 @@ mod tests {
             .map(|record| record["time"].as_f64().unwrap())
             .collect();
         assert!(times.is_sorted());
+        let end = records.last().unwrap();
+        assert_eq!(end["type"], "end");
+        assert_eq!(end["calls"], 1);
+        assert!(end["thought"]["tokens"].as_u64().unwrap() > 1800);
     }
 
     #[test]

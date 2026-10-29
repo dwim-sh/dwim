@@ -35,6 +35,10 @@ use crate::{
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
 
+/// Longest the shell waits, on quitting, for the model's thread to stop
+/// the turn in progress and end the transcript.
+const FINISH: Duration = Duration::from_secs(2);
+
 /// Runs the shell until the user quits, showing the model's thinking if
 /// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
 /// of the session in `log`.
@@ -51,10 +55,13 @@ pub fn run(
     let (requests, requests_rx) = mpsc::channel();
     let (replies_tx, replies) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
+    // Disconnected once the model's thread is done.
+    let (done, finished) = mpsc::channel::<()>();
     {
         let dir = dir.clone();
         let stop = stop.clone();
         thread::spawn(move || {
+            let _done = done;
             if let Err(e) = work(
                 model,
                 &dir,
@@ -104,6 +111,18 @@ pub fn run(
     // line between it and whatever the shell prints next.
     app.lines.push(Line::new());
     app.screen.draw(&app.lines, &[], (0, 0))?;
+    // With no more messages to answer, and the turn in progress stopped,
+    // the model's thread ends the transcript; while the model is still
+    // loading, there is no transcript to end.
+    let loaded = !matches!(
+        app.status,
+        Status::Downloading { .. } | Status::Loading { .. }
+    );
+    app.stop.store(true, Ordering::Relaxed);
+    drop(app);
+    if loaded {
+        let _ = finished.recv_timeout(FINISH);
+    }
     result
 }
 
