@@ -21,7 +21,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim_gpu::{Cpu, Gpu};
-use dwim_harness::{self as harness, Harness};
+use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
 use crate::{
@@ -35,30 +35,40 @@ use crate::{
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
 
+/// Longest the shell waits, on quitting, for the model's thread to stop
+/// the turn in progress and end the transcript.
+const FINISH: Duration = Duration::from_secs(2);
+
 /// Runs the shell until the user quits, showing the model's thinking if
-/// `thinking` is set, or once ctrl+o is pressed.
+/// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
+/// of the session in `log`.
 pub fn run(
     name: &str,
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     thinking: bool,
+    log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
 
     let (requests, requests_rx) = mpsc::channel();
     let (replies_tx, replies) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
+    // Disconnected once the model's thread is done.
+    let (done, finished) = mpsc::channel::<()>();
     {
         let dir = dir.clone();
         let stop = stop.clone();
         thread::spawn(move || {
+            let _done = done;
             if let Err(e) = work(
                 model,
                 &dir,
                 device,
                 context,
                 thinking_budget,
+                log,
                 requests_rx,
                 &replies_tx,
                 &stop,
@@ -101,6 +111,18 @@ pub fn run(
     // line between it and whatever the shell prints next.
     app.lines.push(Line::new());
     app.screen.draw(&app.lines, &[], (0, 0))?;
+    // With no more messages to answer, and the turn in progress stopped,
+    // the model's thread ends the transcript; while the model is still
+    // loading, there is no transcript to end.
+    let loaded = !matches!(
+        app.status,
+        Status::Downloading { .. } | Status::Loading { .. }
+    );
+    app.stop.store(true, Ordering::Relaxed);
+    drop(app);
+    if loaded {
+        let _ = finished.recv_timeout(FINISH);
+    }
     result
 }
 
@@ -174,7 +196,7 @@ enum Reply {
 }
 
 /// Fetches the model if needed, then loads it and answers messages until
-/// the UI hangs up.
+/// the UI hangs up, keeping a transcript in `log`.
 #[allow(clippy::too_many_arguments)]
 fn work(
     model: &'static models::Model,
@@ -182,6 +204,7 @@ fn work(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -196,9 +219,11 @@ fn work(
             serve(
                 gguf,
                 Cpu,
+                "cpu",
                 model,
                 context,
                 thinking_budget,
+                log,
                 requests,
                 replies,
                 stop,
@@ -213,13 +238,15 @@ fn work(
                 .next()
                 .unwrap_or(gpu.name())
                 .to_string();
-            let _ = replies.send(Reply::Device(name));
+            let _ = replies.send(Reply::Device(name.clone()));
             serve(
                 gguf,
                 gpu,
+                &name,
                 model,
                 context,
                 thinking_budget,
+                log,
                 requests,
                 replies,
                 stop,
@@ -228,14 +255,17 @@ fn work(
     }
 }
 
-/// Loads the model and answers messages until the UI hangs up.
+/// Loads the model onto `device`, which is called `on`, and answers
+/// messages until the UI hangs up, keeping a transcript in `log`.
 #[allow(clippy::too_many_arguments)]
 fn serve<D: dwim_gpu::Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
+    on: &str,
     which: &'static models::Model,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -253,10 +283,15 @@ fn serve<D: dwim_gpu::Device + 'static>(
     models::start(&mut chat, which, &system, |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
-    let mut harness = Harness::new(chat, &cwd, move |chat| {
-        models::start(chat, which, &system, |_, _| {}).map(|_| ())
+    if let Some(path) = log.path() {
+        let _ = replies.send(Reply::Notice(format!("Transcript in {}", path.display())));
+    }
+    let mut harness = Harness::new(chat, &cwd, {
+        let system = system.clone();
+        move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    harness.keep_log(log, which.name, on, &system);
     let _ = replies.send(Reply::Ready);
 
     for request in requests {

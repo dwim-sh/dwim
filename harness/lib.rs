@@ -21,6 +21,12 @@
 //! note, the user's earlier messages, and the most recent exchanges, with
 //! the thoughts left out. A reply that runs out of room is stopped short
 //! and goes on after a compaction.
+//!
+//! Given a [`Log`], the harness keeps a transcript of the whole session in
+//! it, thoughts and compactions included, for finding out afterwards where
+//! a session's tokens went.
+
+mod log;
 
 use std::{
     error::Error,
@@ -33,6 +39,8 @@ use std::{
 
 use dwim_models::{Chat, Chunk, LanguageModel, ToolCall, Turn};
 use dwim_tools::Tools;
+
+pub use crate::log::Log;
 
 /// Most of a project's `AGENTS.md` that goes into the system prompt.
 const MAX_INSTRUCTIONS: usize = 4000;
@@ -302,6 +310,8 @@ pub struct Harness<M: LanguageModel> {
     reserve: usize,
     /// Most tokens of a thought, if they are limited.
     thinking_budget: Option<usize>,
+    /// The transcript of the whole session.
+    log: Log,
 }
 
 /// Where a conversation's time has gone: the model's, by what it was
@@ -398,6 +408,7 @@ impl<M: LanguageModel> Harness<M> {
             note_tokens,
             reserve,
             thinking_budget: Some(THINKING_BUDGET),
+            log: Log::none(),
         })
     }
 
@@ -408,11 +419,29 @@ impl<M: LanguageModel> Harness<M> {
         self.chat
             .limit_thoughts(tokens.unwrap_or(usize::MAX), BUDGET_CLOSING);
         self.thinking_budget = tokens;
+        self.log.thinking_budget(tokens);
     }
 
     /// Most tokens of a thought, if they are limited.
     pub fn thinking_budget(&self) -> Option<usize> {
         self.thinking_budget
+    }
+
+    /// Keeps a transcript of the session in `log`, starting with what the
+    /// model was given before the first message: `model`, the `device` it
+    /// runs on, where it is, the room it has, how it samples, its thinking
+    /// budget, and the `system` prompt.
+    pub fn keep_log(&mut self, mut log: Log, model: &str, device: &str, system: &str) {
+        log.start(
+            model,
+            device,
+            &self.dir,
+            self.chat.capacity(),
+            self.chat.sampler(),
+            self.thinking_budget,
+            system,
+        );
+        self.log = log;
     }
 
     /// Where the conversation's time has gone so far.
@@ -445,14 +474,31 @@ impl<M: LanguageModel> Harness<M> {
         message: &str,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
+        let mut interrupted = false;
+        let result = self.converse(message, &mut |event| {
+            let flow = on_event(event);
+            interrupted |= flow.is_break();
+            flow
+        });
+        self.log
+            .end(result.as_ref().err().map(|e| e as _), interrupted);
+        result
+    }
+
+    /// Sends a message from the user, as [`Harness::send`] does.
+    fn converse(
+        &mut self,
+        message: &str,
+        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
-        let mut outcome = self.run(Turn::User(message.to_string()), ahead, &mut on_event)?;
+        let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
                 return Ok(());
             }
-            if self.compact(&mut on_event)? {
-                outcome = self.run(Turn::User(CONTINUE.to_string()), None, &mut on_event)?;
+            if self.compaction(on_event)? {
+                outcome = self.run(Turn::User(CONTINUE.to_string()), None, on_event)?;
                 if outcome == Outcome::Cut {
                     let _ = on_event(Event::Cut);
                 }
@@ -474,6 +520,9 @@ impl<M: LanguageModel> Harness<M> {
         // The last call run, as its name and arguments.
         let mut last = None;
         loop {
+            if let Turn::User(message) = &input {
+                self.log.user(message, ahead.as_deref(), self.chat.tokens());
+            }
             // Where the agent is goes ahead of the first message as fed;
             // the transcript keeps the message alone, since a compaction
             // says where the agent is afresh.
@@ -485,10 +534,15 @@ impl<M: LanguageModel> Harness<M> {
                 return Ok(Outcome::Done);
             }
             let mut text = String::new();
+            let before = self.chat.stats();
             let calls = {
                 let collect = |chunk: Chunk| {
-                    if let Chunk::Text(piece) = chunk {
-                        text.push_str(piece);
+                    match chunk {
+                        Chunk::Thought(piece) => self.log.stream("thought", piece),
+                        Chunk::Text(piece) => {
+                            self.log.stream("text", piece);
+                            text.push_str(piece);
+                        }
                     }
                     on_event(event(chunk))
                 };
@@ -499,6 +553,14 @@ impl<M: LanguageModel> Harness<M> {
                 }
             };
             let cut = self.chat.cut();
+            self.log.reply(
+                &calls,
+                self.chat.thought_ended(),
+                cut,
+                self.chat.tokens(),
+                &before,
+                &self.chat.stats(),
+            );
             self.record(input)?;
             self.record(Turn::Reply {
                 text,
@@ -512,9 +574,11 @@ impl<M: LanguageModel> Harness<M> {
             }
             let mut outputs = Vec::new();
             for call in &calls {
+                let mut seconds = None;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = dwim_tools::describe(&call);
+                        self.log.call(&call.name, &detail);
                         if on_event(Event::Call {
                             name: &call.name,
                             detail: &detail,
@@ -531,12 +595,15 @@ impl<M: LanguageModel> Harness<M> {
                             let start = Instant::now();
                             let output = self.tools.run(&call);
                             self.calls += 1;
-                            self.tool_seconds += start.elapsed().as_secs_f64();
+                            let elapsed = start.elapsed().as_secs_f64();
+                            self.tool_seconds += elapsed;
+                            seconds = Some(elapsed);
                             output
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
+                self.log.output(&output, seconds);
                 if on_event(Event::Output(&output)).is_break() {
                     return Ok(Outcome::Done);
                 }
@@ -566,7 +633,7 @@ impl<M: LanguageModel> Harness<M> {
         let capacity = self.chat.capacity();
         if self.chat.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
             && !self.transcript.is_empty()
-            && !self.compact(on_event)?
+            && !self.compaction(on_event)?
         {
             return Ok(false);
         }
@@ -590,7 +657,27 @@ impl<M: LanguageModel> Harness<M> {
         &mut self,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<bool, Box<dyn Error>> {
-        if self.transcript.is_empty() || on_event(Event::Compacting).is_break() {
+        let mut interrupted = false;
+        let result = self.compaction(&mut |event| {
+            let flow = on_event(event);
+            interrupted |= flow.is_break();
+            flow
+        });
+        self.log
+            .end(result.as_ref().err().map(|e| e as _), interrupted);
+        result
+    }
+
+    /// Compacts the conversation, as [`Harness::compact`] does.
+    fn compaction(
+        &mut self,
+        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.transcript.is_empty() {
+            return Ok(false);
+        }
+        self.log.compacting();
+        if on_event(Event::Compacting).is_break() {
             return Ok(false);
         }
         let before = self.chat.tokens();
@@ -599,6 +686,7 @@ impl<M: LanguageModel> Harness<M> {
             let Chunk::Text(text) = chunk else {
                 return ControlFlow::Continue(());
             };
+            self.log.stream("note", text);
             let flow = on_event(Event::Note(text));
             interrupted |= flow.is_break();
             flow
@@ -616,7 +704,7 @@ impl<M: LanguageModel> Harness<M> {
             &messages,
             start < self.transcript.len(),
         );
-        let mut kept = vec![Turn::User(head)];
+        let mut kept = vec![Turn::User(head.clone())];
         kept.extend(
             self.transcript[start..]
                 .iter()
@@ -630,11 +718,19 @@ impl<M: LanguageModel> Harness<M> {
         for turn in kept {
             self.record(turn)?;
         }
-        let _ = on_event(Event::Compacted {
-            before,
-            after: self.chat.tokens(),
-        });
+        let after = self.chat.tokens();
+        self.log
+            .compacted(before, after, &head, self.transcript.len() - 1);
+        let _ = on_event(Event::Compacted { before, after });
         Ok(true)
+    }
+}
+
+impl<M: LanguageModel> Drop for Harness<M> {
+    /// Ends the transcript: the session finished.
+    fn drop(&mut self) {
+        let stats = self.stats();
+        self.log.finish(self.chat.tokens(), &stats);
     }
 }
 
@@ -742,6 +838,15 @@ mod tests {
         chat.system("Be brief.", |_, _| {}).unwrap();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap()
+    }
+
+    /// The records of the log at `path`, which is removed.
+    fn records(path: &Path) -> Vec<serde_json::Value> {
+        let text = fs::read_to_string(path).unwrap();
+        fs::remove_file(path).unwrap();
+        text.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     /// The names of the events of a turn, and the note it wrote.
@@ -925,6 +1030,8 @@ mod tests {
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
         assert_eq!(limited.thinking_budget(), Some(THINKING_BUDGET));
+        let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
+        limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
         limited.set_thinking_budget(Some(100));
         let mut thought = String::new();
         let mut events = Vec::new();
@@ -956,6 +1063,18 @@ mod tests {
             "{:?}",
             turns.last()
         );
+        drop(limited);
+        // The log has the budget, its change, and the thought it ended.
+        let records = records(&path);
+        assert_eq!(records[0]["thinking_budget"], THINKING_BUDGET);
+        assert_eq!(records[1]["type"], "thinking_budget");
+        assert_eq!(records[1]["tokens"], 100);
+        let replies: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["type"] == "reply")
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply["thought_ended"] == true));
 
         // Lifted, the budget lets a thought run.
         let scripts = [reply(1000, false)];
@@ -972,6 +1091,93 @@ mod tests {
         .unwrap();
         assert!(!thought.contains(BUDGET_CLOSING));
         assert!(thought.len() >= 1000);
+    }
+
+    #[test]
+    fn logs_the_whole_session() {
+        // A call and its result, then replies of 1800 tokens until one is
+        // stopped short and goes on after a compaction.
+        let mut scripts = vec![reply(100, true), reply(100, false)];
+        scripts.extend((0..8).map(|_| reply(1800, false)));
+        let mut harness = harness(&scripts, 8000, "Task: go on.");
+        let path = std::env::temp_dir().join(format!("dwim-log-{}.jsonl", std::process::id()));
+        harness.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
+        for i in 0..5 {
+            send(&mut harness, &format!("message {i}"));
+        }
+        drop(harness);
+        let records = records(&path);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            kinds[..10],
+            [
+                "start", "user", "thought", "text", "reply", "call", "output", "thought", "text",
+                "reply"
+            ]
+        );
+        assert_eq!(records[0]["model"], "tiny");
+        assert_eq!(records[0]["system"], "Be brief.");
+        assert_eq!(records[0]["thinking_budget"], THINKING_BUDGET);
+        assert_eq!(records[0]["device"], "cpu");
+        assert_eq!(records[0]["temperature"], 0.0);
+        assert_eq!(records[0]["top_k"], 1);
+        assert_eq!(records[0]["top_p"], 1.0);
+        assert_eq!(records[0]["seed"], 1);
+        assert_eq!(records[1]["text"], "message 0");
+        assert!(
+            records[1]["ahead"]
+                .as_str()
+                .unwrap()
+                .starts_with("# Environment")
+        );
+        assert_eq!(records[2]["text"].as_str().unwrap().trim(), "x".repeat(100));
+        assert_eq!(records[4]["calls"].as_array().unwrap().len(), 1);
+        assert!(records[4]["thought_tokens"].as_u64().unwrap() > 100);
+        assert_eq!(records[4]["thought_ended"], false);
+        assert_eq!(records[5]["detail"], "echo ok");
+        assert!(records[6]["seconds"].is_number());
+        assert!(records[11]["ahead"].is_null());
+
+        // The cut reply, the compaction it prompts, and the reply that goes
+        // on after it.
+        let cut = records
+            .iter()
+            .position(|record| record["cut"] == true)
+            .unwrap();
+        assert_eq!(
+            kinds[cut..cut + 8],
+            [
+                "reply",
+                "compacting",
+                "note",
+                "compacted",
+                "user",
+                "thought",
+                "text",
+                "reply"
+            ]
+        );
+        assert_eq!(records[cut + 2]["text"], "Task: go on.");
+        assert!(records[cut + 3]["after"].as_u64() < records[cut + 3]["before"].as_u64());
+        let head = records[cut + 3]["head"].as_str().unwrap();
+        assert!(head.starts_with("# Environment"), "{head}");
+        assert!(head.contains("Task: go on."), "{head}");
+        assert!(head.contains("message 0"), "{head}");
+        assert!(records[cut + 3]["turns"].as_u64().unwrap() > 0);
+        assert_eq!(records[cut + 4]["text"], CONTINUE);
+        let times: Vec<f64> = records
+            .iter()
+            .map(|record| record["time"].as_f64().unwrap())
+            .collect();
+        assert!(times.is_sorted());
+        let end = records.last().unwrap();
+        assert_eq!(end["type"], "end");
+        assert_eq!(end["calls"], 1);
+        assert!(end["thought"]["tokens"].as_u64().unwrap() > 1800);
     }
 
     #[test]
