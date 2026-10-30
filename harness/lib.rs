@@ -32,7 +32,7 @@ mod log;
 use std::{
     error::Error,
     fs,
-    ops::{ControlFlow, Range},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -705,38 +705,47 @@ impl<M: LanguageModel> Harness<M> {
         let capacity = self.chat.capacity();
         let start = tail(&self.transcript, capacity / TAIL);
         let messages = messages(&self.transcript[..start], capacity / MESSAGES);
-        let mut pages = pages(&self.transcript, start, &note, capacity / PAGES);
         let environment = environment(&self.dir);
         let exchanges = start < self.transcript.len();
         let head = |pages: bool| note_turn(&environment, &note, &messages, pages, exchanges);
-        let tokens = |range: Range<usize>| -> usize {
-            self.transcript[range]
-                .iter()
-                .map(|(_, tokens)| tokens)
-                .sum()
-        };
 
         self.chat.clear();
         (self.restart)(&mut self.chat)?;
-        // The pages go only as far as leaves the conversation under the
-        // high-water mark with the system prompt, the head turn, and the
-        // tail: the oldest go first.
+        // The newest pages that fit in their budget, each as an exchange
+        // of its own. They go only as far as leaves the conversation under
+        // the high-water mark with the system prompt, the head turn, and
+        // the tail: the oldest go first.
+        let mut kept_pages = Vec::new();
+        let mut total = 0;
+        for (call, output) in pages(&self.transcript, start, &note) {
+            let reply = Turn::Reply {
+                text: String::new(),
+                calls: vec![call.to_string()],
+            };
+            let results = Turn::Results(vec![output.to_string()]);
+            let tokens = self.chat.measure(&reply)? + self.chat.measure(&results)?;
+            if total + tokens > capacity / PAGES {
+                break;
+            }
+            total += tokens;
+            kept_pages.push((reply, results, tokens));
+        }
         let room = (capacity * HIGH_WATER.0 / HIGH_WATER.1).saturating_sub(
             self.chat.tokens()
                 + self.chat.measure(&Turn::User(head(true)))?
-                + tokens(start..self.transcript.len()),
-        );
-        while pages.iter().map(|&i| tokens(i..i + 2)).sum::<usize>() > room {
-            pages.remove(0);
-        }
-        let head = head(!pages.is_empty());
-        let mut kept = vec![Turn::User(head.clone())];
-        for i in pages {
-            kept.extend(
-                self.transcript[i..i + 2]
+                + self.transcript[start..]
                     .iter()
-                    .map(|(turn, _)| turn.clone()),
-            );
+                    .map(|(_, tokens)| tokens)
+                    .sum::<usize>(),
+        );
+        while total > room {
+            let (_, _, tokens) = kept_pages.pop().expect("the pages add up to the total");
+            total -= tokens;
+        }
+        let head = head(!kept_pages.is_empty());
+        let mut kept = vec![Turn::User(head.clone())];
+        for (reply, results, _) in kept_pages.into_iter().rev() {
+            kept.extend([reply, results]);
         }
         kept.extend(
             self.transcript[start..]
@@ -812,54 +821,50 @@ fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
     kept
 }
 
-/// The exchanges among the turns before `start` in `transcript` that read
-/// a page of a file `note` names, as the indices of their replies, oldest
-/// first: each a reply with a `read` call among its calls, and the results
-/// that answer it. The newest that fit in `budget` tokens, leaving out
-/// one whose results the turns from `start` on, or a newer page, hold
-/// already.
-fn pages(transcript: &[(Turn, usize)], start: usize, note: &str, budget: usize) -> Vec<usize> {
-    let results = |i: usize| match &transcript[i].0 {
-        Turn::Results(outputs) => Some(outputs),
-        _ => None,
-    };
-    let mut seen: Vec<&Vec<String>> = (start..transcript.len()).filter_map(results).collect();
+/// The `read` calls among the turns before `start` in `transcript` that
+/// read a page of a file `note` names, each with its result, newest first:
+/// the newest of each page, and none of a page the turns from `start` on
+/// read too.
+fn pages<'a>(transcript: &'a [(Turn, usize)], start: usize, note: &str) -> Vec<(&'a str, &'a str)> {
+    let mut seen: Vec<(String, u64)> = transcript[start..]
+        .iter()
+        .filter_map(|(turn, _)| match turn {
+            Turn::Reply { calls, .. } => Some(calls),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|call| page(call))
+        .collect();
     let mut kept = Vec::new();
-    let mut total = 0;
     for i in (0..start.saturating_sub(1)).rev() {
-        let (Turn::Reply { calls, .. }, tokens) = &transcript[i] else {
+        let ((Turn::Reply { calls, .. }, _), (Turn::Results(outputs), _)) =
+            (&transcript[i], &transcript[i + 1])
+        else {
             continue;
         };
-        let Some(outputs) = results(i + 1) else {
-            continue;
-        };
-        if !calls.iter().any(|call| reads_named(call, note)) || seen.contains(&outputs) {
-            continue;
+        for (call, output) in calls.iter().zip(outputs).rev() {
+            let Some(page) = page(call) else {
+                continue;
+            };
+            if names(note, &page.0) && !seen.contains(&page) {
+                seen.push(page);
+                kept.push((call.as_str(), output.as_str()));
+            }
         }
-        let tokens = tokens + transcript[i + 1].1;
-        if total + tokens > budget {
-            break;
-        }
-        total += tokens;
-        seen.push(outputs);
-        kept.push(i);
     }
-    kept.reverse();
     kept
 }
 
-/// Whether `call`, the body of a tool call, reads a file `note` names.
-fn reads_named(call: &str, note: &str) -> bool {
-    let Ok(call) = ToolCall::parse(call) else {
-        return false;
-    };
+/// The file and the line a page starts at, if `call`, the body of a tool
+/// call, reads one.
+fn page(call: &str) -> Option<(String, u64)> {
+    let call = ToolCall::parse(call).ok()?;
     if call.name != "read" {
-        return false;
+        return None;
     }
-    let Some(path) = call.arguments.get("path").and_then(|path| path.as_str()) else {
-        return false;
-    };
-    names(note, path)
+    let path = call.arguments.get("path")?.as_str()?;
+    let start = dwim_tools::read::start(&call.arguments).unwrap_or(1).max(1);
+    Some((path.to_string(), start))
 }
 
 /// Whether `note` names the file at `path`: a word of it, of the characters
@@ -1609,45 +1614,76 @@ mod tests {
             text(), // 11
         ];
         let all = transcript.len();
-        // The newest page of each file the note names, by the path as the
-        // call gave it or its last component.
-        assert_eq!(
-            pages(&transcript, all, "edit a.rs and lib.rs", 1000),
-            [5, 9]
-        );
-        assert_eq!(pages(&transcript, all, "edit src/b/lib.rs", 1000), [5]);
-        assert_eq!(pages(&transcript, all, "edit a.rs", 1000), [9]);
-        assert_eq!(
-            pages(&transcript, all, "edit c.rs", 1000),
-            Vec::<usize>::new()
-        );
-        assert_eq!(pages(&transcript, all, "", 1000), Vec::<usize>::new());
-        // Newest first, within the budget.
-        assert_eq!(pages(&transcript, all, "a.rs lib.rs", 239), [9]);
-        assert_eq!(pages(&transcript, all, "a.rs lib.rs", 240), [5, 9]);
-        assert_eq!(
-            pages(&transcript, all, "a.rs lib.rs", 119),
-            Vec::<usize>::new()
-        );
+        let calls = |start: usize, note: &str| -> Vec<&str> {
+            pages(&transcript, start, note)
+                .into_iter()
+                .map(|(call, _)| call)
+                .collect()
+        };
+        // The newest page of each file the note names, newest first.
+        assert_eq!(calls(all, "edit a.rs and lib.rs"), [read_a, read_b]);
+        assert_eq!(calls(all, "edit src/b/lib.rs"), [read_b]);
+        assert_eq!(calls(all, "edit a.rs"), [read_a]);
+        assert_eq!(calls(all, "edit c.rs"), Vec::<&str>::new());
+        assert_eq!(calls(all, ""), Vec::<&str>::new());
         // A page the tail holds is not kept again, nor is a bash command's
         // output a page.
-        assert_eq!(pages(&transcript, 9, "a.rs lib.rs", 1000), [5]);
-        assert_eq!(pages(&transcript, 7, "a.rs lib.rs", 1000), [5]);
+        assert_eq!(calls(9, "a.rs lib.rs"), [read_b]);
+        assert_eq!(calls(7, "a.rs lib.rs"), [read_b]);
         assert_eq!(
-            pages(&transcript, 5, "a.rs lib.rs", 1000),
-            Vec::<usize>::new(),
+            calls(5, "a.rs lib.rs"),
+            Vec::<&str>::new(),
             "the tail holds a.rs's page already"
         );
+        assert_eq!(calls(0, "a.rs lib.rs"), Vec::<&str>::new());
+        assert_eq!(page(grep_a), None);
+        assert_eq!(page("not a call"), None);
+        assert_eq!(page(read_b), Some(("src/b/lib.rs".to_string(), 201)));
+    }
+
+    #[test]
+    fn keeps_a_page_apart_from_the_calls_around_it() {
+        let reply = |calls: &[&str]| {
+            (
+                Turn::Reply {
+                    text: String::new(),
+                    calls: calls.iter().map(|call| call.to_string()).collect(),
+                },
+                10,
+            )
+        };
+        let results = |outputs: &[&str]| {
+            (
+                Turn::Results(outputs.iter().map(|output| output.to_string()).collect()),
+                10,
+            )
+        };
+        let read_a = r#"{"name": "read", "arguments": {"path": "a.rs"}}"#;
+        let read_a_on = r#"{"name": "read", "arguments": {"path": "a.rs", "start": "201"}}"#;
+        let read_b = r#"{"name": "read", "arguments": {"path": "b.rs"}}"#;
+        let test = r#"{"name": "bash", "arguments": {"command": "cargo test a.rs"}}"#;
+        let transcript = vec![
+            reply(&[read_a, test, read_b]),
+            results(&["old a", "a long log", "b"]),
+            reply(&[read_a_on]),
+            results(&["a on"]),
+            reply(&[read_a]),
+            results(&["new a"]),
+        ];
+        // Only the pages of the files named come back, without the output
+        // of the calls made with them, and a page read again comes back
+        // once, newest, though what it read has changed.
         assert_eq!(
-            pages(&transcript, 0, "a.rs lib.rs", 1000),
-            Vec::<usize>::new()
+            pages(&transcript, transcript.len(), "edit a.rs"),
+            [(read_a, "new a"), (read_a_on, "a on")]
         );
-        assert!(!reads_named(grep_a, "a.rs"));
-        assert!(!reads_named(
-            "<function=read>\n<parameter=path>\n\n</parameter>\n</function>",
-            "a.rs"
-        ));
-        assert!(!reads_named("not a call", "a.rs"));
+        assert_eq!(
+            pages(&transcript, transcript.len(), "edit a.rs and b.rs"),
+            [(read_a, "new a"), (read_a_on, "a on"), (read_b, "b")]
+        );
+        // A page read in the tail is not kept from before it, whatever it
+        // was read along with.
+        assert_eq!(pages(&transcript, 4, "edit a.rs"), [(read_a_on, "a on")]);
     }
 
     #[test]
