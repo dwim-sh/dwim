@@ -731,7 +731,7 @@ impl<M: LanguageModel> Harness<M> {
             let results = Turn::Results(vec![output]);
             let tokens = self.chat.measure(&reply)? + self.chat.measure(&results)?;
             if total + tokens > capacity / PAGES {
-                break;
+                continue;
             }
             total += tokens;
             kept_pages.push((reply, results, tokens));
@@ -1575,6 +1575,24 @@ mod tests {
         assert_eq!(pages_of(&turns, "alpha.txt").len(), 0);
         assert_eq!(pages_of(&turns, "beta.txt").len(), 1);
         assert_eq!(pages_of(&turns[2..3], "beta.txt").len(), 1);
+    }
+
+    #[test]
+    fn keeps_an_older_page_that_fits_past_a_newer_one_that_does_not() {
+        let files = Files::new(&["alpha.txt", "beta.txt"]);
+        let long: String = (1..=100).map(|i| format!("beta.txt line {i}\n")).collect();
+        fs::write(files.path("beta.txt"), long).unwrap();
+        let (mut harness, _) = after_reading(
+            &files,
+            &["alpha.txt", "beta.txt"],
+            10,
+            8000,
+            "Next: edit alpha.txt and beta.txt.",
+        );
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert_eq!(pages_of(&turns, "beta.txt").len(), 0);
+        assert_eq!(pages_of(&turns[2..3], "alpha.txt").len(), 1);
     }
 
     #[test]
