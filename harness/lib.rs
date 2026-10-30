@@ -4,8 +4,8 @@
 //! A [`Harness`] wraps a [`Chat`] and reports each turn's thoughts, text,
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
 //! them as they happen. The tools are `bash`, which runs a shell command,
-//! and `read`, which reads a file a page at a time; they live in
-//! `dwim_tools`. The system prompt pushes the model to use them rather
+//! `read`, which reads a file a page at a time, and `edit`, which replaces
+//! lines of a file by their numbers; they live in `dwim_tools`. The system prompt pushes the model to use them rather
 //! than answer from memory or ask the user for a command, and carries the
 //! project's own instructions. Where the model is, and what the project
 //! looks like, go ahead of the first message instead, since a model won't
@@ -106,7 +106,7 @@ const NOTE_HEAD: &str = "The conversation so far was compacted to make room in t
 const CONTINUE: &str = "Your reply was stopped short because the context window was full, and the conversation has been compacted since. Go on from where you left off.";
 
 /// How the agent should behave: the start of the system prompt.
-const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there and a read tool that reads files, and you may use them at any time without asking.
+const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, and an edit tool that replaces lines of a file by their numbers, and you may use them at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
 - Never say you can't access files or run commands, and never ask the user which command to run: pick one yourself.
