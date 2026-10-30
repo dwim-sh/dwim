@@ -10,7 +10,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::string;
+use crate::{number, plural, string};
 
 /// Most lines in a page.
 pub const PAGE: usize = 200;
@@ -54,11 +54,25 @@ pub fn run(arguments: &Value) -> String {
 /// The `start` argument as a line number, written as a number or, as the
 /// `<function=…>` call format writes every argument, as a string.
 pub fn start(arguments: &Value) -> Option<u64> {
-    match arguments.get("start")? {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
+    number(arguments, "start")
+}
+
+/// The line `line` as a page shows it, without its line ending, cut at
+/// [`LINE`] bytes with a mark, and whether it was cut.
+pub fn shown_line(line: &[u8]) -> (String, bool) {
+    let content = line.strip_suffix(b"\n").unwrap_or(line);
+    let content = content.strip_suffix(b"\r").unwrap_or(content);
+    let mut content = String::from_utf8_lossy(content).into_owned();
+    let long = content.len() > LINE;
+    if long {
+        let end = (0..=LINE)
+            .rev()
+            .find(|&i| content.is_char_boundary(i))
+            .unwrap_or(0);
+        content.truncate(end);
+        content.push('…');
     }
+    (content, long)
 }
 
 /// The page of `file` from line `start`: its lines, each after its number
@@ -78,18 +92,7 @@ fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
         if lines < start {
             continue;
         }
-        let mut content = line.strip_suffix(b"\n").unwrap_or(&line);
-        content = content.strip_suffix(b"\r").unwrap_or(content);
-        let mut content = String::from_utf8_lossy(content).into_owned();
-        let long = content.len() > LINE;
-        if long {
-            let end = (0..=LINE)
-                .rev()
-                .find(|&i| content.is_char_boundary(i))
-                .unwrap_or(0);
-            content.truncate(end);
-            content.push('…');
-        }
+        let (content, long) = shown_line(&line);
         let entry = format!("{lines}\t{content}\n");
         if shown == PAGE || (shown > 0 && text.len() + entry.len() > BYTES) {
             // The file goes on past the page: count the rest.
@@ -145,15 +148,6 @@ fn count(file: &mut impl BufRead) -> io::Result<u64> {
         file.consume(n);
     }
     Ok(lines + u64::from(last != b'\n'))
-}
-
-/// `word`, or its plural if `n` is not one.
-fn plural(n: u64, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
-    }
 }
 
 #[cfg(test)]

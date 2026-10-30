@@ -1,10 +1,12 @@
-//! The tools the model can call: `bash`, which runs a shell command, and
-//! `read`, which gives it a file a page at a time. Each declares itself
+//! The tools the model can call: `bash`, which runs a shell command,
+//! `read`, which gives it a file a page at a time, and `edit`, which
+//! replaces lines of a file by their numbers. Each declares itself
 //! as the JSON signature the model's chat template lists, and turns a
 //! call into the text the model sees.
 
 pub mod bash;
 pub mod call;
+pub mod edit;
 pub mod read;
 
 use serde_json::Value;
@@ -14,7 +16,7 @@ pub use crate::call::ToolCall;
 
 /// The tools' signatures, one per line, as the system prompt lists them.
 pub fn signatures() -> String {
-    [bash::SIGNATURE, read::SIGNATURE].join("\n")
+    [bash::SIGNATURE, read::SIGNATURE, edit::SIGNATURE].join("\n")
 }
 
 /// The tools, with what they keep between calls.
@@ -38,13 +40,15 @@ impl Tools {
         match call.name.as_str() {
             "bash" => self.bash.run(&call.arguments),
             "read" => read::run(&call.arguments),
+            "edit" => edit::run(&call.arguments),
             name => format!("error: unknown tool '{name}'"),
         }
     }
 }
 
 /// How a call reads on screen: the command for `bash`, the file and where
-/// in it for `read`, and the arguments as written for anything else.
+/// in it for `read` and `edit`, and the arguments as written for anything
+/// else.
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" => string(&call.arguments, "command").map(str::to_string),
@@ -52,9 +56,37 @@ pub fn describe(call: &ToolCall) -> String {
             Some(start) if start > 1 => format!("{path} from line {start}"),
             _ => path.to_string(),
         }),
+        "edit" => string(&call.arguments, "path").map(|path| {
+            match (
+                number(&call.arguments, "start"),
+                number(&call.arguments, "end"),
+            ) {
+                (Some(start), Some(end)) => format!("{path} lines {start}–{end}"),
+                _ => path.to_string(),
+            }
+        }),
         _ => None,
     }
     .unwrap_or_else(|| call.arguments.to_string())
+}
+
+/// The argument `key` as a number, written as a number or, as the
+/// `<function=…>` call format writes every argument, as a string.
+fn number(arguments: &Value, key: &str) -> Option<u64> {
+    match arguments.get(key)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// `word`, or its plural if `n` is not one.
+fn plural(n: u64, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 /// The string argument `key`, if there is one.
@@ -125,15 +157,21 @@ mod tests {
             "a.rs from line 201"
         );
         assert_eq!(
+            describe(&call(
+                r#"{"name": "edit", "arguments": {"path": "a.rs", "start": 3, "end": "5"}}"#
+            )),
+            "a.rs lines 3–5"
+        );
+        assert_eq!(
             describe(&call(r#"{"name": "other", "arguments": {"x": 1}}"#)),
             r#"{"x":1}"#
         );
     }
 
     #[test]
-    fn lists_both_tools() {
+    fn lists_the_tools() {
         let signatures = signatures();
-        assert_eq!(signatures.lines().count(), 2);
+        assert_eq!(signatures.lines().count(), 3);
         for line in signatures.lines() {
             let signature: Value = serde_json::from_str(line).unwrap();
             assert_eq!(signature["type"], "function");
