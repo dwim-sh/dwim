@@ -848,8 +848,7 @@ fn pages(transcript: &[(Turn, usize)], start: usize, note: &str, budget: usize) 
     kept
 }
 
-/// Whether `call`, the body of a tool call, reads a file `note` names: by
-/// the path as the call gives it, or by its last component.
+/// Whether `call`, the body of a tool call, reads a file `note` names.
 fn reads_named(call: &str, note: &str) -> bool {
     let Ok(call) = ToolCall::parse(call) else {
         return false;
@@ -860,8 +859,27 @@ fn reads_named(call: &str, note: &str) -> bool {
     let Some(path) = call.arguments.get("path").and_then(|path| path.as_str()) else {
         return false;
     };
-    let name = Path::new(path).file_name().and_then(|name| name.to_str());
-    !path.is_empty() && (note.contains(path) || name.is_some_and(|name| note.contains(name)))
+    names(note, path)
+}
+
+/// Whether `note` names the file at `path`: a word of it, of the characters
+/// paths are written in, is the path, or a path that ends in it or that it
+/// ends in, a whole component at a time. So `harness/lib.rs` names
+/// `lib.rs` and `/src/harness/lib.rs`, but not `tools/lib.rs`, and `data.rs`
+/// does not name `a.rs`.
+fn names(note: &str, path: &str) -> bool {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let ends_in = |long: &str, end: &str| {
+        long.strip_suffix(end)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+    };
+    !path.is_empty()
+        && note
+            .split(|c: char| !c.is_alphanumeric() && !"/._-+".contains(c))
+            .map(|word| word.trim_end_matches('.'))
+            .map(|word| word.strip_prefix("./").unwrap_or(word))
+            .filter(|word| !word.is_empty())
+            .any(|word| ends_in(path, word) || ends_in(word, path))
 }
 
 /// The turn that opens a compacted conversation: where the agent is, the
@@ -1630,6 +1648,29 @@ mod tests {
             "a.rs"
         ));
         assert!(!reads_named("not a call", "a.rs"));
+    }
+
+    #[test]
+    fn names_files_by_whole_path_components() {
+        // By the path, its end, or a longer path that ends in it, wherever
+        // in the text it is written.
+        for note in [
+            "Edit harness/lib.rs.",
+            "lib.rs:12 is wrong",
+            "see `lib.rs`, then",
+            "(/src/harness/lib.rs)",
+            "./harness/lib.rs",
+        ] {
+            assert!(names(note, "harness/lib.rs"), "{note}");
+        }
+        assert!(names("Edit harness/lib.rs.", "./harness/lib.rs"));
+        // Not the same name in another directory, nor the end of a name.
+        assert!(!names("Edit harness/lib.rs.", "tools/lib.rs"));
+        assert!(!names("Edit data.rs.", "a.rs"));
+        assert!(!names("Edit a.rs.", "data.rs"));
+        assert!(!names("a b c", "x"));
+        assert!(!names("", "a.rs"));
+        assert!(!names("a.rs", ""));
     }
 
     #[test]
