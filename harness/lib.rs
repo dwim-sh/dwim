@@ -37,8 +37,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use dwim_models::{Chat, Chunk, LanguageModel, ToolCall, Turn};
-use dwim_tools::Tools;
+use dwim_models::{Chat, Chunk, LanguageModel, Turn};
+use dwim_tools::{ToolCall, Tools};
 
 pub use crate::log::Log;
 

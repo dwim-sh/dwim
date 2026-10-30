@@ -4,12 +4,13 @@
 //! call into the text the model sees.
 
 pub mod bash;
+pub mod call;
 pub mod read;
 
-use dwim_models::ToolCall;
 use serde_json::Value;
 
 use crate::bash::Bash;
+pub use crate::call::ToolCall;
 
 /// The tools' signatures, one per line, as the system prompt lists them.
 pub fn signatures() -> String {

@@ -1,8 +1,5 @@
 use std::{ops::ControlFlow, time::Instant};
 
-use serde::Deserialize;
-use serde_json::Value;
-
 use crate::{LanguageModel, Result, Sampler, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
@@ -123,57 +120,6 @@ pub enum Chunk<'a> {
     Thought(&'a str),
     /// Part of the reply itself.
     Text(&'a str),
-}
-
-/// A call the model made to a tool, as written in a `<tool_call>` block.
-#[derive(Debug, Deserialize)]
-pub struct ToolCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-impl ToolCall {
-    /// Parses the body of a `<tool_call>` block: either a JSON object with
-    /// the name and the arguments, as Qwen3 writes it, or a `<function=name>`
-    /// block of `<parameter=name>` values, as Qwen3-Coder writes it, whose
-    /// values are all strings.
-    pub fn parse(text: &str) -> Result<Self> {
-        let text = text.trim();
-        if text.starts_with('{') {
-            return Ok(serde_json::from_str(text)?);
-        }
-        let rest = text
-            .strip_prefix("<function=")
-            .ok_or("a tool call is a JSON object or a <function=...> block")?;
-        let (name, mut rest) = rest.split_once('>').ok_or("unterminated function name")?;
-        let mut arguments = serde_json::Map::new();
-        loop {
-            rest = rest.trim_start();
-            if let Some(after) = rest.strip_prefix("</function>") {
-                if !after.trim().is_empty() {
-                    return Err("text after </function>".into());
-                }
-                break;
-            }
-            let param = rest
-                .strip_prefix("<parameter=")
-                .ok_or("expected <parameter=...> or </function>")?;
-            let (key, rest_of_param) =
-                param.split_once('>').ok_or("unterminated parameter name")?;
-            let (value, after) = rest_of_param
-                .split_once("</parameter>")
-                .ok_or("unterminated parameter")?;
-            // The value sits on its own lines between the tags.
-            let value = value.strip_prefix('\n').unwrap_or(value);
-            let value = value.strip_suffix('\n').unwrap_or(value);
-            arguments.insert(key.to_string(), Value::String(value.to_string()));
-            rest = after;
-        }
-        Ok(Self {
-            name: name.to_string(),
-            arguments: Value::Object(arguments),
-        })
-    }
 }
 
 impl<M: LanguageModel> Chat<M> {
@@ -963,21 +909,11 @@ mod tests {
         let calls = chat.send("go", text(&mut reply)).unwrap();
         assert_eq!(reply.trim(), "");
         assert_eq!(calls, [format!("\n{json}\n")]);
-        let call = ToolCall::parse(&calls[0]).unwrap();
-        assert_eq!(
-            (call.name.as_str(), call.arguments["command"].as_str()),
-            ("bash", Some("ls"))
-        );
 
         let calls = chat
             .respond(&["a b\n".to_string()], text(&mut reply))
             .unwrap();
         assert_eq!(calls, [format!("\n{coder}\n")]);
-        let call = ToolCall::parse(&calls[0]).unwrap();
-        assert_eq!(
-            (call.name.as_str(), call.arguments["command"].as_str()),
-            ("bash", Some("date"))
-        );
 
         let calls = chat
             .respond(&["Mon".to_string()], text(&mut reply))

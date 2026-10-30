@@ -9,7 +9,7 @@ mod sampler;
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Chat, Chunk, Stats, Tally, ToolCall, Turn};
+pub use chat::{Chat, Chunk, Stats, Tally, Turn};
 pub use dwim_gpu::{Device, Tensor, ternary};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
