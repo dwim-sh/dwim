@@ -428,9 +428,8 @@ fn report(stdout: &Stream, stderr: &Stream, status: &str) -> String {
 mod tests {
     use std::{sync::mpsc, time::Duration};
 
-    use dwim_models::ToolCall;
-
     use super::*;
+    use crate::ToolCall;
 
     fn call(text: &str) -> ToolCall {
         ToolCall::parse(text).unwrap()
