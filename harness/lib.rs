@@ -892,7 +892,9 @@ fn names(note: &str, path: &str) -> bool {
 
 /// The turn that opens a compacted conversation: where the agent is, the
 /// note, the user's earlier messages, and whether pages the model read
-/// earlier, and the most recent exchanges, follow.
+/// earlier, and the most recent exchanges, follow. There are no pages
+/// without exchanges, as a page's read is in a reply and the last reply is
+/// always among the exchanges.
 fn note_turn(
     environment: &str,
     note: &str,
@@ -911,12 +913,11 @@ fn note_turn(
             text.push_str(&format!("\n\n<message>\n{message}\n</message>"));
         }
     }
-    text.push_str(match (pages, exchanges) {
-        (true, true) => "\n\nPages you read earlier of files the note names follow, read again just now, and then the most recent exchanges as they were.",
-        (true, false) => "\n\nPages you read earlier of files the note names follow, read again just now.",
-        (false, true) => "\n\nThe most recent exchanges follow as they were.",
-        (false, false) => "",
-    });
+    if pages {
+        text.push_str("\n\nPages you read earlier of files the note names follow, read again just now, and then the most recent exchanges as they were.");
+    } else if exchanges {
+        text.push_str("\n\nThe most recent exchanges follow as they were.");
+    }
     text
 }
 
