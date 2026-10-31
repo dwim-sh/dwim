@@ -674,8 +674,10 @@ impl<M: LanguageModel> Harness<M> {
                 &before,
                 &self.chat.stats(),
             );
-            self.record(input)?;
-            self.record(Turn::Reply {
+            // The turns read back after a compaction were counted when
+            // they were made: only the turns made now are spent.
+            self.spent += self.record(input)?;
+            self.spent += self.record(Turn::Reply {
                 text,
                 calls: calls.clone(),
             })?;
@@ -841,12 +843,11 @@ impl<M: LanguageModel> Harness<M> {
         Ok(self.chat.measure(&prompt)? + PLAN_TOKENS + FRAMING)
     }
 
-    /// Adds a turn to the transcript.
-    fn record(&mut self, turn: Turn) -> Result<(), Box<dyn Error>> {
+    /// Adds a turn to the transcript, and returns the tokens it takes.
+    fn record(&mut self, turn: Turn) -> Result<usize, Box<dyn Error>> {
         let tokens = self.chat.measure(&turn)?;
-        self.spent += tokens;
         self.transcript.push((turn, tokens));
-        Ok(())
+        Ok(tokens)
     }
 
     /// Makes room for `input`, and for `more` tokens after it, compacting
@@ -1262,6 +1263,20 @@ mod tests {
             }
         }
         assert_eq!(compactions, 1);
+    }
+
+    #[test]
+    fn a_compaction_spends_nothing() {
+        // The turns read back after a compaction were counted against the
+        // decision budget when they were made: counting them again would
+        // have the model asked for its plan right after a compaction.
+        let scripts = [reply(100, true), reply(100, false)];
+        let mut harness = harness(&scripts, 8000, "Task: go on.");
+        send(&mut harness, "go");
+        let spent = harness.spent;
+        assert!(spent > 0);
+        assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+        assert_eq!(harness.spent, spent);
     }
 
     #[test]
