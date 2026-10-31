@@ -229,6 +229,11 @@ impl Printer {
                 self.end_thought();
                 eprintln!("[compacting the conversation]");
             }
+            harness::Event::Planning => {
+                self.end_thought();
+                eprintln!("[planning the changes, then making them]");
+            }
+            harness::Event::Plan(text) => self.print(harness::Event::Text(text)),
             harness::Event::Note(text) => self.print(harness::Event::Thought(text)),
             harness::Event::Compacted { before, after } => {
                 self.end_thought();

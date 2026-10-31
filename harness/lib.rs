@@ -31,6 +31,7 @@ mod log;
 use std::{
     error::Error,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
@@ -55,7 +56,43 @@ const REPEATED: &str = "error: you just ran this, and its output is above. Don't
 
 /// Most tokens the model may think before it is made to act, unless the
 /// budget is set otherwise: the thinking budget.
-pub const THINKING_BUDGET: usize = 2048;
+pub const THINKING_BUDGET: usize = 512;
+
+/// Thoughts in a row ended at the budget, while investigating, after
+/// which the model is asked for its plan and set to acting: a thought
+/// that runs to the budget twice over the same ground is the model going
+/// round in circles, and asking for the plan ends them.
+pub const CUTS_BEFORE_PLAN: u32 = 2;
+
+/// Tokens the conversation may grow by, read and generated, without a
+/// change made to a file, before the model is asked for its plan, or to
+/// bring it up to date, and set to acting: the decision budget. Thoughts
+/// cut at their budget are one way to spend without deciding; reading
+/// page after page, each after a short thought, is the other, and this
+/// bounds both. A change starts the count over, as does a message from
+/// the user. A run that read three files whole before its first long
+/// thought had grown by about 25k tokens by then.
+pub const DECISION_BUDGET: usize = 32 << 10;
+
+/// Most tokens of a plan.
+const PLAN_TOKENS: usize = 768;
+
+/// What the model is asked for its plan with, once it has spent the
+/// decision budget, or had its thoughts cut [`CUTS_BEFORE_PLAN`] times in
+/// a row, without a change made.
+const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools: the changes to make, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
+
+/// What the model is asked with when, acting, it has spent the decision
+/// budget again without a change.
+const REPLAN_PROMPT: &str = "You have gone on for a while without changing a file. Bring the plan up to date, in plain text, without tools: what is done, and what remains as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them.";
+
+/// What the model is told once it has written its plan.
+const ACT_PROMPT: &str =
+    "Carry out the plan, one change at a time, and check the result after each.";
+
+/// How the model samples while acting: Qwen3.8's settings for replies
+/// made without thinking, where the file's are for those made with it.
+const ACT_SAMPLING: (f32, f32) = (0.7, 0.8);
 
 /// What ends a thought that runs to the thinking budget, in the model's
 /// voice, as Qwen3's own thinking budget ends one: the model then goes on
@@ -261,6 +298,10 @@ pub enum Event<'a> {
     Output(&'a str),
     /// The reply was stopped short because the context window was full.
     Cut,
+    /// The model is writing its plan, having been asked for it, which
+    /// follows in `Plan` pieces; it acts on it after.
+    Planning,
+    Plan(&'a str),
     /// The conversation is being compacted: the model is writing the note
     /// it will go on from, which follows in `Note` pieces.
     Compacting,
@@ -271,6 +312,16 @@ pub enum Event<'a> {
         before: usize,
         after: usize,
     },
+}
+
+/// What the agent is doing: investigating, with thinking, until it makes
+/// a change or its thoughts run to the budget twice; or acting, without,
+/// on what it found or planned, thinking once more only after a call
+/// fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Investigate,
+    Act,
 }
 
 /// What opens the conversation over with the system prompt, once the chat
@@ -310,6 +361,24 @@ pub struct Harness<M: LanguageModel> {
     reserve: usize,
     /// Most tokens of a thought, if they are limited.
     thinking_budget: Option<usize>,
+    /// Whether the agent is investigating or acting.
+    mode: Mode,
+    /// Thoughts in a row ended at the budget while investigating, with no
+    /// change made since.
+    cuts: u32,
+    /// Tokens the conversation has grown by since the last change to a
+    /// file, the last plan, or the user's message.
+    spent: usize,
+    /// Tokens of growth without a change before the plan is asked for.
+    decision_budget: usize,
+    /// Whether the model has written a plan this turn, so that the next
+    /// request is to bring it up to date.
+    planned: bool,
+    /// Whether the last call failed while acting, so that the next reply
+    /// is made with a thought, to find out why.
+    recover: bool,
+    /// How the model samples while investigating: the file's settings.
+    sampling: (f32, f32),
     /// The transcript of the whole session.
     log: Log,
 }
@@ -408,6 +477,13 @@ impl<M: LanguageModel> Harness<M> {
             note_tokens,
             reserve,
             thinking_budget: Some(THINKING_BUDGET),
+            mode: Mode::Investigate,
+            cuts: 0,
+            spent: 0,
+            decision_budget: DECISION_BUDGET,
+            planned: false,
+            recover: false,
+            sampling: (0.0, 0.0),
             log: Log::none(),
         })
     }
@@ -420,6 +496,13 @@ impl<M: LanguageModel> Harness<M> {
             .limit_thoughts(tokens.unwrap_or(usize::MAX), BUDGET_CLOSING);
         self.thinking_budget = tokens;
         self.log.thinking_budget(tokens);
+    }
+
+    /// Sets how many tokens the conversation may grow by without a change
+    /// made before the model is asked for its plan, [`DECISION_BUDGET`]
+    /// unless set.
+    pub fn set_decision_budget(&mut self, tokens: usize) {
+        self.decision_budget = tokens;
     }
 
     /// Most tokens of a thought, if they are limited.
@@ -492,6 +575,9 @@ impl<M: LanguageModel> Harness<M> {
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
+        self.set_mode(Mode::Investigate);
+        self.spent = 0;
+        self.planned = false;
         let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
@@ -533,6 +619,9 @@ impl<M: LanguageModel> Harness<M> {
             if !self.make_room(&fed, on_event)? {
                 return Ok(Outcome::Done);
             }
+            // Acting, the model thinks only to find out why a call failed.
+            self.chat
+                .set_thinking(self.mode == Mode::Investigate || std::mem::take(&mut self.recover));
             let mut text = String::new();
             let before = self.chat.stats();
             let calls = {
@@ -572,6 +661,16 @@ impl<M: LanguageModel> Harness<M> {
             if calls.is_empty() {
                 return Ok(Outcome::Done);
             }
+            if self.mode == Mode::Investigate {
+                self.cuts = if self.chat.thought_ended() {
+                    self.cuts + 1
+                } else {
+                    0
+                };
+            }
+            let before = fingerprint(&self.dir);
+            let mut changed = false;
+            let mut failed = false;
             let mut outputs = Vec::new();
             for call in &calls {
                 let mut seconds = None;
@@ -598,6 +697,7 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
+                            failed |= call_failed(&call.name, &output);
                             output
                         }
                     }
@@ -609,13 +709,103 @@ impl<M: LanguageModel> Harness<M> {
                 }
                 outputs.push(output);
             }
+            changed |= before.is_some() && fingerprint(&self.dir) != before;
+            if changed {
+                // A change is a decision made: the count starts over, and
+                // the model acts from here.
+                self.spent = 0;
+                self.set_mode(Mode::Act);
+            }
+            // The results count as spent, though they are recorded with the
+            // reply to them.
+            let pending = self.chat.measure(&Turn::Results(outputs.clone()))?;
+            let undecided = self.spent + pending >= self.decision_budget
+                || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN);
+            if !changed && undecided {
+                // Spent without deciding: the plan, or the plan brought up
+                // to date, and then acting on it.
+                self.chat.feed_results(&outputs)?;
+                self.record(Turn::Results(outputs))?;
+                self.plan(on_event)?;
+                self.set_mode(Mode::Act);
+                self.spent = 0;
+                input = Turn::User(ACT_PROMPT.to_string());
+                continue;
+            }
+            if self.mode == Mode::Act {
+                self.recover = failed;
+            }
             input = Turn::Results(outputs);
         }
+    }
+
+    /// Sets the agent investigating or acting: with thinking and the
+    /// file's sampling, or without thinking and with the sampling for it.
+    fn set_mode(&mut self, mode: Mode) {
+        if self.sampling == (0.0, 0.0) {
+            let sampler = self.chat.sampler();
+            self.sampling = (sampler.temperature, sampler.top_p);
+        }
+        let (temperature, top_p) = match mode {
+            Mode::Investigate => self.sampling,
+            Mode::Act => ACT_SAMPLING,
+        };
+        let sampler = self.chat.sampler_mut();
+        sampler.temperature = temperature;
+        sampler.top_p = top_p;
+        self.chat.set_thinking(mode == Mode::Investigate);
+        if mode != self.mode {
+            self.log.mode(match mode {
+                Mode::Investigate => "investigate",
+                Mode::Act => "act",
+            });
+        }
+        self.mode = mode;
+        self.cuts = 0;
+        self.recover = false;
+    }
+
+    /// Asks the model for its plan, reported as `Plan` pieces, and records
+    /// the exchange, so that the plan stays in the conversation to act on.
+    fn plan(
+        &mut self,
+        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<(), Box<dyn Error>> {
+        let prompt = if self.planned {
+            REPLAN_PROMPT
+        } else {
+            PLAN_PROMPT
+        };
+        self.planned = true;
+        self.log.user(prompt, None, self.chat.tokens());
+        let _ = on_event(Event::Planning);
+        let before = self.chat.stats();
+        let plan = self.chat.answer(prompt, PLAN_TOKENS, |chunk| {
+            let Chunk::Text(text) = chunk else {
+                return ControlFlow::Continue(());
+            };
+            self.log.stream("plan", text);
+            on_event(Event::Plan(text))
+        })?;
+        self.log.reply(
+            &[],
+            false,
+            self.chat.cut(),
+            self.chat.tokens(),
+            &before,
+            &self.chat.stats(),
+        );
+        self.record(Turn::User(prompt.to_string()))?;
+        self.record(Turn::Reply {
+            text: plan,
+            calls: Vec::new(),
+        })
     }
 
     /// Adds a turn to the transcript.
     fn record(&mut self, turn: Turn) -> Result<(), Box<dyn Error>> {
         let tokens = self.chat.measure(&turn)?;
+        self.spent += tokens;
         self.transcript.push((turn, tokens));
         Ok(())
     }
@@ -803,6 +993,52 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
     text
 }
 
+/// Whether a call to the tool `name` failed, by its `output`: an error
+/// from the tool, or a command that exited with a status other than
+/// zero.
+fn call_failed(name: &str, output: &str) -> bool {
+    output.starts_with("error:")
+        || (name == "bash"
+            && output
+                .rsplit_once("[exit code ")
+                .is_some_and(|(_, code)| !code.starts_with("0]")))
+}
+
+/// What the files of `dir` are, as a number that changes when any of
+/// them does: the changes git sees, against the index and in untracked
+/// files, with the sizes and times of the untracked ones. `None` where
+/// git cannot say.
+fn fingerprint(dir: &Path) -> Option<u64> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+    };
+    let status = git(&["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let diff = git(&["diff", "--no-color"])?;
+    let mut hasher = DefaultHasher::new();
+    status.hash(&mut hasher);
+    diff.hash(&mut hasher);
+    for line in String::from_utf8_lossy(&status).lines() {
+        if let Some(path) = line.strip_prefix("?? ")
+            && let Ok(metadata) = fs::metadata(dir.join(path))
+        {
+            metadata.len().hash(&mut hasher);
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos())
+                .hash(&mut hasher);
+        }
+    }
+    Some(hasher.finish())
+}
+
 /// The event for a piece of the model's reply.
 fn event(chunk: Chunk) -> Event {
     match chunk {
@@ -861,6 +1097,8 @@ mod tests {
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
                     Event::Cut => "cut",
+                    Event::Planning => "planning",
+                    Event::Plan(_) => "plan",
                     Event::Compacting => "compacting",
                     Event::Note(text) => {
                         note.push_str(text);
@@ -991,6 +1229,8 @@ mod tests {
         let max_len = 8000;
         let scripts: Vec<String> = (0..8).map(|_| reply(1800, false)).collect();
         let mut harness = harness(&scripts, max_len, "Task: go on.");
+        // The replies are long thoughts: not the budget's business here.
+        harness.set_thinking_budget(None);
         for i in 0..3 {
             let (events, _) = send(&mut harness, &format!("message {i}"));
             assert_eq!(events, ["thought", "text"], "{i}");
@@ -1093,6 +1333,238 @@ mod tests {
         assert!(thought.len() >= 1000);
     }
 
+    /// A reply after a thought of `thought` bytes, calling `tool` with
+    /// `argument` as its one parameter, `parameter`; with no thought at all
+    /// if `thought` is zero, as a reply made without thinking is scripted.
+    fn reply_calling(thought: usize, tool: &str, parameter: &str, argument: &str) -> String {
+        let call = format!(
+            "<tool_call>\n<function={tool}>\n<parameter={parameter}>\n{argument}\n</parameter>\n</function>\n</tool_call>"
+        );
+        if thought == 0 {
+            call
+        } else {
+            format!("{}\n</think>\n\n{call}", "x".repeat(thought))
+        }
+    }
+
+    /// A git repository of its own, for a harness to work in. The scripts
+    /// that work in it name it, as the model does: bash runs where the
+    /// process does.
+    fn repo() -> PathBuf {
+        static REPOS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = REPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dwim-modes-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        dir
+    }
+
+    /// A harness around a scripted model working in `dir`, under a budget
+    /// of 100, keeping a log at `path`. `DIR` in a script stands for the
+    /// directory.
+    fn harness_in(dir: &Path, scripts: &[String], path: &Path) -> Harness<Scripted> {
+        let at = dir.display().to_string();
+        let scripts: Vec<String> = scripts.iter().map(|s| s.replace("DIR", &at)).collect();
+        let tokenizer = Tokenizer::tiny();
+        let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+        let model = Scripted::new(&tokenizer, &scripts, 100_000);
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(1.0, 1, 0.95, 0.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let mut harness =
+            Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap();
+        harness.set_thinking_budget(Some(100));
+        harness.keep_log(Log::create(path).unwrap(), "tiny", "cpu", "Be brief.");
+        harness
+    }
+
+    /// The replies of the log at `path`, as thought tokens and whether the
+    /// thought was ended at the budget, and the modes it records.
+    fn replies_and_modes(path: &Path) -> (Vec<(u64, bool)>, Vec<String>) {
+        let records = records(path);
+        let replies = records
+            .iter()
+            .filter(|record| record["type"] == "reply")
+            .map(|reply| {
+                (
+                    reply["thought_tokens"].as_u64().unwrap(),
+                    reply["thought_ended"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let modes = records
+            .iter()
+            .filter(|record| record["type"] == "mode")
+            .map(|record| record["mode"].as_str().unwrap().to_string())
+            .collect();
+        (replies, modes)
+    }
+
+    #[test]
+    fn plans_after_two_cut_thoughts_and_then_acts() {
+        // Two thoughts in a row run over the budget with nothing changed:
+        // the model is asked for its plan, which it writes without
+        // thinking, and acts from then on without thinking, with the
+        // sampling for it; a thought that ran over once, then ended by
+        // itself, would not have done it.
+        let path = std::env::temp_dir().join(format!("dwim-plans-{}.jsonl", std::process::id()));
+        let scripts = [
+            reply_calling(1000, "bash", "command", "echo looked"),
+            reply_calling(1000, "bash", "command", "echo looked again"),
+            "1. a.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "echo made > DIR/a.txt"),
+            "Done.".to_string(),
+        ];
+        let dir = repo();
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let (events, _) = send(&mut harness, "go");
+        assert_eq!(
+            events,
+            [
+                "thought", "text", "call", "output", "thought", "text", "call", "output",
+                "planning", "plan", "call", "output", "text"
+            ],
+            "{events:?}"
+        );
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert!(
+            turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT)),
+            "the plan prompt is in the transcript"
+        );
+        assert!(
+            turns.iter().any(|turn| matches!(turn, Turn::Reply { text, calls } if text.contains("1. a.txt") && calls.is_empty())),
+            "and so is the plan"
+        );
+        assert!(
+            turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User(m) if m == ACT_PROMPT)),
+            "and the word to act"
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
+        assert_eq!(harness.chat.sampler().temperature, ACT_SAMPLING.0);
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act"], "{modes:?}");
+        assert_eq!(replies.len(), 5, "{replies:?}");
+        assert!(replies[0].1 && replies[1].1, "two cuts: {replies:?}");
+        assert_eq!(
+            replies[2].0, 0,
+            "the plan is written without thinking: {replies:?}"
+        );
+        assert_eq!(replies[3].0, 0, "and the model acts without: {replies:?}");
+        assert_eq!(replies[4].0, 0, "{replies:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plans_once_the_decision_budget_is_spent_and_again_while_acting() {
+        // Short thoughts, each followed by a read of a long file, spend
+        // the decision budget without a change: the plan is asked for and
+        // the model acts. Acting, reads that spend it again get the plan
+        // brought up to date; a change starts the count over.
+        let path = std::env::temp_dir().join(format!("dwim-spent-{}.jsonl", std::process::id()));
+        let dir = repo();
+        fs::write(dir.join("big.txt"), "y".repeat(1500)).unwrap();
+        // Each read differs, or the second would be refused as repeated.
+        let scripts = [
+            reply_calling(20, "bash", "command", "cat DIR/big.txt; echo 1"),
+            reply_calling(20, "bash", "command", "cat DIR/big.txt; echo 2"),
+            "1. a.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "cat DIR/big.txt; echo 3"),
+            reply_calling(0, "bash", "command", "cat DIR/big.txt; echo 4"),
+            "Done, what remains: 1. a.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "echo made > DIR/a.txt"),
+            "Done.".to_string(),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        // Two reads of 1500 bytes, under a budget of 2000 tokens of growth.
+        harness.set_decision_budget(2000);
+        let (events, _) = send(&mut harness, "go");
+        assert_eq!(
+            events,
+            [
+                "thought", "text", "call", "output", "thought", "text", "call", "output",
+                "planning", "plan", "call", "output", "call", "output", "planning", "plan", "call",
+                "output", "text"
+            ],
+            "{events:?}"
+        );
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT))
+                .count(),
+            1
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(m) if m == REPLAN_PROMPT))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act"], "{modes:?}");
+        assert!(
+            replies[0].0 > 0 && !replies[0].1 && replies[1].0 > 0 && !replies[1].1,
+            "short thoughts, not cut: {replies:?}"
+        );
+        assert!(
+            replies[2..].iter().all(|&(thought, _)| thought == 0),
+            "none after: {replies:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn acts_once_the_model_changes_a_file_and_thinks_again_after_a_failure() {
+        // The model changes a file while investigating: it acts from then
+        // on, without thinking, until a command fails, which gets it one
+        // thought, and then without again. The next message has it
+        // investigate again, with the file's sampling.
+        let path = std::env::temp_dir().join(format!("dwim-acts-{}.jsonl", std::process::id()));
+        let scripts = [
+            reply_calling(20, "bash", "command", "echo made > DIR/a.txt"),
+            reply_calling(0, "bash", "command", "false"),
+            reply_calling(30, "bash", "command", "cat DIR/a.txt"),
+            "Done.".to_string(),
+            reply_calling(20, "bash", "command", "echo ok"),
+            "Ok.".to_string(),
+        ];
+        let dir = repo();
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let investigating = harness.chat.sampler().temperature;
+        send(&mut harness, "go");
+        assert_eq!(harness.chat.sampler().temperature, ACT_SAMPLING.0);
+        send(&mut harness, "again");
+        assert_eq!(harness.chat.sampler().temperature, investigating);
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act", "investigate"], "{modes:?}");
+        assert_eq!(replies.len(), 6, "{replies:?}");
+        assert!(replies[0].0 > 0 && !replies[0].1, "{replies:?}");
+        assert_eq!(replies[1].0, 0, "acting, no thought: {replies:?}");
+        assert!(replies[2].0 > 0, "a thought after the failure: {replies:?}");
+        assert_eq!(replies[3].0, 0, "then none again: {replies:?}");
+        assert!(
+            replies[4].0 > 0,
+            "investigating again on the next message: {replies:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn logs_the_whole_session() {
         // A call and its result, then replies of 1800 tokens until one is
@@ -1100,6 +1572,9 @@ mod tests {
         let mut scripts = vec![reply(100, true), reply(100, false)];
         scripts.extend((0..8).map(|_| reply(1800, false)));
         let mut harness = harness(&scripts, 8000, "Task: go on.");
+        // The long thoughts are to be stopped short for room, not ended
+        // at the budget.
+        harness.set_thinking_budget(None);
         let path = std::env::temp_dir().join(format!("dwim-log-{}.jsonl", std::process::id()));
         harness.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
         for i in 0..5 {
@@ -1121,7 +1596,7 @@ mod tests {
         );
         assert_eq!(records[0]["model"], "tiny");
         assert_eq!(records[0]["system"], "Be brief.");
-        assert_eq!(records[0]["thinking_budget"], THINKING_BUDGET);
+        assert!(records[0]["thinking_budget"].is_null());
         assert_eq!(records[0]["device"], "cpu");
         assert_eq!(records[0]["temperature"], 0.0);
         assert_eq!(records[0]["top_k"], 1);

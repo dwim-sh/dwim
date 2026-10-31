@@ -206,6 +206,11 @@ impl Log {
         );
     }
 
+    /// Records that the agent is now investigating or acting.
+    pub fn mode(&mut self, mode: &str) {
+        self.write("mode", json!({ "mode": mode }));
+    }
+
     /// Records that the most tokens of a thought are now `tokens`, or that
     /// they are no longer limited.
     pub fn thinking_budget(&mut self, tokens: Option<usize>) {

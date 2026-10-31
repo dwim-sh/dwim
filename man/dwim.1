@@ -69,13 +69,24 @@ Show the model's thinking in the shell from the start, as
 does.
 .TP
 .BI \-\-thinking\-budget " tokens"
-Most tokens the model may think before it is made to act (default: 2048;
+Most tokens the model may think before it is made to act (default: 512;
 0 for no limit).
 A thought that runs to the budget is ended with a sentence in the model's
 own voice, as the model's makers end one, and the model goes on to run a
 command or reply from what it has thought so far: left to itself, it
 tends to go over what it has found again and again instead of acting on
 it.
+The agent investigates with thinking, and acts without: it thinks until
+it changes a file, or until it has spent its decision budget, 32k tokens
+of the conversation read and written with nothing changed, or until two
+thoughts in a row run to the budget with nothing changed, when it is
+asked to write its plan, the changes to make and what to run to check
+them, and then to carry it out. From then on its replies are made
+without thinking, and with the model's sampling for such replies, until
+a command fails, which gets it one thought to find out why, or until the
+next message, which has it investigate again. Acting, another 32k tokens
+without a change has it bring the plan up to date and go on; a change
+starts the count over.
 .TP
 .BI \-\-transcript " file"
 Write the session's transcript to

@@ -49,6 +49,10 @@ pub struct Chat<M: LanguageModel> {
     thought_ended: bool,
     /// Most tokens a thought may run to, and what closes it there.
     thought_limit: Option<(usize, String)>,
+    /// Whether replies are made with thinking: opened with the thought
+    /// open for the model, or with it closed at once, as the template
+    /// opens a reply made without thinking.
+    thinking: bool,
     /// Tokens it takes to end a reply, at most.
     ending: usize,
     im_start: u32,
@@ -146,6 +150,7 @@ impl<M: LanguageModel> Chat<M> {
             cut: false,
             thought_ended: false,
             thought_limit: None,
+            thinking: true,
             stats: Stats::default(),
         })
     }
@@ -240,6 +245,26 @@ impl<M: LanguageModel> Chat<M> {
     /// goes on to act or reply instead of thinking in circles.
     pub fn limit_thoughts(&mut self, tokens: usize, closing: &str) {
         self.thought_limit = Some((tokens, closing.to_string()));
+    }
+
+    /// Has replies made with thinking, or without: the template opens a
+    /// reply made without thinking with the thought closed at once, and
+    /// the model goes straight to its reply or its calls.
+    pub fn set_thinking(&mut self, thinking: bool) {
+        self.thinking = thinking;
+    }
+
+    /// The sampler, to be set.
+    pub fn sampler_mut(&mut self) -> &mut Sampler {
+        &mut self.sampler
+    }
+
+    /// Feeds the results of the tool calls the last reply made, in order,
+    /// each in a `<tool_response>` block as text, without a reply: a
+    /// message follows.
+    pub fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
+        let turn = self.results(outputs)?;
+        self.feed(&turn, Kind::Prompt).map(|_| ())
     }
 
     /// Whether the last reply was stopped short because the context was
@@ -416,18 +441,25 @@ impl<M: LanguageModel> Chat<M> {
         &mut self,
         mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Vec<String>> {
-        // The template opens the thought for the model.
+        // The template opens the thought for the model, or opens and
+        // closes it when the reply is to be made without thinking.
         let mut prompt = vec![self.im_start];
         prompt.extend(self.tokenizer.encode("assistant\n")?);
         prompt.push(self.think);
-        prompt.extend(self.tokenizer.encode("\n")?);
+        if self.thinking {
+            prompt.extend(self.tokenizer.encode("\n")?);
+        } else {
+            prompt.extend(self.tokenizer.encode("\n\n")?);
+            prompt.push(self.think_end);
+            prompt.extend(self.tokenizer.encode("\n\n")?);
+        }
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
         // Whether the model is inside its <think> block, and the tokens of
         // the thought so far.
-        let mut thinking = true;
+        let mut thinking = self.thinking;
         let mut thought = 0;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;

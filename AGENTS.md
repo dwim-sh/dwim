@@ -11,7 +11,8 @@ runs it, in one program.
   on a device, `chat` is the conversation around it.
 * `harness/`: the agent around the model: the system prompt (which includes
   this file), the tool loop, compaction near the end of the context, the
-  thinking budget, and the session transcript.
+  thinking budget and the two modes it bounds (investigating with thinking,
+  then planning and acting without), and the session transcript.
 * `tools/`: the tools, one file each, and `call`, which parses a call as the
   model writes it.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,
