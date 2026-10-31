@@ -45,7 +45,7 @@ pub fn run(arguments: &Value) -> String {
     };
     let start = match arguments.get("start") {
         None => None,
-        Some(_) => match start(arguments) {
+        Some(_) => match number(arguments, "start") {
             Some(start) => Some(start.max(1)),
             None => return "error: 'start' is a line number".to_string(),
         },
@@ -75,12 +75,6 @@ pub fn run(arguments: &Value) -> String {
         Ok(text) => text,
         Err(e) => format!("error: reading {path}: {e}"),
     }
-}
-
-/// The `start` argument as a line number, written as a number or, as the
-/// `<function=…>` call format writes every argument, as a string.
-pub fn start(arguments: &Value) -> Option<u64> {
-    number(arguments, "start")
 }
 
 /// The line `line` as a page shows it, without its line ending, cut at

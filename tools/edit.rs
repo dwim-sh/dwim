@@ -147,14 +147,16 @@ enum Tier {
 /// Where `wanted` begins in `lines`, as indexes from zero, at the closest
 /// tier that matches it anywhere.
 fn find(lines: &[&[u8]], wanted: &[&str]) -> Vec<usize> {
+    if wanted.len() > lines.len() {
+        return Vec::new();
+    }
     for tier in [Tier::Exact, Tier::TrailingSpace, Tier::Trimmed] {
-        let found: Vec<usize> = (0..=lines.len().saturating_sub(wanted.len()))
+        let found: Vec<usize> = (0..=lines.len() - wanted.len())
             .filter(|&at| {
-                wanted.len() <= lines.len() - at
-                    && wanted
-                        .iter()
-                        .enumerate()
-                        .all(|(k, want)| matches(want, lines[at + k], tier))
+                wanted
+                    .iter()
+                    .enumerate()
+                    .all(|(k, want)| matches(want, lines[at + k], tier))
             })
             .collect();
         if !found.is_empty() {

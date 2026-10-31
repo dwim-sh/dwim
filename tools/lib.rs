@@ -52,10 +52,12 @@ impl Tools {
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" => string(&call.arguments, "command").map(str::to_string),
-        "read" => string(&call.arguments, "path").map(|path| match read::start(&call.arguments) {
-            Some(start) if start > 1 => format!("{path} from line {start}"),
-            _ => path.to_string(),
-        }),
+        "read" => {
+            string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
+                Some(start) if start > 1 => format!("{path} from line {start}"),
+                _ => path.to_string(),
+            })
+        }
         "edit" => {
             string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
                 Some(start) => format!("{path} at line {start}"),
