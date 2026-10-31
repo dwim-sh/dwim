@@ -996,7 +996,8 @@ fn tail(transcript: &[(Turn, usize)], budget: usize) -> usize {
 
 /// The user's own messages among `turns`, oldest first, as many of the
 /// most recent as fit in `budget` tokens: not the notes of earlier
-/// compactions, nor the prompts to go on after a reply was cut.
+/// compactions, nor the prompts to go on after a reply was cut, nor
+/// those for the plan and to act on it.
 fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
     let mut kept = Vec::new();
     let mut total = 0;
@@ -1928,6 +1929,10 @@ mod tests {
             reply(10),
             (Turn::User(format!("# Environment\n\n{NOTE_HEAD} x")), 10),
             user(2),
+            (Turn::User(PLAN_PROMPT.to_string()), 10),
+            reply(10),
+            (Turn::User(ACT_PROMPT.to_string()), 10),
+            (Turn::User(REPLAN_PROMPT.to_string()), 10),
             user(3),
         ];
         assert_eq!(
