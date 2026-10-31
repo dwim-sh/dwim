@@ -77,12 +77,16 @@ pub fn run(arguments: &Value) -> String {
     }
 }
 
+/// The line `line` without its ending, whether that is `\n` or `\r\n`.
+pub fn content(line: &[u8]) -> &[u8] {
+    let content = line.strip_suffix(b"\n").unwrap_or(line);
+    content.strip_suffix(b"\r").unwrap_or(content)
+}
+
 /// The line `line` as a page shows it, without its line ending, cut at
 /// [`LINE`] bytes with a mark, and whether it was cut.
 pub fn shown_line(line: &[u8]) -> (String, bool) {
-    let content = line.strip_suffix(b"\n").unwrap_or(line);
-    let content = content.strip_suffix(b"\r").unwrap_or(content);
-    let mut content = String::from_utf8_lossy(content).into_owned();
+    let mut content = String::from_utf8_lossy(content(line)).into_owned();
     let long = content.len() > LINE;
     if long {
         let end = (0..=LINE)

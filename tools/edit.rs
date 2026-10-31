@@ -11,7 +11,7 @@
 //! the file back after each to see that it took: this is that, as a tool,
 //! with the reading back in the result.
 
-use std::fs;
+use std::{borrow::Cow, fs};
 
 use serde_json::Value;
 
@@ -56,8 +56,12 @@ pub fn run(arguments: &Value) -> String {
     };
     let lines: Vec<&[u8]> = content.split_inclusive(|&byte| byte == b'\n').collect();
     let count = lines.len();
+    let texts: Vec<Cow<str>> = lines
+        .iter()
+        .map(|line| String::from_utf8_lossy(read::content(line)))
+        .collect();
     let wanted = split(old);
-    let found = find(&lines, &wanted);
+    let found = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
         ([], _) => {
             let around = match start {
@@ -144,9 +148,10 @@ enum Tier {
     Trimmed,
 }
 
-/// Where `wanted` begins in `lines`, as indexes from zero, at the closest
-/// tier that matches it anywhere.
-fn find(lines: &[&[u8]], wanted: &[&str]) -> Vec<usize> {
+/// Where `wanted` begins in `lines`, the lines of the file without their
+/// endings, as indexes from zero, at the closest tier that matches it
+/// anywhere.
+fn find(lines: &[Cow<str>], wanted: &[&str]) -> Vec<usize> {
     if wanted.len() > lines.len() {
         return Vec::new();
     }
@@ -156,7 +161,7 @@ fn find(lines: &[&[u8]], wanted: &[&str]) -> Vec<usize> {
                 wanted
                     .iter()
                     .enumerate()
-                    .all(|(k, want)| matches(want, lines[at + k], tier))
+                    .all(|(k, want)| matches(want, &lines[at + k], tier))
             })
             .collect();
         if !found.is_empty() {
@@ -167,12 +172,9 @@ fn find(lines: &[&[u8]], wanted: &[&str]) -> Vec<usize> {
 }
 
 /// Whether `want`, a line as the model gives it, is `line`, a line of the
-/// file with its ending, at `tier`; or its start, if `want` is a line
+/// file without its ending, at `tier`; or its start, if `want` is a line
 /// `read` cut.
-fn matches(want: &str, line: &[u8], tier: Tier) -> bool {
-    let line = String::from_utf8_lossy(line);
-    let line = line.strip_suffix('\n').unwrap_or(&line);
-    let line = line.strip_suffix('\r').unwrap_or(line);
+fn matches(want: &str, line: &str, tier: Tier) -> bool {
     let (want, line) = match tier {
         Tier::Exact => (want, line),
         Tier::TrailingSpace => (want.trim_end(), line.trim_end()),
