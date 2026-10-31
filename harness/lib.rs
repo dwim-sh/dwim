@@ -703,7 +703,7 @@ impl<M: LanguageModel> Harness<M> {
             let mut outputs = Vec::new();
             for call in &calls {
                 let mut seconds = None;
-                let output = match ToolCall::parse(call) {
+                let (name, output) = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = dwim_tools::describe(&call);
                         self.log.call(&call.name, &detail);
@@ -716,7 +716,7 @@ impl<M: LanguageModel> Harness<M> {
                             return Ok(Outcome::Done);
                         }
                         let this = Some((call.name.clone(), call.arguments.to_string()));
-                        if this == last {
+                        let output = if this == last {
                             REPEATED.to_string()
                         } else {
                             last = this;
@@ -726,12 +726,13 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            failed |= call_failed(&call.name, &output);
                             output
-                        }
+                        };
+                        (call.name, output)
                     }
-                    Err(e) => format!("error: malformed tool call: {e}"),
+                    Err(e) => (String::new(), format!("error: malformed tool call: {e}")),
                 };
+                failed |= call_failed(&name, &output);
                 self.log.output(&output, seconds);
                 if on_event(Event::Output(&output)).is_break() {
                     return Ok(Outcome::Done);
@@ -1041,15 +1042,12 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
     text
 }
 
-/// Whether a call to the tool `name` failed, by its `output`: an error
-/// from the tool, or a command that exited with a status other than
-/// zero.
+/// Whether a call to the tool `name` failed, by its `output`: an error,
+/// from the tool or from the harness, as a malformed or a repeated call
+/// gets; or a command that did not exit with status zero, one killed by
+/// a signal included.
 fn call_failed(name: &str, output: &str) -> bool {
-    output.starts_with("error:")
-        || (name == "bash"
-            && output
-                .rsplit_once("[exit code ")
-                .is_some_and(|(_, code)| !code.starts_with("0]")))
+    output.starts_with("error:") || (name == "bash" && !output.ends_with("[exit code 0]"))
 }
 
 /// What the files of `dir` are, as a number that changes when any of
@@ -1945,6 +1943,20 @@ mod tests {
             "the newest that fit"
         );
         assert_eq!(messages(&turns, 5), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn tells_a_failed_call() {
+        assert!(!call_failed("bash", "ok\n[exit code 0]"));
+        assert!(call_failed("bash", "[exit code 1]"));
+        assert!(call_failed("bash", "boom\n[killed by signal 11 (SIGSEGV)]"));
+        assert!(call_failed("bash", "error: bash is not available"));
+        assert!(call_failed("", "error: malformed tool call: no function"));
+        assert!(call_failed("read", REPEATED));
+        assert!(!call_failed(
+            "read",
+            "1\tfn main() {}\n[lines 1–1 of 1 in a.rs; end of file]"
+        ));
     }
 
     #[test]
