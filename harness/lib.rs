@@ -31,6 +31,7 @@ mod log;
 use std::{
     error::Error,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
@@ -58,9 +59,21 @@ const REPEATED: &str = "error: you just ran this, and its output is above. Don't
 pub const THINKING_BUDGET: usize = 2048;
 
 /// What ends a thought that runs to the thinking budget, in the model's
-/// voice, as Qwen3's own thinking budget ends one: the model then goes on
-/// to call a tool or reply from what it has thought so far.
-const BUDGET_CLOSING: &str = "Considering the limited time by the user, I have to give the solution based on the thinking directly now.";
+/// voice, as Qwen3's own thinking budget ends one, but committing to a
+/// choice rather than asking for a solution: a thought runs over the
+/// budget while weighing alternatives, with no solution chosen, and told
+/// to give the solution the model went to check one more thing instead
+/// and then weighed the alternatives again from the start. Four such laps
+/// in a row on one run, each cut at the budget and each ending in a read.
+const BUDGET_CLOSING: &str = "I have thought about this long enough: I'll go with what I have and do the next step now rather than weigh it further.";
+
+/// What a call gets instead of its output while the gate is up: after a
+/// thought has run to the budget, the next call has to change a file, and
+/// until one does, a read is not run and a command that changed nothing
+/// gets this for its output. Told only to act, the model went to check
+/// one more thing every time; told that checking does not count, it has
+/// nothing left to do but the change.
+const GATED: &str = "error: not run. Your last thought ran to the budget, and after that the next call must change a file. You have read what you need: make the change now, with bash, and check it after.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -305,6 +318,11 @@ pub struct Harness<M: LanguageModel> {
     restart: Restart<M>,
     /// Most tokens of a note.
     note_tokens: usize,
+    /// The working directory as it stood when the last thought ran to the
+    /// budget, if no call has changed it since: while it is set, a call
+    /// that changes nothing gets [`GATED`] for its output. `Some(None)` in
+    /// a directory whose changes cannot be told, which gates reads alone.
+    gate: Option<Option<u64>>,
     /// Tokens kept free past every reply: room for the note prompt and
     /// the note.
     reserve: usize,
@@ -406,6 +424,7 @@ impl<M: LanguageModel> Harness<M> {
             transcript: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
+            gate: None,
             reserve,
             thinking_budget: Some(THINKING_BUDGET),
             log: Log::none(),
@@ -492,6 +511,7 @@ impl<M: LanguageModel> Harness<M> {
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
+        self.gate = None;
         let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
@@ -572,6 +592,9 @@ impl<M: LanguageModel> Harness<M> {
             if calls.is_empty() {
                 return Ok(Outcome::Done);
             }
+            if self.chat.thought_ended() && self.gate.is_none() {
+                self.gate = Some(fingerprint(&self.dir));
+            }
             let mut outputs = Vec::new();
             for call in &calls {
                 let mut seconds = None;
@@ -590,6 +613,8 @@ impl<M: LanguageModel> Harness<M> {
                         let this = Some((call.name.clone(), call.arguments.to_string()));
                         if this == last {
                             REPEATED.to_string()
+                        } else if self.gate.is_some() && call.name == "read" {
+                            GATED.to_string()
                         } else {
                             last = this;
                             let start = Instant::now();
@@ -598,7 +623,17 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            output
+                            match self.gate {
+                                // The gate is lifted by a change, or by a
+                                // command where changes cannot be told.
+                                Some(Some(before)) if fingerprint(&self.dir) == Some(before) => {
+                                    GATED.to_string()
+                                }
+                                _ => {
+                                    self.gate = None;
+                                    output
+                                }
+                            }
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
@@ -801,6 +836,41 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
         text.push_str("\n\nThe most recent exchanges follow as they were.");
     }
     text
+}
+
+/// What the files of `dir` are, as a number that changes when any of
+/// them does: the changes git sees, against the index and in untracked
+/// files, with the sizes and times of the untracked ones. `None` where
+/// git cannot say.
+fn fingerprint(dir: &Path) -> Option<u64> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+    };
+    let status = git(&["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let diff = git(&["diff", "--no-color"])?;
+    let mut hasher = DefaultHasher::new();
+    status.hash(&mut hasher);
+    diff.hash(&mut hasher);
+    for line in String::from_utf8_lossy(&status).lines() {
+        if let Some(path) = line.strip_prefix("?? ")
+            && let Ok(metadata) = fs::metadata(dir.join(path))
+        {
+            metadata.len().hash(&mut hasher);
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos())
+                .hash(&mut hasher);
+        }
+    }
+    Some(hasher.finish())
 }
 
 /// The event for a piece of the model's reply.
@@ -1091,6 +1161,90 @@ mod tests {
         .unwrap();
         assert!(!thought.contains(BUDGET_CLOSING));
         assert!(thought.len() >= 1000);
+    }
+
+    /// A reply after a thought of `thought` bytes, calling `tool` with
+    /// `argument` as its one parameter, `parameter`.
+    fn reply_calling(thought: usize, tool: &str, parameter: &str, argument: &str) -> String {
+        format!(
+            "{}\n</think>\n\n<tool_call>\n<function={tool}>\n<parameter={parameter}>\n{argument}\n</parameter>\n</function>\n</tool_call>",
+            "x".repeat(thought)
+        )
+    }
+
+    #[test]
+    fn gates_calls_after_a_cut_thought_until_one_changes_a_file() {
+        // In a git repository of its own, under a budget of 100: a thought
+        // of 1000 runs over it, and the call after it changes nothing, so
+        // it gets the gate; the next thought runs over too, and its call
+        // writes a file, which lifts the gate; the thought after that ends
+        // by itself, and its call runs as usual.
+        let dir = std::env::temp_dir().join(format!("dwim-gate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(dir.join("old.txt"), "old\n").unwrap();
+        // The commands name the directory, as the model does when it
+        // works in one: bash runs where the process does.
+        let at = dir.display();
+        let scripts = [
+            reply_calling(1000, "bash", "command", "echo looked"),
+            reply_calling(1000, "read", "path", &format!("{at}/old.txt")),
+            reply_calling(
+                1000,
+                "bash",
+                "command",
+                &format!("echo made > {at}/new.txt"),
+            ),
+            reply_calling(10, "bash", "command", &format!("cat {at}/new.txt")),
+            reply(10, false),
+        ];
+        let tokenizer = Tokenizer::tiny();
+        let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+        let model = Scripted::new(&tokenizer, &scripts, 100_000);
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let mut harness =
+            Harness::new(chat, &dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap();
+        harness.set_thinking_budget(Some(100));
+        let mut outputs = Vec::new();
+        harness
+            .send("go", |event| {
+                if let Event::Output(output) = event {
+                    outputs.push(output.to_string());
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(outputs.len(), 4, "{outputs:?}");
+        assert_eq!(outputs[0], GATED, "a call that changed nothing");
+        assert!(
+            outputs[0].contains("must change a file"),
+            "the gate says what lifts it"
+        );
+        assert!(
+            outputs[1].starts_with("error: not run"),
+            "read is not run while gated: {}",
+            outputs[1]
+        );
+        assert!(
+            outputs[2].ends_with("[exit code 0]"),
+            "a call that changed a file runs as usual: {}",
+            outputs[2]
+        );
+        assert!(
+            outputs[3].starts_with("made\n"),
+            "the gate is down after a thought that ended by itself: {}",
+            outputs[3]
+        );
+        assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "made\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
