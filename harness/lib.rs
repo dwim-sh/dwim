@@ -73,7 +73,7 @@ const BUDGET_CLOSING: &str = "I have thought about this long enough: I'll go wit
 /// gets this for its output. Told only to act, the model went to check
 /// one more thing every time; told that checking does not count, it has
 /// nothing left to do but the change.
-const GATED: &str = "error: not run. Your last thought ran to the budget, and after that the next call must change a file. You have read what you need: make the change now, with edit or bash, and check it after.";
+const GATED: &str = "Not run, by the rule in your instructions: your last thought ran to its budget, so your next call must change a file. Nothing else runs until one does, and nothing is wrong with the tools. Make the change now, with edit, or with a bash command that writes a file, and check it after.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -115,6 +115,7 @@ const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user
 - To read a file, use read, not cat. A long file read without a start line comes as an outline, its definitions with their line numbers: pick the line you need and read from it, a page of up to 200 numbered lines that says where the next page starts. Read a file whole only when you need all of it.
 - If a command fails, read the error and try another way. A command's result ends with its exit code, and what it printed to standard error comes after a `[stderr]` line.
 - When a command prints more than fits, the result shows the start and the end of its output and names a file that holds all of it, with the line to read it from: use read on that file instead of running the command again.
+- A thought that runs to its budget is ended for you, and after one the next call must change a file: a read is not run, nor a command that changes nothing, until a call does change a file. That is a rule, not a fault: make the change you have planned, with edit or with bash, and check it after.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
@@ -1254,7 +1255,7 @@ mod tests {
             "the gate says what lifts it"
         );
         assert!(
-            outputs[1].starts_with("error: not run"),
+            outputs[1].starts_with("Not run, by the rule"),
             "read is not run while gated: {}",
             outputs[1]
         );

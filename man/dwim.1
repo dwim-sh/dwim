@@ -77,10 +77,12 @@ has, and the model goes on to run a command or reply from what it has
 thought so far: left to itself, it tends to go over what it has found
 again and again instead of acting on it.
 After such a thought the next command must change a file: a read is not
-run, and a command that changes nothing gets an error saying so in place
+run, and a command that changes nothing gets a note saying so in place
 of its output, until one does change a file or you send a message; and
 the reply after a refused command is made without thinking, so that the
 model acts on the change it has planned rather than plan it again.
+The system prompt states the rule, so that the model takes a refusal
+for the rule and not for a fault in its tools.
 Told only to act, the model went to check one more thing every time and
 then weighed its choices again from the start.
 .TP
