@@ -5,7 +5,8 @@
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
 //! them as they happen. The tools are `bash`, which runs a shell command,
 //! `read`, which reads a file a page at a time, and `edit`, which replaces
-//! lines of a file by their numbers; they live in `dwim_tools`. The system prompt pushes the model to use them rather
+//! a string in a file and shows the lines as they now stand; they live in
+//! `dwim_tools`. The system prompt pushes the model to use them rather
 //! than answer from memory or ask the user for a command, and carries the
 //! project's own instructions. Where the model is, and what the project
 //! looks like, go ahead of the first message instead, since a model won't
