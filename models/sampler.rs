@@ -1,21 +1,24 @@
 /// Picks the next token from a model's logits: from the `top_k` most likely
 /// tokens, then the smallest set of those whose probability reaches `top_p`,
-/// at `temperature`. A temperature of zero always picks the most likely token.
+/// leaving out any less than `min_p` times as likely as the most likely, at
+/// `temperature`. A temperature of zero always picks the most likely token.
 pub struct Sampler {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    pub min_p: f32,
     /// What the random numbers it samples with started from.
     pub seed: u64,
     rng: Rng,
 }
 
 impl Sampler {
-    pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Self {
+    pub fn new(temperature: f32, top_k: usize, top_p: f32, min_p: f32, seed: u64) -> Self {
         Self {
             temperature,
             top_k,
             top_p,
+            min_p,
             seed,
             rng: Rng(seed.max(1)),
         }
@@ -48,10 +51,15 @@ impl Sampler {
             *p /= sum;
         }
 
-        // Keep the most likely tokens up to a total probability of top_p.
+        // Keep the most likely tokens up to a total probability of top_p,
+        // and none less than min_p times as likely as the most likely: the
+        // cut scales with how sure the model is, where top_p at a flat
+        // distribution keeps a long tail of unlikely tokens. The most likely
+        // is always kept.
+        let floor = self.min_p * probs[0];
         let mut kept = 0.0;
         let mut n = 0;
-        while n < probs.len() && kept < self.top_p {
+        while n < probs.len() && kept < self.top_p && probs[n] >= floor {
             kept += probs[n];
             n += 1;
         }
@@ -90,18 +98,38 @@ mod tests {
         logits[7] = 5.0;
         logits[300] = 4.0;
         logits[999] = 3.0;
-        let mut greedy = Sampler::new(0.0, 20, 0.95, 1);
+        let mut greedy = Sampler::new(0.0, 20, 0.95, 0.0, 1);
         assert_eq!(greedy.sample(&logits), 7);
         // At a low temperature the top token is all but certain, and with
         // top_p of nearly nothing it is the only one kept.
-        let mut sampler = Sampler::new(1.0, 3, 0.01, 1);
+        let mut sampler = Sampler::new(1.0, 3, 0.01, 0.0, 1);
         for _ in 0..20 {
             assert_eq!(sampler.sample(&logits), 7);
         }
         // With k of two, the third never comes up.
-        let mut sampler = Sampler::new(100.0, 2, 1.0, 1);
+        let mut sampler = Sampler::new(100.0, 2, 1.0, 0.0, 1);
         let picks: std::collections::HashSet<u32> =
             (0..200).map(|_| sampler.sample(&logits)).collect();
         assert!(picks.contains(&7) && picks.contains(&300) && !picks.contains(&999));
+    }
+
+    #[test]
+    fn drops_tokens_far_less_likely_than_the_top() {
+        let mut logits = vec![0.0; 1000];
+        logits[7] = 5.0;
+        logits[300] = 4.0;
+        logits[999] = 0.0;
+        // The second is e^-1 as likely as the first, the rest e^-5: a min_p
+        // between keeps the first two and drops the rest, with top_p and
+        // top_k wide open.
+        let mut sampler = Sampler::new(1.0, 1000, 1.0, 0.1, 1);
+        let picks: std::collections::HashSet<u32> =
+            (0..200).map(|_| sampler.sample(&logits)).collect();
+        assert!(picks.contains(&7) && picks.contains(&300) && picks.len() == 2);
+        // A min_p of one keeps the most likely alone.
+        let mut sampler = Sampler::new(1.0, 1000, 1.0, 1.0, 1);
+        for _ in 0..20 {
+            assert_eq!(sampler.sample(&logits), 7);
+        }
     }
 }

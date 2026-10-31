@@ -129,6 +129,7 @@ impl Log {
                 "temperature": decimal(sampler.temperature),
                 "top_k": sampler.top_k,
                 "top_p": decimal(sampler.top_p),
+                "min_p": decimal(sampler.min_p),
                 "seed": sampler.seed,
                 "thinking_budget": thinking_budget,
                 "system": system,

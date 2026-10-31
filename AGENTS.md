@@ -18,7 +18,7 @@ A coding agent harness in Rust.
 
 The one model is `bonsai-2-27b`: PrismML's Ternary Bonsai 2 27B, Qwen3.8-27B with its matrices made ternary (`{-1, 0, 1}` with an f16 scale per 128 weights, 5.95 GB as shipped in the `PTQ1_0` GGUF packing). It is a hybrid: 64 layers of which every fourth is full attention (24 query heads, 4 key/value heads, 256 wide, the first 64 elements rotated by RoPE) and the rest Gated DeltaNet linear attention (16 key heads and 48 value heads of 128, a causal convolution of 4 taps, and a 128×128 recurrent state per value head). The matrices are stored in a rotated basis: activations are rotated by a blockwise (1024) Walsh-Hadamard transform with fixed signs before every ternary matmul, and the embedding table's rows are rotated back after lookup. The file stores the linear-attention value heads in llama.cpp's tiled head order; `bonsai.rs` puts them back into the checkpoint's grouped order when loading. The whole model runs on the device; only the embedding lookup is on the CPU.
 
-The model thinks by default (its template opens `<think>` for it), calls tools as `<tool_call><function=bash>…`, and samples at temperature 1.0, top-k 20, top-p 0.95 as the file recommends. Its own chat template puts the tools at the top of the system prompt, which the harness follows.
+The model thinks by default (its template opens `<think>` for it), calls tools as `<tool_call><function=bash>…`, and samples at temperature 1.0, top-k 20, top-p 0.95 as the file recommends, and min-p 0.05 as its model card does. Its own chat template puts the tools at the top of the system prompt, which the harness follows.
 
 ## Building
 

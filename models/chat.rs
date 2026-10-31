@@ -619,7 +619,7 @@ mod tests {
     fn chat(scripts: &[&str]) -> Chat<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let model = Scripted::new(&tokenizer, scripts, 1 << 16);
-        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         chat
     }
@@ -827,7 +827,7 @@ mod tests {
             ],
             max_len,
         );
-        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         chat.reserve(40);
         let mut reply = String::new();
