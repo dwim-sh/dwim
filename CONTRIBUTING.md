@@ -9,7 +9,11 @@ from source when the device opens.
 ```
 cargo build              # debug, with the model and the devices optimized
 cargo build --release    # for anything that runs the model for long
+make install             # a release build and the manual page, in ~/.local
 ```
+
+`make install PREFIX=/usr/local` installs system-wide, which may need `sudo`;
+`make uninstall` removes what `make install` put there.
 
 Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
 driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
