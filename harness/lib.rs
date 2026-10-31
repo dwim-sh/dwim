@@ -701,7 +701,6 @@ impl<M: LanguageModel> Harness<M> {
                 };
             }
             let before = fingerprint(&self.dir);
-            let mut changed = false;
             let mut failed = false;
             let mut outputs = Vec::new();
             for call in &calls {
@@ -742,7 +741,7 @@ impl<M: LanguageModel> Harness<M> {
                 }
                 outputs.push(output);
             }
-            changed |= before.is_some() && fingerprint(&self.dir) != before;
+            let changed = fingerprint(&self.dir) != before;
             if changed {
                 // A change is a decision made: the count starts over, and
                 // the model acts from here.
@@ -1051,9 +1050,29 @@ fn call_failed(name: &str, output: &str) -> bool {
 
 /// What the files of `dir` are, as a number that changes when any of
 /// them does: the changes git sees, against the index and in untracked
-/// files, with the sizes and times of the untracked ones. `None` where
-/// git cannot say.
-fn fingerprint(dir: &Path) -> Option<u64> {
+/// files, with the sizes and times of the untracked ones; or, where git
+/// cannot say, as outside a repository, the paths, sizes and times of
+/// every file under `dir` but the hidden ones.
+fn fingerprint(dir: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match git_state(dir) {
+        Some((status, diff)) => {
+            status.hash(&mut hasher);
+            diff.hash(&mut hasher);
+            for line in String::from_utf8_lossy(&status).lines() {
+                if let Some(path) = line.strip_prefix("?? ") {
+                    file_state(&dir.join(path), &mut hasher);
+                }
+            }
+        }
+        None => walk(dir, &mut hasher),
+    }
+    hasher.finish()
+}
+
+/// What git sees changed in `dir`: its status, untracked files included,
+/// and its diff against the index. `None` where git cannot say.
+fn git_state(dir: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
@@ -1065,23 +1084,42 @@ fn fingerprint(dir: &Path) -> Option<u64> {
     };
     let status = git(&["status", "--porcelain=v1", "--untracked-files=all"])?;
     let diff = git(&["diff", "--no-color"])?;
-    let mut hasher = DefaultHasher::new();
-    status.hash(&mut hasher);
-    diff.hash(&mut hasher);
-    for line in String::from_utf8_lossy(&status).lines() {
-        if let Some(path) = line.strip_prefix("?? ")
-            && let Ok(metadata) = fs::metadata(dir.join(path))
-        {
-            metadata.len().hash(&mut hasher);
-            metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|since| since.as_nanos())
-                .hash(&mut hasher);
+    Some((status, diff))
+}
+
+/// Hashes the size and time of the file at `path`, if there is one.
+fn file_state(path: &Path, hasher: &mut DefaultHasher) {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        metadata.len().hash(hasher);
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_nanos())
+            .hash(hasher);
+    }
+}
+
+/// Hashes the path, size and time of every file under `dir` but the
+/// hidden ones, in name order, without following symbolic links.
+fn walk(dir: &Path, hasher: &mut DefaultHasher) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<fs::DirEntry> = entries
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        path.hash(hasher);
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => walk(&path, hasher),
+            Ok(kind) if kind.is_file() => file_state(&path, hasher),
+            _ => {}
         }
     }
-    Some(hasher.finish())
 }
 
 /// The event for a piece of the model's reply.
@@ -1406,14 +1444,20 @@ mod tests {
         }
     }
 
-    /// A git repository of its own, for a harness to work in. The scripts
-    /// that work in it name it, as the model does: bash runs where the
-    /// process does.
-    fn repo() -> PathBuf {
-        static REPOS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = REPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// A directory of its own, for a harness to work in. The scripts that
+    /// work in it name it, as the model does: bash runs where the process
+    /// does.
+    fn scratch() -> PathBuf {
+        static DIRS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("dwim-modes-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A git repository of its own, for a harness to work in.
+    fn repo() -> PathBuf {
+        let dir = scratch();
         assert!(
             Command::new("git")
                 .args(["init", "-q"])
@@ -1781,6 +1825,29 @@ mod tests {
             replies[4].0 > 0,
             "investigating again on the next message: {replies:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn acts_once_the_model_changes_a_file_outside_a_git_repository() {
+        // Where git cannot say what changed, the files' own sizes and
+        // times do: a change is seen all the same.
+        let path = std::env::temp_dir().join(format!("dwim-plain-{}.jsonl", std::process::id()));
+        let scripts = [
+            reply_calling(20, "bash", "command", "ls DIR"),
+            reply_calling(20, "bash", "command", "echo made > DIR/sub/a.txt"),
+            "Done.".to_string(),
+        ];
+        let dir = scratch();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut harness = harness_in(&dir, &scripts, &path);
+        send(&mut harness, "go");
+        assert_eq!(harness.chat.sampler().temperature, ACT_SAMPLING.0);
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act"], "{modes:?}");
+        assert!(replies[0].0 > 0 && replies[1].0 > 0, "{replies:?}");
+        assert_eq!(replies[2].0, 0, "acting after the change: {replies:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
