@@ -643,6 +643,7 @@ impl<M: LanguageModel> Harness<M> {
                 input = Turn::User(ACT_PROMPT.to_string());
                 continue;
             }
+            let start = self.chat.tokens();
             // Acting, the model thinks only to find out why a call failed.
             self.chat
                 .set_thinking(self.mode == Mode::Investigate || std::mem::take(&mut self.recover));
@@ -674,13 +675,15 @@ impl<M: LanguageModel> Harness<M> {
                 &before,
                 &self.chat.stats(),
             );
-            // The turns read back after a compaction were counted when
-            // they were made: only the turns made now are spent.
-            self.spent += self.record(input)?;
-            self.spent += self.record(Turn::Reply {
+            self.record(input)?;
+            self.record(Turn::Reply {
                 text,
                 calls: calls.clone(),
             })?;
+            // What the conversation grew by: the input, and the reply with
+            // its thought, which the transcript leaves out. The turns read
+            // back after a compaction were counted when they were made.
+            self.spent += self.chat.tokens() - start;
             if cut {
                 return Ok(Outcome::Cut);
             }
@@ -1654,6 +1657,40 @@ mod tests {
             replies[2..].iter().all(|&(thought, _)| thought == 0),
             "none after: {replies:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn thinking_spends_the_decision_budget() {
+        // Two long thoughts, each followed by a call with a short result,
+        // spend the decision budget by themselves: the budget is what the
+        // conversation grows by, the thoughts included, though the
+        // transcript leaves them out.
+        let path = std::env::temp_dir().join(format!("dwim-thinking-{}.jsonl", std::process::id()));
+        let scripts = [
+            reply_calling(1500, "bash", "command", "echo 1"),
+            reply_calling(1500, "bash", "command", "echo 2"),
+            "1. a.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "echo made > DIR/a.txt"),
+            "Done.".to_string(),
+        ];
+        let dir = repo();
+        let mut harness = harness_in(&dir, &scripts, &path);
+        harness.set_thinking_budget(None);
+        harness.set_decision_budget(2500);
+        let (events, _) = send(&mut harness, "go");
+        assert_eq!(
+            events,
+            [
+                "thought", "text", "call", "output", "thought", "text", "call", "output",
+                "planning", "plan", "call", "output", "text"
+            ],
+            "{events:?}"
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
+        drop(harness);
+        let (replies, _) = replies_and_modes(&path);
+        assert!(replies[0].0 >= 1500 && !replies[0].1, "{replies:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
