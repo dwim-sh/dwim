@@ -33,7 +33,7 @@ pub struct Opts {
     pub thinking: bool,
 
     /// most tokens the model may think before it is made to act
-    /// (default: 2048; 0 for no limit)
+    /// (default: 512; 0 for no limit)
     #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
     pub thinking_budget: usize,
 
