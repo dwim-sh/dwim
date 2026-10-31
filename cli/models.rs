@@ -232,7 +232,9 @@ fn prune(dir: &Path) {
 }
 
 /// The sampler for the model, with the settings its file recommends where
-/// it has them.
+/// it has them. Bonsai's file does not carry `min_p`; its model card
+/// recommends 0.05, which it found to follow instructions more reliably
+/// than none.
 pub fn sampler(gguf: &Gguf) -> Sampler {
     let number = |key: &str, default: f32| {
         gguf.f32(&format!("general.sampling.{key}"))
@@ -242,6 +244,7 @@ pub fn sampler(gguf: &Gguf) -> Sampler {
         number("temp", 1.0),
         number("top_k", 20.0) as usize,
         number("top_p", 0.95),
+        number("min_p", 0.05),
         seed(),
     )
 }

@@ -834,7 +834,7 @@ mod tests {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
-        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 1)).unwrap();
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap()
@@ -1126,6 +1126,7 @@ mod tests {
         assert_eq!(records[0]["temperature"], 0.0);
         assert_eq!(records[0]["top_k"], 1);
         assert_eq!(records[0]["top_p"], 1.0);
+        assert_eq!(records[0]["min_p"], 0.0);
         assert_eq!(records[0]["seed"], 1);
         assert_eq!(records[1]["text"], "message 0");
         assert!(
