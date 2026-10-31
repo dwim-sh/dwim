@@ -37,6 +37,11 @@ pub struct Opts {
     #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
     pub thinking_budget: usize,
 
+    /// sampling temperature (default: what the model file recommends; 0
+    /// always picks the likeliest token)
+    #[argh(option)]
+    pub temperature: Option<f32>,
+
     /// file to write the session's transcript to, as JSON Lines (default:
     /// a new file under ~/.local/state/dwim/projects/)
     #[argh(option)]
