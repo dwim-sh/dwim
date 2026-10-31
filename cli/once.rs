@@ -24,11 +24,13 @@ use crate::{fetch, models, opts::Device};
 /// once it replies with text alone, keeping a transcript of it in `log`;
 /// then reports where the time went, if
 /// `stats` asks for it.
+#[allow(clippy::too_many_arguments)]
 pub fn once(
     name: &str,
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    temperature: Option<f32>,
     prompt: &str,
     stats: bool,
     log: Log,
@@ -53,6 +55,7 @@ pub fn once(
             "cpu",
             context,
             thinking_budget,
+            temperature,
             prompt,
             log,
         )?,
@@ -72,6 +75,7 @@ pub fn once(
                 &device,
                 context,
                 thinking_budget,
+                temperature,
                 prompt,
                 log,
             )?
@@ -97,13 +101,14 @@ fn answer<D: dwim_gpu::Device + 'static>(
     on: &str,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    temperature: Option<f32>,
     prompt: &str,
     log: Log,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
     let name = which.name;
     let mut progress = Progress::new();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let sampler = models::sampler(&gguf);
+    let sampler = models::sampler(&gguf, temperature);
     let loading = Instant::now();
     let size = models::size(&gguf, &device, context)?;
     eprintln!("{}", models::describe(&size));
