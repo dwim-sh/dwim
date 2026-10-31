@@ -377,7 +377,8 @@ pub struct Harness<M: LanguageModel> {
     /// Whether the last call failed while acting, so that the next reply
     /// is made with a thought, to find out why.
     recover: bool,
-    /// How the model samples while investigating: the file's settings.
+    /// How the model samples while investigating: the settings the chat
+    /// was made with, as temperature and top-p.
     sampling: (f32, f32),
     /// The transcript of the whole session.
     log: Log,
@@ -465,6 +466,8 @@ impl<M: LanguageModel> Harness<M> {
         let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
         chat.reserve(reserve);
         chat.limit_thoughts(THINKING_BUDGET, BUDGET_CLOSING);
+        let sampler = chat.sampler();
+        let sampling = (sampler.temperature, sampler.top_p);
         Ok(Self {
             chat,
             tools: Tools::new(),
@@ -483,7 +486,7 @@ impl<M: LanguageModel> Harness<M> {
             decision_budget: DECISION_BUDGET,
             planned: false,
             recover: false,
-            sampling: (0.0, 0.0),
+            sampling,
             log: Log::none(),
         })
     }
@@ -766,10 +769,6 @@ impl<M: LanguageModel> Harness<M> {
     /// Sets the agent investigating or acting: with thinking and the
     /// file's sampling, or without thinking and with the sampling for it.
     fn set_mode(&mut self, mode: Mode) {
-        if self.sampling == (0.0, 0.0) {
-            let sampler = self.chat.sampler();
-            self.sampling = (sampler.temperature, sampler.top_p);
-        }
         let (temperature, top_p) = match mode {
             Mode::Investigate => self.sampling,
             Mode::Act => ACT_SAMPLING,
