@@ -605,6 +605,8 @@ impl<M: LanguageModel> Harness<M> {
     ) -> Result<Outcome, Box<dyn Error>> {
         // The last call run, as its name and arguments.
         let mut last = None;
+        // Whether the input is the results that get the plan.
+        let mut planning = false;
         loop {
             if let Turn::User(message) = &input {
                 self.log.user(message, ahead.as_deref(), self.chat.tokens());
@@ -616,8 +618,30 @@ impl<M: LanguageModel> Harness<M> {
                 (Turn::User(message), Some(ahead)) => Turn::User(format!("{ahead}\n\n{message}")),
                 _ => input.clone(),
             };
-            if !self.make_room(&fed, on_event)? {
+            // The results that get the plan need room for it too.
+            let more = if planning { self.plan_tokens()? } else { 0 };
+            if !self.make_room(&fed, more, on_event)? {
                 return Ok(Outcome::Done);
+            }
+            if planning {
+                // Spent without deciding: the results, then the plan, or
+                // the plan brought up to date, and then acting on it.
+                planning = false;
+                let Turn::Results(outputs) = &fed else {
+                    return Err("the plan answers tool results".into());
+                };
+                self.chat.feed_results(outputs)?;
+                self.record(input)?;
+                if !self.plan(on_event)? {
+                    return Ok(Outcome::Done);
+                }
+                if self.chat.cut() {
+                    return Ok(Outcome::Cut);
+                }
+                self.set_mode(Mode::Act);
+                self.spent = 0;
+                input = Turn::User(ACT_PROMPT.to_string());
+                continue;
             }
             // Acting, the model thinks only to find out why a call failed.
             self.chat
@@ -722,20 +746,8 @@ impl<M: LanguageModel> Harness<M> {
             let undecided = self.spent + pending >= self.decision_budget
                 || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN);
             if !changed && undecided {
-                // Spent without deciding: the plan, or the plan brought up
-                // to date, and then acting on it. The results go in first,
-                // with room made for them as for any input.
-                if !self.make_room(&Turn::Results(outputs.clone()), on_event)? {
-                    return Ok(Outcome::Done);
-                }
-                self.chat.feed_results(&outputs)?;
-                self.record(Turn::Results(outputs))?;
-                if !self.plan(on_event)? {
-                    return Ok(Outcome::Done);
-                }
-                self.set_mode(Mode::Act);
-                self.spent = 0;
-                input = Turn::User(ACT_PROMPT.to_string());
+                planning = true;
+                input = Turn::Results(outputs);
                 continue;
             }
             if self.mode == Mode::Act {
@@ -783,21 +795,12 @@ impl<M: LanguageModel> Harness<M> {
         if on_event(Event::Planning).is_break() {
             return Ok(false);
         }
-        let prompt = if self.planned {
-            REPLAN_PROMPT
-        } else {
-            PLAN_PROMPT
-        };
+        let prompt = self.plan_prompt();
         self.planned = true;
         self.log.user(prompt, None, self.chat.tokens());
-        // The plan takes what is free above the reserve, which is the
-        // note's should the conversation have to be compacted next.
-        let room = self.chat.capacity().saturating_sub(
-            self.chat.tokens() + self.chat.measure(&Turn::User(prompt.to_string()))? + self.reserve,
-        );
         let before = self.chat.stats();
         let mut interrupted = false;
-        let plan = self.chat.answer(prompt, PLAN_TOKENS.min(room), |chunk| {
+        let plan = self.chat.answer(prompt, PLAN_TOKENS, |chunk| {
             let Chunk::Text(text) = chunk else {
                 return ControlFlow::Continue(());
             };
@@ -822,6 +825,22 @@ impl<M: LanguageModel> Harness<M> {
         Ok(!interrupted)
     }
 
+    /// What the model is asked for its plan with next: for the plan, or
+    /// to bring it up to date once it has written one this turn.
+    fn plan_prompt(&self) -> &'static str {
+        if self.planned {
+            REPLAN_PROMPT
+        } else {
+            PLAN_PROMPT
+        }
+    }
+
+    /// Most tokens the next plan takes, with the prompt for it.
+    fn plan_tokens(&self) -> Result<usize, Box<dyn Error>> {
+        let prompt = Turn::User(self.plan_prompt().to_string());
+        Ok(self.chat.measure(&prompt)? + PLAN_TOKENS + FRAMING)
+    }
+
     /// Adds a turn to the transcript.
     fn record(&mut self, turn: Turn) -> Result<(), Box<dyn Error>> {
         let tokens = self.chat.measure(&turn)?;
@@ -830,16 +849,18 @@ impl<M: LanguageModel> Harness<M> {
         Ok(())
     }
 
-    /// Makes room for `input`, compacting the conversation first if the
-    /// input would take the context past the high-water mark. Returns
-    /// whether the input may go in: not if the compaction was interrupted,
-    /// and an error if the input cannot fit even so.
+    /// Makes room for `input`, and for `more` tokens after it, compacting
+    /// the conversation first if they would take the context past the
+    /// high-water mark. Returns whether the input may go in: not if the
+    /// compaction was interrupted, and an error if the input cannot fit
+    /// even so.
     fn make_room(
         &mut self,
         input: &Turn,
+        more: usize,
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<bool, Box<dyn Error>> {
-        let needed = self.chat.measure(input)?;
+        let needed = self.chat.measure(input)? + more;
         let capacity = self.chat.capacity();
         if self.chat.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
             && !self.transcript.is_empty()
@@ -1392,11 +1413,22 @@ mod tests {
     /// of 100, keeping a log at `path`. `DIR` in a script stands for the
     /// directory.
     fn harness_in(dir: &Path, scripts: &[String], path: &Path) -> Harness<Scripted> {
+        harness_within(dir, scripts, path, 100_000)
+    }
+
+    /// A harness as `harness_in` makes one, with room for `max_len`
+    /// tokens.
+    fn harness_within(
+        dir: &Path,
+        scripts: &[String],
+        path: &Path,
+        max_len: usize,
+    ) -> Harness<Scripted> {
         let at = dir.display().to_string();
         let scripts: Vec<String> = scripts.iter().map(|s| s.replace("DIR", &at)).collect();
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-        let model = Scripted::new(&tokenizer, &scripts, 100_000);
+        let model = Scripted::new(&tokenizer, &scripts, max_len);
         let mut chat = Chat::new(model, tokenizer, Sampler::new(1.0, 1, 0.95, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         let mut harness =
@@ -1607,6 +1639,61 @@ mod tests {
             replies[2..].iter().all(|&(thought, _)| thought == 0),
             "none after: {replies:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn makes_room_for_the_results_and_the_plan() {
+        // The results that spend the decision budget, and the plan they
+        // get, would take the context past the high-water mark: the
+        // conversation is compacted before them, not after the plan, and
+        // the plan is written whole.
+        let path = std::env::temp_dir().join(format!("dwim-room-{}.jsonl", std::process::id()));
+        let dir = repo();
+        fs::write(dir.join("big.txt"), "y".repeat(1200)).unwrap();
+        let scripts = [
+            reply_calling(20, "bash", "command", "cat DIR/big.txt; echo 1"),
+            reply_calling(20, "bash", "command", "cat DIR/big.txt; echo 2"),
+            // The note, then the plan: both are asked for as answers.
+            "Task: go on.".to_string(),
+            "1. a.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "echo made > DIR/a.txt"),
+            "Done.".to_string(),
+        ];
+        let max_len = 4000;
+        let mut harness = harness_within(&dir, &scripts, &path, max_len);
+        harness.set_decision_budget(2000);
+        let (events, note) = send(&mut harness, "go");
+        assert_eq!(
+            events,
+            [
+                "thought",
+                "text",
+                "call",
+                "output",
+                "thought",
+                "text",
+                "call",
+                "output",
+                "compacting",
+                "note",
+                "compacted",
+                "planning",
+                "plan",
+                "call",
+                "output",
+                "text"
+            ],
+            "{events:?}"
+        );
+        assert_eq!(note, "Task: go on.");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert!(
+            turns.iter().any(|turn| matches!(turn, Turn::Reply { text, calls } if text.contains("1. a.txt") && calls.is_empty())),
+            "the plan is in the transcript"
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
+        assert!(harness.tokens() <= max_len - harness.reserve);
         fs::remove_dir_all(dir).unwrap();
     }
 
