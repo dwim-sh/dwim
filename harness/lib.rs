@@ -74,17 +74,19 @@ pub const CUTS_BEFORE_PLAN: u32 = 2;
 /// thought had grown by about 25k tokens by then.
 pub const DECISION_BUDGET: usize = 32 << 10;
 
-/// Most tokens of a plan.
-const PLAN_TOKENS: usize = 768;
+/// Most tokens of a plan, in a context with room for it: a plan of
+/// changes to three files ran past 768 and was cut mid-word, with two of
+/// the files unwritten. A small context allows a sixteenth of itself.
+const PLAN_TOKENS: usize = 2048;
 
 /// What the model is asked for its plan with, once it has spent the
 /// decision budget, or had its thoughts cut [`CUTS_BEFORE_PLAN`] times in
 /// a row, without a change made.
-const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools: the smallest change that does the job, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
+const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools, and without restating what you found or weighing choices: the smallest change that does the job, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
 
 /// What the model is asked with when, acting, it has spent the decision
 /// budget again without a change.
-const REPLAN_PROMPT: &str = "You have gone on for a while without changing a file. Bring the plan up to date, in plain text, without tools: what is done, and what remains as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them.";
+const REPLAN_PROMPT: &str = "You have gone on for a while without changing a file. Bring the plan up to date, in plain text, without tools, and without restating what you found: what is done, and what remains as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them.";
 
 /// What the model is told once it has written its plan.
 const ACT_PROMPT: &str =
@@ -810,7 +812,7 @@ impl<M: LanguageModel> Harness<M> {
         self.log.user(prompt, None, self.chat.tokens());
         let before = self.chat.stats();
         let mut interrupted = false;
-        let plan = self.chat.answer(prompt, PLAN_TOKENS, |chunk| {
+        let plan = self.chat.answer(prompt, self.plan_limit(), |chunk| {
             let Chunk::Text(text) = chunk else {
                 return ControlFlow::Continue(());
             };
@@ -845,10 +847,16 @@ impl<M: LanguageModel> Harness<M> {
         }
     }
 
+    /// Most tokens of a plan here: [`PLAN_TOKENS`], or a sixteenth of the
+    /// context if that is less.
+    fn plan_limit(&self) -> usize {
+        PLAN_TOKENS.min(self.chat.capacity() / 16)
+    }
+
     /// Most tokens the next plan takes, with the prompt for it.
     fn plan_tokens(&self) -> Result<usize, Box<dyn Error>> {
         let prompt = Turn::User(self.plan_prompt().to_string());
-        Ok(self.chat.measure(&prompt)? + PLAN_TOKENS + FRAMING)
+        Ok(self.chat.measure(&prompt)? + self.plan_limit() + FRAMING)
     }
 
     /// Adds a turn to the transcript, and returns the tokens it takes.
