@@ -49,6 +49,9 @@ pub struct Chat<M: LanguageModel> {
     thought_ended: bool,
     /// Most tokens a thought may run to, and what closes it there.
     thought_limit: Option<(usize, String)>,
+    /// Whether the next reply is to be made without thinking: opened with
+    /// the thought closed at once, as the template opens one.
+    skip_thinking: bool,
     /// Tokens it takes to end a reply, at most.
     ending: usize,
     im_start: u32,
@@ -146,6 +149,7 @@ impl<M: LanguageModel> Chat<M> {
             cut: false,
             thought_ended: false,
             thought_limit: None,
+            skip_thinking: false,
             stats: Stats::default(),
         })
     }
@@ -240,6 +244,13 @@ impl<M: LanguageModel> Chat<M> {
     /// goes on to act or reply instead of thinking in circles.
     pub fn limit_thoughts(&mut self, tokens: usize, closing: &str) {
         self.thought_limit = Some((tokens, closing.to_string()));
+    }
+
+    /// Has the next reply made without thinking: the template opens it
+    /// with the thought closed at once, so the model acts on what it has
+    /// thought already rather than think it over again.
+    pub fn skip_thinking_once(&mut self) {
+        self.skip_thinking = true;
     }
 
     /// Whether the last reply was stopped short because the context was
@@ -416,18 +427,26 @@ impl<M: LanguageModel> Chat<M> {
         &mut self,
         mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Vec<String>> {
-        // The template opens the thought for the model.
+        // The template opens the thought for the model, or opens and
+        // closes it when the reply is to be made without thinking.
+        let unthinking = std::mem::take(&mut self.skip_thinking);
         let mut prompt = vec![self.im_start];
         prompt.extend(self.tokenizer.encode("assistant\n")?);
         prompt.push(self.think);
-        prompt.extend(self.tokenizer.encode("\n")?);
+        if unthinking {
+            prompt.extend(self.tokenizer.encode("\n\n")?);
+            prompt.push(self.think_end);
+            prompt.extend(self.tokenizer.encode("\n\n")?);
+        } else {
+            prompt.extend(self.tokenizer.encode("\n")?);
+        }
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
         // Whether the model is inside its <think> block, and the tokens of
         // the thought so far.
-        let mut thinking = true;
+        let mut thinking = !unthinking;
         let mut thought = 0;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;

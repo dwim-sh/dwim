@@ -73,7 +73,7 @@ const BUDGET_CLOSING: &str = "I have thought about this long enough: I'll go wit
 /// gets this for its output. Told only to act, the model went to check
 /// one more thing every time; told that checking does not count, it has
 /// nothing left to do but the change.
-const GATED: &str = "error: not run. Your last thought ran to the budget, and after that the next call must change a file. You have read what you need: make the change now, with bash, and check it after.";
+const GATED: &str = "error: not run. Your last thought ran to the budget, and after that the next call must change a file. You have read what you need: make the change now, with edit or bash, and check it after.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -323,6 +323,10 @@ pub struct Harness<M: LanguageModel> {
     /// that changes nothing gets [`GATED`] for its output. `Some(None)` in
     /// a directory whose changes cannot be told, which gates reads alone.
     gate: Option<Option<u64>>,
+    /// Whether a call was refused at the gate since the last reply, so
+    /// that the next reply is made without thinking: given a thought, the
+    /// model planned the change again and then reached for another read.
+    refused: bool,
     /// Tokens kept free past every reply: room for the note prompt and
     /// the note.
     reserve: usize,
@@ -425,6 +429,7 @@ impl<M: LanguageModel> Harness<M> {
             restart: Box::new(restart),
             note_tokens,
             gate: None,
+            refused: false,
             reserve,
             thinking_budget: Some(THINKING_BUDGET),
             log: Log::none(),
@@ -512,6 +517,7 @@ impl<M: LanguageModel> Harness<M> {
     ) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
         self.gate = None;
+        self.refused = false;
         let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
@@ -552,6 +558,9 @@ impl<M: LanguageModel> Harness<M> {
             };
             if !self.make_room(&fed, on_event)? {
                 return Ok(Outcome::Done);
+            }
+            if std::mem::take(&mut self.refused) {
+                self.chat.skip_thinking_once();
             }
             let mut text = String::new();
             let before = self.chat.stats();
@@ -614,6 +623,7 @@ impl<M: LanguageModel> Harness<M> {
                         if this == last {
                             REPEATED.to_string()
                         } else if self.gate.is_some() && call.name == "read" {
+                            self.refused = true;
                             GATED.to_string()
                         } else {
                             last = this;
@@ -627,6 +637,7 @@ impl<M: LanguageModel> Harness<M> {
                                 // The gate is lifted by a change, or by a
                                 // command where changes cannot be told.
                                 Some(Some(before)) if fingerprint(&self.dir) == Some(before) => {
+                                    self.refused = true;
                                     GATED.to_string()
                                 }
                                 _ => {
@@ -899,11 +910,17 @@ mod tests {
     }
 
     /// A harness around a scripted model with room for `max_len` tokens,
-    /// which says `scripts` in turn and `note` when asked for a note.
+    /// which says `scripts` in turn and `note` when asked for a note, if
+    /// there is one: the scripted model takes any reply made without
+    /// thinking for a request for the note, and a reply after a call
+    /// refused at the gate is made without thinking too.
     fn harness(scripts: &[String], max_len: usize, note: &str) -> Harness<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-        let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
+        let mut model = Scripted::new(&tokenizer, &scripts, max_len);
+        if !note.is_empty() {
+            model = model.answers(&tokenizer, note);
+        }
         let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -1096,7 +1113,9 @@ mod tests {
     #[test]
     fn ends_a_thought_at_the_thinking_budget() {
         // A thought of 1000 tokens, under a budget of 100, is ended there
-        // with the closing, and the reply goes on to its call and its text.
+        // with the closing, and the reply goes on to its call, which
+        // changes nothing and so is refused at the gate; the reply after
+        // that is made without thinking, so its thought is not said.
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
         assert_eq!(limited.thinking_budget(), Some(THINKING_BUDGET));
@@ -1121,17 +1140,13 @@ mod tests {
             })
             .unwrap();
         events.dedup();
-        assert_eq!(
-            events,
-            ["thought", "text", "call", "output", "thought", "text"]
-        );
+        assert_eq!(events, ["thought", "text", "call", "output", "text"]);
         assert!(thought.contains(BUDGET_CLOSING), "{thought}");
         assert!(thought.len() < 1000, "{}", thought.len());
         let turns: Vec<&Turn> = limited.transcript().collect();
         assert!(
             matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim().ends_with("Ok.")),
-            "{:?}",
-            turns.last()
+            "{turns:?}"
         );
         drop(limited);
         // The log has the budget, its change, and the thought it ended.
@@ -1144,7 +1159,9 @@ mod tests {
             .filter(|record| record["type"] == "reply")
             .collect();
         assert_eq!(replies.len(), 2);
-        assert!(replies.iter().all(|reply| reply["thought_ended"] == true));
+        assert_eq!(replies[0]["thought_ended"], true);
+        assert_eq!(replies[1]["thought_tokens"], 0, "made without thinking");
+        assert_eq!(replies[1]["thought_ended"], false);
 
         // Lifted, the budget lets a thought run.
         let scripts = [reply(1000, false)];
@@ -1176,9 +1193,10 @@ mod tests {
     fn gates_calls_after_a_cut_thought_until_one_changes_a_file() {
         // In a git repository of its own, under a budget of 100: a thought
         // of 1000 runs over it, and the call after it changes nothing, so
-        // it gets the gate; the next thought runs over too, and its call
-        // writes a file, which lifts the gate; the thought after that ends
-        // by itself, and its call runs as usual.
+        // it gets the gate. The replies after a refusal are made without
+        // thinking: the next reads, and is refused too; the one after
+        // writes a file, which lifts the gate. The thought after that
+        // ends by itself, and its call runs as usual.
         let dir = std::env::temp_dir().join(format!("dwim-gate-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -1193,15 +1211,17 @@ mod tests {
         // The commands name the directory, as the model does when it
         // works in one: bash runs where the process does.
         let at = dir.display();
+        // A reply made without thinking has no thought to script.
+        let unthinking = |script: String| script.split("</think>\n\n").nth(1).unwrap().to_string();
         let scripts = [
             reply_calling(1000, "bash", "command", "echo looked"),
-            reply_calling(1000, "read", "path", &format!("{at}/old.txt")),
-            reply_calling(
-                1000,
+            unthinking(reply_calling(0, "read", "path", &format!("{at}/old.txt"))),
+            unthinking(reply_calling(
+                0,
                 "bash",
                 "command",
                 &format!("echo made > {at}/new.txt"),
-            ),
+            )),
             reply_calling(10, "bash", "command", &format!("cat {at}/new.txt")),
             reply(10, false),
         ];
@@ -1213,11 +1233,16 @@ mod tests {
         let mut harness =
             Harness::new(chat, &dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap();
         harness.set_thinking_budget(Some(100));
+        let path = std::env::temp_dir().join(format!("dwim-gate-{}.jsonl", std::process::id()));
+        harness.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
         let mut outputs = Vec::new();
+        let mut thoughts = Vec::new();
         harness
             .send("go", |event| {
-                if let Event::Output(output) = event {
-                    outputs.push(output.to_string());
+                match event {
+                    Event::Output(output) => outputs.push(output.to_string()),
+                    Event::Thought(text) => thoughts.push(text.to_string()),
+                    _ => {}
                 }
                 ControlFlow::Continue(())
             })
@@ -1244,6 +1269,27 @@ mod tests {
             outputs[3]
         );
         assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "made\n");
+        // The two replies after refusals thought nothing; the others did.
+        drop(harness);
+        let replies: Vec<(u64, bool)> = records(&path)
+            .iter()
+            .filter(|record| record["type"] == "reply")
+            .map(|reply| {
+                (
+                    reply["thought_tokens"].as_u64().unwrap(),
+                    reply["thought_ended"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(replies.len(), 5, "{replies:?}");
+        assert!(replies[0].1, "the first thought was cut: {replies:?}");
+        assert_eq!(replies[1].0, 0, "no thought after a refusal: {replies:?}");
+        assert_eq!(replies[2].0, 0, "nor after the second: {replies:?}");
+        assert!(
+            replies[3].0 > 0 && !replies[3].1,
+            "thinking again, and ending by itself: {replies:?}"
+        );
+        assert!(thoughts.concat().contains(BUDGET_CLOSING));
         fs::remove_dir_all(dir).unwrap();
     }
 
