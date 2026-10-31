@@ -33,6 +33,13 @@ To install the latest development version:
 cargo install --git https://github.com/dwim-sh/dwim
 ```
 
+Or, from a checkout, with the manual page:
+
+```console
+make install                     # in ~/.local
+make install PREFIX=/usr/local   # system-wide, which may need sudo
+```
+
 Either way, the model (about 6 GB) is downloaded on first use.
 
 ## Features
