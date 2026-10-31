@@ -134,8 +134,14 @@ pub fn run(arguments: &Value) -> String {
     } else {
         String::new()
     };
+    // A start the one match does not begin at is a sign the model may have
+    // meant another place; say where the edit went.
+    let elsewhere = match start {
+        Some(start) if start != first => format!("; old_string began at line {first}, not {start}"),
+        _ => String::new(),
+    };
     format!(
-        "{shown}\n[{path}: {what}{moved}; {} {} in all]",
+        "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]",
         now.len(),
         plural(now.len() as u64, "line")
     )
@@ -579,10 +585,20 @@ mod tests {
         let result = file.edit_at("a\nb", "x", 3);
         assert!(result.starts_with("1\ta\n2\tb\n3\tx\n4\tc\n"), "{result}");
         assert_eq!(file.text(), "a\nb\nx\nc\n");
-        // A wrong start does not matter when the string matches once.
+        // A wrong start does not stop an edit that matches once, but the
+        // result says where it went.
         let file = File::new(FIVE);
-        assert!(!file.edit_at("three", "3", 1).starts_with("error"));
+        let result = file.edit_at("three", "3", 1);
+        assert!(
+            result.ends_with(&format!(
+                "[{}: lines 3–3 replaced by 1 line; old_string began at line 3, not 1; 5 lines in all]",
+                file.path()
+            )),
+            "{result}"
+        );
         assert_eq!(file.text(), "one\ntwo\n3\nfour\nfive\n");
+        let result = file.edit_at("3", "three", 3);
+        assert!(!result.contains("not 3"), "{result}");
     }
 
     #[test]
