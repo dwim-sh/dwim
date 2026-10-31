@@ -85,8 +85,9 @@ them, and then to carry it out. From then on its replies are made
 without thinking, and with the model's sampling for such replies, until
 a command fails, which gets it one thought to find out why, or until the
 next message, which has it investigate again. Acting, another 32k tokens
-without a change has it bring the plan up to date and go on; a change
-starts the count over.
+without a change, or four commands in a row that change nothing, has it
+write its plan, or bring it up to date, and go on; a change starts the
+count over.
 .TP
 .BI \-\-transcript " file"
 Write the session's transcript to

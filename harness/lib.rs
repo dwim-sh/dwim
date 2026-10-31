@@ -65,6 +65,14 @@ pub const THINKING_BUDGET: usize = 512;
 /// round in circles, and asking for the plan ends them.
 pub const CUTS_BEFORE_PLAN: u32 = 2;
 
+/// Calls in a row, while acting, that changed nothing, after which the
+/// model is asked to bring its plan up to date: acting on a plan that
+/// did not say what to change, the model went to look, and each page it
+/// read ended by saying where the next began, which with no thought to
+/// interrupt it is where it went, a minute a page. A build that fails
+/// and the reads to find out why fit within this.
+pub const LOOKS_BEFORE_PLAN: u32 = 4;
+
 /// Tokens the conversation may grow by, read and generated, without a
 /// change made to a file, before the model is asked for its plan, or to
 /// bring it up to date, and set to acting: the decision budget. Thoughts
@@ -381,6 +389,8 @@ pub struct Harness<M: LanguageModel> {
     /// Whether the last call failed while acting, so that the next reply
     /// is made with a thought, to find out why.
     recover: bool,
+    /// Calls in a row, while acting, that changed nothing.
+    looks: u32,
     /// How the model samples while investigating: the settings the chat
     /// was made with, as temperature and top-p.
     sampling: (f32, f32),
@@ -490,6 +500,7 @@ impl<M: LanguageModel> Harness<M> {
             decision_budget: DECISION_BUDGET,
             planned: false,
             recover: false,
+            looks: 0,
             sampling,
             log: Log::none(),
         })
@@ -761,8 +772,12 @@ impl<M: LanguageModel> Harness<M> {
             // The results count as spent, though they are recorded with the
             // reply to them.
             let pending = self.chat.measure(&Turn::Results(outputs.clone()))?;
+            if self.mode == Mode::Act {
+                self.looks = if changed { 0 } else { self.looks + 1 };
+            }
             let undecided = self.spent + pending >= self.decision_budget
-                || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN);
+                || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN)
+                || (self.mode == Mode::Act && self.looks >= LOOKS_BEFORE_PLAN);
             if !changed && undecided {
                 planning = true;
                 input = Turn::Results(outputs);
@@ -795,6 +810,7 @@ impl<M: LanguageModel> Harness<M> {
         self.mode = mode;
         self.cuts = 0;
         self.recover = false;
+        self.looks = 0;
     }
 
     /// Asks the model for its plan, reported as `Plan` pieces, and records
@@ -1652,6 +1668,55 @@ mod tests {
         drop(harness);
         let (_, modes) = replies_and_modes(&path);
         assert!(modes.is_empty(), "{modes:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn brings_the_plan_up_to_date_after_looking_without_a_change() {
+        // Acting, four calls in a row that change nothing get the plan
+        // asked for, since the model went to acting by a change of its
+        // own and never wrote one; a change starts the count over.
+        let path = std::env::temp_dir().join(format!("dwim-looks-{}.jsonl", std::process::id()));
+        let dir = repo();
+        fs::write(dir.join("old.txt"), "old\n").unwrap();
+        let scripts = [
+            reply_calling(20, "bash", "command", "echo made > DIR/a.txt"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 1"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 2"),
+            reply_calling(0, "bash", "command", "echo again > DIR/a.txt"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 3"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 4"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 5"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 6"),
+            "Done: a.txt. Remains: 1. b.txt, line 1: write made.".to_string(),
+            reply_calling(0, "bash", "command", "echo made > DIR/b.txt"),
+            "Done.".to_string(),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let (events, _) = send(&mut harness, "go");
+        let mut expected = vec!["thought", "text", "call", "output"];
+        for _ in 0..7 {
+            expected.extend(["call", "output"]);
+        }
+        expected.extend(["planning", "plan", "call", "output", "text"]);
+        assert_eq!(events, expected, "{events:?}");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT))
+                .count(),
+            1,
+            "the plan is asked for, once, after four looks in a row"
+        );
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "made\n");
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act"], "{modes:?}");
+        assert!(
+            replies[1..].iter().all(|&(thought, _)| thought == 0),
+            "{replies:?}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
