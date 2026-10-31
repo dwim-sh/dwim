@@ -47,6 +47,7 @@ pub fn run(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    temperature: Option<f32>,
     thinking: bool,
     log: Log,
 ) -> Result<(), Box<dyn Error>> {
@@ -68,6 +69,7 @@ pub fn run(
                 device,
                 context,
                 thinking_budget,
+                temperature,
                 log,
                 requests_rx,
                 &replies_tx,
@@ -204,6 +206,7 @@ fn work(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    temperature: Option<f32>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
@@ -223,6 +226,7 @@ fn work(
                 model,
                 context,
                 thinking_budget,
+                temperature,
                 log,
                 requests,
                 replies,
@@ -246,6 +250,7 @@ fn work(
                 model,
                 context,
                 thinking_budget,
+                temperature,
                 log,
                 requests,
                 replies,
@@ -265,13 +270,14 @@ fn serve<D: dwim_gpu::Device + 'static>(
     which: &'static models::Model,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    temperature: Option<f32>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let sampler = models::sampler(&gguf);
+    let sampler = models::sampler(&gguf, temperature);
     let size = models::size(&gguf, &device, context)?;
     let _ = replies.send(Reply::Notice(models::describe(&size)));
     let model = models::load(gguf, device, size.context, |done, total| {

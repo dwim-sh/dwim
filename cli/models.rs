@@ -232,14 +232,14 @@ fn prune(dir: &Path) {
 }
 
 /// The sampler for the model, with the settings its file recommends where
-/// it has them.
-pub fn sampler(gguf: &Gguf) -> Sampler {
+/// it has them, at `temperature` if one is given instead of the file's.
+pub fn sampler(gguf: &Gguf, temperature: Option<f32>) -> Sampler {
     let number = |key: &str, default: f32| {
         gguf.f32(&format!("general.sampling.{key}"))
             .unwrap_or(default)
     };
     Sampler::new(
-        number("temp", 1.0),
+        temperature.unwrap_or_else(|| number("temp", 1.0)),
         number("top_k", 20.0) as usize,
         number("top_p", 0.95),
         seed(),

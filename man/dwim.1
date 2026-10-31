@@ -77,6 +77,13 @@ command or reply from what it has thought so far: left to itself, it
 tends to go over what it has found again and again instead of acting on
 it.
 .TP
+.BI \-\-temperature " t"
+Sample at temperature
+.I t
+instead of the one the model file recommends (1.0 for bonsai-2-27b, as
+Qwen3.8's makers recommend for thinking); 0 always picks the likeliest
+token.
+.TP
 .BI \-\-transcript " file"
 Write the session's transcript to
 .I file
