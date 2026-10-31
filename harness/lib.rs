@@ -730,7 +730,9 @@ impl<M: LanguageModel> Harness<M> {
                 }
                 self.chat.feed_results(&outputs)?;
                 self.record(Turn::Results(outputs))?;
-                self.plan(on_event)?;
+                if !self.plan(on_event)? {
+                    return Ok(Outcome::Done);
+                }
                 self.set_mode(Mode::Act);
                 self.spent = 0;
                 input = Turn::User(ACT_PROMPT.to_string());
@@ -771,10 +773,16 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Asks the model for its plan, reported as `Plan` pieces, and records
     /// the exchange, so that the plan stays in the conversation to act on.
+    /// Returns whether the plan was written out: not when `on_event`
+    /// breaks, which leaves what there is of it in the conversation, and
+    /// the turn ends.
     fn plan(
         &mut self,
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<bool, Box<dyn Error>> {
+        if on_event(Event::Planning).is_break() {
+            return Ok(false);
+        }
         let prompt = if self.planned {
             REPLAN_PROMPT
         } else {
@@ -782,19 +790,21 @@ impl<M: LanguageModel> Harness<M> {
         };
         self.planned = true;
         self.log.user(prompt, None, self.chat.tokens());
-        let _ = on_event(Event::Planning);
         // The plan takes what is free above the reserve, which is the
         // note's should the conversation have to be compacted next.
         let room = self.chat.capacity().saturating_sub(
             self.chat.tokens() + self.chat.measure(&Turn::User(prompt.to_string()))? + self.reserve,
         );
         let before = self.chat.stats();
+        let mut interrupted = false;
         let plan = self.chat.answer(prompt, PLAN_TOKENS.min(room), |chunk| {
             let Chunk::Text(text) = chunk else {
                 return ControlFlow::Continue(());
             };
             self.log.stream("plan", text);
-            on_event(Event::Plan(text))
+            let flow = on_event(Event::Plan(text));
+            interrupted |= flow.is_break();
+            flow
         })?;
         self.log.reply(
             &[],
@@ -808,7 +818,8 @@ impl<M: LanguageModel> Harness<M> {
         self.record(Turn::Reply {
             text: plan,
             calls: Vec::new(),
-        })
+        })?;
+        Ok(!interrupted)
     }
 
     /// Adds a turn to the transcript.
@@ -1473,6 +1484,66 @@ mod tests {
         );
         assert_eq!(replies[3].0, 0, "and the model acts without: {replies:?}");
         assert_eq!(replies[4].0, 0, "{replies:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_plan_ends_the_turn() {
+        // The user interrupts while the plan is written: what there is of
+        // it stays in the conversation, and the turn ends there, without
+        // the word to act on it. The next message has the model
+        // investigate again.
+        let path =
+            std::env::temp_dir().join(format!("dwim-interrupted-{}.jsonl", std::process::id()));
+        let scripts = [
+            reply_calling(1000, "bash", "command", "echo looked"),
+            reply_calling(1000, "bash", "command", "echo looked again"),
+            "1. a.txt, line 1: write made.".to_string(),
+            reply(20, true),
+            reply(20, false),
+        ];
+        let dir = repo();
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let mut events = Vec::new();
+        harness
+            .send("go", |event| {
+                let (name, flow) = match event {
+                    Event::Plan(_) => ("plan", ControlFlow::Break(())),
+                    Event::Planning => ("planning", ControlFlow::Continue(())),
+                    Event::Call { .. } => ("call", ControlFlow::Continue(())),
+                    _ => ("other", ControlFlow::Continue(())),
+                };
+                events.push(name);
+                flow
+            })
+            .unwrap();
+        assert_eq!(events.last(), Some(&"plan"), "{events:?}");
+        assert_eq!(events.iter().filter(|&&e| e == "call").count(), 2);
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert!(
+            turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT))
+        );
+        assert!(
+            matches!(turns.last(), Some(Turn::Reply { calls, .. }) if calls.is_empty()),
+            "{:?}",
+            turns.last()
+        );
+        assert!(
+            !turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User(m) if m == ACT_PROMPT)),
+            "the turn ends without the word to act"
+        );
+        let (events, _) = send(&mut harness, "again");
+        assert_eq!(
+            events,
+            ["thought", "text", "call", "output", "thought", "text"]
+        );
+        drop(harness);
+        let (_, modes) = replies_and_modes(&path);
+        assert!(modes.is_empty(), "{modes:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
