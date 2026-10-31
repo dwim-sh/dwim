@@ -64,7 +64,7 @@ pub fn run(arguments: &Value) -> String {
         .map(|line| String::from_utf8_lossy(read::content(line)))
         .collect();
     let wanted = split(old);
-    let found = find(&texts, &wanted);
+    let (found, tier) = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
         ([], _) => {
             let around = match start {
@@ -100,7 +100,7 @@ pub fn run(arguments: &Value) -> String {
         }
     };
     let (first, last) = (at + 1, at + wanted.len());
-    let new = match whole(&lines[at..last], &wanted, new) {
+    let new = match fitted(&lines[at..last], &wanted, new, tier) {
         Ok(new) => new,
         Err(line) => {
             return format!(
@@ -174,10 +174,10 @@ impl Tier {
 
 /// Where `wanted` begins in `lines`, the lines of the file without their
 /// endings, as indexes from zero, at the closest tier that matches it
-/// anywhere.
-fn find(lines: &[Cow<str>], wanted: &[&str]) -> Vec<usize> {
+/// anywhere, and that tier.
+fn find(lines: &[Cow<str>], wanted: &[&str]) -> (Vec<usize>, Tier) {
     if wanted.len() > lines.len() {
-        return Vec::new();
+        return (Vec::new(), Tier::Exact);
     }
     for tier in [Tier::Exact, Tier::TrailingSpace, Tier::Trimmed] {
         let found: Vec<usize> = (0..=lines.len() - wanted.len())
@@ -189,10 +189,10 @@ fn find(lines: &[Cow<str>], wanted: &[&str]) -> Vec<usize> {
             })
             .collect();
         if !found.is_empty() {
-            return found;
+            return (found, tier);
         }
     }
-    Vec::new()
+    (Vec::new(), Tier::Exact)
 }
 
 /// Whether `want`, a line as the model gives it, is `line`, a line of the
@@ -208,12 +208,33 @@ fn matches(want: &str, line: &str, tier: Tier) -> bool {
 }
 
 /// The lines of `text`, the new string, as they go into the file in place
-/// of `old`, the lines matched by `wanted`. A line of `old` that `read`
-/// cut, matched by its start, is one the model has not seen whole: a line
-/// of `text` that is it as `read` shows it, cut, is that line whole, and
-/// if no line of `text` is, the edit would lose what the model has not
-/// seen, so the index of the first such line is the error.
-fn whole(old: &[&[u8]], wanted: &[&str], text: &str) -> Result<Vec<Vec<u8>>, usize> {
+/// of `old`, the lines matched by `wanted` at `tier`.
+///
+/// When `wanted` matched with its indentation lost, and `text` is indented
+/// as `wanted` was given, the new lines are indented as the file is: the
+/// indentation of the first line of `wanted` becomes that of the line it
+/// matched, on every line that has it. Written as given, they would carry
+/// the lost indentation into the file.
+///
+/// A line of `old` that `read` cut, matched by its start, is one the model
+/// has not seen whole: a line of `text` that is it as `read` shows it,
+/// cut, is that line whole, and if no line of `text` is, the edit would
+/// lose what the model has not seen, so the index of the first such line
+/// is the error.
+fn fitted(old: &[&[u8]], wanted: &[&str], text: &str, tier: Tier) -> Result<Vec<Vec<u8>>, usize> {
+    let new: Vec<&str> = if text.is_empty() {
+        Vec::new()
+    } else {
+        split(text)
+    };
+    let first = |lines: &[&str]| lines.iter().position(|line| !line.trim().is_empty());
+    let (from, to) = match (tier, first(wanted), first(&new)) {
+        (Tier::Trimmed, Some(k), Some(n)) if indent(wanted[k]) == indent(new[n]) => (
+            indent(wanted[k]),
+            indent(&String::from_utf8_lossy(read::content(old[k]))).to_string(),
+        ),
+        _ => ("", String::new()),
+    };
     let cut: Vec<(usize, String)> = old
         .iter()
         .zip(wanted)
@@ -224,25 +245,31 @@ fn whole(old: &[&[u8]], wanted: &[&str], text: &str) -> Result<Vec<Vec<u8>>, usi
         })
         .collect();
     let mut kept = vec![false; cut.len()];
-    let mut new = Vec::new();
-    if !text.is_empty() {
-        for line in split(text) {
-            let same = cut
-                .iter()
-                .position(|(_, shown)| line.ends_with('…') && shown.trim() == line.trim());
-            match same {
-                Some(i) => {
-                    kept[i] = true;
-                    new.push(read::content(old[cut[i].0]).to_vec());
-                }
-                None => new.push(line.as_bytes().to_vec()),
+    let mut lines = Vec::new();
+    for line in new {
+        let same = cut
+            .iter()
+            .position(|(_, shown)| line.ends_with('…') && shown.trim() == line.trim());
+        match same {
+            Some(i) => {
+                kept[i] = true;
+                lines.push(read::content(old[cut[i].0]).to_vec());
             }
+            None if !line.trim().is_empty() && line.starts_with(from) => {
+                lines.push(format!("{to}{}", &line[from.len()..]).into_bytes());
+            }
+            None => lines.push(line.as_bytes().to_vec()),
         }
     }
     match kept.iter().position(|&kept| !kept) {
         Some(i) => Err(cut[i].0),
-        None => Ok(new),
+        None => Ok(lines),
     }
+}
+
+/// The white space `line` begins with.
+fn indent(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
 }
 
 /// Line numbers from indexes, as a list.
@@ -423,6 +450,51 @@ mod tests {
                 .starts_with("error")
         );
         assert_eq!(file.text(), "    fn g() {\n        2\n    }\n");
+    }
+
+    #[test]
+    fn indents_new_lines_as_the_file_is_when_the_old_lost_theirs() {
+        // Old and new given alike without their indentation: the new
+        // lines take the file's, blank lines left blank.
+        let text = "def f():\n    if x:\n        return 1\n    return 2\n";
+        let file = File::new(text);
+        let result = file.edit("if x:\n    return 1", "if y:\n\n    return 1");
+        assert!(
+            result.starts_with("1\tdef f():\n2\t    if y:\n3\t\n4\t"),
+            "{result}"
+        );
+        assert_eq!(
+            file.text(),
+            "def f():\n    if y:\n\n        return 1\n    return 2\n"
+        );
+        // Given with less of it, the difference is made up.
+        let file = File::new(text);
+        file.edit("  if x:\n      return 1", "  if y:\n      return 1");
+        assert_eq!(
+            file.text(),
+            "def f():\n    if y:\n        return 1\n    return 2\n"
+        );
+        // Given with more, taken off.
+        let file = File::new(text);
+        file.edit(
+            "        if x:\n            return 1",
+            "        if y:\n            return 1",
+        );
+        assert_eq!(
+            file.text(),
+            "def f():\n    if y:\n        return 1\n    return 2\n"
+        );
+        // New lines indented unlike the old were indented on purpose.
+        let file = File::new(text);
+        file.edit("if x:\n    return 1", "    if y:\n        return 1");
+        assert_eq!(
+            file.text(),
+            "def f():\n    if y:\n        return 1\n    return 2\n"
+        );
+        // Matched with its indentation, nothing changes.
+        let file = File::new(text);
+        file.edit("    if x:\n        return 1", "if y:\n    return 1");
+        assert_eq!(file.text(), "def f():\nif y:\n    return 1\n    return 2\n");
     }
 
     #[test]
