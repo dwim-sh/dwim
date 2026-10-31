@@ -4,9 +4,12 @@
 //! sees its change made without reading the file again. The string to
 //! replace is matched as the model copies it from a page: exactly, or but
 //! for the white space at the ends of its lines, or but for how far they
-//! are indented. A line a page cut matches by its start. A string that
-//! matches more than once is refused, with the lines it matches at, and
-//! the line it begins at, given, says which. Left to itself, the model
+//! are indented. A line a page cut matches by its start, and is kept
+//! whole: the model has not seen the rest of it, so an edit that would
+//! change or drop it is refused, and one that copies it as the page shows
+//! it, cut, writes it back whole. A string that matches more than once is
+//! refused, with the lines it matches at, and the line it begins at,
+//! given, says which. Left to itself, the model
 //! edits by an old string and a new, in Python through bash, and reads
 //! the file back after each to see that it took: this is that, as a tool,
 //! with the reading back in the result.
@@ -18,7 +21,7 @@ use serde_json::Value;
 use crate::{number, plural, read, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
 
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
@@ -97,8 +100,18 @@ pub fn run(arguments: &Value) -> String {
         }
     };
     let (first, last) = (at + 1, at + wanted.len());
+    let new = match whole(&lines[at..last], &wanted, new) {
+        Ok(new) => new,
+        Err(line) => {
+            return format!(
+                "error: line {} of {path} is longer than read shows, cut at {} bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
+                at + line + 1,
+                read::LINE
+            );
+        }
+    };
 
-    let updated = replaced(&lines, first, last, new);
+    let updated = replaced(&lines, first, last, &new);
     if let Err(e) = fs::write(path, &updated) {
         return format!("error: cannot write {path}: {e}");
     }
@@ -186,6 +199,44 @@ fn matches(want: &str, line: &str, tier: Tier) -> bool {
             .is_some_and(|head| line.len() > read::LINE && line.starts_with(head))
 }
 
+/// The lines of `text`, the new string, as they go into the file in place
+/// of `old`, the lines matched by `wanted`. A line of `old` that `read`
+/// cut, matched by its start, is one the model has not seen whole: a line
+/// of `text` that is it as `read` shows it, cut, is that line whole, and
+/// if no line of `text` is, the edit would lose what the model has not
+/// seen, so the index of the first such line is the error.
+fn whole(old: &[&[u8]], wanted: &[&str], text: &str) -> Result<Vec<Vec<u8>>, usize> {
+    let cut: Vec<(usize, String)> = old
+        .iter()
+        .zip(wanted)
+        .enumerate()
+        .filter_map(|(k, (line, want))| {
+            let (shown, long) = read::shown_line(line);
+            (long && want.trim_end().ends_with('…')).then_some((k, shown))
+        })
+        .collect();
+    let mut kept = vec![false; cut.len()];
+    let mut new = Vec::new();
+    if !text.is_empty() {
+        for line in split(text) {
+            let same = cut
+                .iter()
+                .position(|(_, shown)| line.ends_with('…') && shown.trim() == line.trim());
+            match same {
+                Some(i) => {
+                    kept[i] = true;
+                    new.push(read::content(old[cut[i].0]).to_vec());
+                }
+                None => new.push(line.as_bytes().to_vec()),
+            }
+        }
+    }
+    match kept.iter().position(|&kept| !kept) {
+        Some(i) => Err(cut[i].0),
+        None => Ok(new),
+    }
+}
+
 /// Line numbers from indexes, as a list.
 fn list(at: &[usize]) -> String {
     at.iter()
@@ -195,22 +246,17 @@ fn list(at: &[usize]) -> String {
 }
 
 /// The file of `lines` with lines `start` through `end`, counting from 1,
-/// replaced by those of `text`. The new lines end as the file's first line
-/// does, and the file ends in a newline if it did.
-fn replaced(lines: &[&[u8]], start: usize, end: usize, text: &str) -> Vec<u8> {
+/// replaced by `new`, lines without their endings. The new lines end as
+/// the file's first line does, and the file ends in a newline if it did.
+fn replaced(lines: &[&[u8]], start: usize, end: usize, new: &[Vec<u8>]) -> Vec<u8> {
     let eol: &[u8] = match lines.first() {
         Some(line) if line.ends_with(b"\r\n") => b"\r\n",
         _ => b"\n",
     };
-    let new: Vec<&str> = if text.is_empty() {
-        Vec::new()
-    } else {
-        split(text)
-    };
     let unterminated = lines.last().is_some_and(|line| !line.ends_with(b"\n"));
     let mut updated = lines[..start - 1].concat();
-    for line in &new {
-        updated.extend_from_slice(line.as_bytes());
+    for line in new {
+        updated.extend_from_slice(line);
         updated.extend_from_slice(eol);
     }
     updated.extend_from_slice(&lines[end..].concat());
@@ -369,12 +415,38 @@ mod tests {
                 .starts_with("error")
         );
         assert_eq!(file.text(), "    fn g() {\n        2\n    }\n");
-        // A line read cut matches by its start.
+    }
+
+    #[test]
+    fn matches_a_cut_line_by_its_start_and_keeps_it_whole() {
         let long = "y".repeat(400);
         let file = File::new(&format!("short\n{long}\nend\n"));
         let cut = format!("{}…", "y".repeat(read::LINE));
-        let result = file.edit(&cut, "replaced");
-        assert!(!result.starts_with("error"), "{result}");
+        // Copied cut into new_string, the line goes back whole.
+        let result = file.edit(&format!("short\n{cut}"), &format!("brief\n{cut}"));
+        assert!(result.starts_with("1\tbrief\n2\t"), "{result}");
+        assert_eq!(file.text(), format!("brief\n{long}\nend\n"));
+        // Changed or dropped, the edit would lose what the model has not
+        // seen, so it is refused.
+        let tweaked = format!("{}…", "z".repeat(read::LINE));
+        for new in [tweaked.as_str(), "replaced", ""] {
+            let result = file.edit(&cut, new);
+            assert_eq!(
+                result,
+                format!(
+                    "error: line 2 of {} is longer than read shows, cut at 300 bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
+                    file.path()
+                )
+            );
+            assert_eq!(file.text(), format!("brief\n{long}\nend\n"));
+        }
+        // A line that ends in … in the file is just a line.
+        let file = File::new("so on…\nend\n");
+        file.edit("so on…", "and so on…");
+        assert_eq!(file.text(), "and so on…\nend\n");
+        // And a long line given whole was seen whole.
+        let file = File::new(&format!("short\n{long}\nend\n"));
+        file.edit(&long, "replaced");
         assert_eq!(file.text(), "short\nreplaced\nend\n");
     }
 
