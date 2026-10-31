@@ -288,7 +288,9 @@ fn list(at: &[usize]) -> String {
 
 /// The file of `lines` with lines `start` through `end`, counting from 1,
 /// replaced by `new`, lines without their endings. The new lines end as
-/// the file's first line does, and the file ends in a newline if it did.
+/// the file's first line does, and the file ends in a newline if it did,
+/// unless the last lines were removed: then the line before them keeps
+/// its ending, so that a line outside the edit does not change.
 fn replaced(lines: &[&[u8]], start: usize, end: usize, new: &[Vec<u8>]) -> Vec<u8> {
     let eol: &[u8] = match lines.first() {
         Some(line) if line.ends_with(b"\r\n") => b"\r\n",
@@ -301,7 +303,7 @@ fn replaced(lines: &[&[u8]], start: usize, end: usize, new: &[Vec<u8>]) -> Vec<u
         updated.extend_from_slice(eol);
     }
     updated.extend_from_slice(&lines[end..].concat());
-    if unterminated && end == lines.len() {
+    if unterminated && end == lines.len() && !new.is_empty() {
         let without = updated.len() - eol.len().min(updated.len());
         if updated[without..] == *eol {
             updated.truncate(without);
@@ -440,6 +442,9 @@ mod tests {
         let file = File::new("one\ntwo\nthree");
         file.edit("three", "3");
         assert_eq!(file.text(), "one\ntwo\n3");
+        // Removed, the line before them keeps its ending.
+        file.edit("3", "");
+        assert_eq!(file.text(), "one\ntwo\n");
     }
 
     #[test]
