@@ -66,16 +66,17 @@ pub const THINKING_BUDGET: usize = 512;
 pub const CUTS_BEFORE_PLAN: u32 = 2;
 
 /// Calls in a row, while acting, that changed nothing, after which the
-/// model is asked to bring its plan up to date: acting on a plan that
-/// did not say what to change, the model went to look, and each page it
-/// read ended by saying where the next began, which with no thought to
-/// interrupt it is where it went, a minute a page. A build that fails
-/// and the reads to find out why fit within this.
-pub const LOOKS_BEFORE_PLAN: u32 = 4;
+/// model is asked whether it is done: acting on a plan that did not say
+/// what to change, the model went to look, and each page it read ended
+/// by saying where the next began, which with no thought to interrupt it
+/// is where it went, a minute a page; and once its tests passed, it went
+/// over its own diff page by page instead of replying. A build that
+/// fails and the reads to find out why fit within this.
+pub const LOOKS_BEFORE_ASKING: u32 = 4;
 
 /// Tokens the conversation may grow by, read and generated, without a
-/// change made to a file, before the model is asked for its plan, or to
-/// bring it up to date, and set to acting: the decision budget. Thoughts
+/// change made to a file, before the model is asked for its plan and set
+/// to acting, or, acting, whether it is done: the decision budget. Thoughts
 /// cut at their budget are one way to spend without deciding; reading
 /// page after page, each after a short thought, is the other, and this
 /// bounds both. A change starts the count over, as does a message from
@@ -91,11 +92,14 @@ const PLAN_TOKENS: usize = 2048;
 /// What the model is asked for its plan with, once it has spent the
 /// decision budget, or had its thoughts cut [`CUTS_BEFORE_PLAN`] times in
 /// a row, without a change made.
-const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools, and without restating what you found or weighing choices: the smallest change that does the job, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
+const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools, and without restating what you found or weighing choices: the smallest change that does the job, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. Name the lines from what you have read: nothing is left to be confirmed by reading it again first.";
 
 /// What the model is asked with when, acting, it has spent the decision
-/// budget again without a change.
-const REPLAN_PROMPT: &str = "You have gone on for a while without changing a file. Bring the plan up to date, in plain text, without tools, and without restating what you found: what is done, and what remains as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them.";
+/// budget again, or made [`LOOKS_BEFORE_ASKING`] calls in a row, without
+/// a change: whether it is done. Asked as a message, so that the reply
+/// is the model's own: text alone, which ends the turn, or a call, which
+/// goes on with the work.
+const DONE_PROMPT: &str = "You have gone on for a while without changing a file. If the changes are made and checked, reply now with what you changed and what you ran to check it, in a few sentences, and make no more calls. If not, say what remains, as a numbered list of the file, the lines, and what goes there, and go on with the first.";
 
 /// What the model is told once it has written its plan.
 const ACT_PROMPT: &str =
@@ -383,9 +387,6 @@ pub struct Harness<M: LanguageModel> {
     spent: usize,
     /// Tokens of growth without a change before the plan is asked for.
     decision_budget: usize,
-    /// Whether the model has written a plan this turn, so that the next
-    /// request is to bring it up to date.
-    planned: bool,
     /// Whether the last call failed while acting, so that the next reply
     /// is made with a thought, to find out why.
     recover: bool,
@@ -498,7 +499,6 @@ impl<M: LanguageModel> Harness<M> {
             cuts: 0,
             spent: 0,
             decision_budget: DECISION_BUDGET,
-            planned: false,
             recover: false,
             looks: 0,
             sampling,
@@ -595,7 +595,6 @@ impl<M: LanguageModel> Harness<M> {
         let ahead = self.environment.take();
         self.set_mode(Mode::Investigate);
         self.spent = 0;
-        self.planned = false;
         let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
@@ -623,8 +622,9 @@ impl<M: LanguageModel> Harness<M> {
     ) -> Result<Outcome, Box<dyn Error>> {
         // The last call run, as its name and arguments.
         let mut last = None;
-        // Whether the input is the results that get the plan.
-        let mut planning = false;
+        // Whether the input is the results that get the plan asked for,
+        // or the question whether the model is done.
+        let mut asking = false;
         loop {
             if let Turn::User(message) = &input {
                 self.log.user(message, ahead.as_deref(), self.chat.tokens());
@@ -637,28 +637,38 @@ impl<M: LanguageModel> Harness<M> {
                 _ => input.clone(),
             };
             // The results that get the plan need room for it too.
-            let more = if planning { self.plan_tokens()? } else { 0 };
+            let more = if asking && self.mode == Mode::Investigate {
+                self.plan_tokens()?
+            } else {
+                0
+            };
             if !self.make_room(&fed, more, on_event)? {
                 return Ok(Outcome::Done);
             }
-            if planning {
-                // Spent without deciding: the results, then the plan, or
-                // the plan brought up to date, and then acting on it.
-                planning = false;
+            if asking {
+                // Spent without deciding: the results, and then, investigating,
+                // the plan and acting on it; acting, the question whether
+                // the model is done, which it answers as it does a message.
+                asking = false;
                 let Turn::Results(outputs) = &fed else {
                     return Err("the plan answers tool results".into());
                 };
                 self.chat.feed_results(outputs)?;
                 self.record(input)?;
-                if !self.plan(on_event)? {
-                    return Ok(Outcome::Done);
-                }
-                if self.chat.cut() {
-                    return Ok(Outcome::Cut);
-                }
-                self.set_mode(Mode::Act);
                 self.spent = 0;
-                input = Turn::User(ACT_PROMPT.to_string());
+                if self.mode == Mode::Investigate {
+                    if !self.plan(on_event)? {
+                        return Ok(Outcome::Done);
+                    }
+                    if self.chat.cut() {
+                        return Ok(Outcome::Cut);
+                    }
+                    self.set_mode(Mode::Act);
+                    input = Turn::User(ACT_PROMPT.to_string());
+                } else {
+                    self.looks = 0;
+                    input = Turn::User(DONE_PROMPT.to_string());
+                }
                 continue;
             }
             let start = self.chat.tokens();
@@ -777,9 +787,9 @@ impl<M: LanguageModel> Harness<M> {
             }
             let undecided = self.spent + pending >= self.decision_budget
                 || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN)
-                || (self.mode == Mode::Act && self.looks >= LOOKS_BEFORE_PLAN);
+                || (self.mode == Mode::Act && self.looks >= LOOKS_BEFORE_ASKING);
             if !changed && undecided {
-                planning = true;
+                asking = true;
                 input = Turn::Results(outputs);
                 continue;
             }
@@ -825,8 +835,7 @@ impl<M: LanguageModel> Harness<M> {
         if on_event(Event::Planning).is_break() {
             return Ok(false);
         }
-        let prompt = self.plan_prompt();
-        self.planned = true;
+        let prompt = PLAN_PROMPT;
         self.log.user(prompt, None, self.chat.tokens());
         let before = self.chat.stats();
         let mut interrupted = false;
@@ -855,16 +864,6 @@ impl<M: LanguageModel> Harness<M> {
         Ok(!interrupted)
     }
 
-    /// What the model is asked for its plan with next: for the plan, or
-    /// to bring it up to date once it has written one this turn.
-    fn plan_prompt(&self) -> &'static str {
-        if self.planned {
-            REPLAN_PROMPT
-        } else {
-            PLAN_PROMPT
-        }
-    }
-
     /// Most tokens of a plan here: [`PLAN_TOKENS`], or a sixteenth of the
     /// context if that is less.
     fn plan_limit(&self) -> usize {
@@ -873,7 +872,7 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Most tokens the next plan takes, with the prompt for it.
     fn plan_tokens(&self) -> Result<usize, Box<dyn Error>> {
-        let prompt = Turn::User(self.plan_prompt().to_string());
+        let prompt = Turn::User(PLAN_PROMPT.to_string());
         Ok(self.chat.measure(&prompt)? + self.plan_limit() + FRAMING)
     }
 
@@ -1037,7 +1036,7 @@ fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
             continue;
         };
         if message.contains(NOTE_HEAD)
-            || [CONTINUE, PLAN_PROMPT, REPLAN_PROMPT, ACT_PROMPT].contains(&message.as_str())
+            || [CONTINUE, PLAN_PROMPT, DONE_PROMPT, ACT_PROMPT].contains(&message.as_str())
         {
             continue;
         }
@@ -1672,10 +1671,10 @@ mod tests {
     }
 
     #[test]
-    fn brings_the_plan_up_to_date_after_looking_without_a_change() {
-        // Acting, four calls in a row that change nothing get the plan
-        // asked for, since the model went to acting by a change of its
-        // own and never wrote one; a change starts the count over.
+    fn asks_whether_it_is_done_after_looking_without_a_change() {
+        // Acting, four calls in a row that change nothing get the model
+        // asked whether it is done, and a call in answer goes on with the
+        // work; a change starts the count over.
         let path = std::env::temp_dir().join(format!("dwim-looks-{}.jsonl", std::process::id()));
         let dir = repo();
         fs::write(dir.join("old.txt"), "old\n").unwrap();
@@ -1688,26 +1687,31 @@ mod tests {
             reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 4"),
             reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 5"),
             reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 6"),
-            "Done: a.txt. Remains: 1. b.txt, line 1: write made.".to_string(),
             reply_calling(0, "bash", "command", "echo made > DIR/b.txt"),
             "Done.".to_string(),
         ];
         let mut harness = harness_in(&dir, &scripts, &path);
         let (events, _) = send(&mut harness, "go");
         let mut expected = vec!["thought", "text", "call", "output"];
-        for _ in 0..7 {
+        for _ in 0..8 {
             expected.extend(["call", "output"]);
         }
-        expected.extend(["planning", "plan", "call", "output", "text"]);
+        expected.push("text");
         assert_eq!(events, expected, "{events:?}");
         let turns: Vec<&Turn> = harness.transcript().collect();
         assert_eq!(
             turns
                 .iter()
-                .filter(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT))
+                .filter(|turn| matches!(turn, Turn::User(m) if m == DONE_PROMPT))
                 .count(),
             1,
-            "the plan is asked for, once, after four looks in a row"
+            "asked once, after four looks in a row"
+        );
+        assert!(
+            !turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User(m) if m == PLAN_PROMPT)),
+            "no plan is asked for while acting"
         );
         assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "made\n");
         drop(harness);
@@ -1721,11 +1725,52 @@ mod tests {
     }
 
     #[test]
-    fn plans_once_the_decision_budget_is_spent_and_again_while_acting() {
+    fn replies_once_asked_whether_it_is_done_and_it_is() {
+        // Acting, asked after four looks whether it is done, the model
+        // replies with text alone, and the turn ends there: the reply
+        // reaches the user instead of another page.
+        let path = std::env::temp_dir().join(format!("dwim-done-{}.jsonl", std::process::id()));
+        let dir = repo();
+        fs::write(dir.join("old.txt"), "old\n").unwrap();
+        let scripts = [
+            reply_calling(20, "bash", "command", "echo made > DIR/a.txt"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 1"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 2"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 3"),
+            reply_calling(0, "bash", "command", "cat DIR/old.txt; echo 4"),
+            "I wrote a.txt and checked it against old.txt.".to_string(),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let (events, _) = send(&mut harness, "go");
+        let mut expected = vec!["thought", "text", "call", "output"];
+        for _ in 0..4 {
+            expected.extend(["call", "output"]);
+        }
+        expected.push("text");
+        assert_eq!(events, expected, "{events:?}");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        assert!(
+            matches!(&turns[turns.len() - 2], Turn::User(m) if m == DONE_PROMPT),
+            "the reply answers the question: {:?}",
+            turns[turns.len() - 2]
+        );
+        assert!(
+            matches!(turns.last(), Some(Turn::Reply { text, calls }) if text.starts_with("I wrote") && calls.is_empty())
+        );
+        drop(harness);
+        let (replies, modes) = replies_and_modes(&path);
+        assert_eq!(modes, ["act"], "{modes:?}");
+        assert_eq!(replies.last().unwrap().0, 0, "answered without thinking");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plans_once_the_decision_budget_is_spent_and_is_asked_if_done_when_spent_again() {
         // Short thoughts, each followed by a read of a long file, spend
         // the decision budget without a change: the plan is asked for and
-        // the model acts. Acting, reads that spend it again get the plan
-        // brought up to date; a change starts the count over.
+        // the model acts. Acting, reads that spend it again get the model
+        // asked whether it is done, and it goes on with a change; a change
+        // starts the count over.
         let path = std::env::temp_dir().join(format!("dwim-spent-{}.jsonl", std::process::id()));
         let dir = repo();
         fs::write(dir.join("big.txt"), "y".repeat(1500)).unwrap();
@@ -1736,7 +1781,6 @@ mod tests {
             "1. a.txt, line 1: write made.".to_string(),
             reply_calling(0, "bash", "command", "cat DIR/big.txt; echo 3"),
             reply_calling(0, "bash", "command", "cat DIR/big.txt; echo 4"),
-            "Done, what remains: 1. a.txt, line 1: write made.".to_string(),
             reply_calling(0, "bash", "command", "echo made > DIR/a.txt"),
             "Done.".to_string(),
         ];
@@ -1748,8 +1792,7 @@ mod tests {
             events,
             [
                 "thought", "text", "call", "output", "thought", "text", "call", "output",
-                "planning", "plan", "call", "output", "call", "output", "planning", "plan", "call",
-                "output", "text"
+                "planning", "plan", "call", "output", "call", "output", "call", "output", "text"
             ],
             "{events:?}"
         );
@@ -1764,7 +1807,7 @@ mod tests {
         assert_eq!(
             turns
                 .iter()
-                .filter(|turn| matches!(turn, Turn::User(m) if m == REPLAN_PROMPT))
+                .filter(|turn| matches!(turn, Turn::User(m) if m == DONE_PROMPT))
                 .count(),
             1
         );
@@ -2077,7 +2120,7 @@ mod tests {
             (Turn::User(PLAN_PROMPT.to_string()), 10),
             reply(10),
             (Turn::User(ACT_PROMPT.to_string()), 10),
-            (Turn::User(REPLAN_PROMPT.to_string()), 10),
+            (Turn::User(DONE_PROMPT.to_string()), 10),
             user(3),
         ];
         assert_eq!(
