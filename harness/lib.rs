@@ -700,7 +700,10 @@ impl<M: LanguageModel> Harness<M> {
                     0
                 };
             }
-            let before = fingerprint(&self.dir);
+            // What the files were before the first call that may change
+            // them, if there is one: a read changes nothing, nor does a
+            // call refused as repeated.
+            let mut before = None;
             let mut failed = false;
             let mut outputs = Vec::new();
             for call in &calls {
@@ -722,6 +725,9 @@ impl<M: LanguageModel> Harness<M> {
                             REPEATED.to_string()
                         } else {
                             last = this;
+                            if call.name != "read" && before.is_none() {
+                                before = Some(fingerprint(&self.dir));
+                            }
                             let start = Instant::now();
                             let output = self.tools.run(&call);
                             self.calls += 1;
@@ -741,7 +747,7 @@ impl<M: LanguageModel> Harness<M> {
                 }
                 outputs.push(output);
             }
-            let changed = fingerprint(&self.dir) != before;
+            let changed = before.is_some_and(|before| fingerprint(&self.dir) != before);
             if changed {
                 // A change is a decision made: the count starts over, and
                 // the model acts from here.
