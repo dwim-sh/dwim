@@ -4,7 +4,12 @@
 //! that outgrows its preview is shown by its start and its end, and is
 //! kept whole in a file of the tool's own, which the result names along
 //! with the line to `read` it from, so the model can get the rest with
-//! that tool instead of running the command again.
+//! that tool instead of running the command again. A pipeline ends with
+//! the status of its last command to fail, not of its last command: the
+//! model pipes builds and tests through `head` and `tail` to keep their
+//! output short, and with the shell's own rule every one of them ended
+//! with `head`'s zero, so a failed build read as a success to the model
+//! and to the harness alike.
 
 use std::{
     collections::VecDeque,
@@ -23,7 +28,7 @@ use serde_json::Value;
 use crate::string;
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code. Long output is cut to its start and end, and kept whole in a file the result names for `read`.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
@@ -87,8 +92,11 @@ impl Bash {
             return "error: bash needs a 'command' string".to_string();
         };
         self.calls += 1;
+        // `set -o pipefail` first, by itself, so that a shell without it
+        // runs the command all the same.
+        let command = format!("set -o pipefail 2>/dev/null\n{command}");
         let mut child = match Command::new("sh")
-            .args(["-c", command])
+            .args(["-c", &command])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -450,6 +458,10 @@ mod tests {
         assert_eq!(sh("exit 3", &mut bash), "[exit code 3]");
         assert_eq!(sh("true", &mut bash), "[exit code 0]");
         assert_eq!(sh("echo; echo", &mut bash), "[exit code 0]");
+        // A pipeline fails when any of its commands does.
+        assert_eq!(sh("false | true", &mut bash), "[exit code 1]");
+        assert_eq!(sh("exit 4 | head -1", &mut bash), "[exit code 4]");
+        assert_eq!(sh("echo hi | head -1", &mut bash), "hi\n[exit code 0]");
         assert_eq!(
             sh("kill -9 $$", &mut bash),
             "[killed by signal 9 (SIGKILL)]"
