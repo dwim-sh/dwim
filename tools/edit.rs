@@ -13,6 +13,12 @@
 //! edits by an old string and a new, in Python through bash, and reads
 //! the file back after each to see that it took: this is that, as a tool,
 //! with the reading back in the result.
+//!
+//! An empty new string removes the lines. The call format puts a value on
+//! lines of its own between its tags, so a value of one blank line and an
+//! empty value arrive the same, and the tool cannot tell them apart; the
+//! model is told to put a blank line in place of lines by including the
+//! line before them in both strings.
 
 use std::{borrow::Cow, fs};
 
@@ -21,7 +27,7 @@ use serde_json::Value;
 use crate::{number, plural, read, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
 
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
