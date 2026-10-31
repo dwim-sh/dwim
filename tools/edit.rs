@@ -161,6 +161,17 @@ enum Tier {
     Trimmed,
 }
 
+impl Tier {
+    /// `text` with the white space the tier disregards taken off.
+    fn trim(self, text: &str) -> &str {
+        match self {
+            Tier::Exact => text,
+            Tier::TrailingSpace => text.trim_end(),
+            Tier::Trimmed => text.trim(),
+        }
+    }
+}
+
 /// Where `wanted` begins in `lines`, the lines of the file without their
 /// endings, as indexes from zero, at the closest tier that matches it
 /// anywhere.
@@ -188,15 +199,12 @@ fn find(lines: &[Cow<str>], wanted: &[&str]) -> Vec<usize> {
 /// file without its ending, at `tier`; or its start, if `want` is a line
 /// `read` cut.
 fn matches(want: &str, line: &str, tier: Tier) -> bool {
-    let (want, line) = match tier {
-        Tier::Exact => (want, line),
-        Tier::TrailingSpace => (want.trim_end(), line.trim_end()),
-        Tier::Trimmed => (want.trim(), line.trim()),
-    };
-    want == line
+    // Whether read cut the line, as it stands, before any trimming.
+    let long = line.len() > read::LINE;
+    tier.trim(want) == tier.trim(line)
         || want
             .strip_suffix('…')
-            .is_some_and(|head| line.len() > read::LINE && line.starts_with(head))
+            .is_some_and(|head| long && tier.trim(line).starts_with(tier.trim(head)))
 }
 
 /// The lines of `text`, the new string, as they go into the file in place
@@ -440,6 +448,13 @@ mod tests {
             );
             assert_eq!(file.text(), format!("brief\n{long}\nend\n"));
         }
+        // A cut line with white space at its end matches at every tier.
+        let spaced = format!("{}   ", "y".repeat(read::LINE - 1));
+        let file = File::new(&format!("a  \n{spaced}\nend\n"));
+        let cut = format!("{} …", "y".repeat(read::LINE - 1));
+        let result = file.edit(&format!("a\n{cut}"), &format!("b\n{cut}"));
+        assert!(result.starts_with("1\tb\n2\t"), "{result}");
+        assert_eq!(file.text(), format!("b\n{spaced}\nend\n"));
         // A line that ends in … in the file is just a line.
         let file = File::new("so on…\nend\n");
         file.edit("so on…", "and so on…");
