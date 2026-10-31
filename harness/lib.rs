@@ -80,7 +80,7 @@ const PLAN_TOKENS: usize = 768;
 /// What the model is asked for its plan with, once it has spent the
 /// decision budget, or had its thoughts cut [`CUTS_BEFORE_PLAN`] times in
 /// a row, without a change made.
-const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools: the changes to make, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
+const PLAN_PROMPT: &str = "You have looked at enough to decide, so plan now, and then act on the plan rather than look further or think it over again. Write the plan in plain text, without tools: the smallest change that does the job, as a numbered list of the file, the lines, and what goes there, in the order to make them; then what to run to check them. If something must still be found out first, say what, in one line at the end.";
 
 /// What the model is asked with when, acting, it has spent the decision
 /// budget again without a change.
@@ -315,9 +315,9 @@ pub enum Event<'a> {
 }
 
 /// What the agent is doing: investigating, with thinking, until it makes
-/// a change or its thoughts run to the budget twice; or acting, without,
-/// on what it found or planned, thinking once more only after a call
-/// fails.
+/// a change, or its thoughts run to the budget twice, or it has spent the
+/// decision budget; or acting, without thinking, on what it found or
+/// planned, thinking once more only after a call fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Investigate,
@@ -723,7 +723,11 @@ impl<M: LanguageModel> Harness<M> {
                 || (self.mode == Mode::Investigate && self.cuts >= CUTS_BEFORE_PLAN);
             if !changed && undecided {
                 // Spent without deciding: the plan, or the plan brought up
-                // to date, and then acting on it.
+                // to date, and then acting on it. The results go in first,
+                // with room made for them as for any input.
+                if !self.make_room(&Turn::Results(outputs.clone()), on_event)? {
+                    return Ok(Outcome::Done);
+                }
                 self.chat.feed_results(&outputs)?;
                 self.record(Turn::Results(outputs))?;
                 self.plan(on_event)?;
@@ -779,8 +783,13 @@ impl<M: LanguageModel> Harness<M> {
         self.planned = true;
         self.log.user(prompt, None, self.chat.tokens());
         let _ = on_event(Event::Planning);
+        // The plan takes what is free above the reserve, which is the
+        // note's should the conversation have to be compacted next.
+        let room = self.chat.capacity().saturating_sub(
+            self.chat.tokens() + self.chat.measure(&Turn::User(prompt.to_string()))? + self.reserve,
+        );
         let before = self.chat.stats();
-        let plan = self.chat.answer(prompt, PLAN_TOKENS, |chunk| {
+        let plan = self.chat.answer(prompt, PLAN_TOKENS.min(room), |chunk| {
             let Chunk::Text(text) = chunk else {
                 return ControlFlow::Continue(());
             };
@@ -959,7 +968,9 @@ fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
         let Turn::User(message) = turn else {
             continue;
         };
-        if message.contains(NOTE_HEAD) || message == CONTINUE {
+        if message.contains(NOTE_HEAD)
+            || [CONTINUE, PLAN_PROMPT, REPLAN_PROMPT, ACT_PROMPT].contains(&message.as_str())
+        {
             continue;
         }
         if total + tokens > budget {
