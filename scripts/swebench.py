@@ -19,6 +19,36 @@ DATASET = "SWE-bench/SWE-bench_Lite"
 ROWS = "https://datasets-server.huggingface.co/rows?dataset=SWE-bench%2FSWE-bench_Lite&config=default&split=test"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# Runs the harness with two changes. The evaluation images only exist for
+# x86_64, and an arm64 Docker refuses to pull them unless asked for that
+# platform, so ask; Rosetta or QEMU then runs them. And each instance's image
+# is about 2 GB of its own, 600 GB over the 300, so remove it once scored.
+HARNESS = """
+import runpy, sys
+import docker.models.images as images
+import swebench.harness.docker_utils as docker_utils
+
+pull = images.ImageCollection.pull
+def pull_amd64(self, repository, tag=None, all_tags=False, **kwargs):
+    kwargs.setdefault("platform", "linux/amd64")
+    return pull(self, repository, tag, all_tags, **kwargs)
+images.ImageCollection.pull = pull_amd64
+
+cleanup_container = docker_utils.cleanup_container
+def cleanup_container_and_image(client, container, logger):
+    image = container.image.id if container else None
+    cleanup_container(client, container, logger)
+    if image:
+        try:
+            client.images.remove(image, force=True)
+        except Exception as e:
+            print(f"could not remove image {image}: {e}", file=sys.stderr)
+docker_utils.cleanup_container = cleanup_container_and_image
+
+sys.argv[0] = "run_evaluation"
+runpy.run_module("swebench.harness.run_evaluation", run_name="__main__")
+"""
+
 
 def instances():
     """Every instance of the dataset, from the Hugging Face datasets server."""
@@ -107,7 +137,7 @@ def score(args, predictions):
     print("scoring the patches, which runs each project's tests in Docker", file=sys.stderr)
     subprocess.run(
         [
-            sys.executable, "-m", "swebench.harness.run_evaluation",
+            sys.executable, "-c", HARNESS,
             "--dataset_name", DATASET,
             "--predictions_path", str(predictions),
             "--max_workers", str(args.workers),
