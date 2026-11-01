@@ -167,6 +167,9 @@ enum Reply {
     /// Part of the model's thought, before it replies.
     Thought(String),
     Text(String),
+    /// A token sampled, as it may be hidden (a tool-call tag or body, a
+    /// thought that closes) rather than shown as thought or text.
+    Token,
     /// A tool is about to run: its name and how it was called.
     Call {
         name: String,
@@ -333,6 +336,7 @@ fn reply(event: harness::Event) -> Reply {
     match event {
         harness::Event::Thought(text) => Reply::Thought(text.to_string()),
         harness::Event::Text(text) => Reply::Text(text.to_string()),
+        harness::Event::Token => Reply::Token,
         harness::Event::Call { name, detail } => Reply::Call {
             name: name.to_string(),
             detail: detail.to_string(),
@@ -636,6 +640,21 @@ impl App {
             Reply::Ready => self.status = Status::Idle,
             Reply::Thought(text) => self.generated(Segment::Thought, &text),
             Reply::Text(text) => self.generated(Segment::Text, &text),
+            Reply::Token => {
+                // Count the token toward the status line's rate, without
+                // touching the reply text (the token may be hidden in a
+                // tool-call body or a closing thought tag).
+                self.status = match self.status {
+                    Status::Generating { start, tokens } => Status::Generating {
+                        start,
+                        tokens: tokens + 1,
+                    },
+                    _ => Status::Generating {
+                        start: Instant::now(),
+                        tokens: 1,
+                    },
+                };
+            }
             Reply::Call { name, detail } => {
                 // The text so far is finished; the tool's output and the
                 // rest of the reply follow it.
@@ -734,16 +753,14 @@ impl App {
             &text
         };
         self.reply.push_str(text);
-        self.status = match self.status {
-            Status::Generating { start, tokens } => Status::Generating {
-                start,
-                tokens: tokens + 1,
-            },
-            _ => Status::Generating {
+        // The tokens are counted by the `Token` events as they are sampled;
+        // a text or thought chunk only moves the clock, never the count.
+        if !matches!(self.status, Status::Generating { .. }) {
+            self.status = Status::Generating {
                 start: Instant::now(),
-                tokens: 1,
-            },
-        };
+                tokens: 0,
+            };
+        }
         self.commit(false);
     }
 

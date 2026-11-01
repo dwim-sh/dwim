@@ -214,6 +214,7 @@ impl Printer {
                     self.replied = true;
                 }
             }
+            harness::Event::Token => {}
             harness::Event::Call { name, detail } => {
                 self.end_thought();
                 match name {
