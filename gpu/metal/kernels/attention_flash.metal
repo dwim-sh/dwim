@@ -42,6 +42,12 @@ struct Params {
 #ifndef CHUNK
 #define CHUNK 512
 #endif
+// What to leave out, to time the rest, as bits: 1 leaves out dequantizing
+// the keys and values, 2 the matrix multiplies and their loads, 4 the
+// rescaling of the sums, and 8 the softmax through the scratch.
+#ifndef ABLATE
+#define ABLATE 0
+#endif
 constant uint ROUND = 32;
 // Rows a SIMD group takes, and a threadgroup.
 constant uint ROWS = 8;
@@ -82,11 +88,9 @@ kernel void attention_flash(
 {
     threadgroup half kv[ROUND * STRIDE];
     // Each SIMD group's scores for the round, then their exponentials as
-    // half floats; and the factors its rows' sums are rescaled by, as a
-    // diagonal matrix.
+    // half floats.
     threadgroup float s_scratch[4][ROWS * ROUND];
     threadgroup half p_scratch[4][ROWS * ROUND];
-    threadgroup float diag[4][64];
 
     uint kvh = wg.y % p.n_kv_heads;
     uint c = wg.y / p.n_kv_heads;
@@ -129,9 +133,6 @@ kernel void attention_flash(
     for (uint j = 0; j < DB; j++) {
         simdgroup_load(qm[j], qs + 8 * j, STRIDE);
     }
-    for (uint i = lane; i < 64; i += 32) {
-        diag[sg][i] = 0.0f;
-    }
     simdgroup_float8x8 o[DB];
     for (uint j = 0; j < DB; j++) {
         o[j] = simdgroup_float8x8(0.0f);
@@ -141,19 +142,33 @@ kernel void attention_flash(
 
     for (uint r = start; r < end; r += ROUND) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#if !(ABLATE & 1)
         dequantize(kv, k_quants, k_scales, r, tg_len, kv_dim, base, lid);
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // The rows' scores for the round's positions, eight at a time.
+        // The rows' scores for the round's positions, eight at a time:
+        // the four blocks of positions are accumulated side by side, so
+        // that each multiply waits on the one four back, not the last.
+        simdgroup_float8x8 s[ROUND / 8];
         for (uint b = 0; b < ROUND / 8; b++) {
-            simdgroup_float8x8 s = simdgroup_float8x8(0.0f);
-            for (uint j = 0; j < DB; j++) {
+            s[b] = simdgroup_float8x8(0.0f);
+        }
+#if !(ABLATE & 2)
+        for (uint j = 0; j < DB; j++) {
+            for (uint b = 0; b < ROUND / 8; b++) {
                 simdgroup_half8x8 k;
                 simdgroup_load(k, kv + 8 * b * STRIDE + 8 * j, STRIDE, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(s, qm[j], k, s);
+                simdgroup_multiply_accumulate(s[b], qm[j], k, s[b]);
             }
-            simdgroup_store(s, s_scratch[sg] + 8 * b, ROUND);
+        }
+#endif
+        for (uint b = 0; b < ROUND / 8; b++) {
+            simdgroup_store(s[b], s_scratch[sg] + 8 * b, ROUND);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
+        // The factor the row's sums are rescaled by, as its maximum grows.
+        float factor = 1.0f;
+#if !(ABLATE & 8)
         // The lane's eight positions of its row, masked past its token,
         // against the row's new maximum.
         uint c0 = (lane % 4) * 8;
@@ -167,7 +182,7 @@ kernel void attention_flash(
         mx = max(mx, simd_shuffle_xor(mx, 1));
         mx = max(mx, simd_shuffle_xor(mx, 2));
         float m_new = max(m, mx);
-        float factor = exp(m - m_new);
+        factor = exp(m - m_new);
         float sum = 0.0f;
         for (uint i = 0; i < 8; i++) {
             float e = r + c0 + i < len ? exp(sv[i] - m_new) : 0.0f;
@@ -178,27 +193,37 @@ kernel void attention_flash(
         sum += simd_shuffle_xor(sum, 2);
         l = l * factor + sum;
         m = m_new;
-        if (lane % 4 == 0) {
-            diag[sg][my * 9] = factor;
-        }
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#if !(ABLATE & 1)
         dequantize(kv, v_quants, v_scales, r, tg_len, kv_dim, base, lid);
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // What the rows have summed, rescaled to the new maxima, plus the
-        // exponentials' products with the values.
-        simdgroup_float8x8 f;
-        simdgroup_load(f, diag[sg], 8);
+        // exponentials' products with the values. A lane holds two
+        // elements of one row of each 8x8 of the sums: on Apple GPUs,
+        // lanes 0-15 hold rows 0-3 and 16-31 rows 4-7, two lanes to a row
+        // for columns 0-3, then two for columns 4-7. The row's factor comes
+        // from the lanes of the softmax, four to a row; a multiply by a
+        // diagonal matrix instead cost a third of the kernel.
+        uint orow = ((lane >> 1) & 3) + ((lane >> 4) << 2);
+        float of = simd_shuffle(factor, 4 * orow);
         simdgroup_half8x8 pm[ROUND / 8];
         for (uint b = 0; b < ROUND / 8; b++) {
             simdgroup_load(pm[b], p_scratch[sg] + 8 * b, ROUND);
         }
         for (uint j = 0; j < DB; j++) {
-            simdgroup_multiply(o[j], f, o[j]);
+#if !(ABLATE & 4)
+            o[j].thread_elements()[0] *= of;
+            o[j].thread_elements()[1] *= of;
+#endif
+#if !(ABLATE & 2)
             for (uint b = 0; b < ROUND / 8; b++) {
                 simdgroup_half8x8 v;
                 simdgroup_load(v, kv + 8 * b * STRIDE + 8 * j, STRIDE);
                 simdgroup_multiply_accumulate(o[j], pm[b], v, o[j]);
             }
+#endif
         }
     }
 

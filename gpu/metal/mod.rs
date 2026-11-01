@@ -186,6 +186,47 @@ pub struct Metal {
 // Commands are only encoded from whichever thread owns the device.
 unsafe impl Send for Metal {}
 
+/// The source of the kernel `$name` in `kernels/`.
+macro_rules! source {
+    ($name:literal) => {
+        include_str!(concat!("kernels/", $name, ".metal"))
+    };
+}
+
+/// Compiles the kernel `name` for threadgroups of `threads`, which the GPU
+/// must be able to run, from `defines` ahead of `parts`: the snippets it
+/// shares with other kernels, then its own source.
+fn compile(
+    device: &ProtocolObject<dyn MTLDevice>,
+    name: &str,
+    threads: usize,
+    defines: &[(&str, usize)],
+    parts: &[&str],
+    options: Option<&MTLCompileOptions>,
+) -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
+    let mut source = String::new();
+    for (define, value) in defines {
+        source.push_str(&format!("#define {define} {value}\n"));
+    }
+    for part in parts {
+        source.push_str(part);
+        source.push('\n');
+    }
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(&source), options)
+        .map_err(|e| format!("{name}.metal: {}", e.localizedDescription()))?;
+    let function = library
+        .newFunctionWithName(&NSString::from_str(name))
+        .ok_or_else(|| format!("{name}.metal has no kernel named {name}"))?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
+    if pipeline.maxTotalThreadsPerThreadgroup() < threads {
+        return Err(format!("{name} can't run {threads} threads to a threadgroup").into());
+    }
+    Ok(pipeline)
+}
+
 impl Metal {
     /// Opens the system's default GPU.
     pub fn new() -> Result<Self, Box<dyn Error>> {
@@ -193,47 +234,12 @@ impl Metal {
         let name = device.name().to_string();
         let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
 
-        // Compiles the kernel `name` for threadgroups of `threads`, which
-        // the GPU must be able to run, from `defines` ahead of `parts`: the
-        // snippets it shares with other kernels, then its own source.
-        let compile = |name: &str,
-                       threads: usize,
-                       defines: &[(&str, usize)],
-                       parts: &[&str],
-                       options: Option<&MTLCompileOptions>|
-         -> Result<Object<dyn MTLComputePipelineState>, Box<dyn Error>> {
-            let mut source = String::new();
-            for (define, value) in defines {
-                source.push_str(&format!("#define {define} {value}\n"));
-            }
-            for part in parts {
-                source.push_str(part);
-                source.push('\n');
-            }
-            let library = device
-                .newLibraryWithSource_options_error(&NSString::from_str(&source), options)
-                .map_err(|e| format!("{name}.metal: {}", e.localizedDescription()))?;
-            let function = library
-                .newFunctionWithName(&NSString::from_str(name))
-                .ok_or_else(|| format!("{name}.metal has no kernel named {name}"))?;
-            let pipeline = device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
-            if pipeline.maxTotalThreadsPerThreadgroup() < threads {
-                return Err(format!("{name} can't run {threads} threads to a threadgroup").into());
-            }
-            Ok(pipeline)
-        };
-        macro_rules! source {
-            ($name:literal) => {
-                include_str!(concat!("kernels/", $name, ".metal"))
-            };
-        }
         // A kernel from `kernels/`, with the definitions given after its
         // threads ahead of it, and the snippets given after a semicolon.
         macro_rules! msl {
             ($name:literal, $threads:expr $(, $define:literal = $value:expr)* $(; $($snippet:literal),+)?) => {
                 compile(
+                    &device,
                     $name,
                     $threads,
                     &[$(($define, $value)),*],
@@ -253,6 +259,7 @@ impl Metal {
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
             let mma = |tokens| {
                 compile(
+                    &device,
                     "matmul_ternary_mma",
                     MATRIX_THREADS,
                     &[("TOKENS", tokens)],
@@ -1187,6 +1194,56 @@ mod tests {
                     eprintln!("batch of {n}:");
                     crate::tests::kernel_speed(&gpu, n);
                 }
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the batched attention kernel at depths of context, whole and
+    /// with its dequantization or its matrix multiplies left out, to tell
+    /// which bounds it; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn attention_speed() {
+        let mut gpu = match super::Metal::new() {
+            Ok(gpu) => gpu,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        for (ablate, what) in [
+            (0, "whole"),
+            (1, "without dequantizing"),
+            (2, "without multiplying"),
+            (3, "without either"),
+            (7, "without either or rescaling"),
+            (15, "without either, rescaling, or the softmax"),
+        ] {
+            gpu.kernels.attention_flash[1] = super::compile(
+                &gpu.device,
+                "attention_flash",
+                super::MATRIX_THREADS,
+                &[
+                    ("DIM", 256),
+                    ("CHUNK", super::FLASH_CHUNK),
+                    ("ABLATE", ablate),
+                ],
+                &[source!("attention_flash")],
+                None,
+            )
+            .unwrap();
+            eprintln!("{what}:");
+            crate::tests::attention_speed(&gpu, 64);
+        }
+    }
+
+    /// Times the ternary matmul on the tile kernel, without the matrix
+    /// accelerators; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ternary_matmul_tile_speed() {
+        match super::Metal::new() {
+            Ok(mut gpu) => {
+                gpu.kernels.matmul_ternary_mma = None;
+                crate::tests::ternary_matmul_speed(&gpu);
             }
             Err(e) => eprintln!("skipping: {e}"),
         }
