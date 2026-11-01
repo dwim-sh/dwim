@@ -51,22 +51,11 @@ pub fn run(arguments: &Value) -> String {
     let Some(path) = string(arguments, "path") else {
         return "error: read needs a 'path' string".to_string();
     };
-    let start = match arguments.get("start") {
-        None => None,
-        Some(_) => match number(arguments, "start") {
-            Some(start) => Some(start.max(1)),
-            None => return "error: 'start' is a line number".to_string(),
-        },
+    let (start, lines) = match range(arguments) {
+        Ok(range) => range,
+        Err(e) => return e,
     };
-    let most = match arguments.get("lines") {
-        None => PAGE,
-        Some(_) => match number(arguments, "lines") {
-            Some(lines) if lines >= 1 => (lines as usize).min(PAGE),
-            _ => return "error: 'lines' is a number of lines, 1 or more".to_string(),
-        },
-    };
-    // Lines asked for without a start are from the first.
-    let start = start.or(arguments.get("lines").map(|_| 1));
+    let most = lines.unwrap_or(PAGE);
     let open = || File::open(path).map(BufReader::new);
     let file = match open() {
         Ok(file) => file,
@@ -92,6 +81,28 @@ pub fn run(arguments: &Value) -> String {
         Ok(text) => text,
         Err(e) => format!("error: reading {path}: {e}"),
     }
+}
+
+/// What the arguments ask for: the line to start from, and how many lines,
+/// each where given, or the error the model is shown for one that is not
+/// a number. More lines than a page is a page, and lines asked for without
+/// a start are from the first.
+fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
+    let start = match arguments.get("start") {
+        None => None,
+        Some(_) => match number(arguments, "start") {
+            Some(start) => Some(start.max(1)),
+            None => return Err("error: 'start' is a line number".to_string()),
+        },
+    };
+    let lines = match arguments.get("lines") {
+        None => None,
+        Some(_) => match number(arguments, "lines") {
+            Some(lines) if lines >= 1 => Some((lines as usize).min(PAGE)),
+            _ => return Err("error: 'lines' is a number of lines, 1 or more".to_string()),
+        },
+    };
+    Ok((start.or(lines.map(|_| 1)), lines))
 }
 
 /// The line `line` without its ending, whether that is `\n` or `\r\n`.
