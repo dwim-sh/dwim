@@ -79,18 +79,20 @@ scripts/swebench.py --limit 10                         # the first ten
 scripts/swebench.py                                    # all 300
 ```
 
-The script builds `dwim`, checks each repository out at its base commit, gives
-`dwim` the issue, takes what it changed as the patch, and scores the patches
-with the official harness, which runs each project's tests in Docker. It
-tells you what to install if Docker or the harness is missing; the harness
-needs Python 3.10, and on Apple Silicon a Docker that runs x86_64 images, such
-as Colima started with `--vz-rosetta`. `--no-score` writes `predictions.jsonl`
-without scoring, `--score-only` scores what an earlier run wrote, and `--help`
-lists the rest.
+The script builds `dwim`, and for each instance takes the repository as the
+instance's SWE-bench image has it, with the project and what it needs
+installed, gives `dwim` the issue with its shell commands running in a
+container of that image (`dwim --shell`), takes what it changed as the
+patch, and scores the patch with the official harness, which runs the
+project's tests in the same image. It tells you what to install if Docker
+or the harness is missing; the harness needs Python 3.10, and on Apple
+Silicon a Docker that runs x86_64 images, such as Colima started with
+`--vz-rosetta`. `--no-score` writes `predictions.jsonl` without scoring,
+`--score-only` scores what an earlier run wrote, and `--help` lists the rest.
 
-**The agent runs shell commands from an untrusted issue, in a checkout of an
-untrusted repository, as you.** Run it in a container or a virtual machine,
-not on a machine you care about.
+**The agent's commands run in the container, but the model runs here, and
+its read and edit tools work on the checkout as you, on an untrusted
+issue.** Run it in a virtual machine, not on a machine you care about.
 
 ## Releasing
 
