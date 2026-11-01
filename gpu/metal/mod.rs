@@ -38,6 +38,13 @@ const FLASH_TOKENS: usize = 2;
 const FLASH_CHUNK: usize = 512;
 const FLASH_ROWS: usize = 32;
 
+/// Rows a threadgroup of the attention kernel on the matrix accelerators
+/// takes, and its threads, eight SIMD groups.
+const MMA_ROWS: usize = 64;
+const MMA_THREADS: usize = 256;
+/// Most chunks of positions it splits a context into.
+const MMA_CHUNKS: usize = 32;
+
 /// Kernels encoded into a command buffer before it is committed, without
 /// waiting, so that the GPU works on the first kernels of a forward pass
 /// while the CPU encodes the rest.
@@ -145,6 +152,10 @@ struct Kernels {
     attention_combine: Object<dyn MTLComputePipelineState>,
     /// The flash attention kernel for heads of 128 and of 256.
     attention_flash: [Object<dyn MTLComputePipelineState>; 2],
+    /// Batched attention on the matrix accelerators, where the GPU has them,
+    /// and the packing of the queries for it.
+    attention_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    pack_queries: Object<dyn MTLComputePipelineState>,
     silu_mul: Object<dyn MTLComputePipelineState>,
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
@@ -271,6 +282,23 @@ impl Metal {
         } else {
             None
         };
+        let attention_mma = if matmul_ternary_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let mma = |dim| {
+                compile(
+                    &device,
+                    "attention_mma",
+                    MMA_THREADS,
+                    &[("DIM", dim)],
+                    &[source!("attention_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([mma(128)?, mma(256)?])
+        } else {
+            None
+        };
         let kernels = Kernels {
             matmul_bf16: msl!("matmul_bf16", THREADS),
             matmul_ternary_sums: msl!(
@@ -286,7 +314,9 @@ impl Metal {
                 msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 64; "trits"),
             ],
             matmul_ternary_mma,
+            attention_mma,
             pack_halves: msl!("pack_halves", THREADS),
+            pack_queries: msl!("pack_queries", THREADS),
             add: msl!("add", THREADS),
             rmsnorm: msl!("rmsnorm", THREADS),
             l2norm: msl!("l2norm", THREADS),
@@ -553,6 +583,20 @@ struct AttentionParams {
     chunk: u32,
     /// Tokens the dispatch covers, for the flash kernel.
     tokens: u32,
+    /// Rows of a key/value head's packed queries, for the kernel on the
+    /// matrix accelerators.
+    padded: u32,
+}
+
+/// What `pack_queries.metal` is told.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PackQueriesParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    dim: u32,
+    n: u32,
+    padded: u32,
 }
 
 #[repr(C)]
@@ -933,11 +977,26 @@ impl Device for Metal {
         // A batch of tokens goes through the flash kernel, on the matrix
         // units, where the head is one it is compiled for.
         let flash = match head_dim {
-            128 if n >= FLASH_TOKENS => Some(&self.kernels.attention_flash[0]),
-            256 if n >= FLASH_TOKENS => Some(&self.kernels.attention_flash[1]),
+            128 if n >= FLASH_TOKENS => Some(0),
+            256 if n >= FLASH_TOKENS => Some(1),
             _ => None,
+        }
+        .map(|which| match &self.kernels.attention_mma {
+            Some(mma) => &mma[which],
+            None => &self.kernels.attention_flash[which],
+        });
+        // The kernel on the accelerators takes chunks that keep a batch to
+        // [`MMA_CHUNKS`] of them, so that a deep context is not split into
+        // dispatches a few tokens each by the partials, nor each token's
+        // heads into many partials to combine; it has threadgroups enough
+        // from the rows.
+        let chunk = if flash.is_some() && self.kernels.attention_mma.is_some() {
+            FLASH_CHUNK.max((pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK))
+        } else if flash.is_some() {
+            FLASH_CHUNK
+        } else {
+            CHUNK
         };
-        let chunk = if flash.is_some() { FLASH_CHUNK } else { CHUNK };
         // Every token's heads get as many chunks as the last token attends
         // over, as many tokens to a dispatch as the partials fit.
         let chunks = (pos + n).div_ceil(chunk);
@@ -948,6 +1007,32 @@ impl Device for Metal {
             pos + n
         );
         let per_dispatch = PARTIALS / per_token;
+        // The kernel on the accelerators reads the queries packed by
+        // key/value head, with room past the batch for its last
+        // threadgroup's rows.
+        let group = n_heads / n_kv_heads;
+        let padded = (n * group + MMA_ROWS).next_multiple_of(MMA_ROWS);
+        if flash.is_some() && self.kernels.attention_mma.is_some() {
+            assert!(
+                n_kv_heads * padded * head_dim <= PACKED,
+                "a batch of {n} tokens of queries is more than the kernels pack"
+            );
+            self.packed_for.set(None);
+            let pack = PackQueriesParams {
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                dim: head_dim as u32,
+                n: n as u32,
+                padded: padded as u32,
+            };
+            self.dispatch(
+                &self.kernels.pack_queries,
+                &[&self.packed, &q.buf],
+                &pack,
+                (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
+                THREADS,
+            );
+        }
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
             let params = AttentionParams {
@@ -959,10 +1044,17 @@ impl Device for Metal {
                 chunks: chunks as u32,
                 chunk: chunk as u32,
                 tokens: tokens as u32,
+                padded: padded as u32,
             };
+            let queries: &ProtocolObject<dyn MTLBuffer> =
+                if flash.is_some() && self.kernels.attention_mma.is_some() {
+                    &self.packed
+                } else {
+                    &q.buf
+                };
             let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
                 &out.buf,
-                &q.buf,
+                queries,
                 &k_cache.quants,
                 &k_cache.scales,
                 &v_cache.quants,
@@ -970,13 +1062,18 @@ impl Device for Metal {
                 &self.partials,
             ];
             if let Some(kernel) = flash {
-                let rows = tokens * (n_heads / n_kv_heads);
+                let rows = tokens * group;
+                let (tile, threads) = if self.kernels.attention_mma.is_some() {
+                    (MMA_ROWS, MMA_THREADS)
+                } else {
+                    (FLASH_ROWS, MATRIX_THREADS)
+                };
                 self.dispatch_grid(
                     kernel,
                     &buffers,
                     &params,
-                    (rows.div_ceil(FLASH_ROWS), n_kv_heads * chunks),
-                    MATRIX_THREADS,
+                    (rows.div_ceil(tile), n_kv_heads * chunks),
+                    threads,
                 );
             } else {
                 self.dispatch(
@@ -1157,6 +1254,7 @@ impl Device for Metal {
 
 #[cfg(test)]
 mod tests {
+    use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
     check_against_cpu!(super::Metal::new());
 
     /// Checks the tile kernel a GPU without matrix accelerators takes, on
@@ -1199,9 +1297,24 @@ mod tests {
         }
     }
 
-    /// Times the batched attention kernel at depths of context, whole and
-    /// with its dequantization or its matrix multiplies left out, to tell
-    /// which bounds it; run with `--ignored --nocapture`.
+    /// Checks the batched attention kernel for the SIMD groups' matrices
+    /// against the CPU on a GPU that would take the accelerators' instead.
+    #[test]
+    fn attention_flash_matches_cpu() {
+        match super::Metal::new() {
+            Ok(mut gpu) => {
+                gpu.kernels.attention_mma = None;
+                crate::tests::attention_matches_cpu(&gpu);
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the batched attention kernels at depths of context: the one
+    /// on the matrix accelerators, where the GPU has them, and the one on
+    /// the SIMD groups' matrices, whole and with its dequantization or its
+    /// matrix multiplies left out, to tell which bounds it; run with
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore]
     fn attention_speed() {
@@ -1209,6 +1322,31 @@ mod tests {
             Ok(gpu) => gpu,
             Err(e) => return eprintln!("skipping: {e}"),
         };
+        if gpu.kernels.attention_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            for (ablate, what) in [
+                (0, "whole"),
+                (1, "without dequantizing"),
+                (2, "without multiplying"),
+                (4, "without rescaling"),
+                (7, "without any of them"),
+            ] {
+                let mma = super::compile(
+                    &gpu.device,
+                    "attention_mma",
+                    super::MMA_THREADS,
+                    &[("DIM", 256), ("ABLATE", ablate)],
+                    &[source!("attention_mma")],
+                    Some(&metal4),
+                )
+                .unwrap();
+                gpu.kernels.attention_mma.as_mut().unwrap()[1] = mma;
+                eprintln!("on the matrix accelerators, {what}:");
+                crate::tests::attention_speed(&gpu, 64);
+            }
+            gpu.kernels.attention_mma = None;
+        }
         for (ablate, what) in [
             (0, "whole"),
             (1, "without dequantizing"),
