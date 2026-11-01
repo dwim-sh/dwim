@@ -125,6 +125,7 @@ def run(args, predictions):
                 "model_patch": patch,
             }
             out.write(json.dumps(prediction) + "\n")
+            out.flush()
     return len(rows)
 
 
