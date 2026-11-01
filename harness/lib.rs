@@ -305,6 +305,9 @@ pub enum Event<'a> {
     Thought(&'a str),
     /// Text of the reply.
     Text(&'a str),
+    /// A token sampled, as it may be hidden (a tool-call tag or body, a
+    /// thought that closes) rather than shown as a thought or text piece.
+    Token,
     /// A tool is about to run: its name and how it was called.
     Call {
         name: &'a str,
@@ -685,6 +688,7 @@ impl<M: LanguageModel> Harness<M> {
                             self.log.stream("text", piece);
                             text.push_str(piece);
                         }
+                        Chunk::Token => {}
                     }
                     on_event(event(chunk))
                 };
@@ -1158,6 +1162,7 @@ fn event(chunk: Chunk) -> Event {
     match chunk {
         Chunk::Thought(text) => Event::Thought(text),
         Chunk::Text(text) => Event::Text(text),
+        Chunk::Token => Event::Token,
     }
 }
 
@@ -1205,9 +1210,13 @@ mod tests {
         let mut note = String::new();
         harness
             .send(message, |event| {
-                events.push(match event {
+                // The `Token` events only move the rate counter; they carry
+                // no text and are not interesting to the event-sequence
+                // assertions.
+                let name = match event {
                     Event::Thought(_) => "thought",
                     Event::Text(_) => "text",
+                    Event::Token => return ControlFlow::Continue(()),
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
                     Event::Cut => "cut",
@@ -1219,7 +1228,8 @@ mod tests {
                         "note"
                     }
                     Event::Compacted { .. } => "compacted",
-                });
+                };
+                events.push(name);
                 ControlFlow::Continue(())
             })
             .unwrap();
@@ -1405,7 +1415,10 @@ mod tests {
         let mut events = Vec::new();
         limited
             .send("go", |event| {
-                events.push(match event {
+                // The `Token` events only move the rate counter; they carry
+                // no text and are not interesting to the event-sequence
+                // assertions.
+                let name = match event {
                     Event::Thought(text) => {
                         thought.push_str(text);
                         "thought"
@@ -1413,8 +1426,10 @@ mod tests {
                     Event::Text(_) => "text",
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
+                    Event::Token => return ControlFlow::Continue(()),
                     _ => "other",
-                });
+                };
+                events.push(name);
                 ControlFlow::Continue(())
             })
             .unwrap();

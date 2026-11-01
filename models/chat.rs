@@ -124,6 +124,10 @@ pub enum Chunk<'a> {
     Thought(&'a str),
     /// Part of the reply itself.
     Text(&'a str),
+    /// A token sampled, as it may be hidden (a tool-call tag or body, a
+    /// thought that closes) rather than shown as a `Thought` or `Text`.
+    /// It carries no text.
+    Token,
 }
 
 impl<M: LanguageModel> Chat<M> {
@@ -574,6 +578,14 @@ impl<M: LanguageModel> Chat<M> {
                 interrupted = true;
                 break;
             }
+            // Count each token as sampled, even hidden ones (tool-call tags
+            // and bodies, closing tags) that produce no thought or text
+            // chunk.
+            let flow = on_chunk(Chunk::Token);
+            if flow.is_break() {
+                interrupted = true;
+                break;
+            }
         }
 
         // End the reply the way the chat format expects, ready for the next
@@ -699,6 +711,7 @@ mod tests {
             match chunk {
                 Chunk::Thought(text) => thoughts.push_str(text),
                 Chunk::Text(text) => reply.push_str(text),
+                Chunk::Token => {}
             }
             ControlFlow::Continue(())
         })
@@ -1001,6 +1014,7 @@ mod tests {
                 match chunk {
                     Chunk::Thought(text) => thoughts.push_str(text),
                     Chunk::Text(text) => reply.push_str(text),
+                    Chunk::Token => {}
                 }
                 ControlFlow::Continue(())
             })
