@@ -82,9 +82,11 @@ scripts/swebench.py                                    # all 300
 The script builds `dwim`, checks each repository out at its base commit, gives
 `dwim` the issue, takes what it changed as the patch, and scores the patches
 with the official harness, which runs each project's tests in Docker. It
-tells you what to install if Docker or the harness is missing. `--no-score`
-writes `predictions.jsonl` without scoring, `--score-only` scores what an
-earlier run wrote, and `--help` lists the rest.
+tells you what to install if Docker or the harness is missing; the harness
+needs Python 3.10, and on Apple Silicon a Docker that runs x86_64 images, such
+as Colima started with `--vz-rosetta`. `--no-score` writes `predictions.jsonl`
+without scoring, `--score-only` scores what an earlier run wrote, and `--help`
+lists the rest.
 
 **The agent runs shell commands from an untrusted issue, in a checkout of an
 untrusted repository, as you.** Run it in a container or a virtual machine,
