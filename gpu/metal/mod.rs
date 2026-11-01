@@ -588,6 +588,17 @@ struct AttentionParams {
     padded: u32,
 }
 
+/// A kernel a batch of tokens of attention goes through, the rows (a
+/// token's query head each) a threadgroup of it takes and its threads, and
+/// whether it is the one on the matrix accelerators, which reads the
+/// queries packed by key/value head and takes chunks sized by the depth.
+struct Batched<'a> {
+    kernel: &'a ProtocolObject<dyn MTLComputePipelineState>,
+    rows: usize,
+    threads: usize,
+    accelerators: bool,
+}
+
 /// What `pack_queries.metal` is told.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -974,28 +985,39 @@ impl Device for Metal {
             "the kernel holds up to eight query heads per key/value head"
         );
         out.touch();
-        // A batch of tokens goes through the flash kernel, on the matrix
-        // units, where the head is one it is compiled for.
-        let flash = match head_dim {
+        // A batch of tokens goes through a batched kernel where the head is
+        // one they are compiled for: the one on the matrix accelerators
+        // where the GPU has them, and the flash kernel on the SIMD groups'
+        // matrices elsewhere.
+        let batched = match head_dim {
             128 if n >= FLASH_TOKENS => Some(0),
             256 if n >= FLASH_TOKENS => Some(1),
             _ => None,
         }
         .map(|which| match &self.kernels.attention_mma {
-            Some(mma) => &mma[which],
-            None => &self.kernels.attention_flash[which],
+            Some(mma) => Batched {
+                kernel: &mma[which],
+                rows: MMA_ROWS,
+                threads: MMA_THREADS,
+                accelerators: true,
+            },
+            None => Batched {
+                kernel: &self.kernels.attention_flash[which],
+                rows: FLASH_ROWS,
+                threads: MATRIX_THREADS,
+                accelerators: false,
+            },
         });
+        let accelerators = batched.as_ref().is_some_and(|b| b.accelerators);
         // The kernel on the accelerators takes chunks that keep a batch to
         // [`MMA_CHUNKS`] of them, so that a deep context is not split into
         // dispatches a few tokens each by the partials, nor each token's
         // heads into many partials to combine; it has threadgroups enough
         // from the rows.
-        let chunk = if flash.is_some() && self.kernels.attention_mma.is_some() {
-            (pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK)
-        } else if flash.is_some() {
-            FLASH_CHUNK
-        } else {
-            CHUNK
+        let chunk = match &batched {
+            Some(_) if accelerators => (pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK),
+            Some(_) => FLASH_CHUNK,
+            None => CHUNK,
         };
         // Every token's heads get as many chunks as the last token attends
         // over, as many tokens to a dispatch as the partials fit.
@@ -1012,7 +1034,7 @@ impl Device for Metal {
         // threadgroup's rows.
         let group = n_heads / n_kv_heads;
         let padded = (n * group + MMA_ROWS).next_multiple_of(MMA_ROWS);
-        if flash.is_some() && self.kernels.attention_mma.is_some() {
+        if accelerators {
             assert!(
                 n_kv_heads * padded * head_dim <= PACKED,
                 "a batch of {n} tokens of queries is more than the kernels pack"
@@ -1033,6 +1055,8 @@ impl Device for Metal {
                 THREADS,
             );
         }
+        let queries: &ProtocolObject<dyn MTLBuffer> =
+            if accelerators { &self.packed } else { &q.buf };
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
             let params = AttentionParams {
@@ -1046,12 +1070,6 @@ impl Device for Metal {
                 tokens: tokens as u32,
                 padded: padded as u32,
             };
-            let queries: &ProtocolObject<dyn MTLBuffer> =
-                if flash.is_some() && self.kernels.attention_mma.is_some() {
-                    &self.packed
-                } else {
-                    &q.buf
-                };
             let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
                 &out.buf,
                 queries,
@@ -1061,19 +1079,14 @@ impl Device for Metal {
                 &v_cache.scales,
                 &self.partials,
             ];
-            if let Some(kernel) = flash {
+            if let Some(b) = &batched {
                 let rows = tokens * group;
-                let (tile, threads) = if self.kernels.attention_mma.is_some() {
-                    (MMA_ROWS, MMA_THREADS)
-                } else {
-                    (FLASH_ROWS, MATRIX_THREADS)
-                };
                 self.dispatch_grid(
-                    kernel,
+                    b.kernel,
                     &buffers,
                     &params,
-                    (rows.div_ceil(tile), n_kv_heads * chunks),
-                    threads,
+                    (rows.div_ceil(b.rows), n_kv_heads * chunks),
+                    b.threads,
                 );
             } else {
                 self.dispatch(
