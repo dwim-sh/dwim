@@ -19,6 +19,14 @@
 //! empty value arrive the same, and the tool cannot tell them apart; the
 //! model is told to put a blank line in place of lines by including the
 //! line before them in both strings.
+//!
+//! An old string of more than [`MOST`] lines is refused. Left to itself,
+//! the model changes a few lines of a function by writing the function
+//! out twice, as the old string and the new: on a run, four such edits of
+//! 150 to 180 lines, for changes of 5 to 15 lines each, took 16 of the
+//! run's 76 minutes, and the page they copied from was read again before
+//! each. Refused, it gives the lines that change with a line or two to
+//! find them by, which it writes from memory, as it does for most edits.
 
 use std::{borrow::Cow, fs};
 
@@ -27,10 +35,13 @@ use serde_json::Value;
 use crate::{number, plural, read, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them, 30 at most; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them, 30 at most."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
 
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
+
+/// Most lines an old string may have.
+pub const MOST: usize = 30;
 
 /// Most lines of a range shown: its start and end, half each, past this.
 const SHOWN: usize = 40;
@@ -70,6 +81,12 @@ pub fn run(arguments: &Value) -> String {
         .map(|line| String::from_utf8_lossy(read::content(line)))
         .collect();
     let wanted = split(old);
+    if wanted.len() > MOST {
+        return format!(
+            "error: old_string is {}, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; to remove a long span, use bash; nothing changed",
+            plural(wanted.len() as u64, "line")
+        );
+    }
     let (found, tier) = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
         ([], _) => {
@@ -639,6 +656,24 @@ mod tests {
             run(&json!({ "path": "/nonexistent/file", "old_string": "a", "new_string": "b" }))
                 .starts_with("error: cannot read /nonexistent/file: ")
         );
+    }
+
+    #[test]
+    fn refuses_an_old_string_of_too_many_lines() {
+        let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let file = File::new(&text);
+        let long: String = (1..=MOST + 1).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(
+            file.edit(&long, "new\n"),
+            format!(
+                "error: old_string is {}, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; to remove a long span, use bash; nothing changed",
+                plural(MOST as u64 + 1, "line")
+            )
+        );
+        assert_eq!(file.text(), text);
+        let most: String = (1..=MOST).map(|i| format!("line {i}\n")).collect();
+        assert!(!file.edit(&most, "new\n").starts_with("error"));
+        assert!(file.text().starts_with("new\nline 31\n"));
     }
 
     #[test]

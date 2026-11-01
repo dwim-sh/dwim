@@ -52,12 +52,15 @@ impl Tools {
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" => string(&call.arguments, "command").map(str::to_string),
-        "read" => {
-            string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
-                Some(start) if start > 1 => format!("{path} from line {start}"),
-                _ => path.to_string(),
-            })
-        }
+        "read" => string(&call.arguments, "path").map(|path| {
+            let start = number(&call.arguments, "start").unwrap_or(1).max(1);
+            match number(&call.arguments, "lines") {
+                Some(lines) if lines > 1 => format!("{path} lines {start}–{}", start + lines - 1),
+                Some(_) => format!("{path} line {start}"),
+                None if start > 1 => format!("{path} from line {start}"),
+                None => path.to_string(),
+            }
+        }),
         "edit" => {
             string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
                 Some(start) => format!("{path} at line {start}"),
@@ -154,6 +157,18 @@ mod tests {
                 "<function=read>\n<parameter=path>\na.rs\n</parameter>\n<parameter=start>\n201\n</parameter>\n</function>"
             )),
             "a.rs from line 201"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": 440, "lines": 30}}"#
+            )),
+            "a.rs lines 440–469"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "lines": "1"}}"#
+            )),
+            "a.rs line 1"
         );
         assert_eq!(
             describe(&call(
