@@ -659,9 +659,12 @@ pub fn rope_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
-    // Each case ends with the magnitude of the caches. The last is the
+    // Each case ends with the magnitude of the caches. The last has more
+    // tokens of the model's heads than the kernel on Apple's matrix
+    // accelerators packs the queries of at once, so the batch goes through
+    // two dispatches there, over three chunks; the one before it is the
     // model's heads for a batch whose positions cross what a device may
-    // take in one piece; the one before it, with as many query heads to a
+    // take in one piece; the one before that, with as many query heads to a
     // key/value head as the kernels take, attends over more positions than
     // one dispatch of either backend has partials for, so the batch goes
     // through several; the two before that have caches small enough that
@@ -677,6 +680,7 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         (24, 256, 4, 3, 1000, 1e-3),
         (32, 128, 4, 64, 32704, 1.0),
         (24, 256, 4, 64, 470, 1.0),
+        (24, 256, 4, 700, 470, 1.0),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos, size) in cases {
         let kv_dim = n_kv_heads * head_dim;
