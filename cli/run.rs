@@ -1057,9 +1057,10 @@ fn tilde(path: &Path) -> String {
     }
 }
 
-/// The models `dwim` knows, where their weights are kept, and how much of
-/// each is there, for the `/model` command. The one running says what it
-/// runs on and how much conversation it has room for.
+/// The models `dwim` knows, for the `/model` command: each with its source
+/// and its weights on disk, and the one running with the device it runs on
+/// and how much conversation it has room for, as a table of labels and
+/// values.
 fn models_listing(
     running: &str,
     device: Device,
@@ -1070,9 +1071,8 @@ fn models_listing(
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
         let bullet = if i == 0 { "● " } else { "  " };
-        let mut header = vec![span(bullet), span(model.name).bold()];
-        let mut details = Vec::new();
-        let on_disk = match model.dir() {
+        let header = vec![span(bullet), span(model.name).bold()];
+        let weights = match model.dir() {
             Some(dir) => {
                 let (files, bytes) = fetch::on_disk(model, &dir);
                 match files {
@@ -1090,27 +1090,36 @@ fn models_listing(
             }
             None => "no cache directory".to_string(),
         };
-        details.push(format!("{} · {on_disk}", model.repo));
+        let mut rows = vec![("source", model.repo.to_string()), ("weights", weights)];
         if model.name == running {
-            let on = match device {
-                Device::Cpu => "CPU",
-                Device::Gpu => "GPU",
+            let on = match (device, gpu) {
+                (Device::Cpu, _) => "CPU".to_string(),
+                (Device::Gpu, None) => "GPU".to_string(),
+                (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
             };
-            header.push(span(format!("  running on the {on}")).dark_grey());
-            if let Some(gpu) = gpu {
-                details.push(format!("{gpu} via {BACKEND}"));
-            }
+            rows.push(("device", on));
             if let Some(size) = size {
-                details.push(format!(
-                    "{} tokens of context in {} of memory",
-                    size.context,
-                    fetch::size(size.bytes)
+                rows.push((
+                    "context",
+                    format!(
+                        "{} tokens in {} of memory",
+                        size.context,
+                        fetch::size(size.bytes)
+                    ),
                 ));
             }
         }
-        lines.extend(report(header, details, columns));
+        lines.extend(report(header, table(rows), columns));
     }
     lines
+}
+
+/// Rows of a label and a value as lines, with the values aligned.
+fn table(rows: Vec<(&str, String)>) -> Vec<String> {
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0) + 2;
+    rows.into_iter()
+        .map(|(label, value)| format!("{label:<width$}{value}"))
+        .collect()
 }
 
 /// What the `/help` command says: the commands, and the keys.
