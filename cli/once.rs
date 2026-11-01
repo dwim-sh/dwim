@@ -10,6 +10,7 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Write},
     ops::ControlFlow,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,6 +32,7 @@ pub fn once(
     context: Option<usize>,
     thinking_budget: Option<usize>,
     temperature: Option<f32>,
+    shell: Option<PathBuf>,
     prompt: &str,
     stats: bool,
     log: Log,
@@ -56,6 +58,7 @@ pub fn once(
             context,
             thinking_budget,
             temperature,
+            shell,
             prompt,
             log,
         )?,
@@ -76,6 +79,7 @@ pub fn once(
                 context,
                 thinking_budget,
                 temperature,
+                shell,
                 prompt,
                 log,
             )?
@@ -102,6 +106,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     context: Option<usize>,
     thinking_budget: Option<usize>,
     temperature: Option<f32>,
+    shell: Option<PathBuf>,
     prompt: &str,
     log: Log,
 ) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
@@ -133,6 +138,9 @@ fn answer<D: dwim_gpu::Device + 'static>(
         move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    if let Some(shell) = shell {
+        harness.set_shell(shell);
+    }
     harness.keep_log(log, name, on, &system);
     harness.send(prompt, |event| {
         printer.print(event);
