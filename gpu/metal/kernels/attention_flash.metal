@@ -203,9 +203,11 @@ kernel void attention_flash(
         // exponentials' products with the values. A lane holds two
         // elements of one row of each 8x8 of the sums: on Apple GPUs,
         // lanes 0-15 hold rows 0-3 and 16-31 rows 4-7, two lanes to a row
-        // for columns 0-3, then two for columns 4-7. The row's factor comes
-        // from the lanes of the softmax, four to a row; a multiply by a
-        // diagonal matrix instead cost a third of the kernel.
+        // for columns 0-3, then two for columns 4-7, a layout Apple does
+        // not document, which MLX's steel kernels (mma.h) take too and the
+        // device's `simdgroup_matrix_layout` test checks. The row's factor
+        // comes from the lanes of the softmax, four to a row; a multiply by
+        // a diagonal matrix instead cost a third of the kernel.
         uint orow = ((lane >> 1) & 3) + ((lane >> 4) << 2);
         float of = simd_shuffle(factor, 4 * orow);
         simdgroup_half8x8 pm[ROUND / 8];

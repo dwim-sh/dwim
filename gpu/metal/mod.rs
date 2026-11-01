@@ -1277,6 +1277,8 @@ impl Device for Metal {
 #[cfg(test)]
 mod tests {
     use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
+
+    use crate::Device;
     check_against_cpu!(super::Metal::new());
 
     /// Checks the tile kernel a GPU without matrix accelerators takes, on
@@ -1316,6 +1318,54 @@ mod tests {
                 }
             }
             Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Checks the layout of a SIMD group's 8x8 matrix over its lanes that
+    /// `attention_flash.metal` rescales the rows of its sums by: lanes 0-15
+    /// hold rows 0-3 and 16-31 rows 4-7, two lanes to a row for columns
+    /// 0-3, then two for columns 4-7.
+    #[test]
+    fn simdgroup_matrix_layout() {
+        const SOURCE: &str = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void simdgroup_matrix_layout(
+                device float* out [[buffer(0)]],
+                uint lane [[thread_index_in_simdgroup]])
+            {
+                threadgroup float m[64];
+                for (uint i = lane; i < 64; i += 32) {
+                    m[i] = float(i);
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_float8x8 a;
+                simdgroup_load(a, m, 8);
+                out[2 * lane] = a.thread_elements()[0];
+                out[2 * lane + 1] = a.thread_elements()[1];
+            }
+        "#;
+        let gpu = match super::Metal::new() {
+            Ok(gpu) => gpu,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let kernel = super::compile(
+            &gpu.device,
+            "simdgroup_matrix_layout",
+            32,
+            &[],
+            &[SOURCE],
+            None,
+        )
+        .unwrap();
+        let out = gpu.alloc(64);
+        gpu.dispatch(&kernel, &[&out.buf], &0u32, 1, 32);
+        let got = gpu.read(&out);
+        for lane in 0..32 {
+            let row = ((lane >> 1) & 3) + ((lane >> 4) << 2);
+            let col = (lane & 1) * 2 + ((lane >> 3) & 1) * 4;
+            let want = [(row * 8 + col) as f32, (row * 8 + col + 1) as f32];
+            assert_eq!(got[2 * lane..2 * lane + 2], want, "lane {lane}");
         }
     }
 
