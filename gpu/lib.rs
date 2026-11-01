@@ -25,6 +25,13 @@ pub type Gpu = Metal;
 #[cfg(not(target_vendor = "apple"))]
 pub type Gpu = Vulkan;
 
+/// The name of the API [`Gpu`] drives the GPU through.
+#[cfg(target_vendor = "apple")]
+pub const BACKEND: &str = "Metal";
+/// The name of the API [`Gpu`] drives the GPU through.
+#[cfg(not(target_vendor = "apple"))]
+pub const BACKEND: &str = "Vulkan";
+
 /// Elements the Hadamard rotation transforms at a time.
 pub const HADAMARD_BLOCK: usize = 1024;
 

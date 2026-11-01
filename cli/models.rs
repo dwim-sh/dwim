@@ -84,6 +84,7 @@ impl Model {
 
 /// Tokens of conversation the model has room for, and the device memory
 /// it takes with them.
+#[derive(Clone, Copy)]
 pub struct Size {
     pub context: usize,
     pub bytes: u64,

@@ -20,7 +20,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim_gpu::{Cpu, Gpu};
+use dwim_gpu::{BACKEND, Cpu, Gpu};
 use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
@@ -81,7 +81,10 @@ pub fn run(
     let mut app = App {
         screen: Screen::new()?,
         model: name.to_string(),
-        device: None,
+        device,
+        gpu: None,
+        size: None,
+        transcript: None,
         cwd: env::current_dir().unwrap_or_default(),
         input: Input::default(),
         history: Vec::new(),
@@ -107,8 +110,14 @@ pub fn run(
         stop,
     };
     let result = app.run();
-    // Leave the conversation on screen, but not the input box, with a blank
-    // line between it and whatever the shell prints next.
+    // Leave the conversation on screen, but not the input box, with where
+    // the transcript is as the last word and a blank line between it and
+    // whatever the shell prints next.
+    if let Some(path) = &app.transcript {
+        app.lines.push(vec![
+            span(format!("  Transcript in {}", tilde(path))).dark_grey(),
+        ]);
+    }
     app.lines.push(Line::new());
     app.screen.draw(&app.lines, &[], (0, 0))?;
     // With no more messages to answer, and the turn in progress stopped,
@@ -126,11 +135,19 @@ pub fn run(
     result
 }
 
-/// How the thinking budget reads once set.
+/// How the thinking budget reads when asked.
 fn budget_notice(tokens: Option<usize>) -> String {
     match tokens {
         Some(tokens) => format!("Thinking budget: {tokens} tokens"),
-        None => "Thinking budget: none".to_string(),
+        None => "No thinking budget".to_string(),
+    }
+}
+
+/// How setting the thinking budget is acknowledged.
+fn budget_set(tokens: Option<usize>) -> String {
+    match tokens {
+        Some(tokens) => format!("Thinking budget set to {tokens} tokens"),
+        None => "Thinking budget lifted".to_string(),
     }
 }
 
@@ -149,8 +166,13 @@ enum Request {
 enum Reply {
     /// Part of one of the model's files has been downloaded.
     Downloading(Progress),
-    /// Which device the model is being loaded onto.
+    /// The name of the GPU the model is being loaded onto.
     Device(String),
+    /// How much room the model has for conversation, and the memory it
+    /// takes with it.
+    Size(models::Size),
+    /// Where the transcript of the session is kept.
+    Transcript(PathBuf),
     /// How many of the model's tensors are loaded, out of how many.
     Loading {
         done: usize,
@@ -221,21 +243,18 @@ fn work(
     })?;
     let gguf = model.open(dir)?;
     match device {
-        Device::Cpu => {
-            let _ = replies.send(Reply::Device("cpu".to_string()));
-            serve(
-                gguf,
-                Cpu,
-                "cpu",
-                model,
-                context,
-                thinking_budget,
-                log,
-                requests,
-                replies,
-                stop,
-            )
-        }
+        Device::Cpu => serve(
+            gguf,
+            Cpu,
+            "cpu",
+            model,
+            context,
+            thinking_budget,
+            log,
+            requests,
+            replies,
+            stop,
+        ),
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
@@ -280,7 +299,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf);
     let size = models::size(&gguf, &device, context)?;
-    let _ = replies.send(Reply::Notice(models::describe(&size)));
+    let _ = replies.send(Reply::Size(size));
     let model = models::load(gguf, device, size.context, |done, total| {
         let _ = replies.send(Reply::Loading { done, total });
     })?;
@@ -291,7 +310,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
     if let Some(path) = log.path() {
-        let _ = replies.send(Reply::Notice(format!("Transcript in {}", path.display())));
+        let _ = replies.send(Reply::Transcript(path.to_path_buf()));
     }
     let mut harness = Harness::new(chat, &cwd, {
         let system = system.clone();
@@ -319,7 +338,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
             }),
             Request::ThinkingBudget(tokens) => {
                 harness.set_thinking_budget(tokens);
-                let _ = replies.send(Reply::Notice(budget_notice(tokens)));
+                let _ = replies.send(Reply::Notice(budget_set(tokens)));
                 Ok(())
             }
         };
@@ -397,8 +416,14 @@ enum Segment {
 struct App {
     screen: Screen,
     model: String,
-    /// The device the model runs on, once known.
-    device: Option<String>,
+    /// The kind of device the model runs on, and the name of the GPU once
+    /// it is open.
+    device: Device,
+    gpu: Option<String>,
+    /// The room the model has for conversation, once it is sized.
+    size: Option<models::Size>,
+    /// Where the transcript is kept, if one is.
+    transcript: Option<PathBuf>,
     cwd: PathBuf,
     input: Input,
     /// Messages sent so far, and which one is recalled into the input.
@@ -618,7 +643,9 @@ impl App {
                 };
                 self.status = Status::Downloading { since, progress };
             }
-            Reply::Device(device) => self.device = Some(device),
+            Reply::Device(name) => self.gpu = Some(name),
+            Reply::Size(size) => self.size = Some(size),
+            Reply::Transcript(path) => self.transcript = Some(path),
             Reply::Loading { done, total } => {
                 let since = match self.status {
                     Status::Loading { since, .. } => since,
@@ -637,7 +664,14 @@ impl App {
                 };
                 self.status = Status::Prompting { since, read, total };
             }
-            Reply::Ready => self.status = Status::Idle,
+            Reply::Ready => {
+                // With the state after the system prompt restored, there
+                // was nothing to read, and loading ran up to here.
+                if let Status::Loading { since, .. } = self.status {
+                    self.loading = since.elapsed();
+                }
+                self.status = Status::Idle;
+            }
             Reply::Thought(text) => self.generated(Segment::Thought, &text),
             Reply::Text(text) => self.generated(Segment::Text, &text),
             Reply::Token => {
@@ -804,29 +838,40 @@ impl App {
         }
     }
 
-    /// Runs a slash command, printing what it has to say.
+    /// Runs a slash command, printing what it has to say: a report under a
+    /// bullet, the way a tool's output follows its call, or one line.
     fn command(&mut self, command: &str) {
         let (columns, _) = self.screen.size();
         let lines = match command.trim() {
-            "model" => models_listing(&self.model),
-            "thinking-budget" => vec![vec![span(format!(
-                "● {}",
-                budget_notice(self.thinking_budget)
-            ))]],
-            command if command.starts_with("thinking-budget ") => vec![vec![span(
-                "● /thinking-budget takes a number of tokens, or 0 for no limit",
-            )]],
+            "model" => models_listing(
+                &self.model,
+                self.device,
+                self.gpu.as_deref(),
+                self.size.as_ref(),
+                columns,
+            ),
             "stats" => {
-                let report = self.stats.report(self.loading, self.started.elapsed());
-                report
-                    .into_iter()
-                    .map(|line| vec![span(format!("  {line}"))])
-                    .collect()
+                let mut details = self.stats.report(self.loading, self.started.elapsed());
+                details.push(match &self.transcript {
+                    Some(path) => format!("transcript in {}", tilde(path)),
+                    None => "no transcript kept".to_string(),
+                });
+                report(
+                    vec![span("● "), span("This session").bold()],
+                    details,
+                    columns,
+                )
             }
-            other => vec![vec![span(format!("● Unknown command /{other}"))]],
+            "help" => help(columns),
+            "thinking-budget" => notice(budget_notice(self.thinking_budget)),
+            command if command.starts_with("thinking-budget ") => {
+                notice("/thinking-budget takes a number of tokens, or 0 for no cap")
+            }
+            other => notice(format!("Unknown command /{other} · /help lists them")),
         };
         self.lines
             .extend(lines.iter().map(|line| tui::truncate(line, columns)));
+        self.lines.push(Line::new());
     }
 
     fn draw(&mut self) -> Result<(), Box<dyn Error>> {
@@ -852,13 +897,7 @@ impl App {
                     .map(|line| reply_line(segment, line)),
             );
         }
-        if !matches!(self.status, Status::Reading(_)) {
-            live.push(Line::new());
-        }
-        if let Some(status) = self.status_line() {
-            live.push(status);
-            live.push(Line::new());
-        }
+        live.push(Line::new());
 
         // The input box, as tall as its text but no taller than the screen,
         // scrolled to show the cursor.
@@ -890,7 +929,7 @@ impl App {
             live.push(tui::boxed(vec![prompt, content], columns));
         }
         live.push(border("╰", "╯"));
-        live.push(self.footer());
+        live.push(self.footer(columns));
 
         let lines = std::mem::take(&mut self.lines);
         self.screen.draw(&lines, &live, cursor)?;
@@ -898,44 +937,57 @@ impl App {
     }
 
     /// What the model is doing, with a spinner, while it's busy.
-    fn status_line(&self) -> Option<Line> {
+    fn status(&self) -> Option<Line> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+        let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
+        let percent = |done: usize, total: usize| match total {
+            0 => String::new(),
+            _ => format!("{}% · ", done * 100 / total),
+        };
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
             Status::Downloading { since, progress } => (
-                format!("Downloading {}…", self.model),
+                "Downloading model…",
                 since,
                 download_details(progress, since.elapsed()),
             ),
             Status::Loading { since, done, total } => (
-                match &self.device {
-                    Some(device) => format!("Loading {} onto {device}…", self.model),
-                    None => format!("Loading {}…", self.model),
+                match self.device {
+                    Device::Cpu => "Loading model…",
+                    Device::Gpu => "Loading model to GPU…",
                 },
                 since,
-                format!("{done}/{total} tensors · {}s", since.elapsed().as_secs()),
+                format!("{}{}", percent(done, total), seconds(since)),
             ),
             Status::Prompting { since, read, total } => (
-                "Reading system prompt…".to_string(),
+                "Reading system prompt…",
                 since,
-                format!("{read}/{total} tokens · {}s", since.elapsed().as_secs()),
+                format!("{}{}", percent(read, total), seconds(since)),
             ),
             Status::Reading(since) => (
-                "Reading…".to_string(),
+                "Reading…",
                 since,
-                format!("{}s · esc to interrupt", since.elapsed().as_secs()),
+                format!("{} · esc to interrupt", seconds(since)),
             ),
             Status::Generating { start, tokens } => (
                 match self.segment {
-                    Segment::Thought => "Thinking…".to_string(),
-                    Segment::Text => "Generating…".to_string(),
-                    Segment::Note => "Compacting…".to_string(),
-                    Segment::Plan => "Planning…".to_string(),
+                    Segment::Thought => "Thinking…",
+                    Segment::Text => "Generating…",
+                    Segment::Note => "Compacting…",
+                    Segment::Plan => "Planning…",
                 },
                 start,
                 format!(
-                    "{tokens} tokens · {:.1} tok/s · {}esc to interrupt",
-                    tokens as f32 / start.elapsed().as_secs_f32(),
+                    "{}{}esc to interrupt",
+                    // Too early to tell the speed.
+                    if start.elapsed() >= Duration::from_secs(1) {
+                        format!(
+                            "{:.1} tok/s · ",
+                            tokens as f32 / start.elapsed().as_secs_f32()
+                        )
+                    } else {
+                        String::new()
+                    },
                     match (self.segment, self.thinking) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
                         (Segment::Thought, true) => "ctrl+o to hide · ",
@@ -951,17 +1003,24 @@ impl App {
         ])
     }
 
-    /// The directory the agent works in.
-    fn footer(&self) -> Line {
-        vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()]
+    /// The line under the input box: the directory the agent works in,
+    /// and, while the model is busy, what it is doing, at the right.
+    fn footer(&self, columns: usize) -> Line {
+        let mut line = vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()];
+        if let Some(status) = self.status() {
+            let gap = columns.saturating_sub(tui::width(&line) + tui::width(&status) + 2);
+            line.push(span(" ".repeat(gap.max(2))));
+            line.extend(status);
+        }
+        line
     }
 }
 
 /// How a download is going: the file, how much of it has arrived, and at what
 /// speed, with the time left once the file's size is known.
 fn download_details(progress: Progress, elapsed: Duration) -> String {
-    let Progress { file, done, total } = progress;
-    let mut details = format!("{file} · {}", fetch::size(done));
+    let Progress { done, total, .. } = progress;
+    let mut details = fetch::size(done);
     if let Some(total) = total {
         details.push_str(&format!(
             " / {} ({}%)",
@@ -999,35 +1058,96 @@ fn tilde(path: &Path) -> String {
 }
 
 /// The models `dwim` knows, where their weights are kept, and how much of
-/// each is there, for the `/model` command. The one running is marked.
-fn models_listing(running: &str) -> Vec<Line> {
+/// each is there, for the `/model` command. The one running says what it
+/// runs on and how much conversation it has room for.
+fn models_listing(
+    running: &str,
+    device: Device,
+    gpu: Option<&str>,
+    size: Option<&models::Size>,
+    columns: usize,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
         let bullet = if i == 0 { "● " } else { "  " };
-        let mut line = vec![
-            span(bullet),
-            span(model.name).bold(),
-            span(format!("  {}", model.repo)),
-        ];
-        if model.name == running {
-            line.push(span("  running").dark_grey());
-        }
-        lines.push(line);
-        let location = match model.dir() {
+        let mut header = vec![span(bullet), span(model.name).bold()];
+        let mut details = Vec::new();
+        let on_disk = match model.dir() {
             Some(dir) => {
                 let (files, bytes) = fetch::on_disk(model, &dir);
-                let status = match files {
+                match files {
                     0 => "not fetched".to_string(),
-                    n if n == model.files.len() => fetch::size(bytes),
-                    n => format!("{n}/{} files, {}", model.files.len(), fetch::size(bytes)),
-                };
-                format!("{} · {status}", tilde(&dir))
+                    n if n == model.files.len() => {
+                        format!("{} in {}", fetch::size(bytes), tilde(&dir))
+                    }
+                    n => format!(
+                        "{n}/{} files, {} in {}",
+                        model.files.len(),
+                        fetch::size(bytes),
+                        tilde(&dir)
+                    ),
+                }
             }
             None => "no cache directory".to_string(),
         };
-        lines.push(vec![span(format!("  {location}")).dark_grey()]);
+        details.push(format!("{} · {on_disk}", model.repo));
+        if model.name == running {
+            let on = match device {
+                Device::Cpu => "CPU",
+                Device::Gpu => "GPU",
+            };
+            header.push(span(format!("  running on the {on}")).dark_grey());
+            if let Some(gpu) = gpu {
+                details.push(format!("{gpu} via {BACKEND}"));
+            }
+            if let Some(size) = size {
+                details.push(format!(
+                    "{} tokens of context in {} of memory",
+                    size.context,
+                    fetch::size(size.bytes)
+                ));
+            }
+        }
+        lines.extend(report(header, details, columns));
     }
     lines
+}
+
+/// What the `/help` command says: the commands, and the keys.
+fn help(columns: usize) -> Vec<Line> {
+    report(
+        vec![span("● "), span("Commands").bold()],
+        [
+            "/model              the model, the device it runs on, and its context window",
+            "/stats              where this session's time has gone",
+            "/compact            compact the conversation now",
+            "/thinking-budget N  cap the model's thinking at N tokens, 0 for no cap",
+            "/help               this list",
+            "ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits",
+        ]
+        .map(str::to_string),
+        columns,
+    )
+}
+
+/// A report: its header, then its details under `⎿`, dimmed and wrapped to
+/// the terminal's `columns`, the way a tool's output follows its call.
+fn report(header: Line, details: impl IntoIterator<Item = String>, columns: usize) -> Vec<Line> {
+    let mut lines = vec![header];
+    let mut first = true;
+    for detail in details {
+        for text in tui::wrap(&detail, columns.saturating_sub(4)) {
+            let prefix = if first { "  ⎿ " } else { "    " };
+            first = false;
+            lines.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
+        }
+    }
+    lines
+}
+
+/// One line said in place of a reply.
+fn notice(text: impl Into<String>) -> Vec<Line> {
+    vec![vec![span(format!("● {}", text.into()))]]
 }
 
 /// A line of a part of the reply, the first one marked with a bullet. A

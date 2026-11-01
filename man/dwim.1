@@ -107,18 +107,21 @@ Display usage information.
 .SH INTERACTIVE SHELL
 The shell reads one message at a time.
 Anything you type is sent to the agent.
+The line under the input box names the directory the agent works in and,
+while the model is busy, what it is doing.
 Lines starting with a slash are commands:
 .TP
 .B /model
-List the models
+Show the model, the device it runs on, where its weights are kept, and
+how many tokens of conversation it has room for, along with the other
+models
 .B dwim
-knows, where their weights are kept and how much of each has been fetched,
-marking the one running.
+knows.
 .TP
 .B /stats
-Show where the conversation's time has gone, as
+Show where the session's time has gone, as
 .B \-\-stats
-does.
+does, and where its transcript is.
 .TP
 .B /compact
 Compact the conversation now, as happens on its own when it nears the
@@ -128,6 +131,9 @@ end of the context window.
 Set the most tokens the model may think before it is made to act, as
 .B \-\-thinking\-budget
 does, with 0 for no limit; alone, show it.
+.TP
+.B /help
+List the commands and the keys.
 .PP
 The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O
@@ -142,7 +148,7 @@ or
 .B Ctrl\-D
 on an empty line exits
 .BR dwim ,
-and
+printing where the session's transcript is, and
 .B Ctrl\-C
 on a line with text clears it.
 .SH FILES
