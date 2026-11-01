@@ -57,6 +57,17 @@ earlier messages, and the most recent exchanges without their thoughts.
 A reply that runs out of room is stopped short and goes on after a
 compaction.
 .TP
+.B \-\-bench
+Instead of a session, time the model at several depths of context and
+print a table of tokens a second: at each of 1k, 8k, 32k, 64k and 128k
+tokens of context, as many of them as the context has room for, the rate
+it reads a page of 2048 tokens, and the rate it generates 32 tokens one
+at a time. The context is filled with text to each depth in turn, which
+takes as long as reading that much, and a row is printed as each depth
+is done.
+.B \-\-context
+bounds the depths timed.
+.TP
 .B \-\-stats
 When answering a prompt given on the command line, print where the time
 went once the reply ends: the time loading the model; the tokens read as

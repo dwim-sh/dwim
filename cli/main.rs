@@ -1,3 +1,4 @@
+mod bench;
 mod fetch;
 mod models;
 mod once;
@@ -32,6 +33,16 @@ fn main() {
     };
     if opts.version {
         println!("dwim {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if opts.bench {
+        if let Err(e) =
+            check_memory().and_then(|()| bench::bench(&opts.model, opts.device, opts.context))
+        {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 

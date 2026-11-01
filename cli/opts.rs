@@ -28,6 +28,11 @@ pub struct Opts {
     #[argh(switch)]
     pub stats: bool,
 
+    /// time the model reading a page and generating at several depths of
+    /// context, and print tokens a second for each
+    #[argh(switch)]
+    pub bench: bool,
+
     /// show the model's thinking in the shell, which ctrl+o toggles
     #[argh(switch)]
     pub thinking: bool,
