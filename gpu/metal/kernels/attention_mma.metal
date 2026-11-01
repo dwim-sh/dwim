@@ -5,8 +5,9 @@
 // A threadgroup takes ROWS rows, a token's query head each, of one
 // key/value head, over a chunk of `chunk` positions, which the device
 // picks for the depth, in rounds of ROUND. The queries come packed by
-// `pack_queries.metal`, half floats scaled for the softmax, the head's
-// rows one after another, which the accelerators read as they multiply.
+// `pack_queries.metal` for the dispatch, half floats scaled for the
+// softmax, the head's rows one after another, which the accelerators read
+// as they multiply.
 // For each round the threads dequantize its keys into threadgroup memory,
 // the accelerators multiply the queries into them for the rows' scores,
 // which go to threadgroup memory, where four threads to a row mask the
@@ -152,11 +153,11 @@ kernel void attention_mma(
         ROWS, DIM, ROUND, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, execution_simdgroups<THREADS / 32>> qk;
     matmul2d<pv_desc, execution_simdgroups<THREADS / 32>> pv;
-    // The head's queries, the dispatch's rows from `first` on: a row past
-    // the batch is zeros, and its results are not kept.
+    // The head's queries, the dispatch's rows: a row past them is zeros,
+    // and its results are not kept.
     auto qa = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
         q + kvh * p.padded * DIM, dextents<int32_t, 2>(DIM, p.padded));
-    auto qs = qa.slice<DIM, ROWS>(0, p.first * group + r0);
+    auto qs = qa.slice<DIM, ROWS>(0, r0);
     auto ks = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
         kv, dextents<int32_t, 2>(DIM, ROUND), array<int32_t, 2>{1, int32_t(STRIDE)});
     auto vs = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(

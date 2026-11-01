@@ -583,8 +583,8 @@ struct AttentionParams {
     chunk: u32,
     /// Tokens the dispatch covers, for the flash kernel.
     tokens: u32,
-    /// Rows of a key/value head's packed queries, for the kernel on the
-    /// matrix accelerators.
+    /// Rows of a key/value head's packed queries of the dispatch, for the
+    /// kernel on the matrix accelerators.
     padded: u32,
 }
 
@@ -606,6 +606,8 @@ struct PackQueriesParams {
     n_heads: u32,
     n_kv_heads: u32,
     dim: u32,
+    /// The first token of the dispatch, and its tokens.
+    first: u32,
     n: u32,
     padded: u32,
 }
@@ -1023,7 +1025,9 @@ impl Device for Metal {
             None => CHUNK,
         };
         // Every token's heads get as many chunks as the last token attends
-        // over, as many tokens to a dispatch as the partials fit.
+        // over, as many tokens to a dispatch as the partials fit, and, on
+        // the accelerators, as the packed queries fit: each key/value
+        // head's rows of the dispatch's tokens, padded to whole tiles.
         let chunks = (pos + n).div_ceil(chunk);
         let per_token = n_heads * chunks * (head_dim + 2);
         assert!(
@@ -1031,37 +1035,39 @@ impl Device for Metal {
             "attention over {} positions needs more partials than {PARTIALS}",
             pos + n
         );
-        let per_dispatch = PARTIALS / per_token;
-        // The kernel on the accelerators reads the queries packed by
-        // key/value head, with room past the batch for its last
-        // threadgroup's rows.
         let group = n_heads / n_kv_heads;
-        let padded = (n * group + MMA_ROWS).next_multiple_of(MMA_ROWS);
+        let mut per_dispatch = PARTIALS / per_token;
         if accelerators {
+            let rows = PACKED / (n_kv_heads * head_dim) / MMA_ROWS * MMA_ROWS;
             assert!(
-                n_kv_heads * padded * head_dim <= PACKED,
-                "a batch of {n} tokens of queries is more than the kernels pack"
+                rows >= group,
+                "the kernels pack fewer queries than {n_heads} heads of {head_dim} take"
             );
-            self.packed_for.set(None);
-            let pack = PackQueriesParams {
-                n_heads: n_heads as u32,
-                n_kv_heads: n_kv_heads as u32,
-                dim: head_dim as u32,
-                n: n as u32,
-                padded: padded as u32,
-            };
-            self.dispatch(
-                &self.kernels.pack_queries,
-                &[&self.packed, &q.buf],
-                &pack,
-                (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
-                THREADS,
-            );
+            per_dispatch = per_dispatch.min(rows / group);
         }
         let queries: &ProtocolObject<dyn MTLBuffer> =
             if accelerators { &self.packed } else { &q.buf };
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
+            let padded = (tokens * group).next_multiple_of(MMA_ROWS);
+            if accelerators {
+                self.packed_for.set(None);
+                let pack = PackQueriesParams {
+                    n_heads: n_heads as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    dim: head_dim as u32,
+                    first: first as u32,
+                    n: tokens as u32,
+                    padded: padded as u32,
+                };
+                self.dispatch(
+                    &self.kernels.pack_queries,
+                    &[&self.packed, &q.buf],
+                    &pack,
+                    (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
+                    THREADS,
+                );
+            }
             let params = AttentionParams {
                 n_heads: n_heads as u32,
                 head_dim: head_dim as u32,

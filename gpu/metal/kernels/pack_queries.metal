@@ -1,8 +1,8 @@
-// The queries of a batch of tokens as half floats by key/value head, for
-// `attention_mma.metal`: out[kvh][row][d] = half(q[t][h][d] / sqrt(dim))
-// for the rows of the head, a token's query head each, the heads that
-// share a key/value head one after another, and the rows padded to
-// `padded` with zeros.
+// The queries of a dispatch of tokens, `n` from `first`, as half floats
+// by key/value head, for `attention_mma.metal`:
+// out[kvh][row][d] = half(q[first + t][h][d] / sqrt(dim)) for the rows of
+// the head, a token's query head each, the heads that share a key/value
+// head one after another, and the rows padded to `padded` with zeros.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -11,6 +11,7 @@ struct Params {
     uint n_heads;
     uint n_kv_heads;
     uint dim;
+    uint first;
     uint n;
     // The rows of a key/value head with the padding.
     uint padded;
@@ -34,7 +35,7 @@ kernel void pack_queries(
         out[i] = half4(0.0h);
         return;
     }
-    uint t = row / group;
+    uint t = p.first + row / group;
     uint h = kvh * group + row % group;
     out[i] = half4(q[(t * p.n_heads + h) * quads + d] * rsqrt(float(p.dim)));
 }
