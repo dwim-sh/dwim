@@ -991,7 +991,7 @@ impl Device for Metal {
         // heads into many partials to combine; it has threadgroups enough
         // from the rows.
         let chunk = if flash.is_some() && self.kernels.attention_mma.is_some() {
-            FLASH_CHUNK.max((pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK))
+            (pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK)
         } else if flash.is_some() {
             FLASH_CHUNK
         } else {
