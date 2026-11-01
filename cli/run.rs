@@ -936,13 +936,15 @@ impl App {
         Ok(())
     }
 
-    /// What the model is doing, with a spinner, while it's busy.
+    /// What the model is doing, with a spinner, while it's busy. Every
+    /// number is padded to a fixed width, so the status, which sits at the
+    /// right of the footer, does not shift as the numbers change.
     fn status(&self) -> Option<Line> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-        let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
+        let seconds = |since: Instant| format!("{:>3}s", since.elapsed().as_secs());
         let percent = |done: usize, total: usize| match total {
-            0 => String::new(),
-            _ => format!("{}% · ", done * 100 / total),
+            0 => "  0%".to_string(),
+            _ => format!("{:>3}%", done * 100 / total),
         };
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
@@ -957,12 +959,12 @@ impl App {
                     Device::Gpu => "Loading model to GPU…",
                 },
                 since,
-                format!("{}{}", percent(done, total), seconds(since)),
+                format!("{} · {}", percent(done, total), seconds(since)),
             ),
             Status::Prompting { since, read, total } => (
                 "Reading system prompt…",
                 since,
-                format!("{}{}", percent(read, total), seconds(since)),
+                format!("{} · {}", percent(read, total), seconds(since)),
             ),
             Status::Reading(since) => (
                 "Reading…",
@@ -978,13 +980,10 @@ impl App {
                 },
                 start,
                 format!(
-                    "{}{}esc to interrupt",
+                    "{:>5} tok/s · {}esc to interrupt",
                     // Too early to tell the speed.
                     if start.elapsed() >= Duration::from_secs(1) {
-                        format!(
-                            "{:.1} tok/s · ",
-                            tokens as f32 / start.elapsed().as_secs_f32()
-                        )
+                        format!("{:.1}", tokens as f32 / start.elapsed().as_secs_f32())
                     } else {
                         String::new()
                     },
@@ -998,52 +997,58 @@ impl App {
         };
         let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
         Some(vec![
-            span(format!("{frame} {verb}")).bold(),
+            span(format!("  {frame} {verb}")).bold(),
             span(format!(" {details}")).dark_grey(),
         ])
     }
 
-    /// The line under the input box: the directory the agent works in,
-    /// and, while the model is busy, what it is doing, at the right.
+    /// The line under the input box: what the model is doing, while it is
+    /// busy, at the left, and the directory the agent works in at the
+    /// right, where it stays put whether the model is busy or not.
     fn footer(&self, columns: usize) -> Line {
-        let mut line = vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()];
-        if let Some(status) = self.status() {
-            let gap = columns.saturating_sub(tui::width(&line) + tui::width(&status) + 2);
-            line.push(span(" ".repeat(gap.max(2))));
-            line.extend(status);
-        }
+        let mut line = self.status().unwrap_or_default();
+        let cwd = span(format!("{}  ", tilde(&self.cwd))).dark_grey();
+        let gap = columns.saturating_sub(tui::width(&line) + tui::width(&vec![cwd.clone()]));
+        line.push(span(" ".repeat(gap.max(2))));
+        line.push(cwd);
         line
     }
 }
 
-/// How a download is going: the file, how much of it has arrived, and at what
-/// speed, with the time left once the file's size is known.
+/// How a download is going: how much of the file has arrived, out of how
+/// much, at what speed, and the time left once the file's size is known.
+/// The fields are padded to fixed widths, as the status line's are.
 fn download_details(progress: Progress, elapsed: Duration) -> String {
     let Progress { done, total, .. } = progress;
-    let mut details = fetch::size(done);
+    let mut details = format!("{:>8}", fetch::size(done));
     if let Some(total) = total {
         details.push_str(&format!(
-            " / {} ({}%)",
+            " / {:>8} ({:>3}%)",
             fetch::size(total),
             done * 100 / total.max(1)
         ));
     }
-    // Too early to tell the speed, or nothing has arrived yet.
-    if elapsed < Duration::from_secs(1) || done == 0 {
-        return details;
-    }
+    // Too early to tell the speed, or nothing has arrived yet: the fields
+    // are left blank at their widths.
     let rate = done as f64 / elapsed.as_secs_f64();
-    details.push_str(&format!(" · {}/s", fetch::size(rate as u64)));
-    if let Some(total) = total
-        && done < total
-    {
-        let left = ((total - done) as f64 / rate).round() as u64;
-        let left = match left {
-            0..60 => format!("{left}s"),
-            60..3600 => format!("{}m {}s", left / 60, left % 60),
-            _ => format!("{}h {}m", left / 3600, left % 3600 / 60),
+    let speed = if elapsed < Duration::from_secs(1) || done == 0 {
+        String::new()
+    } else {
+        format!("{}/s", fetch::size(rate as u64))
+    };
+    details.push_str(&format!(" · {speed:>10}"));
+    if let Some(total) = total {
+        let left = if speed.is_empty() || done >= total {
+            String::new()
+        } else {
+            let left = ((total - done) as f64 / rate).round() as u64;
+            match left {
+                0..60 => format!("{left}s"),
+                60..3600 => format!("{}m {:02}s", left / 60, left % 60),
+                _ => format!("{}h {:02}m", left / 3600, left % 3600 / 60),
+            }
         };
-        details.push_str(&format!(" · {left} left"));
+        details.push_str(&format!(" · {left:>7} left"));
     }
     details
 }
