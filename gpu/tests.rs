@@ -353,6 +353,48 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
     }
 }
 
+/// Times attention for a batch of `n` tokens at the model's heads, at
+/// depths of context, and prints each depth's time, its rate, and how
+/// much of the arithmetic it does a second: a page is read at a depth
+/// three times slower than at the start, which the arithmetic of attention
+/// does not account for.
+pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
+    let mut rng = Rng(29);
+    let (heads, head_dim, kv_heads) = (24, 256, 4);
+    let kv_dim = kv_heads * head_dim;
+    let q = buffer(gpu, &rng.floats(n * heads * head_dim));
+    let mut out = gpu.alloc(n * heads * head_dim);
+    // Reading it waits for the runs before, which is all the wait is for.
+    let sync = gpu.alloc(1);
+    for pos in [1024, 8192, 32768, 65536] {
+        let k = cache(gpu, &rng.floats((pos + n) * kv_dim), 0);
+        let v = cache(gpu, &rng.floats((pos + n) * kv_dim), 0);
+        let mut run = || gpu.attention(&mut out, &q, &k, &v, pos, heads, head_dim, kv_heads);
+        // Warm up until the clocks are up.
+        for _ in 0..3 {
+            run();
+        }
+        gpu.read(&sync);
+        let runs = (40_000 / pos).max(3);
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            run();
+        }
+        gpu.read(&sync);
+        let each = start.elapsed().as_secs_f64() / runs as f64;
+        // Each token's heads score and weight the positions up to its own,
+        // a multiply and an add per element of the head each.
+        let positions: usize = (0..n).map(|t| pos + t + 1).sum();
+        let flops = (4 * positions * heads * head_dim) as f64;
+        eprintln!(
+            "attention n={n} at {pos:<6} {:8.2} ms  {:6.3} ms/token  {:5.2} TFLOP/s",
+            each * 1e3,
+            each * 1e3 / n as f64,
+            flops / each / 1e12
+        );
+    }
+}
+
 /// Times a run of small elementwise dispatches, for the cost of a dispatch
 /// itself: adds of a token's width of activations, back to back.
 pub fn dispatch_overhead<D: Device>(gpu: &D) {
@@ -617,9 +659,12 @@ pub fn rope_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
-    // Each case ends with the magnitude of the caches. The last is the
+    // Each case ends with the magnitude of the caches. The last has more
+    // tokens of the model's heads than the kernel on Apple's matrix
+    // accelerators packs the queries of at once, so the batch goes through
+    // two dispatches there, over three chunks; the one before it is the
     // model's heads for a batch whose positions cross what a device may
-    // take in one piece; the one before it, with as many query heads to a
+    // take in one piece; the one before that, with as many query heads to a
     // key/value head as the kernels take, attends over more positions than
     // one dispatch of either backend has partials for, so the batch goes
     // through several; the two before that have caches small enough that
@@ -635,6 +680,7 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         (24, 256, 4, 3, 1000, 1e-3),
         (32, 128, 4, 64, 32704, 1.0),
         (24, 256, 4, 64, 470, 1.0),
+        (24, 256, 4, 700, 470, 1.0),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos, size) in cases {
         let kv_dim = n_kv_heads * head_dim;

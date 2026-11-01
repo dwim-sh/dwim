@@ -1561,6 +1561,17 @@ mod tests {
         }
     }
 
+    /// Times the batched attention kernel at depths of context; run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn attention_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::attention_speed(&gpu, 64),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
     /// Times the cost of a dispatch; run with `--ignored --nocapture`.
     #[test]
     #[ignore]
