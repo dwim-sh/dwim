@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 """Runs `dwim` over SWE-bench Lite and scores what it changed.
 
-For each instance: check the repository out at the commit before the fix,
-give `dwim` the issue, and take whatever it changed as the patch. The patches
-go to predictions.jsonl, and are then scored by the official SWE-bench
-harness, which runs each project's tests in Docker.
+For each instance: take the repository as the instance's evaluation image
+has it, at the commit before the fix with the project and what it needs
+installed; give `dwim` the issue, with its shell commands running in a
+container of that image; take whatever it changed as the patch; and score
+the patch with the official SWE-bench harness, which runs the project's
+tests in the same image. The patches go to predictions.jsonl as they are
+made, and the harness's report is written at the end.
 
     scripts/swebench.py --instance pallets__flask-4045
     scripts/swebench.py --limit 10
     scripts/swebench.py
 
-The agent runs shell commands from an untrusted issue, in a checkout of an
-untrusted repository, as you. Run this in a container or a virtual machine.
+The agent's commands run in the container, but the model runs here, and
+its read and edit tools work on the checkout as you, on an untrusted issue.
+Run this in a virtual machine rather than on a machine you care about.
 """
-import argparse, glob, json, os, pathlib, shutil, subprocess, sys, urllib.request
+import argparse, glob, json, os, pathlib, shutil, stat, subprocess, sys, urllib.request
 
 DATASET = "SWE-bench/SWE-bench_Lite"
 ROWS = "https://datasets-server.huggingface.co/rows?dataset=SWE-bench%2FSWE-bench_Lite&config=default&split=test"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# Runs the harness with two changes. The evaluation images only exist for
-# x86_64, and an arm64 Docker refuses to pull them unless asked for that
-# platform, so ask; Rosetta or QEMU then runs them. And each instance's image
-# is about 2 GB of its own, 600 GB over the 300, so remove it once scored.
+# The evaluation images only exist for x86_64; an arm64 Docker runs them
+# under Rosetta or QEMU, if asked for that platform.
+PLATFORM = "linux/amd64"
+
+# What `dwim --shell` runs each command through: `docker exec` in the
+# instance's container, in the same directory, which is mounted there at
+# the same path, with the project's conda environment active.
+SHELL = """#!/bin/sh
+exec docker exec -i -w "$(pwd -P)" {container} bash -c \
+'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && exec bash -c "$1"' bash "$2"
+"""
+
+# Runs the harness with two changes. An arm64 Docker refuses to pull an
+# x86_64 image unless asked for that platform, so ask. And each instance's
+# image is about 2 GB of its own, 600 GB over the 300, so remove it once
+# the instance is scored.
 HARNESS = """
 import runpy, sys
 import docker.models.images as images
@@ -69,26 +85,59 @@ def binary(path):
     return str(built)
 
 
-def checkout(repo, commit, repos):
-    """A clone of repo at commit, under repos/."""
-    clone = repos / repo.replace("/", "__")
-    if not clone.exists():
-        url = f"https://github.com/{repo}.git"
-        subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", url, str(clone)], check=True)
-    for command in (["git", "checkout", "--quiet", "--force", commit], ["git", "clean", "-qfdx"]):
-        subprocess.run(command, cwd=clone, check=True)
+def docker(*args, check=True):
+    """Runs a docker command, quietly, and returns what it printed."""
+    return subprocess.run(["docker", *args], check=check, capture_output=True, text=True).stdout
+
+
+def checkout(row, work):
+    """The repository as the instance's image has it at /testbed, copied
+    out to a directory of the instance's own under work/."""
+    image = row["image"]
+    if not docker("image", "inspect", "--format", "{{.Id}}", image, check=False):
+        print(f"  pulling {image}", file=sys.stderr)
+        subprocess.run(["docker", "pull", "--quiet", "--platform", PLATFORM, image], check=True, stdout=subprocess.DEVNULL)
+    clone = work / "checkouts" / row["instance_id"]
+    shutil.rmtree(clone, ignore_errors=True)
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    name = f"dwim.{row['instance_id']}.copy"
+    docker("rm", "-f", name)
+    docker("create", "--platform", PLATFORM, "--name", name, image, "true")
+    docker("cp", f"{name}:/testbed", str(clone))
+    docker("rm", name)
     return clone
 
 
-def solve(row, args, dwim, repos, work):
+def container(row, clone):
+    """A container of the instance's image, with `clone` mounted at /testbed,
+    where the project is installed from, and at its own path, where the
+    model's commands name it; returns its name."""
+    name = f"dwim.{row['instance_id']}"
+    docker("rm", "-f", name)
+    docker(
+        "run", "--detach", "--platform", PLATFORM, "--name", name,
+        "--volume", f"{clone}:/testbed", "--volume", f"{clone}:{clone}", "--workdir", str(clone),
+        row["image"], "sleep", "infinity",
+    )
+    return name
+
+
+def solve(row, args, dwim, work):
     """Runs `dwim` over one instance, and returns the patch it leaves behind."""
-    clone = checkout(row["repo"], row["base_commit"], repos)
+    clone = checkout(row, work)
+    name = container(row, clone)
+    shell = work / f"{row['instance_id']}.sh"
+    shell.write_text(SHELL.format(container=name))
+    shell.chmod(shell.stat().st_mode | stat.S_IXUSR)
     log = work / f"{row['instance_id']}.log"
     transcript = work / f"{row['instance_id']}.jsonl"
     try:
         with open(log, "w") as output:
             subprocess.run(
-                [dwim, "--model", args.model, "--transcript", str(transcript), row["problem_statement"]],
+                [
+                    dwim, "--model", args.model, "--shell", str(shell), "--transcript", str(transcript),
+                    row["problem_statement"],
+                ],
                 cwd=clone,
                 stdout=output,
                 stderr=output,
@@ -96,11 +145,16 @@ def solve(row, args, dwim, repos, work):
             )
     except subprocess.TimeoutExpired:
         print(f"  timed out after {args.timeout}s", file=sys.stderr)
-    return subprocess.run(["git", "diff"], cwd=clone, capture_output=True, text=True).stdout
+    finally:
+        docker("rm", "-f", name, check=False)
+    patch = subprocess.run(["git", "diff"], cwd=clone, capture_output=True, text=True).stdout
+    shutil.rmtree(clone, ignore_errors=True)
+    return patch
 
 
 def run(args, predictions):
-    """Runs `dwim` over the instances, writing a prediction for each."""
+    """Runs `dwim` over the instances, writing a prediction for each, and
+    scoring it unless told not to."""
     rows = instances()
     if args.instance:
         rows = [row for row in rows if row["instance_id"] in args.instance]
@@ -111,13 +165,14 @@ def run(args, predictions):
         rows = rows[: args.limit]
 
     dwim = binary(args.dwim)
+    if not args.no_score:
+        scorable()
     work = pathlib.Path(args.work).resolve()
-    repos = work / "repos"
-    repos.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
     with open(predictions, "w") as out:
         for i, row in enumerate(rows, 1):
             print(f"[{i}/{len(rows)}] {row['instance_id']}", file=sys.stderr)
-            patch = solve(row, args, dwim, repos, work)
+            patch = solve(row, args, dwim, work)
             print(f"  {len(patch)} bytes of patch, log and transcript in {work}", file=sys.stderr)
             prediction = {
                 "instance_id": row["instance_id"],
@@ -126,26 +181,54 @@ def run(args, predictions):
             }
             out.write(json.dumps(prediction) + "\n")
             out.flush()
+            if patch and not args.no_score:
+                harness(args, predictions, "--instance_ids", row["instance_id"], "--max_workers", "1")
+                print(f"  {verdict(args, row['instance_id'])}", file=sys.stderr)
+    if not args.no_score:
+        # The harness reports on the instances of each run: write the report
+        # over them all, from the test outputs kept.
+        harness(args, predictions, "--rewrite_reports", "True")
+        report(args)
     return len(rows)
 
 
-def score(args, predictions):
-    """Scores the predictions with the official harness, in Docker."""
+def scorable():
+    """Exits with what to install if the patches can't be scored here."""
     if shutil.which("docker") is None:
-        sys.exit("docker is needed to score the patches: install it, or pass --no-score")
-    if subprocess.run([sys.executable, "-c", "import swebench"], capture_output=True).returncode:
+        sys.exit("docker is needed to run the agent's commands and score its patches: install it")
+    if subprocess.run([sys.executable, "-I", "-c", "import swebench.harness"], capture_output=True).returncode:
         sys.exit(f"the harness is needed to score the patches: {sys.executable} -m pip install swebench")
-    print("scoring the patches, which runs each project's tests in Docker", file=sys.stderr)
+
+
+def harness(args, predictions, *more):
+    """Runs the official harness over the predictions, with `more` arguments."""
     subprocess.run(
         [
-            sys.executable, "-c", HARNESS,
+            sys.executable, "-I", "-c", HARNESS,
             "--dataset_name", DATASET,
             "--predictions_path", str(predictions),
             "--max_workers", str(args.workers),
             "--run_id", args.run_id,
+            *more,
         ],
-        check=True,
+        check=False,
     )
+
+
+def verdict(args, instance_id):
+    """What the harness made of an instance's patch."""
+    paths = glob.glob(f"logs/run_evaluation/{args.run_id}/*/{instance_id}/report.json")
+    if not paths:
+        return "not scored"
+    with open(paths[0]) as file:
+        return "resolved" if json.load(file)[instance_id]["resolved"] else "not resolved"
+
+
+def score(args, predictions):
+    """Scores the predictions of an earlier run with the official harness."""
+    scorable()
+    print("scoring the patches, which runs each project's tests in Docker", file=sys.stderr)
+    harness(args, predictions)
     report(args)
 
 
@@ -170,20 +253,20 @@ def main():
     parser.add_argument("--limit", type=int, help="run only the first so many instances")
     parser.add_argument("--model", default="bonsai-2-27b", help="model for `dwim` to run (default: %(default)s)")
     parser.add_argument("--timeout", type=int, default=600, help="seconds per instance (default: %(default)s)")
-    parser.add_argument("--work", default="swebench-work", help="where clones and logs go (default: %(default)s)")
+    parser.add_argument("--work", default="swebench-work", help="where checkouts and logs go (default: %(default)s)")
     parser.add_argument("--out", default="predictions.jsonl", help="where the patches go (default: %(default)s)")
     parser.add_argument("--dwim", help="dwim binary to run (default: build target/release/dwim)")
     parser.add_argument("--no-score", action="store_true", help="write the patches without scoring them")
     parser.add_argument("--score-only", action="store_true", help="score patches written by an earlier run")
     parser.add_argument("--run-id", default="dwim", help="name for this run in the harness (default: %(default)s)")
-    parser.add_argument("--workers", type=int, default=4, help="instances scored at once (default: %(default)s)")
+    parser.add_argument("--workers", type=int, default=4, help="instances scored at once with --score-only (default: %(default)s)")
     args = parser.parse_args()
 
     predictions = pathlib.Path(args.out).resolve()
-    if not args.score_only:
-        run(args, predictions)
-    if not args.no_score:
+    if args.score_only:
         score(args, predictions)
+    else:
+        run(args, predictions)
 
 
 if __name__ == "__main__":
