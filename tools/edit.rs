@@ -63,6 +63,13 @@ pub fn run(arguments: &Value) -> String {
     if old == new {
         return "error: old_string and new_string are the same; nothing changed".to_string();
     }
+    let wanted = split(old);
+    if wanted.len() > MOST {
+        return format!(
+            "error: old_string is {}, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; to remove a long span, use bash; nothing changed",
+            plural(wanted.len() as u64, "line")
+        );
+    }
     let start = match arguments.get("start") {
         None => None,
         Some(_) => match number(arguments, "start") {
@@ -80,13 +87,6 @@ pub fn run(arguments: &Value) -> String {
         .iter()
         .map(|line| String::from_utf8_lossy(read::content(line)))
         .collect();
-    let wanted = split(old);
-    if wanted.len() > MOST {
-        return format!(
-            "error: old_string is {}, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; to remove a long span, use bash; nothing changed",
-            plural(wanted.len() as u64, "line")
-        );
-    }
     let (found, tier) = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
         ([], _) => {
@@ -671,6 +671,13 @@ mod tests {
             )
         );
         assert_eq!(file.text(), text);
+        // Before the file is read, so a path that is wrong too says so.
+        assert!(
+            run(
+                &json!({ "path": "/nonexistent/file", "old_string": &long, "new_string": "new\n" })
+            )
+            .starts_with("error: old_string is")
+        );
         let most: String = (1..=MOST).map(|i| format!("line {i}\n")).collect();
         assert!(!file.edit(&most, "new\n").starts_with("error"));
         assert!(file.text().starts_with("new\nline 31\n"));
