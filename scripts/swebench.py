@@ -7,7 +7,9 @@ installed; give `dwim` the issue, with its shell commands running in a
 container of that image; take whatever it changed as the patch; and score
 the patch with the official SWE-bench harness, which runs the project's
 tests in the same image. The patches go to predictions.jsonl as they are
-made, and the harness's report is written at the end.
+made, and the harness's report is written at the end. The model is what
+takes the time, so the next instance's image is pulled while the agent
+works on this one, and the last one's patch is scored behind it.
 
     scripts/swebench.py --instance pallets__flask-4045
     scripts/swebench.py --limit 10
@@ -18,6 +20,7 @@ its read and edit tools work on the checkout as you, on an untrusted issue.
 Run this in a virtual machine rather than on a machine you care about.
 """
 import argparse, glob, json, os, pathlib, shutil, stat, subprocess, sys, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 DATASET = "SWE-bench/SWE-bench_Lite"
 ROWS = "https://datasets-server.huggingface.co/rows?dataset=SWE-bench%2FSWE-bench_Lite&config=default&split=test"
@@ -90,13 +93,19 @@ def docker(*args, check=True):
     return subprocess.run(["docker", *args], check=check, capture_output=True, text=True).stdout
 
 
+def prepare(row, work):
+    """What the agent needs before it starts on an instance: its image,
+    pulled, and its checkout, copied out of the image."""
+    image = row["image"]
+    if not docker("image", "inspect", "--format", "{{.Id}}", image, check=False):
+        subprocess.run(["docker", "pull", "--quiet", "--platform", PLATFORM, image], check=True, stdout=subprocess.DEVNULL)
+    return checkout(row, work)
+
+
 def checkout(row, work):
     """The repository as the instance's image has it at /testbed, copied
     out to a directory of the instance's own under work/."""
     image = row["image"]
-    if not docker("image", "inspect", "--format", "{{.Id}}", image, check=False):
-        print(f"  pulling {image}", file=sys.stderr)
-        subprocess.run(["docker", "pull", "--quiet", "--platform", PLATFORM, image], check=True, stdout=subprocess.DEVNULL)
     clone = work / "checkouts" / row["instance_id"]
     shutil.rmtree(clone, ignore_errors=True)
     clone.parent.mkdir(parents=True, exist_ok=True)
@@ -122,9 +131,9 @@ def container(row, clone):
     return name
 
 
-def solve(row, args, dwim, work):
-    """Runs `dwim` over one instance, and returns the patch it leaves behind."""
-    clone = checkout(row, work)
+def solve(row, args, dwim, work, clone):
+    """Runs `dwim` over one instance, in its prepared checkout `clone`, and
+    returns the patch it leaves behind."""
     name = container(row, clone)
     shell = work / f"{row['instance_id']}.sh"
     shell.write_text(SHELL.format(container=name))
@@ -154,7 +163,9 @@ def solve(row, args, dwim, work):
 
 def run(args, predictions):
     """Runs `dwim` over the instances, writing a prediction for each, and
-    scoring it unless told not to."""
+    scoring it unless told not to. The model is the bottleneck, so one
+    thread prepares the next instance while the agent works on this one,
+    and another scores the patches made, one at a time, behind it."""
     rows = instances()
     if args.instance:
         rows = [row for row in rows if row["instance_id"] in args.instance]
@@ -169,10 +180,20 @@ def run(args, predictions):
         scorable()
     work = pathlib.Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    preparer = ThreadPoolExecutor(max_workers=1)
+    scorer = ThreadPoolExecutor(max_workers=1)
+    prepared = preparer.submit(prepare, rows[0], work) if rows else None
     with open(predictions, "w") as out:
         for i, row in enumerate(rows, 1):
             print(f"[{i}/{len(rows)}] {row['instance_id']}", file=sys.stderr)
-            patch = solve(row, args, dwim, work)
+            try:
+                clone = prepared.result()
+            except subprocess.CalledProcessError as e:
+                print(f"  could not prepare {row['instance_id']}: {e}", file=sys.stderr)
+                clone = None
+            if i < len(rows):
+                prepared = preparer.submit(prepare, rows[i], work)
+            patch = solve(row, args, dwim, work, clone) if clone else ""
             print(f"  {len(patch)} bytes of patch, log and transcript in {work}", file=sys.stderr)
             prediction = {
                 "instance_id": row["instance_id"],
@@ -182,14 +203,22 @@ def run(args, predictions):
             out.write(json.dumps(prediction) + "\n")
             out.flush()
             if patch and not args.no_score:
-                harness(args, predictions, "--instance_ids", row["instance_id"], "--max_workers", "1")
-                print(f"  {verdict(args, row['instance_id'])}", file=sys.stderr)
+                scorer.submit(score_one, args, predictions, work, row["instance_id"])
+    preparer.shutdown()
+    scorer.shutdown()
     if not args.no_score:
         # The harness reports on the instances of each run: write the report
         # over them all, from the test outputs kept.
-        harness(args, predictions, "--rewrite_reports", "True")
+        harness(args, predictions, "--rewrite_reports", "True", log=work / "report.log")
         report(args)
     return len(rows)
+
+
+def score_one(args, predictions, work, instance_id):
+    """Scores one instance's patch with the official harness, keeping what
+    the harness printed in work/, and prints the verdict."""
+    harness(args, predictions, "--instance_ids", instance_id, "--max_workers", "1", log=work / f"{instance_id}.score.log")
+    print(f"  {instance_id}: {verdict(args, instance_id)}", file=sys.stderr)
 
 
 def scorable():
@@ -200,19 +229,23 @@ def scorable():
         sys.exit(f"the harness is needed to score the patches: {sys.executable} -m pip install swebench")
 
 
-def harness(args, predictions, *more):
-    """Runs the official harness over the predictions, with `more` arguments."""
-    subprocess.run(
-        [
-            sys.executable, "-I", "-c", HARNESS,
-            "--dataset_name", DATASET,
-            "--predictions_path", str(predictions),
-            "--max_workers", str(args.workers),
-            "--run_id", args.run_id,
-            *more,
-        ],
-        check=False,
-    )
+def harness(args, predictions, *more, log=None):
+    """Runs the official harness over the predictions, with `more` arguments,
+    writing what it prints to `log` if given."""
+    with open(log, "w") if log else open(os.devnull, "w") as output:
+        subprocess.run(
+            [
+                sys.executable, "-I", "-c", HARNESS,
+                "--dataset_name", DATASET,
+                "--predictions_path", str(predictions),
+                "--max_workers", str(args.workers),
+                "--run_id", args.run_id,
+                *more,
+            ],
+            check=False,
+            stdout=output if log else None,
+            stderr=output if log else None,
+        )
 
 
 def verdict(args, instance_id):
