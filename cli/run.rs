@@ -105,6 +105,7 @@ pub fn run(
         thinking,
         thinking_budget,
         lines: Vec::new(),
+        blank: false,
         requests,
         replies,
         stop,
@@ -448,8 +449,10 @@ struct App {
     thinking: bool,
     /// Most tokens of a thought, if they are limited, as last set.
     thinking_budget: Option<usize>,
-    /// Lines waiting to be printed above the live region.
+    /// Lines waiting to be printed above the live region, and whether the
+    /// last line printed there was blank.
     lines: Vec<Line>,
+    blank: bool,
     requests: Sender<Request>,
     replies: Receiver<Reply>,
     stop: Arc<AtomicBool>,
@@ -878,11 +881,10 @@ impl App {
         let (columns, rows) = self.screen.size();
         let mut live = Vec::new();
 
-        // The line of the reply still being generated, and the status. The
-        // message a reply is to, or a tool's output, already ends in a blank
-        // line. An empty reply has no line yet: after its thought, the model
-        // writes blank lines, or a tool call, which is shown only once it is
-        // complete, and a bullet alone would stand for either.
+        // The line of the reply still being generated. An empty reply has no
+        // line yet: after its thought, the model writes blank lines, or a
+        // tool call, which is shown only once it is complete, and a bullet
+        // alone would stand for either.
         if matches!(self.status, Status::Generating { .. })
             && (self.segment == Segment::Text || self.thinking)
             && !self.reply.is_empty()
@@ -897,7 +899,13 @@ impl App {
                     .map(|line| reply_line(segment, line)),
             );
         }
-        live.push(Line::new());
+        // A blank line between the conversation and the input box, unless
+        // the conversation already ends in one: the message a reply is to,
+        // and a tool's output, do.
+        let blank = self.lines.last().map_or(self.blank, Line::is_empty);
+        if !live.is_empty() || !blank {
+            live.push(Line::new());
+        }
 
         // The input box, as tall as its text but no taller than the screen,
         // scrolled to show the cursor.
@@ -932,6 +940,9 @@ impl App {
         live.push(self.footer(columns));
 
         let lines = std::mem::take(&mut self.lines);
+        if let Some(last) = lines.last() {
+            self.blank = last.is_empty();
+        }
         self.screen.draw(&lines, &live, cursor)?;
         Ok(())
     }
