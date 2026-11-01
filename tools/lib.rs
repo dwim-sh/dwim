@@ -48,16 +48,22 @@ impl Tools {
 
 /// How a call reads on screen: the command for `bash`, the file and where
 /// in it for `read` and `edit`, and the arguments as written for anything
-/// else.
+/// else, or for a read the tool will refuse.
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" => string(&call.arguments, "command").map(str::to_string),
-        "read" => {
-            string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
-                Some(start) if start > 1 => format!("{path} from line {start}"),
+        "read" => string(&call.arguments, "path").and_then(|path| {
+            let (start, lines) = read::range(&call.arguments).ok()?;
+            Some(match (start, lines) {
+                (Some(start), Some(1)) => format!("{path} line {start}"),
+                (Some(start), Some(lines)) => {
+                    let end = start.saturating_add(lines as u64 - 1);
+                    format!("{path} lines {start}–{end}")
+                }
+                (Some(start), None) if start > 1 => format!("{path} from line {start}"),
                 _ => path.to_string(),
             })
-        }
+        }),
         "edit" => {
             string(&call.arguments, "path").map(|path| match number(&call.arguments, "start") {
                 Some(start) => format!("{path} at line {start}"),
@@ -154,6 +160,44 @@ mod tests {
                 "<function=read>\n<parameter=path>\na.rs\n</parameter>\n<parameter=start>\n201\n</parameter>\n</function>"
             )),
             "a.rs from line 201"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": 440, "lines": 30}}"#
+            )),
+            "a.rs lines 440–469"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "lines": "1"}}"#
+            )),
+            "a.rs line 1"
+        );
+        // As many lines as the tool shows, and the arguments as written
+        // for a read it refuses.
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": 440, "lines": 1000}}"#
+            )),
+            format!("a.rs lines 440–{}", 440 + read::PAGE - 1)
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": 18446744073709551615, "lines": 2}}"#
+            )),
+            "a.rs lines 18446744073709551615–18446744073709551615"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "lines": 0}}"#
+            )),
+            r#"{"lines":0,"path":"a.rs"}"#
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "read", "arguments": {"path": "a.rs", "start": "x", "lines": 30}}"#
+            )),
+            r#"{"lines":30,"path":"a.rs","start":"x"}"#
         );
         assert_eq!(
             describe(&call(

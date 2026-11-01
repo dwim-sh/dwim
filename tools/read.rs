@@ -11,6 +11,14 @@
 //! run it read three files of 1300 lines end to end, a page at a time,
 //! before it planned anything, and the outline makes the jump the easy
 //! path rather than the next page.
+//!
+//! A read may ask for fewer lines than a page. The page is the unit for
+//! looking around, but to edit, the model copies the lines it changes
+//! from a page it has read, and it reads the page again for them rather
+//! than trust what is far back in the context: on a run, 20 of 34 reads
+//! were of pages read before, right before an edit of a few of their
+//! lines, and they were most of what the context grew by. Reading just
+//! those lines costs a tenth as much, then and on every token after.
 
 use std::{
     fs::File,
@@ -35,7 +43,7 @@ pub const LINE: usize = 300;
 pub const ENTRY: usize = 120;
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file from a line, a page of up to 200 numbered lines (or 16 KB) at a time. The result says how many lines the file has and where the next page starts. Without a start line, a file longer than a page comes as an outline instead: its definitions with their line numbers, to pick the line to read from.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. Left out, the outline of a long file, or the whole of a short one."}}, "required": ["path"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file from a line, a page of up to 200 numbered lines (or 16 KB) at a time, or as many lines as asked for. The result says how many lines the file has and where the next page starts. Without a start line, a file longer than a page comes as an outline instead: its definitions with their line numbers, to pick the line to read from. To copy lines for an edit, read just those lines.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. Left out, the outline of a long file, or the whole of a short one; with lines, the first line."}, "lines": {"type": "integer", "description": "How many lines to read from start, up to 200, or from the first line without a start. Left out, a page."}}, "required": ["path"]}}}"#;
 
 /// Reads the page of the file in `arguments`, returning what the model
 /// should see.
@@ -43,13 +51,11 @@ pub fn run(arguments: &Value) -> String {
     let Some(path) = string(arguments, "path") else {
         return "error: read needs a 'path' string".to_string();
     };
-    let start = match arguments.get("start") {
-        None => None,
-        Some(_) => match number(arguments, "start") {
-            Some(start) => Some(start.max(1)),
-            None => return "error: 'start' is a line number".to_string(),
-        },
+    let (start, lines) = match range(arguments) {
+        Ok(range) => range,
+        Err(e) => return e,
     };
+    let most = lines.unwrap_or(PAGE);
     let open = || File::open(path).map(BufReader::new);
     let file = match open() {
         Ok(file) => file,
@@ -63,18 +69,40 @@ pub fn run(arguments: &Value) -> String {
         return format!("error: {path} is a directory; list it with ls");
     }
     let result = match start {
-        Some(start) => page(file, path, start),
+        Some(start) => page(file, path, start, most),
         // The outline of a long file, or the first page of one that has
         // nothing to outline, read again from the start.
         None => outline(file, path).and_then(|outline| match outline {
             Some(text) => Ok(text),
-            None => page(open()?, path, 1),
+            None => page(open()?, path, 1, most),
         }),
     };
     match result {
         Ok(text) => text,
         Err(e) => format!("error: reading {path}: {e}"),
     }
+}
+
+/// What the arguments ask for: the line to start from, and how many lines,
+/// each where given, or the error the model is shown for one that is not
+/// a number. More lines than a page is a page, and lines asked for without
+/// a start are from the first.
+pub fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
+    let start = match arguments.get("start") {
+        None => None,
+        Some(_) => match number(arguments, "start") {
+            Some(start) => Some(start.max(1)),
+            None => return Err("error: 'start' is a line number".to_string()),
+        },
+    };
+    let lines = match arguments.get("lines") {
+        None => None,
+        Some(_) => match number(arguments, "lines") {
+            Some(lines) if lines >= 1 => Some((lines as usize).min(PAGE)),
+            _ => return Err("error: 'lines' is a number of lines, 1 or more".to_string()),
+        },
+    };
+    Ok((start.or(lines.map(|_| 1)), lines))
 }
 
 /// The line `line` without its ending, whether that is `\n` or `\r\n`.
@@ -269,9 +297,9 @@ fn defines(line: &str, markdown: bool) -> bool {
 }
 
 /// The page of `file` from line `start`: its lines, each after its number
-/// and a tab, up to [`PAGE`] of them or [`BYTES`] in all, then a line of
+/// and a tab, up to `most` of them or [`BYTES`] in all, then a line of
 /// where the page sits in the file and where the next page starts.
-fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
+fn page(mut file: impl BufRead, path: &str, start: u64, most: usize) -> io::Result<String> {
     let mut text = String::new();
     let mut line = Vec::new();
     // Lines read so far, shown in the page, and cut for length.
@@ -287,7 +315,7 @@ fn page(mut file: impl BufRead, path: &str, start: u64) -> io::Result<String> {
         }
         let (content, long) = shown_line(&line);
         let entry = format!("{lines}\t{content}\n");
-        if shown == PAGE || (shown > 0 && text.len() + entry.len() > BYTES) {
+        if shown == most || (shown > 0 && text.len() + entry.len() > BYTES) {
             // The file goes on past the page: count the rest.
             lines += count(&mut file)?;
             break;
@@ -576,6 +604,36 @@ mod tests {
         fs::write(&short, "fn a() {}\nfn b() {}\n").unwrap();
         let short = short.to_str().unwrap();
         assert!(read(short, None).starts_with("1\tfn a() {}\n2\tfn b() {}\n"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reads_the_lines_asked_for() {
+        let text: String = (1..=450).map(|i| format!("line {i}\n")).collect();
+        let (dir, path) = file("long.txt", &text);
+        let some = run(&serde_json::json!({ "path": &path, "start": 440, "lines": 5 }));
+        assert_eq!(
+            some,
+            format!(
+                "440\tline 440\n441\tline 441\n442\tline 442\n443\tline 443\n444\tline 444\n[lines 440–444 of 450 in {path}; next: read {path} from line 445]"
+            )
+        );
+        // Lines without a start are from the first, in place of the outline;
+        // more than a page is a page.
+        let first = run(&serde_json::json!({ "path": &path, "lines": "1" }));
+        assert_eq!(
+            first,
+            format!("1\tline 1\n[lines 1–1 of 450 in {path}; next: read {path} from line 2]")
+        );
+        let page = run(&serde_json::json!({ "path": &path, "lines": 1000 }));
+        assert_eq!(page.lines().count(), PAGE + 1);
+        assert!(
+            run(&serde_json::json!({ "path": &path, "lines": 0 })).starts_with("error: 'lines' is"),
+        );
+        assert!(
+            run(&serde_json::json!({ "path": &path, "lines": "x" }))
+                .starts_with("error: 'lines' is"),
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -19,18 +19,32 @@
 //! empty value arrive the same, and the tool cannot tell them apart; the
 //! model is told to put a blank line in place of lines by including the
 //! line before them in both strings.
+//!
+//! An old string of which the new string keeps more than [`MOST`] lines,
+//! copied twice around the lines that change, is refused. Left to itself,
+//! the model changes a few lines of a function by writing the function
+//! out twice, as the old string and the new: on a run, four such edits of
+//! 150 to 180 lines, for changes of 5 to 15 lines each, took 16 of the
+//! run's 76 minutes, and the page they copied from was read again before
+//! each. Refused, it gives the lines that change with a line or two to
+//! find them by, which it writes from memory, as it does for most edits.
+//! A long span removed, or replaced by lines of its own, is not refused:
+//! the lines the new string does not keep are written once.
 
-use std::{borrow::Cow, fs};
+use std::{borrow::Cow, collections::HashMap, fs};
 
 use serde_json::Value;
 
 use crate::{number, plural, read, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly, enough lines to match once; if it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
 
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
+
+/// Most lines of an old string the new string may keep.
+pub const MOST: usize = 30;
 
 /// Most lines of a range shown: its start and end, half each, past this.
 const SHOWN: usize = 40;
@@ -52,6 +66,14 @@ pub fn run(arguments: &Value) -> String {
     if old == new {
         return "error: old_string and new_string are the same; nothing changed".to_string();
     }
+    let wanted = split(old);
+    let kept = kept(&wanted, &split(new));
+    if kept > MOST {
+        return format!(
+            "error: old_string has {} that new_string keeps, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; nothing changed",
+            plural(kept as u64, "line")
+        );
+    }
     let start = match arguments.get("start") {
         None => None,
         Some(_) => match number(arguments, "start") {
@@ -69,7 +91,6 @@ pub fn run(arguments: &Value) -> String {
         .iter()
         .map(|line| String::from_utf8_lossy(read::content(line)))
         .collect();
-    let wanted = split(old);
     let (found, tier) = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
         ([], _) => {
@@ -160,6 +181,25 @@ fn split(text: &str) -> Vec<&str> {
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect()
+}
+
+/// How many of the lines of `old` are in `new` too, each line of `new`
+/// matching one of `old`: the lines an edit copies twice.
+fn kept(old: &[&str], new: &[&str]) -> usize {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for line in new {
+        *counts.entry(line).or_default() += 1;
+    }
+    let mut kept = 0;
+    for line in old {
+        if let Some(count) = counts.get_mut(line)
+            && *count > 0
+        {
+            *count -= 1;
+            kept += 1;
+        }
+    }
+    kept
 }
 
 /// How closely a wanted line has to match a line of the file: exactly;
@@ -639,6 +679,43 @@ mod tests {
             run(&json!({ "path": "/nonexistent/file", "old_string": "a", "new_string": "b" }))
                 .starts_with("error: cannot read /nonexistent/file: ")
         );
+    }
+
+    #[test]
+    fn refuses_an_old_string_the_new_mostly_keeps() {
+        let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let file = File::new(&text);
+        // One line changed among MOST + 1 kept.
+        let old: String = (1..=MOST + 2).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 5\n", "changed\n");
+        assert_eq!(
+            file.edit(&old, &new),
+            format!(
+                "error: old_string has {} that new_string keeps, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; nothing changed",
+                plural(MOST as u64 + 1, "line")
+            )
+        );
+        assert_eq!(file.text(), text);
+        // Before the file is read, so a path that is wrong too says so.
+        assert!(
+            run(&json!({ "path": "/nonexistent/file", "old_string": &old, "new_string": &new }))
+                .starts_with("error: old_string has")
+        );
+        // MOST kept lines are allowed, as are a long span replaced by lines
+        // of its own and one removed, which keep none.
+        let old: String = (1..=MOST + 1).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 5\n", "changed\n");
+        assert!(!file.edit(&old, &new).starts_with("error"));
+        assert!(file.text().contains("line 4\nchanged\nline 6\n"));
+        let old: String = (6..=38).map(|i| format!("line {i}\n")).collect();
+        assert!(!file.edit(&old, "other\nlines\n").starts_with("error"));
+        let old: String = (39..=40).map(|i| format!("line {i}\n")).collect();
+        assert!(
+            !file
+                .edit(&format!("other\nlines\n{old}"), "")
+                .starts_with("error")
+        );
+        assert_eq!(file.text(), "line 1\nline 2\nline 3\nline 4\nchanged\n");
     }
 
     #[test]
