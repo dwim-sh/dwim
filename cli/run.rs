@@ -47,6 +47,7 @@ pub fn run(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    shell: Option<PathBuf>,
     thinking: bool,
     log: Log,
 ) -> Result<(), Box<dyn Error>> {
@@ -68,6 +69,7 @@ pub fn run(
                 device,
                 context,
                 thinking_budget,
+                shell,
                 log,
                 requests_rx,
                 &replies_tx,
@@ -234,6 +236,7 @@ fn work(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
@@ -251,6 +254,7 @@ fn work(
             model,
             context,
             thinking_budget,
+            shell,
             log,
             requests,
             replies,
@@ -273,6 +277,7 @@ fn work(
                 model,
                 context,
                 thinking_budget,
+                shell,
                 log,
                 requests,
                 replies,
@@ -292,6 +297,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     which: &'static models::Model,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
@@ -318,6 +324,9 @@ fn serve<D: dwim_gpu::Device + 'static>(
         move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    if let Some(shell) = shell {
+        harness.set_shell(shell);
+    }
     harness.keep_log(log, which.name, on, &system);
     let _ = replies.send(Reply::Ready);
 

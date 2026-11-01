@@ -37,6 +37,11 @@ pub struct Opts {
     #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
     pub thinking_budget: usize,
 
+    /// program to run the model's shell commands through, as `shell -c
+    /// command` (default: sh)
+    #[argh(option)]
+    pub shell: Option<PathBuf>,
+
     /// file to write the session's transcript to, as JSON Lines (default:
     /// a new file under ~/.local/state/dwim/projects/)
     #[argh(option)]
