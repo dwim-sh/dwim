@@ -851,17 +851,17 @@ impl App {
                 columns,
             ),
             "stats" => {
-                let mut details = self.stats.report(self.loading, self.started.elapsed());
-                details.push(match &self.transcript {
-                    Some(path) => format!("transcript in {}", tilde(path)),
-                    None => "no transcript kept".to_string(),
-                });
+                let details = self.stats.report(self.loading, self.started.elapsed());
                 report(
                     vec![span("● "), span("This session").bold()],
                     details,
                     columns,
                 )
             }
+            "transcript" => notice(match &self.transcript {
+                Some(path) => format!("Transcript in {}", tilde(path)),
+                None => "No transcript is kept".to_string(),
+            }),
             "help" => help(columns),
             "thinking-budget" => notice(budget_notice(self.thinking_budget)),
             command if command.starts_with("thinking-budget ") => {
@@ -1120,6 +1120,7 @@ fn help(columns: usize) -> Vec<Line> {
         [
             "/model              the model, the device it runs on, and its context window",
             "/stats              where this session's time has gone",
+            "/transcript         where this session's transcript is",
             "/compact            compact the conversation now",
             "/thinking-budget N  cap the model's thinking at N tokens, 0 for no cap",
             "/help               this list",
