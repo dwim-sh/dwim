@@ -42,12 +42,14 @@ const FINISH: Duration = Duration::from_secs(2);
 /// Runs the shell until the user quits, showing the model's thinking if
 /// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
 /// of the session in `log`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     temperature: Option<f32>,
+    shell: Option<PathBuf>,
     thinking: bool,
     log: Log,
 ) -> Result<(), Box<dyn Error>> {
@@ -70,6 +72,7 @@ pub fn run(
                 context,
                 thinking_budget,
                 temperature,
+                shell,
                 log,
                 requests_rx,
                 &replies_tx,
@@ -237,6 +240,7 @@ fn work(
     context: Option<usize>,
     thinking_budget: Option<usize>,
     temperature: Option<f32>,
+    shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
@@ -255,6 +259,7 @@ fn work(
             context,
             thinking_budget,
             temperature,
+            shell,
             log,
             requests,
             replies,
@@ -278,6 +283,7 @@ fn work(
                 context,
                 thinking_budget,
                 temperature,
+                shell,
                 log,
                 requests,
                 replies,
@@ -298,6 +304,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     context: Option<usize>,
     thinking_budget: Option<usize>,
     temperature: Option<f32>,
+    shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
@@ -324,6 +331,9 @@ fn serve<D: dwim_gpu::Device + 'static>(
         move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    if let Some(shell) = shell {
+        harness.set_shell(shell);
+    }
     harness.keep_log(log, which.name, on, &system);
     let _ = replies.send(Reply::Ready);
 

@@ -53,6 +53,9 @@ const RETAINED: u64 = 4 << 20;
 /// the directory behind, and the next to start removes what earlier
 /// processes that are no longer running left.
 pub struct Bash {
+    /// The program commands run through, as `shell -c command`: `sh`,
+    /// unless another is set.
+    shell: PathBuf,
     dir: PathBuf,
     /// Commands run so far; the next one's files are named by the count.
     calls: usize,
@@ -75,10 +78,18 @@ impl Bash {
         sweep(&tmp);
         let n = OUTPUT_DIRS.fetch_add(1, Ordering::Relaxed);
         Self {
+            shell: PathBuf::from("sh"),
             dir: tmp.join(format!("dwim-{}-{n}", process::id())),
             calls: 0,
             retain: RETAINED,
         }
+    }
+
+    /// Runs commands through `shell`, as `shell -c command`, instead of
+    /// `sh`: a script that runs them somewhere else, such as in a container
+    /// that has what the project needs installed.
+    pub fn set_shell(&mut self, shell: PathBuf) {
+        self.shell = shell;
     }
 
     /// The file for the `stream` of the command being run.
@@ -95,7 +106,7 @@ impl Bash {
         // `set -o pipefail` first, by itself, so that a shell without it
         // runs the command all the same.
         let command = format!("set -o pipefail 2>/dev/null\n{command}");
-        let mut child = match Command::new("sh")
+        let mut child = match Command::new(&self.shell)
             .args(["-c", &command])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -103,7 +114,7 @@ impl Bash {
             .spawn()
         {
             Ok(child) => child,
-            Err(e) => return format!("[error: could not run sh: {e}]"),
+            Err(e) => return format!("[error: could not run {}: {e}]", self.shell.display()),
         };
         let mut stdout = Stream::new("stdout", self);
         let mut stderr = Stream::new("stderr", self);
@@ -434,7 +445,7 @@ fn report(stdout: &Stream, stderr: &Stream, status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
 
     use super::*;
     use crate::ToolCall;
@@ -467,6 +478,20 @@ mod tests {
             "[killed by signal 9 (SIGKILL)]"
         );
         assert!(!bash.dir.exists(), "nothing outgrew its preview");
+    }
+
+    #[test]
+    fn runs_through_the_shell_set() {
+        let script = env::temp_dir().join(format!("dwim-shell-{}", process::id()));
+        fs::write(&script, "#!/bin/sh\necho via; exec sh \"$@\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut bash = Bash::new();
+        bash.set_shell(script.clone());
+        assert_eq!(sh("echo hi", &mut bash), "via\nhi\n[exit code 0]");
+        assert_eq!(sh("exit 3", &mut bash), "via\n[exit code 3]");
+        fs::remove_file(script).unwrap();
+        bash.set_shell(PathBuf::from("/nonexistent/shell"));
+        assert!(sh("true", &mut bash).starts_with("[error: could not run /nonexistent/shell: "));
     }
 
     #[test]

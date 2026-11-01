@@ -519,6 +519,14 @@ impl<M: LanguageModel> Harness<M> {
         self.log.thinking_budget(tokens);
     }
 
+    /// Runs the model's shell commands through `shell`, as `shell -c
+    /// command`, instead of `sh`: a script that runs them somewhere else,
+    /// such as in a container that has what the project needs installed,
+    /// while the model, and its reading and editing of files, stay here.
+    pub fn set_shell(&mut self, shell: PathBuf) {
+        self.tools.set_shell(shell);
+    }
+
     /// Sets how many tokens the conversation may grow by without a change
     /// made before the model is asked for its plan, [`DECISION_BUDGET`]
     /// unless set.

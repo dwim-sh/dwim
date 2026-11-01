@@ -9,6 +9,8 @@ pub mod call;
 pub mod edit;
 pub mod read;
 
+use std::path::PathBuf;
+
 use serde_json::Value;
 
 use crate::bash::Bash;
@@ -33,6 +35,12 @@ impl Default for Tools {
 impl Tools {
     pub fn new() -> Self {
         Self { bash: Bash::new() }
+    }
+
+    /// Runs bash commands through `shell`, as `shell -c command`, instead
+    /// of `sh`.
+    pub fn set_shell(&mut self, shell: PathBuf) {
+        self.bash.set_shell(shell);
     }
 
     /// Runs a call, returning what the model should see.
