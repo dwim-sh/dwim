@@ -5,7 +5,8 @@ runs it, in one program.
 
 ## Layout
 
-* `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI.
+* `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI,
+  and `bench`, which times the model at depths of context.
 * `models/`: the language model: `gguf` reads the weights file, `tokenizer`
   builds the BPE tokenizer from it, `bonsai` is the transformer as operations
   on a device, `chat` is the conversation around it.

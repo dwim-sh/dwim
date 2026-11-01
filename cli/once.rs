@@ -137,27 +137,27 @@ fn answer<D: dwim_gpu::Device + 'static>(
 }
 
 /// Bytes as whole megabytes.
-fn megabytes(bytes: u64) -> usize {
+pub fn megabytes(bytes: u64) -> usize {
     (bytes / (1 << 20)) as usize
 }
 
 /// How far along getting ready is, on standard error: a line rewritten as it
 /// goes when standard error is a terminal, and one line for each stage when
 /// it is not.
-struct Progress {
+pub struct Progress {
     terminal: bool,
     stage: String,
 }
 
 impl Progress {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             terminal: io::stderr().is_terminal(),
             stage: String::new(),
         }
     }
 
-    fn report(&mut self, stage: String, done: usize, total: usize) {
+    pub fn report(&mut self, stage: String, done: usize, total: usize) {
         if self.stage != stage {
             self.stage = stage;
             if !self.terminal {
