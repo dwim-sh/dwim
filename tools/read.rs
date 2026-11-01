@@ -87,7 +87,7 @@ pub fn run(arguments: &Value) -> String {
 /// each where given, or the error the model is shown for one that is not
 /// a number. More lines than a page is a page, and lines asked for without
 /// a start are from the first.
-fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
+pub fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
     let start = match arguments.get("start") {
         None => None,
         Some(_) => match number(arguments, "start") {
