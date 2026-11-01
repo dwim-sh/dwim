@@ -1009,11 +1009,14 @@ impl Device for Metal {
             },
         });
         let accelerators = batched.as_ref().is_some_and(|b| b.accelerators);
-        // The kernel on the accelerators takes chunks that keep a batch to
-        // [`MMA_CHUNKS`] of them, so that a deep context is not split into
+        // The kernel on the accelerators takes chunks that keep a context
+        // to [`MMA_CHUNKS`] of them, so that a deep one is not split into
         // dispatches a few tokens each by the partials, nor each token's
-        // heads into many partials to combine; it has threadgroups enough
-        // from the rows.
+        // heads into many partials to combine. A batch of a few tokens, one
+        // tile of rows, is left the key/value heads' chunks of
+        // threadgroups, 128 for the model's heads: on an M5 at 64k of
+        // context, two to eight tokens take no longer so than with four
+        // times the threadgroups over a quarter of the chunk.
         let chunk = match &batched {
             Some(_) if accelerators => (pos + n).div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK),
             Some(_) => FLASH_CHUNK,
