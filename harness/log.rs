@@ -226,6 +226,12 @@ impl Log {
         );
     }
 
+    /// Records the reminder that follows a call's results once the model
+    /// has gone long without changing a file.
+    pub fn nudge(&mut self, text: &str) {
+        self.write("nudge", json!({ "text": text }));
+    }
+
     /// Records that the conversation is being compacted.
     pub fn compacting(&mut self) {
         self.write("compacting", json!({}));

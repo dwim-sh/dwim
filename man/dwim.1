@@ -103,6 +103,9 @@ from what it has thought so far.
 A turn ends when the model replies with text alone, or, after a hundred
 tool calls without a reply, when it is asked to say what it has done and
 what remains.
+After twenty calls in a row that change no file, a call's result ends with
+a reminder to make the change it has found and check it, or to say what it
+still needs to find out.
 .TP
 .BI \-\-temperature " t"
 Sample at temperature
