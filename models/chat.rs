@@ -6,6 +6,10 @@ use crate::{LanguageModel, Result, Sampler, Tokenizer};
 /// progress reports.
 const BATCH: usize = 64;
 
+/// What follows a `<tool_call>` tag that opens a call, as the chat template
+/// writes one: a tag followed by anything else is text.
+const CALL_OPENING: &str = "\n<function=";
+
 /// A conversation with an instruction-tuned model, in the ChatML format that
 /// Qwen models are trained on:
 ///
@@ -35,6 +39,14 @@ const BATCH: usize = 64;
 /// The whole conversation, including earlier thoughts, stays in the model's
 /// state, as Bonsai's chat template preserves thinking by default. Each
 /// turn runs the model over only its new tokens.
+///
+/// Qwen models call tools from inside the thought as well as after it: a
+/// `<tool_call>` tag followed by a `<function=…>` block ends the thought
+/// and opens the call, wherever it comes, as the model's makers read a
+/// reply. A `<tool_call>` tag followed by anything else, as one the model
+/// only mentions, is part of the thought. Left in the thought, a call the
+/// model meant gets no result, and the model goes on thinking about what
+/// it has asked for: a thought that never ends.
 pub struct Chat<M: LanguageModel> {
     model: M,
     tokenizer: Tokenizer,
@@ -467,6 +479,9 @@ impl<M: LanguageModel> Chat<M> {
         let mut thought = 0;
         // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;
+        // What has followed a <tool_call> tag written in the thought, while
+        // it is not yet known whether the tag opens a call.
+        let mut held: Option<String> = None;
         // Whether the reply has shown any text, or called a tool.
         let mut replied = false;
         // Whether the model tried to end the reply without doing either, and
@@ -497,6 +512,12 @@ impl<M: LanguageModel> Chat<M> {
                     interrupted = true;
                     break;
                 }
+                if let Some(pending) = held.take()
+                    && on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))).is_break()
+                {
+                    interrupted = true;
+                    break;
+                }
                 let flow = on_chunk(Chunk::Thought(&closing));
                 logits = self.feed(&tokens, Kind::Thought)?;
                 thinking = false;
@@ -518,7 +539,48 @@ impl<M: LanguageModel> Chat<M> {
             } else {
                 Kind::Answer
             };
-            if token == self.im_end || token == self.end_of_text {
+            let special = [
+                self.im_end,
+                self.end_of_text,
+                self.think,
+                self.think_end,
+                self.tool_call,
+                self.tool_call_end,
+            ]
+            .contains(&token);
+            // A <tool_call> written in the thought is held until what
+            // follows it says what it is. The opening of a <function=…>
+            // block makes it a call, and the thought ends there, as the
+            // model's makers read it: the model calls tools from inside
+            // the thought, without closing it first. Anything else, as a
+            // tag the model only mentions, is part of the thought, shown
+            // as written.
+            let mut consumed = false;
+            if let Some(pending) = &mut held {
+                let settled = if special {
+                    Some(held.take().unwrap())
+                } else {
+                    consumed = true;
+                    pending.push_str(&text.push(self.tokenizer.decode(token)));
+                    if pending.starts_with(CALL_OPENING) {
+                        thinking = false;
+                        replied = true;
+                        call = held.take();
+                        None
+                    } else if CALL_OPENING.starts_with(pending.as_str()) {
+                        None
+                    } else {
+                        held.take()
+                    }
+                };
+                if let Some(pending) = settled
+                    && on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))).is_break()
+                {
+                    interrupted = true;
+                    break;
+                }
+            }
+            if !consumed && (token == self.im_end || token == self.end_of_text) {
                 if thinking {
                     // The model sometimes ends its reply while still
                     // thinking, which leaves nothing to show for it: close
@@ -537,16 +599,21 @@ impl<M: LanguageModel> Chat<M> {
             if thinking {
                 thought += 1;
             }
-            let flow = if token == self.think {
+            let flow = if consumed {
+                ControlFlow::Continue(())
+            } else if token == self.think {
                 thinking = true;
                 thought = 0;
                 ControlFlow::Continue(())
             } else if token == self.think_end {
                 thinking = false;
                 ControlFlow::Continue(())
-            } else if (token == self.tool_call || token == self.tool_call_end) && thinking {
-                // A tool call contemplated in the thought is not made: the
-                // tag is part of the thought, shown as written.
+            } else if token == self.tool_call && thinking {
+                held = Some(String::new());
+                ControlFlow::Continue(())
+            } else if token == self.tool_call_end && thinking {
+                // A closing tag in the thought is part of it, shown as
+                // written.
                 let chunk = text.push(self.tokenizer.decode(token));
                 on_chunk(Chunk::Thought(&chunk))
             } else if token == self.tool_call {
@@ -1002,11 +1069,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_make_calls_contemplated_in_thoughts() {
-        let call = "<function=bash>\n<parameter=command>\nrm -rf /\n</parameter>\n</function>";
-        let mut chat = chat(&[&format!(
-            "I could run <tool_call>\n{call}\n</tool_call> but I won't.\n</think>\n\nNo action taken."
-        )]);
+    fn a_tag_mentioned_in_the_thought_is_part_of_it() {
+        let mut chat = chat(&[
+            "I could write <tool_call> and </tool_call> tags but I won't.\n</think>\n\nNo action taken.",
+        ]);
         let mut thoughts = String::new();
         let mut reply = String::new();
         let calls = chat
@@ -1022,9 +1088,58 @@ mod tests {
         assert!(calls.is_empty());
         assert_eq!(
             thoughts,
-            format!("I could run <tool_call>\n{call}\n</tool_call> but I won't.\n")
+            "I could write <tool_call> and </tool_call> tags but I won't.\n"
         );
         assert_eq!(reply.trim(), "No action taken.");
+        // A tag the thought ends on is shown too.
+        let mut ending = self::chat(&["A tag: <tool_call>\n</think>\n\nDone."]);
+        let mut thoughts = String::new();
+        ending
+            .send("go", |chunk| {
+                if let Chunk::Thought(text) = chunk {
+                    thoughts.push_str(text);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(thoughts, "A tag: <tool_call>\n");
+    }
+
+    #[test]
+    fn a_call_written_in_the_thought_ends_it() {
+        // The model calls a tool from inside its thought, without closing
+        // it: the thought ends at the call, which is made, and the reply
+        // ends without a closing tag of its own, as the model wrote it.
+        let call = "<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>";
+        let mut chat = chat(&[&format!(
+            "Let me check the date.\n<tool_call>\n{call}\n</tool_call>"
+        )]);
+        let mut thoughts = String::new();
+        let mut reply = String::new();
+        let calls = chat
+            .send("go", |chunk| {
+                match chunk {
+                    Chunk::Thought(text) => thoughts.push_str(text),
+                    Chunk::Text(text) => reply.push_str(text),
+                    Chunk::Token => {}
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(calls, [format!("\n{call}\n")]);
+        assert_eq!(thoughts, "Let me check the date.\n");
+        assert!(reply.trim().is_empty(), "{reply:?}");
+        let expected = chat
+            .tokenizer
+            .encode_with_special(&format!(
+                "<|im_start|>assistant\n<think>\nLet me check the date.\n<tool_call>\n{call}\n</tool_call><|im_end|>\n"
+            ))
+            .unwrap();
+        assert!(
+            chat.model.fed.ends_with(&expected),
+            "the reply is kept as written"
+        );
+        assert!(!chat.thought_ended());
     }
 
     #[test]
