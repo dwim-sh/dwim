@@ -1,4 +1,9 @@
-use std::{ops::ControlFlow, time::Instant};
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::ControlFlow,
+    time::Instant,
+};
 
 use crate::{LanguageModel, Result, Sampler, Tokenizer};
 
@@ -9,6 +14,15 @@ const BATCH: usize = 64;
 /// What follows a `<tool_call>` tag that opens a call, as the chat template
 /// writes one: a tag followed by anything else is text.
 const CALL_OPENING: &str = "\n<function=";
+
+/// A thought that writes the same [`REPEAT_WINDOW`] tokens for the
+/// [`REPEATS`]th time is going round in circles, and is ended as one that
+/// runs to its limit is: a small model at a long context sometimes falls
+/// into saying the same thing over and over, and would not stop on its own
+/// before the context ran out. A window this long is not written three
+/// times by a thought that is getting anywhere.
+const REPEAT_WINDOW: usize = 32;
+const REPEATS: u32 = 3;
 
 /// A conversation with an instruction-tuned model, in the ChatML format that
 /// Qwen models are trained on:
@@ -256,9 +270,11 @@ impl<M: LanguageModel> Chat<M> {
         self.reserve = tokens;
     }
 
-    /// Ends a thought that runs to `tokens`: `closing` is written into it
-    /// as the model's own, and the thought is closed, so that the model
-    /// goes on to act or reply instead of thinking in circles.
+    /// Ends a thought that runs to `tokens`, or that repeats itself:
+    /// `closing` is written into it as the model's own, and the thought is
+    /// closed, so that the model goes on to act or reply instead of
+    /// thinking in circles. With `usize::MAX`, only a thought that repeats
+    /// itself is ended.
     pub fn limit_thoughts(&mut self, tokens: usize, closing: &str) {
         self.thought_limit = Some((tokens, closing.to_string()));
     }
@@ -482,6 +498,11 @@ impl<M: LanguageModel> Chat<M> {
         // What has followed a <tool_call> tag written in the thought, while
         // it is not yet known whether the tag opens a call.
         let mut held: Option<String> = None;
+        // The thought's tokens, how often each window of them has been
+        // written, and whether one has been written too often.
+        let mut recent: Vec<u32> = Vec::new();
+        let mut windows: HashMap<u64, u32> = HashMap::new();
+        let mut repeating = false;
         // Whether the reply has shown any text, or called a tool.
         let mut replied = false;
         // Whether the model tried to end the reply without doing either, and
@@ -501,7 +522,7 @@ impl<M: LanguageModel> Chat<M> {
             }
             if let Some((limit, closing)) = &self.thought_limit
                 && thinking
-                && thought >= *limit
+                && (thought >= *limit || repeating)
             {
                 let closing = format!("\n\n{closing}\n");
                 let mut tokens = self.tokenizer.encode(&closing)?;
@@ -598,12 +619,23 @@ impl<M: LanguageModel> Chat<M> {
             }
             if thinking {
                 thought += 1;
+                recent.push(token);
+                if recent.len() >= REPEAT_WINDOW {
+                    let mut hasher = DefaultHasher::new();
+                    recent[recent.len() - REPEAT_WINDOW..].hash(&mut hasher);
+                    let count = windows.entry(hasher.finish()).or_insert(0);
+                    *count += 1;
+                    repeating |= *count >= REPEATS;
+                }
             }
             let flow = if consumed {
                 ControlFlow::Continue(())
             } else if token == self.think {
                 thinking = true;
                 thought = 0;
+                recent.clear();
+                windows.clear();
+                repeating = false;
                 ControlFlow::Continue(())
             } else if token == self.think_end {
                 thinking = false;
@@ -1066,6 +1098,39 @@ mod tests {
                     .unwrap()
                     .len()
         );
+    }
+
+    #[test]
+    fn ends_a_thought_that_repeats_itself() {
+        // The same line over and over: ended once a window of it has been
+        // written three times, long before the thought's own end, while
+        // a thought that gets somewhere runs to its end.
+        let looping = format!("{}</think>\n\nDone.", "Let me look again.\n".repeat(50));
+        let digits: String = (1..)
+            .flat_map(|i: u32| i.to_string().into_bytes())
+            .map(char::from)
+            .take(600)
+            .collect();
+        let onward = format!("{digits}\n</think>\n\nDone.");
+        for (script, ended) in [(looping.as_str(), true), (onward.as_str(), false)] {
+            let mut chat = chat(&[script]);
+            chat.limit_thoughts(usize::MAX, "Enough.");
+            let mut thoughts = String::new();
+            chat.send("go", |chunk| {
+                if let Chunk::Thought(text) = chunk {
+                    thoughts.push_str(text);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+            assert_eq!(chat.thought_ended(), ended, "{thoughts}");
+            assert_eq!(thoughts.contains("Enough."), ended);
+            if ended {
+                assert!(thoughts.len() < 200, "{}", thoughts.len());
+            } else {
+                assert!(thoughts.len() >= 600);
+            }
+        }
     }
 
     #[test]

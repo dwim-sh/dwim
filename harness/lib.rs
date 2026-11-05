@@ -1180,6 +1180,17 @@ mod tests {
 
     use super::*;
 
+    /// A thought of `n` bytes that goes somewhere: the counting numbers run
+    /// together, which the tiny tokenizer makes `n` tokens, and which never
+    /// repeats a window of itself, as a thought of one letter over would.
+    fn filler(n: usize) -> String {
+        (1..)
+            .flat_map(|i: u32| i.to_string().into_bytes())
+            .map(char::from)
+            .take(n)
+            .collect()
+    }
+
     /// A reply after a thought of `thought` bytes, either with text alone
     /// or calling `bash`.
     fn reply(thought: usize, call: bool) -> String {
@@ -1188,7 +1199,7 @@ mod tests {
         } else {
             "Ok."
         };
-        format!("{}\n</think>\n\n{body}", "x".repeat(thought))
+        format!("{}\n</think>\n\n{body}", filler(thought))
     }
 
     /// A harness around a scripted model with room for `max_len` tokens,
@@ -1494,7 +1505,7 @@ mod tests {
         if thought == 0 {
             call
         } else {
-            format!("{}\n</think>\n\n{call}", "x".repeat(thought))
+            format!("{}\n</think>\n\n{call}", filler(thought))
         }
     }
 
@@ -2043,7 +2054,7 @@ mod tests {
                 .unwrap()
                 .starts_with("# Environment")
         );
-        assert_eq!(records[2]["text"].as_str().unwrap().trim(), "x".repeat(100));
+        assert_eq!(records[2]["text"].as_str().unwrap().trim(), filler(100));
         assert_eq!(records[4]["calls"].as_array().unwrap().len(), 1);
         assert!(records[4]["thought_tokens"].as_u64().unwrap() > 100);
         assert_eq!(records[4]["thought_ended"], false);
