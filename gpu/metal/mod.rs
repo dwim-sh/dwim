@@ -45,6 +45,19 @@ const MMA_THREADS: usize = 256;
 /// Most chunks of positions it splits a context into.
 const MMA_CHUNKS: usize = 32;
 
+/// Rows of the threadgroups of the accelerators' attention for a token
+/// decoded at a time, and their threads: a token has as many rows as a
+/// key/value head has query heads, six for the model, so that a tile of
+/// 64 is mostly padding the accelerators multiply for nothing.
+const DECODE_ROWS: usize = 16;
+const DECODE_THREADS: usize = 128;
+
+/// Positions of context from which a token decoded at a time takes the
+/// accelerators' attention rather than `attention.metal`, whose own loop
+/// reads the caches at under half the rate the accelerators' does at 8k
+/// positions and more, and is no slower at 1k.
+const DECODE_DEPTH: usize = 2048;
+
 /// Kernels encoded into a command buffer before it is committed, without
 /// waiting, so that the GPU works on the first kernels of a forward pass
 /// while the CPU encodes the rest.
@@ -154,7 +167,9 @@ struct Kernels {
     attention_flash: [Object<dyn MTLComputePipelineState>; 2],
     /// Batched attention on the matrix accelerators, where the GPU has them,
     /// and the packing of the queries for it.
-    attention_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    /// For heads of 128 and 256, in tiles of [`MMA_ROWS`] rows, and in
+    /// tiles of [`DECODE_ROWS`] for a token decoded at a time.
+    attention_mma: Option<[Object<dyn MTLComputePipelineState>; 4]>,
     pack_queries: Object<dyn MTLComputePipelineState>,
     silu_mul: Object<dyn MTLComputePipelineState>,
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
@@ -285,17 +300,22 @@ impl Metal {
         let attention_mma = if matmul_ternary_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let mma = |dim| {
+            let mma = |dim, rows, threads| {
                 compile(
                     &device,
                     "attention_mma",
-                    MMA_THREADS,
-                    &[("DIM", dim)],
+                    threads,
+                    &[("DIM", dim), ("ROWS", rows), ("THREADS", threads)],
                     &[source!("attention_mma")],
                     Some(&metal4),
                 )
             };
-            Some([mma(128)?, mma(256)?])
+            Some([
+                mma(128, MMA_ROWS, MMA_THREADS)?,
+                mma(256, MMA_ROWS, MMA_THREADS)?,
+                mma(128, DECODE_ROWS, DECODE_THREADS)?,
+                mma(256, DECODE_ROWS, DECODE_THREADS)?,
+            ])
         } else {
             None
         };
@@ -991,12 +1011,22 @@ impl Device for Metal {
         // one they are compiled for: the one on the matrix accelerators
         // where the GPU has them, and the flash kernel on the SIMD groups'
         // matrices elsewhere.
+        // A token decoded at a time takes the accelerators too, past a
+        // depth of context where reading the caches is the work, in tiles
+        // of its own size.
+        let decode = n == 1 && pos + 1 >= DECODE_DEPTH && self.kernels.attention_mma.is_some();
         let batched = match head_dim {
-            128 if n >= FLASH_TOKENS => Some(0),
-            256 if n >= FLASH_TOKENS => Some(1),
+            128 if n >= FLASH_TOKENS || decode => Some(0),
+            256 if n >= FLASH_TOKENS || decode => Some(1),
             _ => None,
         }
         .map(|which| match &self.kernels.attention_mma {
+            Some(mma) if decode => Batched {
+                kernel: &mma[2 + which],
+                rows: DECODE_ROWS,
+                threads: DECODE_THREADS,
+                accelerators: true,
+            },
             Some(mma) => Batched {
                 kernel: &mma[which],
                 rows: MMA_ROWS,
@@ -1049,7 +1079,8 @@ impl Device for Metal {
             if accelerators { &self.packed } else { &q.buf };
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
-            let padded = (tokens * group).next_multiple_of(MMA_ROWS);
+            let padded =
+                (tokens * group).next_multiple_of(batched.as_ref().map_or(MMA_ROWS, |b| b.rows));
             if accelerators {
                 self.packed_for.set(None);
                 let pack = PackQueriesParams {
@@ -1366,6 +1397,18 @@ mod tests {
             let col = (lane & 1) * 2 + ((lane >> 3) & 1) * 4;
             let want = [(row * 8 + col) as f32, (row * 8 + col + 1) as f32];
             assert_eq!(got[2 * lane..2 * lane + 2], want, "lane {lane}");
+        }
+    }
+
+    /// Times attention for one token, as a step of decoding takes it, at
+    /// depths of context: it reads the caches once, so its speed is a
+    /// rate of reading them. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn decode_attention_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::tests::attention_speed(&gpu, 1),
+            Err(e) => eprintln!("skipping: {e}"),
         }
     }
 
