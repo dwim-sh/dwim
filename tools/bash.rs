@@ -1,6 +1,10 @@
-//! The `bash` tool: runs a shell command and gives the model what it
+//! The `bash` tool: runs a shell command, in the working directory or one
+//! the call names, for at most a timeout, and gives the model what it
 //! printed as a preview, its standard output apart from its standard
-//! error, with a line of how it ended that is always there. A stream
+//! error, with a line of how it ended that is always there. A command
+//! that runs to its timeout is killed, with what it started, and the
+//! model is told, so that a test that hangs or a server that was never
+//! going to end does not hold the session until the user notices. A stream
 //! that outgrows its preview is shown by its start and its end, and is
 //! kept whole in a file of the tool's own, which the result names along
 //! with the line to `read` it from, so the model can get the rest with
@@ -16,19 +20,31 @@ use std::{
     env,
     fs::{self, DirBuilder, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
+    os::unix::{
+        fs::DirBuilderExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
+    time::Duration,
 };
 
 use serde_json::Value;
 
-use crate::string;
+use crate::{number, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}, "timeout": {"type": "integer", "description": "Seconds the command may run (default 300; 0 for no limit). Give a long build or test run more."}, "workdir": {"type": "string", "description": "The directory to run it in (default: the working directory)."}}, "required": ["command"]}}}"#;
+
+/// Seconds a command may run unless the call says otherwise: long enough
+/// for a build or a test run, short enough that a command that hangs, or
+/// a server that was never going to end, does not hold the session long.
+const TIMEOUT: u64 = 300;
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
@@ -105,32 +121,76 @@ impl Bash {
         let Some(command) = string(arguments, "command") else {
             return "error: bash needs a 'command' string".to_string();
         };
+        let timeout = match arguments.get("timeout") {
+            None => Some(Duration::from_secs(TIMEOUT)),
+            Some(_) => match number(arguments, "timeout") {
+                Some(0) => None,
+                Some(seconds) => Some(Duration::from_secs(seconds)),
+                None => {
+                    return "error: 'timeout' is a number of seconds, or 0 for no limit"
+                        .to_string();
+                }
+            },
+        };
+        let workdir = string(arguments, "workdir").map(PathBuf::from);
+        if let Some(dir) = &workdir
+            && !dir.is_dir()
+        {
+            return format!("error: workdir {} is not a directory", dir.display());
+        }
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
         // runs the command all the same.
         let command = format!("set -o pipefail 2>/dev/null\n{command}");
-        let mut child = match Command::new(&self.shell)
+        let mut shell = Command::new(&self.shell);
+        shell
             .args(["-c", &command])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-        {
+            // In a process group of its own, so that the timeout ends what
+            // the command started along with it.
+            .process_group(0);
+        if let Some(dir) = &workdir {
+            shell.current_dir(dir);
+        }
+        let mut child = match shell.spawn() {
             Ok(child) => child,
             Err(e) => return format!("[error: could not run {}: {e}]", self.shell.display()),
         };
+        let pid = child.id();
         let mut stdout = Stream::new("stdout", self);
         let mut stderr = Stream::new("stderr", self);
         let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let (done, finished) = mpsc::channel::<()>();
+        let timed_out = AtomicBool::new(false);
         // Each pipe is read on its own thread, so that neither fills up and
-        // blocks the command while the other is being read.
-        thread::scope(|s| {
+        // blocks the command while the other is being read; a third kills
+        // the command's process group at the timeout, which closes the
+        // pipes too, unless the command ends first.
+        let waited = thread::scope(|s| {
             s.spawn(|| stderr.drain(err));
+            if let Some(timeout) = timeout {
+                let timed_out = &timed_out;
+                s.spawn(move || {
+                    if finished.recv_timeout(timeout).is_err() {
+                        timed_out.store(true, Ordering::Relaxed);
+                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                    }
+                });
+            }
             stdout.drain(out);
+            let waited = child.wait();
+            let _ = done.send(());
+            waited
         });
-        let status = match child.wait() {
+        let status = match waited {
+            Ok(_) if timed_out.load(Ordering::Relaxed) => format!(
+                "[killed after {} s, the timeout; give a longer timeout if the command needs it, or 0 for none]",
+                timeout.unwrap_or_default().as_secs()
+            ),
             Ok(status) => ended(status),
-            Err(e) => format!("[error: could not wait for sh: {e}]"),
+            Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
         report(&stdout, &stderr, &status)
     }
@@ -495,6 +555,57 @@ mod tests {
         fs::remove_file(script).unwrap();
         bash.set_shell(PathBuf::from("/nonexistent/shell"));
         assert!(sh("true", &mut bash).starts_with("[error: could not run /nonexistent/shell: "));
+    }
+
+    #[test]
+    fn kills_a_command_at_its_timeout() {
+        // Timed loosely: on a loaded machine the shell may start late, so
+        // what matters is that the command is killed, and long before it
+        // would have ended by itself.
+        let mut bash = Bash::new();
+        let start = std::time::Instant::now();
+        let output = bash.run(&serde_json::json!({
+            "command": "echo start; sleep 60; echo end",
+            "timeout": 2
+        }));
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(!output.contains("end"), "{output}");
+        assert!(
+            output.ends_with(
+                "[killed after 2 s, the timeout; give a longer timeout if the command needs it, or 0 for none]"
+            ),
+            "{output}"
+        );
+        // What the command started goes with it, so the pipes close.
+        let start = std::time::Instant::now();
+        let output = bash.run(&serde_json::json!({
+            "command": "sleep 60 & sleep 60",
+            "timeout": "2"
+        }));
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(output.ends_with(", or 0 for none]"), "{output}");
+        assert_eq!(
+            bash.run(&serde_json::json!({ "command": "true", "timeout": 0 })),
+            "[exit code 0]"
+        );
+        assert!(
+            bash.run(&serde_json::json!({ "command": "true", "timeout": "soon" }))
+                .starts_with("error: 'timeout' is")
+        );
+    }
+
+    #[test]
+    fn runs_in_the_directory_given() {
+        let mut bash = Bash::new();
+        let dir = env::temp_dir().canonicalize().unwrap();
+        assert_eq!(
+            bash.run(&serde_json::json!({ "command": "pwd", "workdir": dir })),
+            format!("{}\n[exit code 0]", dir.display())
+        );
+        assert!(
+            bash.run(&serde_json::json!({ "command": "pwd", "workdir": "/nonexistent/dir" }))
+                .starts_with("error: workdir /nonexistent/dir is not a directory")
+        );
     }
 
     #[test]
