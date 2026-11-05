@@ -188,8 +188,8 @@ impl Progress {
 }
 
 /// Prints a turn as it happens: the reply to standard output, and the
-/// thought behind it, the tools it runs, and the plan and the note it
-/// writes along the way to standard error.
+/// thought behind it, the tools it runs, and the note it writes along the
+/// way to standard error.
 #[derive(Default)]
 struct Printer {
     /// Whether anything of the reply has been printed, so that the blank
@@ -244,11 +244,6 @@ impl Printer {
                 self.end_thought();
                 eprintln!("[compacting the conversation]");
             }
-            harness::Event::Planning => {
-                self.end_thought();
-                eprintln!("[planning the changes, then making them]");
-            }
-            harness::Event::Plan(text) => self.print(harness::Event::Thought(text)),
             harness::Event::Note(text) => self.print(harness::Event::Thought(text)),
             harness::Event::Compacted { before, after } => {
                 self.end_thought();

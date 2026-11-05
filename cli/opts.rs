@@ -37,9 +37,9 @@ pub struct Opts {
     #[argh(switch)]
     pub thinking: bool,
 
-    /// most tokens the model may think before it is made to act
-    /// (default: 512; 0 for no limit)
-    #[argh(option, default = "dwim_harness::THINKING_BUDGET")]
+    /// most tokens the model may think before it is made to act (default:
+    /// 0, no limit)
+    #[argh(option, default = "dwim_harness::THINKING_BUDGET.unwrap_or(0)")]
     pub thinking_budget: usize,
 
     /// sampling temperature (default: what the model file recommends; 0
