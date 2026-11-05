@@ -46,8 +46,8 @@ By default, as many as fit in the memory the device has free besides the
 model and 256 MB to spare, in thousands, and no fewer than 4096:
 a GPU's free memory as its driver reports it, which for a GPU that shares
 the host's memory is no more than the host has available; on a Mac, as
-much as Metal recommends the GPU use; and on the CPU, the host's
-available memory.
+much as Metal recommends the GPU use, and no more than the host has
+available; and on the CPU, the host's available memory.
 Where the device cannot tell, 16384.
 The conversation is compacted before it outgrows the window: when a
 message or a command's output would take it past four fifths, the agent
