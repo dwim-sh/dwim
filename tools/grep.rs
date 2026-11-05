@@ -66,8 +66,10 @@ pub fn run(arguments: &Value) -> String {
         }
         command
     } else {
+        // Extended syntax, so that a pattern means what it does to `rg`.
         let mut command = Command::new("grep");
         command.args([
+            "-E",
             "-r",
             "-n",
             "-H",
