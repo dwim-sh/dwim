@@ -1,13 +1,18 @@
 //! The tools the model can call: `bash`, which runs a shell command,
-//! `read`, which gives it a file a page at a time, and `edit`, which
-//! replaces a string in a file with another. Each declares itself
-//! as the JSON signature the model's chat template lists, and turns a
-//! call into the text the model sees.
+//! `read`, which gives it a file a page at a time, `edit`, which replaces
+//! a string in a file with another, `write`, which writes a file whole,
+//! `grep`, which searches files for a pattern, and `glob`, which lists
+//! the files whose paths match one. Each declares itself as the JSON
+//! signature the model's chat template lists, and turns a call into the
+//! text the model sees.
 
 pub mod bash;
 pub mod call;
 pub mod edit;
+pub mod glob;
+pub mod grep;
 pub mod read;
+pub mod write;
 
 use std::path::PathBuf;
 
@@ -18,7 +23,15 @@ pub use crate::call::ToolCall;
 
 /// The tools' signatures, one per line, as the system prompt lists them.
 pub fn signatures() -> String {
-    [bash::SIGNATURE, read::SIGNATURE, edit::SIGNATURE].join("\n")
+    [
+        bash::SIGNATURE,
+        read::SIGNATURE,
+        edit::SIGNATURE,
+        write::SIGNATURE,
+        grep::SIGNATURE,
+        glob::SIGNATURE,
+    ]
+    .join("\n")
 }
 
 /// The tools, with what they keep between calls.
@@ -49,14 +62,18 @@ impl Tools {
             "bash" => self.bash.run(&call.arguments),
             "read" => read::run(&call.arguments),
             "edit" => edit::run(&call.arguments),
+            "write" => write::run(&call.arguments),
+            "grep" => grep::run(&call.arguments),
+            "glob" => glob::run(&call.arguments),
             name => format!("error: unknown tool '{name}'"),
         }
     }
 }
 
 /// How a call reads on screen: the command for `bash`, the file and where
-/// in it for `read` and `edit`, and the arguments as written for anything
-/// else, or for a read the tool will refuse.
+/// in it for `read` and `edit`, the file for `write`, the pattern and
+/// where it is looked for with `grep` and `glob`, and the arguments as
+/// written for anything else, or for a read the tool will refuse.
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" => string(&call.arguments, "command").map(str::to_string),
@@ -78,6 +95,13 @@ pub fn describe(call: &ToolCall) -> String {
                 None => path.to_string(),
             })
         }
+        "write" => string(&call.arguments, "path").map(str::to_string),
+        "grep" | "glob" => string(&call.arguments, "pattern").map(|pattern| {
+            match string(&call.arguments, "path").filter(|path| !path.is_empty()) {
+                Some(path) => format!("{pattern} in {path}"),
+                None => pattern.to_string(),
+            }
+        }),
         _ => None,
     }
     .unwrap_or_else(|| call.arguments.to_string())
@@ -214,6 +238,24 @@ mod tests {
             "a.rs at line 3"
         );
         assert_eq!(
+            describe(&call(
+                r#"{"name": "write", "arguments": {"path": "a.rs", "content": "x"}}"#
+            )),
+            "a.rs"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "grep", "arguments": {"pattern": "fn main", "path": "src"}}"#
+            )),
+            "fn main in src"
+        );
+        assert_eq!(
+            describe(&call(
+                r#"{"name": "glob", "arguments": {"pattern": "*.rs"}}"#
+            )),
+            "*.rs"
+        );
+        assert_eq!(
             describe(&call(r#"{"name": "other", "arguments": {"x": 1}}"#)),
             r#"{"x":1}"#
         );
@@ -222,7 +264,7 @@ mod tests {
     #[test]
     fn lists_the_tools() {
         let signatures = signatures();
-        assert_eq!(signatures.lines().count(), 3);
+        assert_eq!(signatures.lines().count(), 6);
         for line in signatures.lines() {
             let signature: Value = serde_json::from_str(line).unwrap();
             assert_eq!(signature["type"], "function");
