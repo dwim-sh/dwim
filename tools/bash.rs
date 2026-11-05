@@ -33,8 +33,11 @@ pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash",
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
 /// stream is shown by its first and last [`HALF`] bytes, cut at line ends
-/// where it can be, and kept whole on disk for the model to read from.
-const PREVIEW: usize = 2000;
+/// where it can be, and kept whole on disk for the model to read from. A
+/// test run or a diff of a few hundred lines comes whole: a preview of a
+/// couple of thousand bytes had the model read the file of nearly every
+/// build and test, a round trip each.
+const PREVIEW: usize = 32 << 10;
 
 /// How much of each end of a stream too long for its preview is shown.
 const HALF: usize = PREVIEW / 2;
@@ -621,16 +624,19 @@ mod tests {
     #[test]
     fn cuts_between_characters() {
         let mut bash = Bash::new();
-        let output = sh("yes ä | head -c 5000", &mut bash);
+        let output = sh("yes ä | head -c 50000", &mut bash);
         assert!(!output.contains('\u{FFFD}'), "{output}");
         assert!(output.starts_with("ä\nä\n"));
         assert!(output.contains("\nä\n[… lines "), "{output}");
         assert!(output.contains(" …]\nä\nä\n"), "{output}");
-        assert_eq!(fs::metadata(bash.dir.join("1.stdout")).unwrap().len(), 5000);
+        assert_eq!(
+            fs::metadata(bash.dir.join("1.stdout")).unwrap().len(),
+            50000
+        );
         let output = sh("printf 'x\\377\\376y'", &mut bash);
         assert_eq!(output, "x\u{FFFD}\u{FFFD}y\n[exit code 0]");
         // A single long line is cut at character boundaries, not line ends.
-        let output = sh("yes ä | head -c 5000 | tr -d '\\n'", &mut bash);
+        let output = sh("yes ä | head -c 50000 | tr -d '\\n'", &mut bash);
         assert!(!output.contains('\u{FFFD}'), "{output}");
         assert!(output.contains("ä\n[… line 1 ("), "{output}");
     }
@@ -639,7 +645,7 @@ mod tests {
     fn discards_past_the_cap_and_says_so() {
         let mut bash = Bash::new();
         bash.retain = 3000;
-        let output = sh("seq 1 2000", &mut bash);
+        let output = sh("seq 1 20000", &mut bash);
         let path = bash.dir.join("1.stdout");
         let note = output
             .lines()
@@ -648,30 +654,30 @@ mod tests {
         assert_eq!(
             note,
             format!(
-                "[stdout: 2000 lines, 8893 bytes, the first 3000 bytes in {}, the rest discarded]",
+                "[stdout: 20000 lines, 108894 bytes, the first 3000 bytes in {}, the rest discarded]",
                 path.display()
             )
         );
-        let expected: String = (1..=2000).map(|i| format!("{i}\n")).collect();
+        let expected: String = (1..=20000).map(|i| format!("{i}\n")).collect();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected[..3000]);
         // The preview still shows the end, which was read even if not kept.
-        assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
+        assert!(output.contains("\n19999\n20000\n[stdout: "), "{output}");
     }
 
     #[test]
     fn reports_a_file_it_could_not_keep() {
         let mut bash = Bash::new();
         bash.dir = PathBuf::from("/dev/null/nowhere");
-        let output = sh("seq 1 2000", &mut bash);
+        let output = sh("seq 1 20000", &mut bash);
         let note = output
             .lines()
             .find(|line| line.starts_with("[stdout: "))
             .unwrap();
         assert!(
-            note.starts_with("[stdout: 2000 lines, 8893 bytes, could not keep the rest: "),
+            note.starts_with("[stdout: 20000 lines, 108894 bytes, could not keep the rest: "),
             "{note}"
         );
-        assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
+        assert!(output.contains("\n19999\n20000\n[stdout: "), "{output}");
         assert!(output.ends_with("[exit code 0]"));
     }
 

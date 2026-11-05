@@ -21,15 +21,16 @@
 //! line before them in both strings.
 //!
 //! An old string of which the new string keeps more than [`MOST`] lines,
-//! copied twice around the lines that change, is refused. Left to itself,
-//! the model changes a few lines of a function by writing the function
-//! out twice, as the old string and the new: on a run, four such edits of
-//! 150 to 180 lines, for changes of 5 to 15 lines each, took 16 of the
-//! run's 76 minutes, and the page they copied from was read again before
-//! each. Refused, it gives the lines that change with a line or two to
-//! find them by, which it writes from memory, as it does for most edits.
-//! A long span removed, or replaced by lines of its own, is not refused:
-//! the lines the new string does not keep are written once.
+//! copied twice around the lines that change, is made, with a note at
+//! the end of the result asking for the lines that change alone next
+//! time. Left to itself, the model changes a few lines of a function by
+//! writing the function out twice, as the old string and the new: on a
+//! run, four such edits of 150 to 180 lines, for changes of 5 to 15 lines
+//! each, took 16 of the run's 76 minutes. Refusing such an edit cost a
+//! round trip and a read of the page again, and the model did not
+//! reliably learn from the refusal; the note costs nothing, and the edit
+//! is done. A long span removed, or replaced by lines of its own, gets no
+//! note: the lines the new string does not keep are written once.
 
 use std::{borrow::Cow, collections::HashMap, fs};
 
@@ -43,7 +44,7 @@ pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit",
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
 
-/// Most lines of an old string the new string may keep.
+/// Most lines of an old string the new string may keep without a note.
 pub const MOST: usize = 30;
 
 /// Most lines of a range shown: its start and end, half each, past this.
@@ -67,13 +68,9 @@ pub fn run(arguments: &Value) -> String {
         return "error: old_string and new_string are the same; nothing changed".to_string();
     }
     let wanted = split(old);
-    let kept = kept(&wanted, &split(new));
-    if kept > MOST {
-        return format!(
-            "error: old_string has {} that new_string keeps, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; nothing changed",
-            plural(kept as u64, "line")
-        );
-    }
+    // Lines copied twice, in the old string and the new, which the note at
+    // the end of the result counts when there are many.
+    let copied = kept(&wanted, &split(new));
     let start = match arguments.get("start") {
         None => None,
         Some(_) => match number(arguments, "start") {
@@ -167,8 +164,15 @@ pub fn run(arguments: &Value) -> String {
         Some(start) if start != first => format!("; old_string began at line {first}, not {start}"),
         _ => String::new(),
     };
+    let note = if copied > MOST {
+        format!(
+            "\n[note: old_string and new_string share {copied} lines; next time give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits]"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]",
+        "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]{note}",
         now.len(),
         plural(now.len() as u64, "line")
     )
@@ -556,7 +560,7 @@ mod tests {
 
     #[test]
     fn matches_a_cut_line_by_its_start_and_keeps_it_whole() {
-        let long = "y".repeat(400);
+        let long = "y".repeat(2 * read::LINE);
         let file = File::new(&format!("short\n{long}\nend\n"));
         let cut = format!("{}…", "y".repeat(read::LINE));
         // Copied cut into new_string, the line goes back whole.
@@ -571,7 +575,7 @@ mod tests {
             assert_eq!(
                 result,
                 format!(
-                    "error: line 2 of {} is longer than read shows, cut at 300 bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
+                    "error: line 2 of {} is longer than read shows, cut at 1000 bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
                     file.path()
                 )
             );
@@ -682,38 +686,39 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_old_string_the_new_mostly_keeps() {
+    fn notes_an_old_string_the_new_mostly_keeps() {
         let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
         let file = File::new(&text);
-        // One line changed among MOST + 1 kept.
+        // One line changed among MOST + 1 kept: made, with the note.
         let old: String = (1..=MOST + 2).map(|i| format!("line {i}\n")).collect();
         let new = old.replace("line 5\n", "changed\n");
-        assert_eq!(
-            file.edit(&old, &new),
-            format!(
-                "error: old_string has {} that new_string keeps, more than {MOST}; give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits; nothing changed",
-                plural(MOST as u64 + 1, "line")
-            )
-        );
-        assert_eq!(file.text(), text);
-        // Before the file is read, so a path that is wrong too says so.
+        let result = file.edit(&old, &new);
         assert!(
-            run(&json!({ "path": "/nonexistent/file", "old_string": &old, "new_string": &new }))
-                .starts_with("error: old_string has")
+            result.ends_with(&format!(
+                "[note: old_string and new_string share {} lines; next time give only the lines that change, with a line or two around them to find the place, and make a change in several places as several edits]",
+                MOST + 1
+            )),
+            "{result}"
         );
-        // MOST kept lines are allowed, as are a long span replaced by lines
+        assert!(file.text().contains("line 4\nchanged\nline 6\n"));
+        // MOST kept lines get no note, nor do a long span replaced by lines
         // of its own and one removed, which keep none.
+        let file = File::new(&text);
         let old: String = (1..=MOST + 1).map(|i| format!("line {i}\n")).collect();
         let new = old.replace("line 5\n", "changed\n");
-        assert!(!file.edit(&old, &new).starts_with("error"));
+        let result = file.edit(&old, &new);
+        assert!(
+            !result.starts_with("error") && !result.contains("[note:"),
+            "{result}"
+        );
         assert!(file.text().contains("line 4\nchanged\nline 6\n"));
         let old: String = (6..=38).map(|i| format!("line {i}\n")).collect();
-        assert!(!file.edit(&old, "other\nlines\n").starts_with("error"));
+        assert!(!file.edit(&old, "other\nlines\n").contains("[note:"));
         let old: String = (39..=40).map(|i| format!("line {i}\n")).collect();
         assert!(
             !file
                 .edit(&format!("other\nlines\n{old}"), "")
-                .starts_with("error")
+                .contains("[note:")
         );
         assert_eq!(file.text(), "line 1\nline 2\nline 3\nline 4\nchanged\n");
     }
