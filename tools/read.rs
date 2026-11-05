@@ -29,21 +29,24 @@ use serde_json::Value;
 
 use crate::{number, plural, string};
 
-/// Most lines in a page.
-pub const PAGE: usize = 200;
+/// Most lines in a page. A page is what the model gets of a file in one
+/// call: a page too small has it read a file in slices, each a round
+/// trip, and lose the thread between them, while a file of a thousand
+/// lines read whole is a tenth of a small context. Most files come whole.
+pub const PAGE: usize = 1000;
 
 /// Most bytes in a page: a page of long lines ends early, so that one
 /// page can't take up much of the context.
-pub const BYTES: usize = 16 << 10;
+pub const BYTES: usize = 48 << 10;
 
 /// Most bytes of a line shown; a longer line is cut there, with a mark.
-pub const LINE: usize = 300;
+pub const LINE: usize = 1000;
 
 /// Most bytes of an outline entry shown; a longer line is cut there.
 pub const ENTRY: usize = 120;
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file from a line, a page of up to 200 numbered lines (or 16 KB) at a time, or as many lines as asked for. The result says how many lines the file has and where the next page starts. Without a start line, a file longer than a page comes as an outline instead: its definitions with their line numbers, to pick the line to read from. To copy lines for an edit, read just those lines.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. Left out, the outline of a long file, or the whole of a short one; with lines, the first line."}, "lines": {"type": "integer", "description": "How many lines to read from start, up to 200, or from the first line without a start. Left out, a page."}}, "required": ["path"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file from a line, a page of up to 1000 numbered lines (or 48 KB) at a time, or as many lines as asked for. The result says how many lines the file has and where the next page starts. Without a start line, a file longer than a page comes as an outline instead: its definitions with their line numbers, to pick the line to read from. To copy lines for an edit, read just those lines.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. Left out, the outline of a long file, or the whole of a short one; with lines, the first line."}, "lines": {"type": "integer", "description": "How many lines to read from start, up to 1000, or from the first line without a start. Left out, a page."}}, "required": ["path"]}}}"#;
 
 /// Reads the page of the file in `arguments`, returning what the model
 /// should see.
@@ -399,34 +402,41 @@ mod tests {
 
     #[test]
     fn pages_through_a_file() {
-        let text: String = (1..=450).map(|i| format!("line {i}\n")).collect();
+        // Two pages and a half.
+        let (a, b, c, n) = (PAGE, 2 * PAGE, 2 * PAGE + 1, 2 * PAGE + PAGE / 4);
+        let text: String = (1..=n).map(|i| format!("line {i}\n")).collect();
         let (dir, path) = file("long.txt", &text);
         let first = read(&path, None);
         assert!(first.starts_with("1\tline 1\n2\tline 2\n"), "{first}");
-        assert!(first.contains("\n200\tline 200\n"), "{first}");
-        assert!(!first.contains("line 201\n"));
+        assert!(first.contains(&format!("\n{a}\tline {a}\n")), "{first}");
+        assert!(!first.contains(&format!("line {}\n", a + 1)));
         assert!(
             first.ends_with(&format!(
-                "[lines 1–200 of 450 in {path}; next: read {path} from line 201]"
+                "[lines 1–{a} of {n} in {path}; next: read {path} from line {}]",
+                a + 1
             )),
             "{first}"
         );
         assert_eq!(first.lines().count(), PAGE + 1);
 
-        let second = read(&path, Some(201));
-        assert!(second.starts_with("201\tline 201\n"), "{second}");
+        let second = read(&path, Some(a as u64 + 1));
+        assert!(
+            second.starts_with(&format!("{}\tline {}\n", a + 1, a + 1)),
+            "{second}"
+        );
         assert!(
             second.ends_with(&format!(
-                "[lines 201–400 of 450 in {path}; next: read {path} from line 401]"
+                "[lines {}–{b} of {n} in {path}; next: read {path} from line {c}]",
+                a + 1
             )),
             "{second}"
         );
 
-        let last = read(&path, Some(401));
-        assert!(last.starts_with("401\tline 401\n"));
-        assert!(last.contains("\n450\tline 450\n"));
+        let last = read(&path, Some(c as u64));
+        assert!(last.starts_with(&format!("{c}\tline {c}\n")));
+        assert!(last.contains(&format!("\n{n}\tline {n}\n")));
         assert!(
-            last.ends_with(&format!("[lines 401–450 of 450 in {path}; end of file]")),
+            last.ends_with(&format!("[lines {c}–{n} of {n} in {path}; end of file]")),
             "{last}"
         );
 
@@ -439,11 +449,11 @@ mod tests {
                     .map(|line| line.split('\t').next().unwrap().parse::<u64>().unwrap()),
             );
         }
-        assert_eq!(seen, (1..=450).collect::<Vec<_>>());
+        assert_eq!(seen, (1..=n as u64).collect::<Vec<_>>());
 
         assert_eq!(
-            read(&path, Some(451)),
-            format!("[{path} has 450 lines; nothing from line 451]")
+            read(&path, Some(n as u64 + 1)),
+            format!("[{path} has {n} lines; nothing from line {}]", n + 1)
         );
         assert_eq!(
             read(&path, Some(0)).lines().next().unwrap(),
@@ -487,7 +497,7 @@ mod tests {
 
     #[test]
     fn cuts_long_lines_between_characters() {
-        let long = "ä".repeat(400);
+        let long = "ä".repeat(LINE);
         let (dir, path) = file("wide.txt", &format!("short\n{long}\n"));
         let page = read(&path, None);
         let second = page.lines().nth(1).unwrap();
@@ -506,12 +516,12 @@ mod tests {
 
     #[test]
     fn ends_a_page_of_long_lines_early() {
-        // 100 lines of 299 bytes: three pages by bytes, half of one by lines.
-        let text: String = (1..=100).map(|i| format!("{i:<299}\n")).collect();
+        // 400 lines of 299 bytes: three pages by bytes, half of one by lines.
+        let text: String = (1..=400).map(|i| format!("{i:<299}\n")).collect();
         let (dir, path) = file("wide.txt", &text);
         let mut start = 1;
         let mut seen = Vec::new();
-        while start <= 100 {
+        while start <= 400 {
             let page = read(&path, Some(start));
             let body: usize = page
                 .lines()
@@ -526,10 +536,10 @@ mod tests {
                 .collect();
             assert!(!shown.is_empty());
             let end = *shown.last().unwrap();
-            if end < 100 {
+            if end < 400 {
                 assert!(
                     page.ends_with(&format!(
-                        "[lines {start}–{end} of 100 in {path}; next: read {path} from line {}]",
+                        "[lines {start}–{end} of 400 in {path}; next: read {path} from line {}]",
                         end + 1
                     )),
                     "{page}"
@@ -537,7 +547,7 @@ mod tests {
             } else {
                 assert!(
                     page.ends_with(&format!(
-                        "[lines {start}–100 of 100 in {path}; end of file]"
+                        "[lines {start}–400 of 400 in {path}; end of file]"
                     )),
                     "{page}"
                 );
@@ -545,7 +555,7 @@ mod tests {
             seen.extend(shown);
             start = end + 1;
         }
-        assert_eq!(seen, (1..=100).collect::<Vec<_>>());
+        assert_eq!(seen, (1..=400).collect::<Vec<_>>());
         assert!(seen.len() > 1);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -596,7 +606,7 @@ mod tests {
         let page = read(&path, Some(1));
         assert!(page.starts_with("1\t//! A module.\n"), "{page}");
         assert!(
-            page.contains(&format!("next: read {path} from line 201]")),
+            page.contains(&format!("next: read {path} from line {}]", PAGE + 1)),
             "{page}"
         );
         // A file of a page or less comes whole, outline or not.
@@ -609,13 +619,14 @@ mod tests {
 
     #[test]
     fn reads_the_lines_asked_for() {
-        let text: String = (1..=450).map(|i| format!("line {i}\n")).collect();
+        let n = PAGE + 50;
+        let text: String = (1..=n).map(|i| format!("line {i}\n")).collect();
         let (dir, path) = file("long.txt", &text);
         let some = run(&serde_json::json!({ "path": &path, "start": 440, "lines": 5 }));
         assert_eq!(
             some,
             format!(
-                "440\tline 440\n441\tline 441\n442\tline 442\n443\tline 443\n444\tline 444\n[lines 440–444 of 450 in {path}; next: read {path} from line 445]"
+                "440\tline 440\n441\tline 441\n442\tline 442\n443\tline 443\n444\tline 444\n[lines 440–444 of {n} in {path}; next: read {path} from line 445]"
             )
         );
         // Lines without a start are from the first, in place of the outline;
@@ -623,9 +634,9 @@ mod tests {
         let first = run(&serde_json::json!({ "path": &path, "lines": "1" }));
         assert_eq!(
             first,
-            format!("1\tline 1\n[lines 1–1 of 450 in {path}; next: read {path} from line 2]")
+            format!("1\tline 1\n[lines 1–1 of {n} in {path}; next: read {path} from line 2]")
         );
-        let page = run(&serde_json::json!({ "path": &path, "lines": 1000 }));
+        let page = run(&serde_json::json!({ "path": &path, "lines": 10 * PAGE }));
         assert_eq!(page.lines().count(), PAGE + 1);
         assert!(
             run(&serde_json::json!({ "path": &path, "lines": 0 })).starts_with("error: 'lines' is"),
@@ -670,21 +681,24 @@ mod tests {
 
     #[test]
     fn cuts_a_long_outline() {
-        let text: String = (1..=500).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        let n = 2 * PAGE + PAGE / 2;
+        let text: String = (1..=n).map(|i| format!("fn f{i}() {{}}\n")).collect();
         let (dir, path) = file("many.rs", &text);
         let outline = read(&path, None);
         let entries: Vec<&str> = outline.lines().filter(|l| !l.starts_with('[')).collect();
         assert_eq!(entries.len(), PAGE);
         assert_eq!(entries[0], "1\tfn f1() {}");
-        assert_eq!(entries[PAGE - 1], "200\tfn f200() {}");
+        assert_eq!(entries[PAGE - 1], format!("{PAGE}\tfn f{PAGE}() {{}}"));
         assert!(
             outline.ends_with(&format!(
-                "[… and 300 more past line 200; read {path} from line 201 for them]"
+                "[… and {} more past line {PAGE}; read {path} from line {} for them]",
+                n - PAGE,
+                PAGE + 1
             )),
             "{outline}"
         );
-        let long = "fn ".to_string() + &"x".repeat(200) + "() {}\n";
-        let text: String = (1..=300).map(|_| long.clone()).collect();
+        let long = "fn ".to_string() + &"x".repeat(2 * ENTRY) + "() {}\n";
+        let text: String = (1..=2 * PAGE).map(|_| long.clone()).collect();
         let (dir2, path) = file("wide.rs", &text);
         let outline = read(&path, None);
         let entry = outline.lines().nth(1).unwrap();

@@ -1,6 +1,10 @@
-//! The `bash` tool: runs a shell command and gives the model what it
+//! The `bash` tool: runs a shell command, in the working directory or one
+//! the call names, for at most a timeout, and gives the model what it
 //! printed as a preview, its standard output apart from its standard
-//! error, with a line of how it ended that is always there. A stream
+//! error, with a line of how it ended that is always there. A command
+//! that runs to its timeout is killed, with what it started, and the
+//! model is told, so that a test that hangs or a server that was never
+//! going to end does not hold the session until the user notices. A stream
 //! that outgrows its preview is shown by its start and its end, and is
 //! kept whole in a file of the tool's own, which the result names along
 //! with the line to `read` it from, so the model can get the rest with
@@ -16,25 +20,40 @@ use std::{
     env,
     fs::{self, DirBuilder, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
+    os::unix::{
+        fs::DirBuilderExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
+    time::Duration,
 };
 
 use serde_json::Value;
 
-use crate::string;
+use crate::{number, string};
 
 /// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}}, "required": ["command"]}}}"#;
+pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}, "timeout": {"type": "integer", "description": "Seconds the command may run (default 300; 0 for no limit). Give a long build or test run more."}, "workdir": {"type": "string", "description": "The directory to run it in (default: the working directory)."}}, "required": ["command"]}}}"#;
+
+/// Seconds a command may run unless the call says otherwise: long enough
+/// for a build or a test run, short enough that a command that hangs, or
+/// a server that was never going to end, does not hold the session long.
+const TIMEOUT: u64 = 300;
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
 /// stream is shown by its first and last [`HALF`] bytes, cut at line ends
-/// where it can be, and kept whole on disk for the model to read from.
-const PREVIEW: usize = 2000;
+/// where it can be, and kept whole on disk for the model to read from. A
+/// test run or a diff of a few hundred lines comes whole: a preview of a
+/// couple of thousand bytes had the model read the file of nearly every
+/// build and test, a round trip each.
+const PREVIEW: usize = 32 << 10;
 
 /// How much of each end of a stream too long for its preview is shown.
 const HALF: usize = PREVIEW / 2;
@@ -102,32 +121,76 @@ impl Bash {
         let Some(command) = string(arguments, "command") else {
             return "error: bash needs a 'command' string".to_string();
         };
+        let timeout = match arguments.get("timeout") {
+            None => Some(Duration::from_secs(TIMEOUT)),
+            Some(_) => match number(arguments, "timeout") {
+                Some(0) => None,
+                Some(seconds) => Some(Duration::from_secs(seconds)),
+                None => {
+                    return "error: 'timeout' is a number of seconds, or 0 for no limit"
+                        .to_string();
+                }
+            },
+        };
+        let workdir = string(arguments, "workdir").map(PathBuf::from);
+        if let Some(dir) = &workdir
+            && !dir.is_dir()
+        {
+            return format!("error: workdir {} is not a directory", dir.display());
+        }
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
         // runs the command all the same.
         let command = format!("set -o pipefail 2>/dev/null\n{command}");
-        let mut child = match Command::new(&self.shell)
+        let mut shell = Command::new(&self.shell);
+        shell
             .args(["-c", &command])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-        {
+            // In a process group of its own, so that the timeout ends what
+            // the command started along with it.
+            .process_group(0);
+        if let Some(dir) = &workdir {
+            shell.current_dir(dir);
+        }
+        let mut child = match shell.spawn() {
             Ok(child) => child,
             Err(e) => return format!("[error: could not run {}: {e}]", self.shell.display()),
         };
+        let pid = child.id();
         let mut stdout = Stream::new("stdout", self);
         let mut stderr = Stream::new("stderr", self);
         let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let (done, finished) = mpsc::channel::<()>();
+        let timed_out = AtomicBool::new(false);
         // Each pipe is read on its own thread, so that neither fills up and
-        // blocks the command while the other is being read.
-        thread::scope(|s| {
+        // blocks the command while the other is being read; a third kills
+        // the command's process group at the timeout, which closes the
+        // pipes too, unless the command ends first.
+        let waited = thread::scope(|s| {
             s.spawn(|| stderr.drain(err));
+            if let Some(timeout) = timeout {
+                let timed_out = &timed_out;
+                s.spawn(move || {
+                    if finished.recv_timeout(timeout).is_err() {
+                        timed_out.store(true, Ordering::Relaxed);
+                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                    }
+                });
+            }
             stdout.drain(out);
+            let waited = child.wait();
+            let _ = done.send(());
+            waited
         });
-        let status = match child.wait() {
+        let status = match waited {
+            Ok(_) if timed_out.load(Ordering::Relaxed) => format!(
+                "[killed after {} s, the timeout; give a longer timeout if the command needs it, or 0 for none]",
+                timeout.unwrap_or_default().as_secs()
+            ),
             Ok(status) => ended(status),
-            Err(e) => format!("[error: could not wait for sh: {e}]"),
+            Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
         report(&stdout, &stderr, &status)
     }
@@ -495,6 +558,57 @@ mod tests {
     }
 
     #[test]
+    fn kills_a_command_at_its_timeout() {
+        // Timed loosely: on a loaded machine the shell may start late, so
+        // what matters is that the command is killed, and long before it
+        // would have ended by itself.
+        let mut bash = Bash::new();
+        let start = std::time::Instant::now();
+        let output = bash.run(&serde_json::json!({
+            "command": "echo start; sleep 60; echo end",
+            "timeout": 2
+        }));
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(!output.contains("end"), "{output}");
+        assert!(
+            output.ends_with(
+                "[killed after 2 s, the timeout; give a longer timeout if the command needs it, or 0 for none]"
+            ),
+            "{output}"
+        );
+        // What the command started goes with it, so the pipes close.
+        let start = std::time::Instant::now();
+        let output = bash.run(&serde_json::json!({
+            "command": "sleep 60 & sleep 60",
+            "timeout": "2"
+        }));
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(output.ends_with(", or 0 for none]"), "{output}");
+        assert_eq!(
+            bash.run(&serde_json::json!({ "command": "true", "timeout": 0 })),
+            "[exit code 0]"
+        );
+        assert!(
+            bash.run(&serde_json::json!({ "command": "true", "timeout": "soon" }))
+                .starts_with("error: 'timeout' is")
+        );
+    }
+
+    #[test]
+    fn runs_in_the_directory_given() {
+        let mut bash = Bash::new();
+        let dir = env::temp_dir().canonicalize().unwrap();
+        assert_eq!(
+            bash.run(&serde_json::json!({ "command": "pwd", "workdir": dir })),
+            format!("{}\n[exit code 0]", dir.display())
+        );
+        assert!(
+            bash.run(&serde_json::json!({ "command": "pwd", "workdir": "/nonexistent/dir" }))
+                .starts_with("error: workdir /nonexistent/dir is not a directory")
+        );
+    }
+
+    #[test]
     fn keeps_the_error_and_the_status_after_a_flood() {
         let mut bash = Bash::new();
         let output = sh("seq 1 50000; echo 'boom: it broke' >&2; exit 7", &mut bash);
@@ -621,16 +735,19 @@ mod tests {
     #[test]
     fn cuts_between_characters() {
         let mut bash = Bash::new();
-        let output = sh("yes ä | head -c 5000", &mut bash);
+        let output = sh("yes ä | head -c 50000", &mut bash);
         assert!(!output.contains('\u{FFFD}'), "{output}");
         assert!(output.starts_with("ä\nä\n"));
         assert!(output.contains("\nä\n[… lines "), "{output}");
         assert!(output.contains(" …]\nä\nä\n"), "{output}");
-        assert_eq!(fs::metadata(bash.dir.join("1.stdout")).unwrap().len(), 5000);
+        assert_eq!(
+            fs::metadata(bash.dir.join("1.stdout")).unwrap().len(),
+            50000
+        );
         let output = sh("printf 'x\\377\\376y'", &mut bash);
         assert_eq!(output, "x\u{FFFD}\u{FFFD}y\n[exit code 0]");
         // A single long line is cut at character boundaries, not line ends.
-        let output = sh("yes ä | head -c 5000 | tr -d '\\n'", &mut bash);
+        let output = sh("yes ä | head -c 50000 | tr -d '\\n'", &mut bash);
         assert!(!output.contains('\u{FFFD}'), "{output}");
         assert!(output.contains("ä\n[… line 1 ("), "{output}");
     }
@@ -639,7 +756,7 @@ mod tests {
     fn discards_past_the_cap_and_says_so() {
         let mut bash = Bash::new();
         bash.retain = 3000;
-        let output = sh("seq 1 2000", &mut bash);
+        let output = sh("seq 1 20000", &mut bash);
         let path = bash.dir.join("1.stdout");
         let note = output
             .lines()
@@ -648,30 +765,30 @@ mod tests {
         assert_eq!(
             note,
             format!(
-                "[stdout: 2000 lines, 8893 bytes, the first 3000 bytes in {}, the rest discarded]",
+                "[stdout: 20000 lines, 108894 bytes, the first 3000 bytes in {}, the rest discarded]",
                 path.display()
             )
         );
-        let expected: String = (1..=2000).map(|i| format!("{i}\n")).collect();
+        let expected: String = (1..=20000).map(|i| format!("{i}\n")).collect();
         assert_eq!(fs::read_to_string(&path).unwrap(), expected[..3000]);
         // The preview still shows the end, which was read even if not kept.
-        assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
+        assert!(output.contains("\n19999\n20000\n[stdout: "), "{output}");
     }
 
     #[test]
     fn reports_a_file_it_could_not_keep() {
         let mut bash = Bash::new();
         bash.dir = PathBuf::from("/dev/null/nowhere");
-        let output = sh("seq 1 2000", &mut bash);
+        let output = sh("seq 1 20000", &mut bash);
         let note = output
             .lines()
             .find(|line| line.starts_with("[stdout: "))
             .unwrap();
         assert!(
-            note.starts_with("[stdout: 2000 lines, 8893 bytes, could not keep the rest: "),
+            note.starts_with("[stdout: 20000 lines, 108894 bytes, could not keep the rest: "),
             "{note}"
         );
-        assert!(output.contains("\n1999\n2000\n[stdout: "), "{output}");
+        assert!(output.contains("\n19999\n20000\n[stdout: "), "{output}");
         assert!(output.ends_with("[exit code 0]"));
     }
 
