@@ -22,6 +22,14 @@ pub const DEFAULT: &str = "bonsai-2-27b";
 /// tell how much memory it has free, and the command line does not say.
 const DEFAULT_CONTEXT: usize = 16384;
 
+/// Most tokens of conversation the model is given room for when it fits
+/// it to the memory free. The device's figure for that leaves out what
+/// other processes hold: on a Mac of 32 GB with another model loaded, the
+/// fit gave all 262,144 positions Bonsai was trained for, and the
+/// machine went 24 GB into swap and decoded a token a second. A session
+/// compacts well before this many, and `--context` gives more.
+const MAX_CONTEXT: usize = 65536;
+
 /// Fewest tokens of conversation the model is given room for when it
 /// fits it to the memory free: room for the system prompt and a few turns.
 const MIN_CONTEXT: usize = 4096;
@@ -135,14 +143,15 @@ pub fn load<D: Device + 'static>(
 
 /// Tokens of conversation that fit in the memory `device` has free,
 /// beside a model of `memory` and some headroom: a whole number of
-/// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
+/// thousands, at least [`MIN_CONTEXT`], and at most [`MAX_CONTEXT`] and
+/// `trained`.
 fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize {
     let Some(free) = device.memory() else {
         return DEFAULT_CONTEXT.min(trained);
     };
     let room = free.saturating_sub(memory.fixed + HEADROOM) / memory.per_token;
     let tokens = (room as usize).min(trained) / 1024 * 1024;
-    tokens.max(MIN_CONTEXT).min(trained)
+    tokens.clamp(MIN_CONTEXT, MAX_CONTEXT).min(trained)
 }
 
 /// The size of the model on `device` with the context it gets by
