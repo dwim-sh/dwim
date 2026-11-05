@@ -358,6 +358,11 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
 /// much of the arithmetic it does a second: a page is read at a depth
 /// three times slower than at the start, which the arithmetic of attention
 /// does not account for.
+/// Bytes a position of a cache `kv_dim` wide takes.
+fn cache_bytes_per(kv_dim: usize) -> usize {
+    kv_dim + kv_dim / CACHE_BLOCK * 2
+}
+
 pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
     let mut rng = Rng(29);
     let (heads, head_dim, kv_heads) = (24, 256, 4);
@@ -375,7 +380,7 @@ pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
             run();
         }
         gpu.read(&sync);
-        let runs = (40_000 / pos).max(3);
+        let runs = (40_000 / pos).max(if n == 1 { 40 } else { 3 });
         let start = std::time::Instant::now();
         for _ in 0..runs {
             run();
@@ -386,11 +391,15 @@ pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
         // a multiply and an add per element of the head each.
         let positions: usize = (0..n).map(|t| pos + t + 1).sum();
         let flops = (4 * positions * heads * head_dim) as f64;
+        // The caches it reads: every position's keys and values, a byte an
+        // element and a half float a block, once for the batch.
+        let bytes = 2 * (pos + n) * cache_bytes_per(kv_dim);
         eprintln!(
-            "attention n={n} at {pos:<6} {:8.2} ms  {:6.3} ms/token  {:5.2} TFLOP/s",
+            "attention n={n} at {pos:<6} {:8.2} ms  {:6.3} ms/token  {:5.2} TFLOP/s  {:5.0} GB/s",
             each * 1e3,
             each * 1e3 / n as f64,
-            flops / each / 1e12
+            flops / each / 1e12,
+            bytes as f64 / each / 1e9
         );
     }
 }
@@ -659,7 +668,8 @@ pub fn rope_matches_cpu<D: Device>(gpu: &D) {
 
 pub fn attention_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(7);
-    // Each case ends with the magnitude of the caches. The last has more
+    // Each case ends with the magnitude of the caches. The last three are
+    // single tokens deep into a context. The one before them has more
     // tokens of the model's heads than the kernel on Apple's matrix
     // accelerators packs the queries of at once, so the batch goes through
     // two dispatches there, over three chunks; the one before it is the
@@ -681,6 +691,12 @@ pub fn attention_matches_cpu<D: Device>(gpu: &D) {
         (32, 128, 4, 64, 32704, 1.0),
         (24, 256, 4, 64, 470, 1.0),
         (24, 256, 4, 700, 470, 1.0),
+        // A token at a time deep into a context, which a device may take
+        // on other kernels than a token near the start: the model's heads,
+        // twice, and heads of 128 two to a key/value head.
+        (24, 256, 4, 1, 5000, 1.0),
+        (24, 256, 4, 1, 40000, 1.0),
+        (16, 128, 8, 1, 3000, 1.0),
     ];
     for (n_heads, head_dim, n_kv_heads, n, pos, size) in cases {
         let kv_dim = n_kv_heads * head_dim;

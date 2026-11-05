@@ -53,8 +53,12 @@ struct Params {
 #ifndef ROUND
 #define ROUND 16
 #endif
-constant uint ROWS = 64;
-constant uint THREADS = 256;
+#ifndef ROWS
+#define ROWS 64
+#endif
+#ifndef THREADS
+#define THREADS 256
+#endif
 constant uint PER_ROW = THREADS / ROWS;
 // Half floats a position of the dequantized keys or values takes, and of
 // a row of the exponentials, padded so that the threads writing different
@@ -199,8 +203,9 @@ kernel void attention_mma(
             sv[i] = valid ? sm[my * ROUND + c0 + i] : -1e30f;
             mx = max(mx, sv[i]);
         }
-        mx = max(mx, simd_shuffle_xor(mx, 1));
-        mx = max(mx, simd_shuffle_xor(mx, 2));
+        for (ushort s = 1; s < PER_ROW; s <<= 1) {
+            mx = max(mx, simd_shuffle_xor(mx, s));
+        }
         float m_new = max(m, mx);
         float factor = exp(m - m_new);
         float sum = 0.0f;
@@ -209,8 +214,9 @@ kernel void attention_mma(
             sum += e;
             pm[my * PSTRIDE + c0 + i] = half(e);
         }
-        sum += simd_shuffle_xor(sum, 1);
-        sum += simd_shuffle_xor(sum, 2);
+        for (ushort s = 1; s < PER_ROW; s <<= 1) {
+            sum += simd_shuffle_xor(sum, s);
+        }
         l = l * factor + sum;
         m = m_new;
         if (lid % PER_ROW == 0) {
