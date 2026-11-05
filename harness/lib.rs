@@ -77,6 +77,20 @@ pub const THINKING_BUDGET: Option<usize> = None;
 /// takes.
 pub const MAX_CALLS: usize = 100;
 
+/// Tool calls in a row without a file changed by `edit` or `write`, after
+/// which the model is reminded to make the change it has found: on
+/// SWE-bench's django-11797 the model showed the bug and read the code at
+/// fault, and then read and searched for the rest of an hour without
+/// changing a file, run after run. Twenty calls take a reproduction and
+/// the reading around it.
+pub const NUDGE_AFTER: usize = 20;
+
+/// What the results of a call are followed by once the model has gone
+/// [`NUDGE_AFTER`] calls without a change: a reminder, which it may follow
+/// with a change or with what it still needs to find out, and which takes
+/// nothing from it, neither its thought nor its tools.
+const NUDGE: &str = "<system-reminder>You have made many tool calls since you last changed a file. If you know what to change, make the change now with edit, then run the reproduction or the tests to check it. If you don't, say in a sentence what you still need to find out, and find that out next.</system-reminder>";
+
 /// What the model is asked with once it has made [`MAX_CALLS`] calls in a
 /// turn: a message it answers without tools, which ends the turn.
 const STEPS_PROMPT: &str = "You have made many tool calls in this turn without replying, and the tools are off until the user's next message. Reply now with what you have done, what you found, and what remains, in a few sentences.";
@@ -140,6 +154,7 @@ const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user
 - Once you know what to change, change it, rather than think it over again: an edit can be undone, and running the changed code tells you more than reasoning about it.
 - Work from the code in front of you and what running it shows, not from what you remember of other versions of the project or of how it was fixed elsewhere.
 - Where what you see differs from what the request describes, the request says what the code should do: check what you see against that, rather than conclude there is nothing to fix.
+- A `<system-reminder>` block at the end of a tool's result is from the harness, not the tool: read it and follow it.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
@@ -355,6 +370,10 @@ pub struct Harness<M: LanguageModel> {
     /// before the model is asked to reply.
     steps: usize,
     max_calls: usize,
+    /// Tool calls in a row without a file changed by `edit` or `write`, and
+    /// how many before the model is reminded to make its change.
+    unchanged: usize,
+    nudge_after: usize,
     /// The transcript of the whole session.
     log: Log,
 }
@@ -456,6 +475,8 @@ impl<M: LanguageModel> Harness<M> {
             thinking_budget: THINKING_BUDGET,
             steps: 0,
             max_calls: MAX_CALLS,
+            unchanged: 0,
+            nudge_after: NUDGE_AFTER,
             log: Log::none(),
         })
     }
@@ -476,6 +497,13 @@ impl<M: LanguageModel> Harness<M> {
     /// while the model, and its reading and editing of files, stay here.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.tools.set_shell(shell);
+    }
+
+    /// Sets how many tool calls in a row without a file changed by `edit`
+    /// or `write` the model may make before it is reminded to make its
+    /// change, [`NUDGE_AFTER`] unless set.
+    pub fn set_nudge_after(&mut self, calls: usize) {
+        self.nudge_after = calls;
     }
 
     /// Sets how many tool calls the model may make in one turn before it
@@ -555,6 +583,7 @@ impl<M: LanguageModel> Harness<M> {
     ) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
         self.steps = 0;
+        self.unchanged = 0;
         let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
@@ -653,6 +682,7 @@ impl<M: LanguageModel> Harness<M> {
             let mut outputs = Vec::new();
             for call in &calls {
                 let mut seconds = None;
+                let mut changes = false;
                 self.steps += 1;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
@@ -666,6 +696,7 @@ impl<M: LanguageModel> Harness<M> {
                         {
                             return Ok(Outcome::Done);
                         }
+                        changes = matches!(call.name.as_str(), "edit" | "write");
                         let this = Some((call.name.clone(), call.arguments.to_string()));
                         if this == last {
                             REPEATED.to_string()
@@ -686,7 +717,20 @@ impl<M: LanguageModel> Harness<M> {
                 if on_event(Event::Output(&output)).is_break() {
                     return Ok(Outcome::Done);
                 }
+                if changes && !output.starts_with("error:") {
+                    self.unchanged = 0;
+                } else {
+                    self.unchanged += 1;
+                }
                 outputs.push(output);
+            }
+            if self.unchanged >= self.nudge_after
+                && let Some(last) = outputs.last_mut()
+            {
+                last.push_str("\n\n");
+                last.push_str(NUDGE);
+                self.log.nudge(NUDGE);
+                self.unchanged = 0;
             }
             input = Turn::Results(outputs);
         }
@@ -1353,6 +1397,45 @@ mod tests {
                 .all(|&(thought, ended)| thought > 0 && !ended),
             "{replies:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reminds_the_model_to_change_a_file_after_many_calls_without() {
+        // Under a nudge of three: the results of the third call without a
+        // change carry the reminder, and the count starts over after it;
+        // a file written starts it over too.
+        let dir = scratch();
+        let file = dir.join("a.txt");
+        let write = format!(
+            "{}\n</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\n{}\n</parameter>\n<parameter=content>\nmade\n</parameter>\n</function>\n</tool_call>",
+            filler(10),
+            file.display()
+        );
+        let mut scripts: Vec<String> = (0..3)
+            .map(|i| reply_calling(10, "bash", "command", &format!("echo {i}")))
+            .collect();
+        scripts.push(write);
+        scripts.extend((3..5).map(|i| reply_calling(10, "bash", "command", &format!("echo {i}"))));
+        scripts.push(reply(10, false));
+        let mut harness = harness(&scripts, 100_000, "");
+        harness.set_nudge_after(3);
+        send(&mut harness, "go");
+        let results: Vec<&String> = harness
+            .transcript()
+            .filter_map(|turn| match turn {
+                Turn::Results(outputs) => outputs.last(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 6, "{results:?}");
+        let nudged: Vec<bool> = results.iter().map(|r| r.ends_with(NUDGE)).collect();
+        assert_eq!(
+            nudged,
+            [false, false, true, false, false, false],
+            "{results:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "made\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
