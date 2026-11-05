@@ -207,10 +207,6 @@ enum Reply {
     Output(String),
     /// The reply was stopped short because the context window was full.
     Cut,
-    /// The model is writing its plan, which follows in pieces, and acts on
-    /// it after.
-    Planning,
-    Plan(String),
     /// The conversation is being compacted: the model's note to go on
     /// from follows, in pieces.
     Compacting,
@@ -380,8 +376,6 @@ fn reply(event: harness::Event) -> Reply {
         harness::Event::Output(output) => Reply::Output(output.to_string()),
         harness::Event::Cut => Reply::Cut,
         harness::Event::Compacting => Reply::Compacting,
-        harness::Event::Planning => Reply::Planning,
-        harness::Event::Plan(text) => Reply::Plan(text.to_string()),
         harness::Event::Note(text) => Reply::Note(text.to_string()),
         harness::Event::Compacted { before, after } => Reply::Compacted { before, after },
     }
@@ -426,8 +420,6 @@ enum Segment {
     Text,
     /// The note the model goes on from after the conversation is compacted.
     Note,
-    /// The plan the model acts on, once asked for it.
-    Plan,
 }
 
 struct App {
@@ -749,14 +741,6 @@ impl App {
                 ]);
                 self.status = Status::Reading(Instant::now());
             }
-            Reply::Planning => {
-                self.finish();
-                self.lines.push(vec![
-                    span("● ").dark_grey(),
-                    span("Planning the changes, then making them…").dark_grey(),
-                ]);
-            }
-            Reply::Plan(text) => self.generated(Segment::Plan, &text),
             Reply::Note(text) => self.generated(Segment::Note, &text),
             Reply::Compacted { before, after } => {
                 self.finish();
@@ -1003,7 +987,6 @@ impl App {
                     Segment::Thought => "Thinking…",
                     Segment::Text => "Generating…",
                     Segment::Note => "Compacting…",
-                    Segment::Plan => "Planning…",
                 },
                 start,
                 format!(
@@ -1017,7 +1000,7 @@ impl App {
                     match (self.segment, self.thinking) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
                         (Segment::Thought, true) => "ctrl+o to hide · ",
-                        (Segment::Text | Segment::Note | Segment::Plan, _) => "",
+                        (Segment::Text | Segment::Note, _) => "",
                     }
                 ),
             ),
@@ -1197,7 +1180,7 @@ fn notice(text: impl Into<String>) -> Vec<Line> {
 /// the model goes on from after a compaction.
 fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
     match segment {
-        Segment::Thought | Segment::Note | Segment::Plan => {
+        Segment::Thought | Segment::Note => {
             let bullet = if i == 0 { span("✻ ") } else { span("  ") };
             vec![bullet.dark_grey(), span(text).dark_grey().italic()]
         }

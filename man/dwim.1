@@ -93,27 +93,16 @@ Show the model's thinking in the shell from the start, as
 does.
 .TP
 .BI \-\-thinking\-budget " tokens"
-Most tokens the model may think before it is made to act (default: 512;
-0 for no limit).
-A thought that runs to the budget is ended with a sentence in the model's
-own voice, as the model's makers end one, and the model goes on to run a
-command or reply from what it has thought so far: left to itself, it
-tends to go over what it has found again and again instead of acting on
-it.
-The agent investigates with thinking, and acts without: it thinks until
-it changes a file, or until it has spent its decision budget, 32k tokens
-of the conversation read and written with nothing changed, or until two
-thoughts in a row run to the budget with nothing changed, when it is
-asked to write its plan, the changes to make and what to run to check
-them, naming the lines from what it has read rather than leaving them to
-be confirmed, and then to carry it out. From then on its replies are made
-without thinking, and with the model's sampling for such replies, until
-a command fails, which gets it one thought to find out why, or until the
-next message, which has it investigate again. Acting, another 32k tokens
-without a change, or four commands in a row that change nothing, has it
-asked whether it is done: if so it replies with what it changed and what
-it ran, and if not it says what remains and goes on; a change starts the
-count over.
+Most tokens the model may think before it is made to act (default: 0,
+no limit).
+The model thinks before every reply, for as long as it needs to; a thought
+that repeats itself is ended whatever the budget. A thought that runs to
+the budget is ended with a sentence in the model's own voice, as the
+model's makers end one, and the model goes on to run a command or reply
+from what it has thought so far.
+A turn ends when the model replies with text alone, or, after a hundred
+tool calls without a reply, when it is asked to say what it has done and
+what remains.
 .TP
 .BI \-\-temperature " t"
 Sample at temperature
