@@ -123,9 +123,12 @@ const DISCARDS: &str = "error: not run: this would take away the changes you hav
 const STEPS_PROMPT: &str = "You have made many tool calls in this turn without replying, and the tools are off until the user's next message. Reply now with what you have done, what you found, and what remains, in a few sentences.";
 
 /// What ends a thought that runs to the thinking budget, in the model's
-/// voice, as Qwen3's own thinking budget ends one: the model then goes on
-/// to call a tool or reply from what it has thought so far.
-const BUDGET_CLOSING: &str = "Considering the limited time by the user, I have to give the solution based on the thinking directly now.";
+/// voice, as Qwen3's own thinking budget ends one, but to check rather
+/// than to answer: Qwen3's "give the solution based on the thinking
+/// directly now" has the model answer from a thought that, on SWE-bench's
+/// django-11797, was most often recalling how the code works, when a read
+/// or a run would have told it.
+const BUDGET_CLOSING: &str = "I am not certain of this from memory, so I will check it in the code now with a tool, and decide from what it shows.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -167,6 +170,7 @@ const CONTINUE: &str = "Your reply was stopped short because the context window 
 const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, and grep and glob tools that search files for text and for names, and you may use them at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
+- While you think, notice when you are recalling how code works rather than reading it: "I think", "I recall", "I believe", "probably". The code here is one version of the project, and may not be the one you remember. Stop the thought there, and read or run that code instead. The same goes for going back and forth: when you have written "wait" or "actually" about the same question twice, stop and find out with a tool. One read or one run settles what more thinking will not.
 - Never say you can't access files or run commands, and never ask the user which command to run: pick one yourself.
 - When a request could be a question or a task, treat it as a task and do it.
 - To change something, run the commands that change it instead of explaining how.
@@ -178,8 +182,7 @@ const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user
 - Once a command or a read has given you what you needed, use it and take the next step: don't run the same command again, and don't read the same lines again.
 - To fix a problem, find the code responsible, make the smallest change that fixes it, then run the code or its tests to check the change, and iterate: if the check fails, read the error, change the code again, and check again.
 - To check a change, run the project's own tests the way its documentation or CI runs them, and to show a problem, add a test beside the existing ones that cover the code: they come with what the code needs set up, which a script of your own has to set up again. Find out how the tests are run, from the project's README, CONTRIBUTING or CI files, before writing one.
-- Once you know what to change, change it, rather than think it over again: an edit can be undone, and running the changed code tells you more than reasoning about it.
-- Work from the code in front of you and what running it shows, not from what you remember of other versions of the project or of how it was fixed elsewhere.
+- When you believe you know the fix, make it with edit and run your reproduction or the tests: that is the check. Don't first prove the fix in your head. An edit can be undone, and running the changed code tells you more than reasoning about it.
 - Where what you see differs from what the request describes, the request says what the code should do: check what you see against that, rather than conclude there is nothing to fix.
 - A `<system-reminder>` block at the end of a tool's result is from the harness, not the tool: read it and follow it.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
