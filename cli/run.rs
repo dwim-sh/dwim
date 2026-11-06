@@ -1001,12 +1001,12 @@ impl App {
         Ok(())
     }
 
-    /// What the model is doing, with a spinner, while it's busy. Every
-    /// number is padded to a fixed width, so the line does not shift as the
-    /// numbers change.
+    /// What the model is doing, with a spinner, while it's busy. Numbers that
+    /// would otherwise shift the line are padded to a fixed width, so it does
+    /// not shift as they change.
     fn status(&self) -> Option<Line> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-        let seconds = |since: Instant| format!("{:>3}s", since.elapsed().as_secs());
+        let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
         let percent = |done: usize, total: usize| match total {
             0 => "  0%".to_string(),
             _ => format!("{:>3}%", done * 100 / total),
