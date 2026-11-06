@@ -267,7 +267,8 @@ impl<M: LanguageModel> Chat<M> {
     /// Feeds `turns` to the model as the conversation so far, without a
     /// reply to them, as the template writes a conversation over: a reply
     /// already made with an empty thought before it, since the template
-    /// leaves earlier thoughts out.
+    /// leaves earlier thoughts out. Fails when the turns do not fit in the
+    /// context window.
     pub fn replay(&mut self, turns: &[Turn]) -> Result<()> {
         let mut tokens = Vec::new();
         for turn in turns {
@@ -283,7 +284,7 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Most tokens a plain answer to `message` takes with its framing, if
     /// it is limited to `limit` tokens: what [`Chat::answer`] needs room
-    /// for.
+    /// for. Fails only if the message cannot be encoded.
     pub fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
         Ok(self.user(message)?.len()
             + opening(&self.tokenizer, false)?.len()

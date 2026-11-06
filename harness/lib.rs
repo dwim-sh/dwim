@@ -700,7 +700,8 @@ impl<M: LanguageModel> Harness<M> {
     /// recent exchanges without their thoughts. Returns whether it did: not
     /// when there is nothing to compact yet, nor when `on_event` breaks
     /// while the note is written, which leaves the conversation as it was
-    /// but for the note.
+    /// but for the note. Fails as the model does, or if what is read back
+    /// does not fit.
     pub fn compact(
         &mut self,
         on_event: impl FnMut(Event) -> ControlFlow<()>,

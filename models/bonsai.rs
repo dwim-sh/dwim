@@ -215,7 +215,8 @@ pub struct Memory {
 
 impl Memory {
     /// The memory the model in `gguf`, configured as `c`, takes on a
-    /// device.
+    /// device. Fails if the file does not say how big one of its tensors
+    /// is.
     pub fn of(c: &Config, gguf: &Gguf) -> Result<Self> {
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host.
