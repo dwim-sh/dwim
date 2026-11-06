@@ -168,34 +168,18 @@ fn help(output: String, args: &[&str]) -> String {
 
 /// Memory a Mac needs to run the model: its CPU and GPU share it, and the
 /// weights alone take 6 GB of it.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MIN_MEMORY: u64 = 16 << 30;
 
 /// Refuses to go on, before any weights are downloaded, on a Mac with too
 /// little memory to run the model.
-#[cfg(target_os = "macos")]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
-    let mut memory: u64 = 0;
-    let mut len = size_of::<u64>();
-    let ret = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut memory).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ret != 0 {
-        return Err(format!(
-            "cannot determine the memory size: {}",
-            std::io::Error::last_os_error()
-        )
-        .into());
-    }
+#[cfg(target_vendor = "apple")]
+fn check_memory() -> Result<(), Box<dyn Error>> {
+    let memory = dwim_gpu::host::total().ok_or("cannot determine the memory size")?;
     if memory < MIN_MEMORY {
         return Err(format!(
-            "dwim requires 16 GiB or more DRAM on a Mac, and this one has {} GiB",
+            "dwim requires {} GiB or more DRAM on a Mac, and this one has {} GiB",
+            MIN_MEMORY >> 30,
             memory >> 30
         )
         .into());
@@ -203,7 +187,7 @@ fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(not(target_vendor = "apple"))]
+fn check_memory() -> Result<(), Box<dyn Error>> {
     Ok(())
 }

@@ -15,7 +15,7 @@ use ash::{
     vk,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
@@ -967,9 +967,9 @@ impl Device for Vulkan {
         // programs use too, unless the firmware set aside more memory for
         // the GPU than the host has for itself.
         if self.integrated
-            && let Some(total) = crate::meminfo("MemTotal")
+            && let Some(total) = host::total()
             && size <= total
-            && let Some(available) = crate::meminfo("MemAvailable")
+            && let Some(available) = host::available()
         {
             free = free.min(available);
         }
