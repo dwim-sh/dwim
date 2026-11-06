@@ -171,6 +171,72 @@ fn auto_notice(auto: bool) -> String {
     }
 }
 
+/// The slash commands, each with the line `/help` says of it.
+const COMMANDS: [(&str, &str); 7] = [
+    (
+        "/model",
+        "the model, the device it runs on, and its context window",
+    ),
+    ("/stats", "where this session's time has gone"),
+    ("/transcript", "where this session's transcript is"),
+    ("/compact", "compact the conversation now"),
+    (
+        "/thinking-budget N",
+        "cap the model's thinking at N tokens, 0 for no cap",
+    ),
+    (
+        "/auto on|off",
+        "go on by itself until it says it is done, or ask",
+    ),
+    ("/help", "this list"),
+];
+
+/// A slash command, as the user types it after the slash.
+enum Command {
+    Model,
+    Stats,
+    Transcript,
+    Compact,
+    /// Ask what the thinking budget is, or set it.
+    ThinkingBudget,
+    SetThinkingBudget(Option<usize>),
+    /// Ask whether auto mode is on, or set it.
+    Auto,
+    SetAuto(bool),
+    Help,
+}
+
+impl Command {
+    /// The command `text` names, or what is wrong with it.
+    fn parse(text: &str) -> Result<Self, String> {
+        let (name, argument) = text
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or((text.trim(), None), |(name, rest)| {
+                (name, Some(rest.trim()))
+            });
+        match (name, argument) {
+            ("model", None) => Ok(Command::Model),
+            ("stats", None) => Ok(Command::Stats),
+            ("transcript", None) => Ok(Command::Transcript),
+            ("compact", None) => Ok(Command::Compact),
+            ("help", None) => Ok(Command::Help),
+            ("thinking-budget", None) => Ok(Command::ThinkingBudget),
+            ("thinking-budget", Some(tokens)) => tokens
+                .parse()
+                .map(|tokens: usize| Command::SetThinkingBudget((tokens > 0).then_some(tokens)))
+                .map_err(|_| {
+                    "/thinking-budget takes a number of tokens, or 0 for no cap".to_string()
+                }),
+            ("auto", None) => Ok(Command::Auto),
+            ("auto", Some("on")) => Ok(Command::SetAuto(true)),
+            ("auto", Some("off")) => Ok(Command::SetAuto(false)),
+            ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
+            _ => Err(format!("Unknown command /{text} · /help lists them")),
+        }
+    }
+}
+
 /// What the shell asks of the model thread.
 enum Request {
     /// A message from the user.
@@ -634,33 +700,25 @@ impl App {
         }
         self.lines.push(Line::new());
 
-        let request = match message.strip_prefix('/') {
-            Some("compact") => Request::Compact,
-            Some("auto on") => {
-                self.auto = true;
-                Request::Auto(true)
+        let request = match message.strip_prefix('/').map(Command::parse) {
+            None => Request::Message(message),
+            Some(Ok(Command::Compact)) => Request::Compact,
+            Some(Ok(Command::SetThinkingBudget(tokens))) => {
+                self.thinking_budget = tokens;
+                Request::ThinkingBudget(tokens)
             }
-            Some("auto off") => {
-                self.auto = false;
-                Request::Auto(false)
+            Some(Ok(Command::SetAuto(auto))) => {
+                self.auto = auto;
+                Request::Auto(auto)
             }
-            Some(command) if command.starts_with("thinking-budget ") => {
-                match command["thinking-budget ".len()..].trim().parse::<usize>() {
-                    Ok(tokens) => {
-                        self.thinking_budget = (tokens > 0).then_some(tokens);
-                        Request::ThinkingBudget(self.thinking_budget)
-                    }
-                    Err(_) => {
-                        self.command(command);
-                        return;
-                    }
-                }
-            }
-            Some(command) => {
+            Some(Ok(command)) => {
                 self.command(command);
                 return;
             }
-            None => Request::Message(message),
+            Some(Err(what)) => {
+                self.say(notice(what));
+                return;
+            }
         };
 
         self.reply.clear();
@@ -880,19 +938,20 @@ impl App {
         }
     }
 
-    /// Runs a slash command, printing what it has to say: a report under a
-    /// bullet, the way a tool's output follows its call, or one line.
-    fn command(&mut self, command: &str) {
+    /// Runs a slash command that the shell answers by itself, printing
+    /// what it has to say: a report under a bullet, the way a tool's output
+    /// follows its call, or one line.
+    fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
-        let lines = match command.trim() {
-            "model" => models_listing(
+        let lines = match command {
+            Command::Model => models_listing(
                 &self.model,
                 self.device,
                 self.gpu.as_deref(),
                 self.size.as_ref(),
                 columns,
             ),
-            "stats" => {
+            Command::Stats => {
                 let details = self.stats.report(self.loading, self.started.elapsed());
                 report(
                     vec![span("● "), span("This session").bold()],
@@ -900,19 +959,24 @@ impl App {
                     columns,
                 )
             }
-            "transcript" => notice(match &self.transcript {
+            Command::Transcript => notice(match &self.transcript {
                 Some(path) => format!("Transcript in {}", tilde(path)),
                 None => "No transcript is kept".to_string(),
             }),
-            "help" => help(columns),
-            "thinking-budget" => notice(budget_notice(self.thinking_budget)),
-            command if command.starts_with("thinking-budget ") => {
-                notice("/thinking-budget takes a number of tokens, or 0 for no cap")
+            Command::Help => help(columns),
+            Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
+            Command::Auto => notice(auto_notice(self.auto)),
+            Command::Compact | Command::SetThinkingBudget(_) | Command::SetAuto(_) => {
+                return;
             }
-            "auto" => notice(auto_notice(self.auto)),
-            command if command.starts_with("auto ") => notice("/auto takes on or off"),
-            other => notice(format!("Unknown command /{other} · /help lists them")),
         };
+        self.say(lines);
+    }
+
+    /// Prints `lines` above the live region, cut to the terminal's width,
+    /// with a blank line after them.
+    fn say(&mut self, lines: Vec<Line>) {
+        let (columns, _) = self.screen.size();
         self.lines
             .extend(lines.iter().map(|line| tui::truncate(line, columns)));
         self.lines.push(Line::new());
@@ -1177,21 +1241,18 @@ fn table(rows: Vec<(&str, String)>) -> Vec<String> {
 
 /// What the `/help` command says: the commands, and the keys.
 fn help(columns: usize) -> Vec<Line> {
-    report(
-        vec![span("● "), span("Commands").bold()],
-        [
-            "/model              the model, the device it runs on, and its context window",
-            "/stats              where this session's time has gone",
-            "/transcript         where this session's transcript is",
-            "/compact            compact the conversation now",
-            "/thinking-budget N  cap the model's thinking at N tokens, 0 for no cap",
-            "/auto on|off        go on by itself until it says it is done, or ask",
-            "/help               this list",
-            "ctrl+o shows or hides the thought and what the model reads · esc interrupts · ctrl+d quits",
-        ]
-        .map(str::to_string),
-        columns,
-    )
+    let width = COMMANDS
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let mut lines: Vec<String> = COMMANDS
+        .iter()
+        .map(|(name, what)| format!("{name:<width$}{what}"))
+        .collect();
+    lines.push("ctrl+o shows or hides the thought and what the model reads · esc interrupts · ctrl+d quits".to_string());
+    report(vec![span("● "), span("Commands").bold()], lines, columns)
 }
 
 /// A report: its header, then its details under `⎿`, dimmed and wrapped to
@@ -1226,6 +1287,49 @@ fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
         Segment::Text => {
             let bullet = if i == 0 { span("● ") } else { span("  ") };
             vec![bullet, span(text)]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_commands() {
+        assert!(matches!(Command::parse("compact"), Ok(Command::Compact)));
+        assert!(matches!(Command::parse("help "), Ok(Command::Help)));
+        assert!(matches!(
+            Command::parse("thinking-budget"),
+            Ok(Command::ThinkingBudget)
+        ));
+        assert!(matches!(
+            Command::parse("thinking-budget 100"),
+            Ok(Command::SetThinkingBudget(Some(100)))
+        ));
+        assert!(matches!(
+            Command::parse("thinking-budget 0"),
+            Ok(Command::SetThinkingBudget(None))
+        ));
+        assert!(Command::parse("thinking-budget lots").is_err());
+        assert!(matches!(
+            Command::parse("auto on"),
+            Ok(Command::SetAuto(true))
+        ));
+        assert!(matches!(Command::parse("auto"), Ok(Command::Auto)));
+        assert!(Command::parse("auto maybe").is_err());
+        assert!(Command::parse("model now").is_err());
+        assert!(
+            Command::parse("nothing").is_err_and(|e| e.starts_with("Unknown command /nothing"))
+        );
+        // Every command has its line in the help.
+        for name in ["model", "stats", "transcript", "compact", "help"] {
+            assert!(Command::parse(name).is_ok(), "{name}");
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(command, _)| command == &format!("/{name}"))
+            );
         }
     }
 }
