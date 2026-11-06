@@ -80,7 +80,7 @@ pub const THINKING_BUDGET: Option<usize> = Some(2048);
 /// takes.
 pub const MAX_CALLS: usize = 100;
 
-/// Tool calls in a row without a file changed by `edit` or `write`, after
+/// Tool calls in a row without one that changed a file, after
 /// which the model is reminded to make the change it has found: on
 /// SWE-bench's django-11797 the model showed the bug and read the code at
 /// fault, and then read and searched for the rest of an hour without
@@ -474,8 +474,8 @@ pub struct Harness<M: LanguageModel> {
     /// before the model is asked to reply.
     steps: usize,
     max_calls: usize,
-    /// Tool calls in a row without a file changed by `edit` or `write`, and
-    /// how many before the model is reminded to make its change.
+    /// Tool calls in a row without one that changed a file, and how many
+    /// before the model is reminded to make its change.
     unchanged: usize,
     nudge_after: usize,
     /// Auto mode: whether a reply with no call that doesn't say it is
@@ -620,9 +620,9 @@ impl<M: LanguageModel> Harness<M> {
         self.tools.set_shell(shell);
     }
 
-    /// Sets how many tool calls in a row without a file changed by `edit`
-    /// or `write` the model may make before it is reminded to make its
-    /// change, [`NUDGE_AFTER`] unless set.
+    /// Sets how many tool calls in a row without one that changed a file
+    /// the model may make before it is reminded to make its change,
+    /// [`NUDGE_AFTER`] unless set.
     #[cfg(test)]
     fn set_nudge_after(&mut self, calls: usize) {
         self.nudge_after = calls;
@@ -846,7 +846,7 @@ impl<M: LanguageModel> Harness<M> {
             let mut outputs = Vec::new();
             for call in &reply.calls {
                 let mut seconds = None;
-                let mut changes = false;
+                let mut changed = false;
                 self.steps += 1;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
@@ -871,7 +871,7 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            changes = output.changed;
+                            changed = output.changed;
                             output.text
                         }
                     }
@@ -881,7 +881,7 @@ impl<M: LanguageModel> Harness<M> {
                 if on_event(Event::Output(output.clone())).is_break() {
                     return Ok(Outcome::Done);
                 }
-                if changes {
+                if changed {
                     self.unchanged = 0;
                 } else {
                     self.unchanged += 1;
