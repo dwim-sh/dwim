@@ -10,8 +10,8 @@ use std::{
     time::SystemTime,
 };
 
-use dwim_gpu::{Cpu, Device as _, Gpu};
-use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+use dwim::gpu::{Cpu, Device as _, Gpu};
+use dwim::models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
 
 use crate::opts;
 

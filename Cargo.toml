@@ -1,21 +1,41 @@
-[workspace]
-members = ["cli", "gpu", "harness", "models", "testing/difftest", "tools"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "dwim"
 version = "0.0.8"
 edition = "2024"
 
-[workspace.dependencies]
-dwim-gpu = { path = "gpu" }
-dwim-harness = { path = "harness" }
-dwim-models = { path = "models" }
-dwim-tools = { path = "tools" }
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "dwim"
+path = "cli/main.rs"
+
+[[bin]]
+name = "difftest"
+path = "testing/difftest/main.rs"
+
+[build-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in", "spv-out"] }
+
+[dependencies]
+argh = "0.1.19"
+ash = "0.38.0"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+fancy-regex = "0.19.1"
+libc = "0.2.189"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+unicode-width = "0.2.2"
+ureq = "3.4.1"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
 
 # The forward pass is unusably slow unoptimized on the CPU, so optimize the
-# model and the CPU device even in debug builds.
-[profile.dev.package.dwim-models]
-opt-level = 3
-
-[profile.dev.package.dwim-gpu]
+# program even in debug builds; the dependencies stay unoptimized.
+[profile.dev.package.dwim]
 opt-level = 3

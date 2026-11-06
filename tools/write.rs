@@ -14,7 +14,7 @@ use std::{fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{Parameter, Signature, Tool, plural, required, string};
+use crate::tools::{Parameter, Signature, Tool, plural, required, string};
 
 const NAME: &str = "write";
 
@@ -80,7 +80,7 @@ mod tests {
 
     /// Runs the call in `arguments`, as the model sees the result.
     fn run(arguments: &Value) -> String {
-        crate::Output::of(super::run(Path::new("."), arguments), false).text
+        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
     }
 
     /// A directory of its own.

@@ -14,7 +14,7 @@ use std::{
 };
 
 use argh::{EarlyExit, FromArgValue, FromArgs};
-use dwim_harness::Log;
+use dwim::harness::Log;
 
 use opts::{Device, Opts};
 
@@ -147,7 +147,7 @@ const MIN_MEMORY: u64 = 16 << 30;
 /// little memory to run the model.
 #[cfg(target_vendor = "apple")]
 fn check_memory() -> Result<(), Box<dyn Error>> {
-    let memory = dwim_gpu::host::total().ok_or("cannot determine the memory size")?;
+    let memory = dwim::gpu::host::total().ok_or("cannot determine the memory size")?;
     if memory < MIN_MEMORY {
         return Err(format!(
             "dwim requires {} GiB or more DRAM on a Mac, and this one has {} GiB",

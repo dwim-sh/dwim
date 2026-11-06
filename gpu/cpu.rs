@@ -3,7 +3,7 @@
 
 use rayon::prelude::*;
 
-use crate::{
+use crate::gpu::{
     CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quantize, sigmoid,
     softplus, ternary,
 };
@@ -27,7 +27,7 @@ impl Device for Cpu {
     }
 
     fn memory(&self) -> Option<u64> {
-        crate::host::available()
+        crate::gpu::host::available()
     }
 
     fn upload(&self, tensor: Tensor) -> Tensor {
@@ -96,7 +96,7 @@ impl Device for Cpu {
 
     fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
         let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
-        assert_eq!(data.len(), crate::cache_bytes(len));
+        assert_eq!(data.len(), crate::gpu::cache_bytes(len));
         let (quants, scales) = data.split_at(len);
         for (q, &b) in cache.quants[..len].iter_mut().zip(quants) {
             *q = b as i8;
@@ -472,7 +472,7 @@ fn softmax(x: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::walsh_hadamard;
-    use crate::{CACHE_BLOCK, F16_MAX, from_f16, quantize, to_f16};
+    use crate::gpu::{CACHE_BLOCK, F16_MAX, from_f16, quantize, to_f16};
 
     #[test]
     fn f16_round_trips_what_it_can_represent() {

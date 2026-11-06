@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use fancy_regex::Regex;
 
-use crate::{Result, gguf::Gguf};
+use crate::models::{Result, gguf::Gguf};
 
 /// The regular expression Qwen's tokenizers split text into words with.
 const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -169,9 +169,9 @@ impl Tokenizer {
 
     /// A tokenizer over a tiny vocabulary for tests: a token per byte, one
     /// merge, and the special tokens of the chat format.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn tiny() -> Self {
-        use crate::gguf::{self, Value};
+        use crate::models::gguf::{self, Value};
 
         let mut tokens: Vec<Value> = byte_chars()
             .iter()
@@ -180,7 +180,7 @@ impl Tokenizer {
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
-        for special in crate::chat::SPECIAL_TOKENS {
+        for special in crate::models::chat::SPECIAL_TOKENS {
             tokens.push(Value::Str(special.to_string()));
             types.push(Value::I32(if special.starts_with("<|") {
                 CONTROL as i32

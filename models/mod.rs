@@ -5,12 +5,11 @@ pub mod bonsai;
 mod chat;
 pub mod gguf;
 mod sampler;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub mod testing;
 mod tokenizer;
 
 pub use chat::{Answer, Chat, Chunk, Reply, Stats, Tally, Turn};
-pub use dwim_gpu::{Device, Tensor, ternary};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;

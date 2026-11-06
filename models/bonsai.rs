@@ -19,9 +19,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
-
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
+use crate::{
+    gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary},
+    models::{Gguf, LanguageModel, Result, gguf::PTQ1_0, rope_table},
+};
 
 /// The model as `dwim` names it.
 pub const NAME: &str = "bonsai-2-27b";
@@ -947,8 +948,8 @@ impl<D: Device> State<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::{self, Value};
-    use dwim_gpu::{Cpu, Gpu};
+    use crate::gpu::{Cpu, Gpu};
+    use crate::models::gguf::{self, Value};
     use std::path::Path;
 
     struct Rng(u64);
@@ -1253,7 +1254,7 @@ mod tests {
             return;
         }
         let gguf = Arc::new(Gguf::open(&path).unwrap());
-        let tokenizer = crate::Tokenizer::from_gguf(&gguf).unwrap();
+        let tokenizer = crate::models::Tokenizer::from_gguf(&gguf).unwrap();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();
         let mut model = Model::load(gguf, device, 256, |_, _| {}).unwrap();

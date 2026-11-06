@@ -21,7 +21,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{Parameter, Signature, Tool, cut, optional_number, plural, required, string};
+use crate::tools::{Parameter, Signature, Tool, cut, optional_number, plural, required, string};
 
 const NAME: &str = "read";
 
@@ -122,7 +122,7 @@ fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
 /// The line `line` as a page shows it, without its line ending, cut at
 /// [`LINE`] bytes with a mark, and whether it was cut.
 pub fn shown_line(line: &[u8]) -> (String, bool) {
-    let mut content = String::from_utf8_lossy(crate::without_ending(line)).into_owned();
+    let mut content = String::from_utf8_lossy(crate::tools::without_ending(line)).into_owned();
     let long = cut(&mut content, LINE);
     (content, long)
 }
@@ -220,7 +220,7 @@ mod tests {
 
     /// Runs the call in `arguments`, as the model sees the result.
     fn run(arguments: &Value) -> String {
-        crate::Output::of(super::run(Path::new("."), arguments), false).text
+        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
     }
 
     fn read(path: &str, start: Option<u64>) -> String {

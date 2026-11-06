@@ -3,7 +3,7 @@
 ## Building
 
 `cargo build` needs nothing beyond Rust. The Vulkan kernels are compiled from
-WGSL to SPIR-V by `naga` in `gpu/build.rs`, and Metal compiles its own kernels
+WGSL to SPIR-V by `naga` in `build.rs`, and Metal compiles its own kernels
 from source when the device opens.
 
 ```
@@ -38,19 +38,19 @@ standard error.
 ## Verifying a change
 
 ```
-cargo test --workspace   # the GPU kernels are checked against the CPU reference
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test               # the GPU kernels are checked against the CPU reference
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 CI runs these with the toolchain `rust-toolchain.toml` pins, which `rustup`
 picks up here too.
 
-`cargo test -p dwim-gpu` skips a backend whose GPU is not available, so it
+`cargo test gpu::` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the
-model in the cache, `cargo test -p dwim-models real_model -- --ignored
---nocapture` completes a prompt with it and reports the speed, and
-`cargo run -p dwim-difftest` checks the GPU against the CPU with it, on a
+model in the cache, `cargo test real_model -- --ignored --nocapture`
+completes a prompt with it and reports the speed, and
+`cargo run --bin difftest` checks the GPU against the CPU with it, on a
 few prompts run in pieces of different sizes and on their continuations
 run a token at a time. The CPU's side is
 recorded into `target/difftest/` on the first run, which takes minutes, and
@@ -96,7 +96,7 @@ issue.** Run it in a virtual machine, not on a machine you care about.
 
 ## Releasing
 
-The version is in the workspace's `Cargo.toml`, which every crate inherits.
+The version is in `Cargo.toml`.
 
 ```
 scripts/release 0.2.0

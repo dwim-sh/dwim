@@ -21,8 +21,8 @@ use std::{
     time::Instant,
 };
 
-use dwim_gpu::{Cpu, Device, Gpu};
-use dwim_models::{
+use dwim::gpu::{Cpu, Device, Gpu};
+use dwim::models::{
     Gguf, LanguageModel,
     bonsai::{self, Model},
 };
@@ -152,7 +152,7 @@ impl Args {
 /// all.
 fn run() -> Result<bool> {
     let args = Args::parse()?;
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let model = bonsai::cache_dir()
         .ok_or("no cache directory")?
         .join(bonsai::WEIGHTS);
@@ -162,7 +162,7 @@ fn run() -> Result<bool> {
     let gguf = Arc::new(Gguf::open(&model)?);
     let dir = root
         .join("target/difftest")
-        .join(format!("{:016x}", key(&root, &model)?));
+        .join(format!("{:016x}", key(root, &model)?));
 
     // What the CPU made of each prompt, recorded unless it already is.
     let mut cpu = None;
@@ -244,7 +244,7 @@ impl Run {
     /// Has the CPU run `prompt` in the pieces the GPU will, and then write
     /// the continuation a token at a time.
     fn record(cpu: &mut Model<Cpu>, gguf: &Gguf, prompt: &str) -> Result<Self> {
-        let tokenizer = dwim_models::Tokenizer::from_gguf(gguf)?;
+        let tokenizer = dwim::models::Tokenizer::from_gguf(gguf)?;
         let mut run = Self {
             tokens: tokenizer.encode(prompt)?,
             prompt: 0,

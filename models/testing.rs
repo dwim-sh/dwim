@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{LanguageModel, Tokenizer, chat};
+use crate::models::{LanguageModel, Tokenizer, chat};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next

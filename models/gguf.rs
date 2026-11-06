@@ -19,7 +19,10 @@ use std::{
     ptr, slice,
 };
 
-use crate::{Result, Tensor, ternary};
+use crate::{
+    gpu::{Tensor, ternary},
+    models::Result,
+};
 
 /// A metadata value.
 #[derive(Clone, Debug, PartialEq)]
@@ -358,7 +361,7 @@ impl Drop for Gguf {
 
 /// Writes a GGUF file, for tests: the metadata, and tensors given by name,
 /// dimensions (innermost first), type, and data.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub fn write(
     path: &Path,
     meta: &[(&str, Value)],

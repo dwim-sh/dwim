@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim_harness::{self as harness, Harness, Log};
-use dwim_models::{Chat, Gguf, LanguageModel, Tokenizer};
+use dwim::harness::{self, Harness, Log};
+use dwim::models::{Chat, Gguf, LanguageModel, Tokenizer};
 
 use crate::{
     fetch,
