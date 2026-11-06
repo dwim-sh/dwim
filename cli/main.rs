@@ -1,9 +1,10 @@
 mod bench;
 mod fetch;
-mod models;
+mod model;
 mod once;
 mod opts;
 mod run;
+mod session;
 mod tui;
 
 use std::{
@@ -12,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use argh::{EarlyExit, FromArgs};
+use argh::{EarlyExit, FromArgValue, FromArgs};
 use dwim_harness::Log;
 
 use opts::{Device, Opts};
@@ -35,49 +36,18 @@ fn main() {
         println!("dwim {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-
-    if opts.bench {
-        if let Err(e) =
-            check_memory().and_then(|()| bench::bench(&opts.model, opts.device, opts.context))
-        {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // A prompt on the command line is a one-off: answer it and exit, with
-    // nothing on standard output but the reply. Without one, open the shell.
+    let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
-    // A budget of zero is no limit.
-    let thinking_budget = (opts.thinking_budget > 0).then_some(opts.thinking_budget);
-    let result = check_memory()
-        .and_then(|()| log(opts.transcript))
-        .and_then(|log| match prompt.trim() {
-            "" => run::run(
-                &opts.model,
-                opts.device,
-                opts.context,
-                thinking_budget,
-                opts.reasoning_effort,
-                opts.temperature,
-                opts.shell,
-                opts.thinking,
-                log,
-            ),
-            prompt => once::once(
-                &opts.model,
-                opts.device,
-                opts.context,
-                thinking_budget,
-                opts.reasoning_effort,
-                opts.temperature,
-                opts.shell,
-                prompt,
-                opts.stats,
-                log,
-            ),
-        });
+    let result = check_memory().and_then(|()| {
+        if opts.bench {
+            return bench::bench(&settings);
+        }
+        let log = log(opts.transcript)?;
+        match prompt.trim() {
+            "" => run::run(settings, opts.thinking, log),
+            prompt => once::once(&settings, prompt, opts.stats, log),
+        }
+    });
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -126,17 +96,19 @@ fn project(dir: &Path) -> String {
 /// The help text, with the default context worked out for the device the
 /// arguments name, if the model is downloaded and the device opens.
 fn help(output: String, args: &[&str]) -> String {
-    let device = match args.iter().position(|&arg| arg == "--device") {
-        Some(i) if args.get(i + 1) == Some(&"cpu") => Device::Cpu,
-        _ => Device::Gpu,
-    };
-    let Some(size) = models::default_size(device) else {
+    let device = args
+        .iter()
+        .position(|&arg| arg == "--device")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|value| Device::from_arg_value(value).ok())
+        .unwrap_or(Device::Gpu);
+    let Some(size) = model::default_size(device) else {
         return output;
     };
     let default = format!(
-        "(default: {} on this machine, taking {:.2} GB of memory)",
+        "(default: {} on this machine, taking {} of memory)",
         size.context,
-        size.bytes as f64 / 1e9
+        model::bytes(size.bytes)
     );
     // Put it in place of the description argh wrapped, wrapped the same way.
     let mut lines = Vec::new();

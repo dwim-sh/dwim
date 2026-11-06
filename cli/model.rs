@@ -1,3 +1,7 @@
+//! The one model, Bonsai 2 27B: where its files come from and are kept, the
+//! device it runs on, how much conversation it has room for there, the
+//! state saved after the system prompt, and how it samples.
+
 use std::{
     error::Error,
     fs,
@@ -6,19 +10,16 @@ use std::{
     time::SystemTime,
 };
 
-use dwim_gpu::{Cpu, Device, Gpu};
+use dwim_gpu::{Cpu, Device as _, Gpu};
 use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
 
-use crate::{fetch, opts};
+use crate::opts;
 
 /// Saved states kept, newest first: a state is a few hundred megabytes,
 /// and the system prompt changes with the project's `AGENTS.md`.
 const STATES_KEPT: usize = 4;
 
-/// Model used when none is named on the command line.
-pub const DEFAULT: &str = "bonsai-2-27b";
-
-/// Tokens of conversation a model has room for when the device cannot
+/// Tokens of conversation the model has room for when the device cannot
 /// tell how much memory it has free, and the command line does not say.
 const DEFAULT_CONTEXT: usize = 16384;
 
@@ -31,60 +32,102 @@ const MIN_CONTEXT: usize = 4096;
 /// driver, and whatever else starts in the meantime.
 const HEADROOM: u64 = 256 << 20;
 
-/// Models `dwim` knows how to fetch.
-pub const MODELS: &[Model] = &[Model {
-    name: "bonsai-2-27b",
-    repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
-    revision: "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
-    files: &["LICENSE", "NOTICE.txt", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
-    weights: "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-}];
+/// The model's name, as the command line gives it.
+pub const NAME: &str = bonsai::NAME;
 
-/// A model hosted on Hugging Face.
-///
-/// The revision pins a commit, so the weights can't change underneath us and
+/// Where the model's files come from: PrismML's repository on Hugging
+/// Face, at a pinned commit, so the weights can't change underneath us and
 /// outputs stay reproducible.
-pub struct Model {
-    pub name: &'static str,
-    pub repo: &'static str,
-    pub revision: &'static str,
-    /// The files fetched.
-    pub files: &'static [&'static str],
-    /// The one among them holding the model: a GGUF file, which carries
-    /// the tokenizer and the sampling settings too.
-    pub weights: &'static str,
+pub const REPO: &str = "prism-ml/Ternary-Bonsai-2-27B-gguf";
+const REVISION: &str = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
+
+/// The files fetched: the licenses, and the weights.
+pub const FILES: [&str; 3] = ["LICENSE", "NOTICE.txt", bonsai::WEIGHTS];
+
+/// URL to download one of the model's files from.
+pub fn url(file: &str) -> String {
+    format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{file}")
 }
 
-impl Model {
-    /// Looks up a model by name.
-    pub fn find(name: &str) -> Option<&'static Model> {
-        MODELS.iter().find(|model| model.name == name)
+/// The directory the files of the model called `name` are kept in, which
+/// is the one model's.
+pub fn locate(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    if name != NAME {
+        return Err(format!("unknown model '{name}' (known: {NAME})").into());
+    }
+    bonsai::cache_dir().ok_or_else(|| "cannot determine the cache directory".into())
+}
+
+/// Opens the model's weights in `dir`.
+pub fn open(dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
+    Ok(Arc::new(Gguf::open(&dir.join(bonsai::WEIGHTS))?))
+}
+
+/// How much of the model is in `dir`: how many of its files, and their
+/// size in bytes.
+pub fn on_disk(dir: &Path) -> (usize, u64) {
+    FILES
+        .iter()
+        .filter_map(|file| fs::metadata(dir.join(file)).ok())
+        .fold((0, 0), |(files, bytes), metadata| {
+            (files + 1, bytes + metadata.len())
+        })
+}
+
+/// A device the model runs on, opened.
+pub enum Opened {
+    Cpu(Cpu),
+    Gpu(Box<Gpu>),
+}
+
+impl Opened {
+    /// Opens the device the command line chose.
+    pub fn open(device: opts::Device) -> Result<Self, Box<dyn Error>> {
+        Ok(match device {
+            opts::Device::Cpu => Opened::Cpu(Cpu),
+            opts::Device::Gpu => Opened::Gpu(Box::new(Gpu::new()?)),
+        })
     }
 
-    /// URL to download one of the model's files from.
-    pub fn url(&self, file: &str) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            self.repo, self.revision, file
-        )
+    /// What the device is called.
+    pub fn name(&self) -> String {
+        match self {
+            Opened::Cpu(device) => device.name(),
+            Opened::Gpu(device) => device.name(),
+        }
     }
 
-    /// Local directory the model's files are stored in, under the platform's
-    /// cache directory (`~/.cache` on Linux, `~/Library/Caches` on macOS):
-    /// the files can always be fetched again.
-    pub fn dir(&self) -> Option<PathBuf> {
-        dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(self.name))
+    /// Bytes of memory free on the device, if it can tell.
+    fn memory(&self) -> Option<u64> {
+        match self {
+            Opened::Cpu(device) => device.memory(),
+            Opened::Gpu(device) => device.memory(),
+        }
     }
 
-    /// Opens the model's weights in `dir`.
-    pub fn open(&self, dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
-        Ok(Arc::new(Gguf::open(&dir.join(self.weights))?))
+    /// Loads the model onto the device, with room for `context` tokens of
+    /// conversation, reporting how many of its tensors are loaded, out of
+    /// how many, as it goes.
+    pub fn load(
+        self,
+        gguf: Arc<Gguf>,
+        context: usize,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
+        Ok(match self {
+            Opened::Cpu(device) => {
+                Box::new(bonsai::Model::load(gguf, device, context, on_progress)?)
+            }
+            Opened::Gpu(device) => {
+                Box::new(bonsai::Model::load(gguf, *device, context, on_progress)?)
+            }
+        })
     }
 }
 
 /// Tokens of conversation the model has room for, and the device memory
 /// it takes with them.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Size {
     pub context: usize,
     pub bytes: u64,
@@ -92,11 +135,7 @@ pub struct Size {
 
 /// The size of the model on `device`, with room for `context` tokens of
 /// conversation, or as many as fit in the memory it has free.
-pub fn size<D: Device>(
-    gguf: &Gguf,
-    device: &D,
-    context: Option<usize>,
-) -> Result<Size, Box<dyn Error>> {
+pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
     let config = bonsai::Config::load(gguf)?;
     let trained = config.context_length;
@@ -117,27 +156,10 @@ pub fn size<D: Device>(
     })
 }
 
-/// Loads the model onto `device`, with room for `context` tokens of
-/// conversation, reporting how many of its tensors are loaded, out of how
-/// many, as it goes.
-pub fn load<D: Device + 'static>(
-    gguf: Arc<Gguf>,
-    device: D,
-    context: usize,
-    on_progress: impl FnMut(usize, usize),
-) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
-    Ok(Box::new(bonsai::Model::load(
-        gguf,
-        device,
-        context,
-        on_progress,
-    )?))
-}
-
 /// Tokens of conversation that fit in the memory `device` has free,
 /// beside a model of `memory` and some headroom: a whole number of
 /// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
-fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize {
+fn fit(memory: &bonsai::Memory, device: &Opened, trained: usize) -> usize {
     let Some(free) = device.memory() else {
         return DEFAULT_CONTEXT.min(trained);
     };
@@ -149,39 +171,49 @@ fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize 
 /// The size of the model on `device` with the context it gets by
 /// default, if the model is downloaded and the device opens.
 pub fn default_size(device: opts::Device) -> Option<Size> {
-    let (model, dir) = fetch::locate(DEFAULT).ok()?;
-    if !dir.join(model.weights).exists() {
+    let dir = locate(NAME).ok()?;
+    if !dir.join(bonsai::WEIGHTS).exists() {
         return None;
     }
-    let gguf = model.open(&dir).ok()?;
-    match device {
-        opts::Device::Cpu => size(&gguf, &Cpu, None).ok(),
-        opts::Device::Gpu => size(&gguf, &Gpu::new().ok()?, None).ok(),
-    }
+    let gguf = open(&dir).ok()?;
+    size(&gguf, &Opened::open(device).ok()?, None).ok()
 }
 
-/// `size` as words: the tokens of context and the memory they take, in
-/// gigabytes.
+/// `size` as words: the tokens of context and the memory they take.
 pub fn describe(size: &Size) -> String {
     format!(
-        "{} tokens of context, {:.2} GB of memory",
+        "{} tokens of context, {} of memory",
         size.context,
-        size.bytes as f64 / 1e9
+        bytes(size.bytes)
     )
 }
 
+/// A byte count for humans, in decimal units.
+pub fn bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// Opens the conversation with the system prompt: from the state saved by
-/// an earlier run of the same model with the same prompt, if there is one
-/// and it fits, and otherwise by reading the prompt, reporting progress as
-/// `Chat::system` does, and saving the state for the next run. Returns
-/// whether the state was restored.
+/// an earlier run with the same prompt, if there is one and it fits, and
+/// otherwise by reading the prompt, reporting progress as `Chat::system`
+/// does, and saving the state for the next run. Returns whether the state
+/// was restored.
 pub fn start<M: LanguageModel>(
     chat: &mut Chat<M>,
-    model: &Model,
     prompt: &str,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<bool, Box<dyn Error>> {
-    let path = state_path(model, prompt);
+    let path = state_path(prompt);
     if let Some(path) = &path
         && let Ok(state) = fs::read(path)
         && chat.restore(&state).is_ok()
@@ -200,12 +232,12 @@ pub fn start<M: LanguageModel>(
     Ok(false)
 }
 
-/// Where the state after `prompt` on `model` is kept: named by a hash of
-/// the two, in the cache directory.
-fn state_path(model: &Model, prompt: &str) -> Option<PathBuf> {
+/// Where the state after `prompt` is kept: named by a hash of the model's
+/// name and the prompt, in the cache directory.
+fn state_path(prompt: &str) -> Option<PathBuf> {
     // FNV-1a, so that the name is the same from one build to the next.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in model.name.bytes().chain([0]).chain(prompt.bytes()) {
+    for byte in NAME.bytes().chain([0]).chain(prompt.bytes()) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }

@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use argh::FromArgs;
 
-use crate::models;
+use crate::{model, session::Settings};
 
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
     /// model to run (default: bonsai-2-27b)
-    #[argh(option, default = "models::DEFAULT.to_string()")]
+    #[argh(option, default = "model::NAME.to_string()")]
     pub model: String,
 
     /// device to run the model on: gpu (default), or cpu
@@ -66,6 +66,27 @@ pub struct Opts {
     /// prompt to answer without the shell, as the words after the options
     #[argh(positional, greedy)]
     pub prompt: Vec<String>,
+}
+
+impl Opts {
+    /// How the model runs, as the options set it.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            model: self.model.clone(),
+            device: self.device,
+            context: self.context,
+            thinking_budget: budget(self.thinking_budget),
+            effort: self.reasoning_effort,
+            temperature: self.temperature,
+            shell: self.shell.clone(),
+        }
+    }
+}
+
+/// A thinking budget as the command line and the `/thinking-budget`
+/// command give it: a number of tokens, or 0 for no limit.
+pub fn budget(tokens: usize) -> Option<usize> {
+    (tokens > 0).then_some(tokens)
 }
 
 /// Where to run the model.

@@ -7,12 +7,9 @@
 //! tokens a second for both, so that the slope is a number a change can be
 //! measured against.
 
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{error::Error, time::Instant};
 
-use dwim_gpu::{Cpu, Device as _, Gpu};
-use dwim_models::{Gguf, LanguageModel, Tokenizer};
-
-use crate::{fetch, models, once::Progress, opts::Device};
+use crate::session::{self, Settings, Stderr};
 
 /// The depths of context, in tokens, at which the model is timed: those
 /// the context has room for, with the page and the generated tokens after.
@@ -35,53 +32,20 @@ const FILLER: &str = include_str!("bench.rs");
 
 /// Times the model at each depth of context and prints a table of tokens
 /// a second, reading and generating, on standard output.
-pub fn bench(name: &str, device: Device, context: Option<usize>) -> Result<(), Box<dyn Error>> {
-    let (model, dir) = fetch::locate(name)?;
-    let mut progress = Progress::new();
-    fetch::fetch(model, &dir, |file| {
-        let total = file.total.unwrap_or(file.done);
-        progress.report(
-            format!("downloading {}", file.file),
-            crate::once::megabytes(file.done),
-            crate::once::megabytes(total),
-        );
-    })?;
-    let gguf = model.open(&dir)?;
-    match device {
-        Device::Cpu => run(gguf, Cpu, model, "the CPU", context),
-        Device::Gpu => {
-            let gpu = Gpu::new()?;
-            let on = gpu.name();
-            run(gguf, gpu, model, &on, context)
-        }
-    }
-}
-
-/// Loads `which` onto `device`, called `on`, with room for `context`
-/// tokens (or as many as fit), and times it at each depth.
-fn run<D: dwim_gpu::Device + 'static>(
-    gguf: Arc<Gguf>,
-    device: D,
-    which: &'static models::Model,
-    on: &str,
-    context: Option<usize>,
-) -> Result<(), Box<dyn Error>> {
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let size = models::size(&gguf, &device, context)?;
-    eprintln!("{}", models::describe(&size));
-    let mut progress = Progress::new();
-    let mut model = models::load(gguf, device, size.context, |done, total| {
-        progress.report(format!("loading {} on {on}", which.name), done, total);
-    })?;
+pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
+    let mut stderr = Stderr::new();
+    let loaded = session::load_model(settings, |loading| stderr.report(&loading))?;
+    let mut model = loaded.model;
     let depths = depths(model.max_len());
     if depths.is_empty() {
         return Err(format!(
             "a context of {} tokens has no room for a depth of {} with a page of {PAGE} and {GENERATED} generated tokens after it",
-            size.context, DEPTHS[0]
+            model.max_len(),
+            DEPTHS[0]
         )
         .into());
     }
-    let filler = tokenizer.encode(FILLER)?;
+    let filler = loaded.tokenizer.encode(FILLER)?;
     let token = |i: usize| filler[i % filler.len()];
     println!("{:>8}  {:>12}  {:>12}", "context", "read", "generate");
     let mut pos = 0;
@@ -91,7 +55,11 @@ fn run<D: dwim_gpu::Device + 'static>(
             let tokens: Vec<u32> = (pos..pos + n).map(token).collect();
             model.forward(&tokens, pos);
             pos += n;
-            progress.report(format!("filling the context to {depth}"), pos, depth);
+            stderr.stage(
+                format!("filling the context to {depth}"),
+                format!("{pos}/{depth}"),
+                pos >= depth,
+            );
         }
         let page: Vec<u32> = (pos..pos + PAGE).map(token).collect();
         let start = Instant::now();
