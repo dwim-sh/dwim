@@ -160,7 +160,7 @@ impl Stderr {
                 ),
                 progress.total.is_some_and(|total| progress.done >= total),
             ),
-            Loading::Device(name) => self.device = name.clone(),
+            Loading::Device(name) => self.device.clone_from(name),
             Loading::Sized(size) => eprintln!("{}", model::describe(size)),
             Loading::Weights { done, total } => self.stage(
                 format!("loading the model on {}", self.device),
