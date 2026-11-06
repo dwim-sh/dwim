@@ -204,7 +204,7 @@ impl Printer {
         match event {
             harness::Event::Thought(text) => {
                 let text = if self.thinking {
-                    text
+                    text.as_str()
                 } else {
                     text.trim_start()
                 };
@@ -217,7 +217,7 @@ impl Printer {
             harness::Event::Text(text) => {
                 self.end_thought();
                 let text = if self.replied {
-                    text
+                    text.as_str()
                 } else {
                     text.trim_start()
                 };
@@ -230,7 +230,7 @@ impl Printer {
             harness::Event::Token => {}
             harness::Event::Call { name, detail } => {
                 self.end_thought();
-                match name {
+                match name.as_str() {
                     "bash" => eprintln!("$ {detail}"),
                     name => eprintln!("{name}({detail})"),
                 }

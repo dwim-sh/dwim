@@ -382,27 +382,28 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// What happens during a turn, as it happens.
-pub enum Event<'a> {
+#[derive(Debug, PartialEq)]
+pub enum Event {
     /// Part of the model's thought, before it replies.
-    Thought(&'a str),
+    Thought(String),
     /// Text of the reply.
-    Text(&'a str),
+    Text(String),
     /// A token sampled, as it may be hidden (a tool-call tag or body, a
     /// thought that closes) rather than shown as a thought or text piece.
     Token,
     /// A tool is about to run: its name and how it was called.
     Call {
-        name: &'a str,
-        detail: &'a str,
+        name: String,
+        detail: String,
     },
     /// What the tool returned, as the model sees it.
-    Output(&'a str),
+    Output(String),
     /// The reply was stopped short because the context window was full.
     Cut,
     /// The conversation is being compacted: the model is writing the note
     /// it will go on from, which follows in `Note` pieces.
     Compacting,
-    Note(&'a str),
+    Note(String),
     /// The conversation was compacted: how many tokens it took before, and
     /// how many it takes now.
     Compacted {
@@ -815,8 +816,8 @@ impl<M: LanguageModel> Harness<M> {
                         let detail = dwim_tools::describe(&call);
                         self.log.call(&call.name, &detail);
                         if on_event(Event::Call {
-                            name: &call.name,
-                            detail: &detail,
+                            name: call.name.clone(),
+                            detail: detail.clone(),
                         })
                         .is_break()
                         {
@@ -840,7 +841,7 @@ impl<M: LanguageModel> Harness<M> {
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
                 self.log.output(&output, seconds);
-                if on_event(Event::Output(&output)).is_break() {
+                if on_event(Event::Output(output.clone())).is_break() {
                     return Ok(Outcome::Done);
                 }
                 if changes {
@@ -890,7 +891,7 @@ impl<M: LanguageModel> Harness<M> {
         let before = self.chat.stats();
         let answer = self.chat.answer(prompt, self.account_limit(), |text| {
             self.log.stream("text", text);
-            on_event(Event::Text(text))
+            on_event(Event::Text(text.to_string()))
         })?;
         self.log.reply(
             &[],
@@ -1006,7 +1007,7 @@ impl<M: LanguageModel> Harness<M> {
             .chat
             .answer(NOTE_PROMPT, self.note_tokens, |text| {
                 self.log.stream("note", text);
-                let flow = on_event(Event::Note(text));
+                let flow = on_event(Event::Note(text.to_string()));
                 interrupted |= flow.is_break();
                 flow
             })?
@@ -1133,11 +1134,27 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
     text
 }
 
+impl Event {
+    /// What the user is told of the event, for the ones that are told
+    /// rather than shown: the reply stopped short, and the compaction as
+    /// it starts and as it ends.
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Event::Cut => Some("Stopped short: the context window is full".to_string()),
+            Event::Compacting => Some("Compacting the conversation…".to_string()),
+            Event::Compacted { before, after } => {
+                Some(format!("Compacted from {before} to {after} tokens"))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The event for a piece of the model's reply.
 fn event(chunk: Chunk) -> Event {
     match chunk {
-        Chunk::Thought(text) => Event::Thought(text),
-        Chunk::Text(text) => Event::Text(text),
+        Chunk::Thought(text) => Event::Thought(text.to_string()),
+        Chunk::Text(text) => Event::Text(text.to_string()),
         Chunk::Token => Event::Token,
     }
 }
@@ -1206,7 +1223,7 @@ mod tests {
                     Event::Cut => "cut",
                     Event::Compacting => "compacting",
                     Event::Note(text) => {
-                        note.push_str(text);
+                        note.push_str(&text);
                         "note"
                     }
                     Event::Compacted { .. } => "compacted",
@@ -1394,7 +1411,7 @@ mod tests {
             .send("go", |event| {
                 let name = match event {
                     Event::Thought(text) => {
-                        thought.push_str(text);
+                        thought.push_str(&text);
                         "thought"
                     }
                     Event::Text(_) => "text",
@@ -1446,7 +1463,7 @@ mod tests {
         let mut thought = String::new();
         free.send("go", |event| {
             if let Event::Thought(text) = event {
-                thought.push_str(text);
+                thought.push_str(&text);
             }
             ControlFlow::Continue(())
         })
