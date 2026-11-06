@@ -45,11 +45,23 @@ unsafe extern "C" {
     ) -> std::ffi::c_int;
 }
 
+/// An integer a sysctl's value is read as: a type every bit pattern of is
+/// a value, so that whatever the kernel writes into it is one.
+#[cfg(target_vendor = "apple")]
+trait Sysctl: Default {}
+#[cfg(target_vendor = "apple")]
+impl Sysctl for u32 {}
+#[cfg(target_vendor = "apple")]
+impl Sysctl for u64 {}
+
 /// The value of the sysctl `name`, an integer of type `T`.
 #[cfg(target_vendor = "apple")]
-fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
+fn sysctl<T: Sysctl>(name: &std::ffi::CStr) -> Option<T> {
     let mut value = T::default();
     let mut len = size_of::<T>();
+    // SAFETY: `value` is a plain integer of `len` bytes, and the kernel
+    // writes at most `len` bytes into it, setting `len` to what it wrote;
+    // `name` is NUL-terminated and outlives the call.
     let status = unsafe {
         sysctlbyname(
             name.as_ptr(),
