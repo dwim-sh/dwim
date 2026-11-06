@@ -93,10 +93,10 @@ Show the model's thinking in the shell from the start, as
 does.
 .TP
 .BI \-\-thinking\-budget " tokens"
-Most tokens the model may think before it is made to act (default: 0,
-no limit).
-The model thinks before every reply, for as long as it needs to; a thought
-that repeats itself is ended whatever the budget. A thought that runs to
+Most tokens the model may think at a time before it is made to act, or 0
+for no limit (default: 2048).
+The model thinks before every reply, and tends to think at length; a
+thought that repeats itself is ended whatever the budget. A thought that runs to
 the budget is ended with a sentence in the model's own voice, as the
 model's makers end one, and the model goes on to run a command or reply
 from what it has thought so far.

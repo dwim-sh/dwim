@@ -62,13 +62,19 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
-/// Most tokens the model may think before it is made to act, if they are
-/// limited: the thinking budget. None by default: the model thinks for as
-/// long as it needs to, and a thought that repeats itself is ended by the
-/// chat. A model made to act before it has thought a task through acts
-/// on a guess, and a model kept from thinking while it edits makes the
-/// mistakes thinking is for.
-pub const THINKING_BUDGET: Option<usize> = None;
+/// Most tokens the model may think at a time before it is made to act, if
+/// they are limited: the thinking budget. Prism's known issues for the
+/// model (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf, KNOWN_ISSUES.md)
+/// say it "tends to reason at length, which costs time and tokens even when
+/// the answer is correct", and advise a thinking budget. Over the 351
+/// thoughts of six runs without one on SWE-bench's django-11797, half were
+/// under 50 tokens and 95 in 100 under 1,620; the dozen over 2,048, a
+/// seventh of all the thinking, were for the most part recalling how the
+/// code works and going back and forth over it, and none of those runs
+/// changed the code. Three of the four runs with this budget did, two of
+/// them with the fix, one decided in a thought of 1,873 tokens that a
+/// budget of 1,024 would have cut.
+pub const THINKING_BUDGET: Option<usize> = Some(2048);
 
 /// Most tool calls the model may make in one turn before it is asked to
 /// reply with what it has: a turn that runs this long without a reply has
@@ -1221,10 +1227,7 @@ mod tests {
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
         assert_eq!(limited.thinking_budget(), THINKING_BUDGET);
-        assert_eq!(
-            THINKING_BUDGET, None,
-            "the model thinks as long as it needs to"
-        );
+        assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
         limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
         limited.set_thinking_budget(Some(100));
@@ -1266,7 +1269,7 @@ mod tests {
         drop(limited);
         // The log has the budget, its change, and the thought it ended.
         let records = records(&path);
-        assert!(records[0]["thinking_budget"].is_null());
+        assert_eq!(records[0]["thinking_budget"], 2048);
         assert_eq!(records[1]["type"], "thinking_budget");
         assert_eq!(records[1]["tokens"], 100);
         let replies: Vec<&serde_json::Value> = records
