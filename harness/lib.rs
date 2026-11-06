@@ -315,7 +315,7 @@ pub fn environment(dir: &Path) -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs() / 86400);
     format!(
-        "# Environment\n\nWorking directory: {}\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
+        "# Environment\n\nWorking directory: {}\nEvery command runs in the working directory, and every path is relative to it; do not cd there or spell it out.\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
         dir.display(),
         files(dir),
         date(days as i64),
@@ -2089,6 +2089,7 @@ mod tests {
         let environment = environment(dir);
         assert!(environment.starts_with("# Environment\n"));
         assert!(environment.contains(&format!("Working directory: {}\n", dir.display())));
+        assert!(environment.contains("\nEvery command runs in the working directory"));
         let files = environment
             .lines()
             .find_map(|line| line.strip_prefix("Files: "))
