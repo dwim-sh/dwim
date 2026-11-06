@@ -109,10 +109,8 @@ pub struct Chat<M: LanguageModel> {
     think_end: u32,
     tool_call: u32,
     tool_call_end: u32,
-    /// The tags around a tool's result: their special tokens, or the tags
-    /// as text in a vocabulary without them.
-    tool_response: Vec<u32>,
-    tool_response_end: Vec<u32>,
+    tool_response: u32,
+    tool_response_end: u32,
     stats: Stats,
 }
 
@@ -231,8 +229,8 @@ impl<M: LanguageModel> Chat<M> {
             think_end: tokenizer.special(THINK_END)?,
             tool_call: tokenizer.special(TOOL_CALL)?,
             tool_call_end: tokenizer.special(TOOL_CALL_END)?,
-            tool_response: tag(&tokenizer, TOOL_RESPONSE)?,
-            tool_response_end: tag(&tokenizer, TOOL_RESPONSE_END)?,
+            tool_response: tokenizer.special(TOOL_RESPONSE)?,
+            tool_response_end: tokenizer.special(TOOL_RESPONSE_END)?,
             ending: 0,
             tokenizer,
             sampler,
@@ -481,9 +479,9 @@ impl<M: LanguageModel> Chat<M> {
             if i > 0 {
                 content.extend(self.tokenizer.encode("\n")?);
             }
-            content.extend(&self.tool_response);
+            content.push(self.tool_response);
             content.extend(self.tokenizer.encode(&format!("\n{output}\n"))?);
-            content.extend(&self.tool_response_end);
+            content.push(self.tool_response_end);
         }
         self.turn("user", content)
     }
@@ -747,15 +745,6 @@ impl<M: LanguageModel> Chat<M> {
         tally.seconds += start.elapsed().as_secs_f64();
         self.len += tokens.len();
         Ok(logits)
-    }
-}
-
-/// A tag of the chat format as tokens: its special token if the vocabulary
-/// has one, and otherwise the tag as text.
-fn tag(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
-    match tokenizer.special(text) {
-        Ok(id) => Ok(vec![id]),
-        Err(_) => tokenizer.encode(text),
     }
 }
 
@@ -1261,10 +1250,7 @@ mod tests {
         turn.push(chat.im_end);
         turn.extend(tokenizer.encode("\n").unwrap());
         assert_eq!(&chat.model.fed[before..before + turn.len()], turn);
-        assert_eq!(
-            turn.iter().filter(|&&t| chat.tool_response == [t]).count(),
-            2
-        );
+        assert_eq!(turn.iter().filter(|&&t| t == chat.tool_response).count(), 2);
     }
 
     #[test]
@@ -1278,9 +1264,9 @@ mod tests {
         let tokenizer = &chat.tokenizer;
         let mut turn = vec![chat.im_start];
         turn.extend(tokenizer.encode("user\n").unwrap());
-        turn.extend(&chat.tool_response);
+        turn.push(chat.tool_response);
         turn.extend(tokenizer.encode(&format!("\n{hostile}\n")).unwrap());
-        turn.extend(&chat.tool_response_end);
+        turn.push(chat.tool_response_end);
         turn.push(chat.im_end);
         turn.extend(tokenizer.encode("\n").unwrap());
         let fed = &chat.model.fed[before..];
@@ -1293,8 +1279,8 @@ mod tests {
         assert_eq!(count(chat.tool_call), 0);
         assert_eq!(count(chat.tool_call_end), 0);
         assert_eq!(count(chat.think_end), 1);
-        assert_eq!(count(chat.tool_response[0]), 1);
-        assert_eq!(count(chat.tool_response_end[0]), 1);
+        assert_eq!(count(chat.tool_response), 1);
+        assert_eq!(count(chat.tool_response_end), 1);
         // And what was said is there byte for byte.
         let bytes: Vec<u8> = fed
             .iter()
