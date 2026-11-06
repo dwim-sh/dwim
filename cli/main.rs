@@ -15,7 +15,7 @@ use std::{
 
 use argh::{EarlyExit, FromArgValue, FromArgs};
 use dwim::harness::Log;
-use dwim::models::bonsai;
+use dwim::models::qwen35;
 
 use opts::{Device, Opts};
 use session::Stderr;
@@ -44,7 +44,7 @@ fn main() {
         if opts.download {
             let mut stderr = Stderr::new();
             let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
-            println!("{}", dir.join(bonsai::WEIGHTS).display());
+            println!("{}", dir.join(qwen35::WEIGHTS).display());
             return Ok(());
         }
         if opts.bench {
@@ -147,9 +147,9 @@ fn help(output: String, args: &[&str]) -> String {
 }
 
 /// Memory a Mac needs to run the model: its CPU and GPU share it, and the
-/// weights alone take 6 GB of it.
+/// weights alone take 16 GB of it.
 #[cfg(target_vendor = "apple")]
-const MIN_MEMORY: u64 = 16 << 30;
+const MIN_MEMORY: u64 = 32 << 30;
 
 /// Refuses to go on, before any weights are downloaded, on a Mac with too
 /// little memory to run the model.

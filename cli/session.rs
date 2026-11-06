@@ -31,6 +31,8 @@ pub struct Settings {
     pub effort: harness::Effort,
     /// The sampling temperature, or the model file's.
     pub temperature: Option<f32>,
+    /// Tokens the model drafts after each token picked, or none.
+    pub speculate: usize,
     /// The program the model's shell commands run through, or `sh`.
     pub shell: Option<PathBuf>,
 }
@@ -119,6 +121,7 @@ pub fn load(
     let loaded = load_model(settings, &mut on_loading)?;
     let sampler = model::sampler(&loaded.gguf, settings.temperature);
     let mut chat = Chat::new(loaded.model, loaded.tokenizer, sampler)?;
+    chat.set_drafts(settings.speculate);
     let cwd = env::current_dir()?;
     let system = harness::system_prompt(&cwd, settings.effort);
     model::start(&mut chat, &system, |read, total| {

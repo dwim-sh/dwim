@@ -12,8 +12,8 @@ use std::{
 };
 
 use dwim::models::{
-    bonsai::{self, File},
     hub,
+    qwen35::{self, File},
 };
 
 /// How long a partial download can go without being written to before it is
@@ -39,8 +39,8 @@ pub struct Progress {
 /// the cache's other users lay them out; a blob one of them downloaded is
 /// linked to without downloading it again.
 pub fn fetch(dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
-    let blobs = hub::blobs_dir(bonsai::REPO).ok_or("cannot determine the home directory")?;
-    for file in &bonsai::FILES {
+    let blobs = hub::blobs_dir(qwen35::REPO).ok_or("cannot determine the home directory")?;
+    for file in &qwen35::FILES {
         let path = dir.join(file.name);
         if path.exists() {
             continue;
@@ -101,7 +101,7 @@ fn download(
         done,
         total: None,
     });
-    let mut request = ureq::get(&hub::url(bonsai::REPO, bonsai::REVISION, file.name));
+    let mut request = ureq::get(&hub::url(qwen35::REPO, qwen35::REVISION, file.name));
     if done > 0 {
         request = request.header("Range", &format!("bytes={done}-"));
     }

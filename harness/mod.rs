@@ -61,9 +61,11 @@ const MAX_FILES: usize = 50;
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
 /// Most tokens the model may think at a time before it is made to act, if
-/// they are limited: the thinking budget. Prism's known issues for the
-/// model (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf, KNOWN_ISSUES.md)
-/// say it "tends to reason at length, which costs time and tokens even when
+/// they are limited: the thinking budget. The figures here are from
+/// Bonsai, PrismML's ternary build of the model, which dwim ran before,
+/// and are carried over to the model itself unmeasured. PrismML's known
+/// issues for that build (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf,
+/// KNOWN_ISSUES.md) say it "tends to reason at length, which costs time and tokens even when
 /// the answer is correct", and advise a thinking budget. Over the 351
 /// thoughts of six runs without one on SWE-bench's django-11797, half were
 /// under 50 tokens and 95 in 100 under 1,620; the dozen over 2,048, a
@@ -194,7 +196,7 @@ For example, for "review commit abc123", run `git show abc123` and point out bug
     )
 }
 
-/// How the tools are called, declared as Bonsai's chat template puts it,
+/// How the tools are called, declared as the model's chat template puts it,
 /// after their signatures.
 const CALLING: &str = r#"If you choose to call a function ONLY reply in the following format with NO suffix:
 
@@ -219,12 +221,13 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// How much the model reasons before it replies, as Bonsai's chat template
+/// How much the model reasons before it replies, as its chat template
 /// asks for it: the template opens the system prompt with a line for an
 /// effort of `xhigh`, its default, or `low`, and with none for `medium`.
-/// Medium unless set: Prism's known issues for the model
-/// (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf, KNOWN_ISSUES.md)
-/// advise it for the model's long reasoning, as "about as accurate" as
+/// Medium unless set: PrismML's known issues for Bonsai, its ternary
+/// build of the model, which these figures are from and are carried over
+/// unmeasured (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf,
+/// KNOWN_ISSUES.md), advise it for the model's long reasoning, as "about as accurate" as
 /// `xhigh` when the output is limited and thinking "noticeably less", and
 /// find that `low` "used about as many tokens as the default `xhigh`".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -287,7 +290,7 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
     prompt
 }
 
-/// The tools, declared as Bonsai's chat template puts them: the start of
+/// The tools, declared as the model's chat template puts them: the start of
 /// the system prompt, before what the user's system prompt says.
 fn tools() -> String {
     format!(
@@ -522,7 +525,7 @@ impl Stats {
             + m.thought.seconds
             + m.answer.seconds
             + self.tool_seconds;
-        vec![
+        let mut lines = vec![
             row(
                 "loading",
                 String::new(),
@@ -551,10 +554,24 @@ impl Stats {
                 String::new(),
             ),
             row("total", String::new(), total.as_secs_f64(), String::new()),
-        ]
-        .into_iter()
-        .map(|line| line.trim_end().to_string())
-        .collect()
+        ];
+        // Drafting, after the tokens generated, where the model drafted.
+        if m.drafted > 0 {
+            lines.insert(
+                5,
+                format!(
+                    "{:<8}{:>13}{:>10}{:>11}",
+                    "drafts",
+                    format!("{} tokens", m.drafted),
+                    "",
+                    format!("{:.0}% kept", 100.0 * m.accepted as f64 / m.drafted as f64)
+                ),
+            );
+        }
+        lines
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
     }
 }
 
@@ -1933,6 +1950,8 @@ mod tests {
                     tokens: 300,
                     seconds: 10.0,
                 },
+                drafted: 0,
+                accepted: 0,
             },
             calls: 2,
             tool_seconds: 0.5,
@@ -1958,7 +1977,7 @@ mod tests {
 
     #[test]
     fn opens_the_prompt_with_the_line_for_the_effort() {
-        // As Bonsai's template does: a line for xhigh and for low, ahead of
+        // As the model's template does: a line for xhigh and for low, ahead of
         // the tools, and none for medium, the default.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(Effort::default(), Effort::Medium);

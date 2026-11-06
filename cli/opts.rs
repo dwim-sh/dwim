@@ -7,7 +7,7 @@ use crate::{model, session::Settings};
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
-    /// model to run (default: bonsai-2-27b)
+    /// model to run (default: qwen3.8-27b)
     #[argh(option, default = "model::NAME.to_string()")]
     pub model: String,
 
@@ -58,6 +58,11 @@ pub struct Opts {
     #[argh(option)]
     pub temperature: Option<f32>,
 
+    /// tokens the model drafts ahead and verifies in one pass, or 0 to
+    /// decode a token at a time (default: 4)
+    #[argh(option, default = "dwim::models::DRAFTS")]
+    pub speculate: usize,
+
     /// program to run the model's shell commands through, as `shell -c
     /// command` (default: sh)
     #[argh(option)]
@@ -83,6 +88,7 @@ impl Opts {
             thinking_budget: budget(self.thinking_budget),
             effort: self.reasoning_effort,
             temperature: self.temperature,
+            speculate: self.speculate,
             shell: self.shell.clone(),
         }
     }

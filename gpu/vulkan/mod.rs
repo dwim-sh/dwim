@@ -15,40 +15,16 @@ use ash::{
     vk,
 };
 
-use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host, ternary};
+use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, host, quant};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
 /// filled while the device copies from the other.
 const STAGING: usize = 64 << 20;
 
-/// Rows of ternary weights one workgroup of the single-token and batch
-/// matmul kernels takes, and tokens one of the batch kernel takes at once.
-const TERNARY_ROWS: usize = 8;
-const TERNARY_TOKENS: usize = 8;
-/// Rows and tokens of a tile of `matmul_ternary_tile.wgsl`; a batch of at
-/// least half a tile's tokens goes through it.
-const TERNARY_TILE_ROWS: usize = 64;
-const TERNARY_TILE_TOKENS: usize = 64;
-/// Workgroup memory the tile kernel takes: the rows' and the tokens' block
-/// as half floats.
-const TERNARY_TILE_MEMORY: usize = (TERNARY_TILE_ROWS + TERNARY_TILE_TOKENS) * 2 * 128;
-/// Workgroups the tile kernel splits a small matrix's columns to reach,
-/// and the most splits.
-const TILE_WORKGROUPS: usize = 80;
-const TILE_SPLITS: usize = 8;
-/// Tokens a workgroup of the bf16 matmul kernel takes at once.
+/// Tokens a workgroup of the bf16 and block-quantized matmul kernels takes
+/// at once.
 const BF16_TOKENS: usize = 8;
-/// Rows a workgroup of the single-token sums kernel takes, the workgroups
-/// it splits a matrix's blocks to reach, and the fewest rows a matrix
-/// needs for building the tables to pay off.
-const SUMS_ROWS: usize = 1024;
-const SUMS_WORKGROUPS: usize = 80;
-const SUMS_MIN_ROWS: usize = 2048;
-/// Most words of packed activations a batch through the batch or the tile
-/// kernel has, two tokens to a word: the size of the buffer they are
-/// packed into.
-const PACKED: usize = 1 << 20;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
 /// submitted.
@@ -79,21 +55,27 @@ pub struct Cache {
     len: usize,
 }
 
-/// A weight matrix in device memory, bf16 or ternary.
+/// A weight matrix in device memory: its weights, and for the
+/// block-quantized formats their scales in a buffer of their own.
 pub struct Weight {
     buf: vk::Buffer,
+    scales: vk::Buffer,
     shape: Vec<usize>,
-    ternary: bool,
+    format: Format,
+}
+
+/// The formats weights come in, as [`Tensor`] has them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Bf16,
+    Q4_0,
+    Q8_0,
 }
 
 struct Kernels {
     matmul_bf16: vk::Pipeline,
-    matmul_ternary: vk::Pipeline,
-    matmul_ternary_batch: vk::Pipeline,
-    matmul_ternary_tile: vk::Pipeline,
-    matmul_ternary_tile_reduce: vk::Pipeline,
-    matmul_ternary_sums: vk::Pipeline,
-    pack_halves: vk::Pipeline,
+    matmul_q4_0: vk::Pipeline,
+    matmul_q8_0: vk::Pipeline,
     add: vk::Pipeline,
     rmsnorm: vk::Pipeline,
     l2norm: vk::Pipeline,
@@ -103,8 +85,6 @@ struct Kernels {
     silu_mul: vk::Pipeline,
     sigmoid_mul: vk::Pipeline,
     store_q8: vk::Pipeline,
-    hadamard: vk::Pipeline,
-    rmsnorm_hadamard: vk::Pipeline,
     conv: vk::Pipeline,
     delta_net: vk::Pipeline,
 }
@@ -121,8 +101,6 @@ impl Kernels {
             0b100_0001
         } else if pipeline == self.conv {
             0b1111
-        } else if pipeline == self.matmul_ternary_tile || pipeline == self.matmul_ternary_sums {
-            0b1001
         } else {
             0b1
         }
@@ -132,26 +110,14 @@ impl Kernels {
     /// before it to have reached the end of the pipe when a buffer it binds
     /// was written since the last such wait: see `Vulkan::events`.
     fn matmul(&self, pipeline: vk::Pipeline) -> bool {
-        [
-            self.matmul_bf16,
-            self.matmul_ternary,
-            self.matmul_ternary_batch,
-            self.matmul_ternary_tile,
-            self.matmul_ternary_tile_reduce,
-            self.matmul_ternary_sums,
-        ]
-        .contains(&pipeline)
+        [self.matmul_bf16, self.matmul_q4_0, self.matmul_q8_0].contains(&pipeline)
     }
 
-    fn all(&self) -> [vk::Pipeline; 20] {
+    fn all(&self) -> [vk::Pipeline; 14] {
         [
             self.matmul_bf16,
-            self.matmul_ternary,
-            self.matmul_ternary_batch,
-            self.matmul_ternary_tile,
-            self.matmul_ternary_tile_reduce,
-            self.matmul_ternary_sums,
-            self.pack_halves,
+            self.matmul_q4_0,
+            self.matmul_q8_0,
             self.add,
             self.rmsnorm,
             self.l2norm,
@@ -161,8 +127,6 @@ impl Kernels {
             self.silu_mul,
             self.sigmoid_mul,
             self.store_q8,
-            self.hadamard,
-            self.rmsnorm_hadamard,
             self.conv,
             self.delta_net,
         ]
@@ -193,8 +157,7 @@ pub struct Vulkan {
     /// different result about once in 500 steps with a barrier after every
     /// kernel, whatever the queue, the ring depth, or the number of kernels
     /// a submission, and none in 14,000 steps with a fence after every
-    /// kernel, and the kernel that went wrong was the single-token ternary
-    /// matmul; the event is the fence's wait for the end of the pipe
+    /// kernel, and the kernel that went wrong was a single-token matmul; the event is the fence's wait for the end of the pipe
     /// without the round trip to the CPU, before the kernels that were seen
     /// to need it. The reset comes after the wait has passed, when the
     /// set's write is known to have landed, and is the command processor's
@@ -212,7 +175,6 @@ pub struct Vulkan {
     staging: [Mapped; 2],
     partials: vk::Buffer,
     /// A batch's activations as half floats, for the batch and tile kernels.
-    packed: vk::Buffer,
     max_groups: u32,
     name: String,
     /// Every buffer and its memory, freed when the device is dropped.
@@ -278,13 +240,6 @@ impl Vulkan {
                 | vk::SubgroupFeatureFlags::SHUFFLE;
             if !subgroup.supported_operations.contains(needed) || subgroup.subgroup_size < 16 {
                 return Err(format!("{name} lacks the subgroup operations the kernels use").into());
-            }
-            if (props.limits.max_compute_shared_memory_size as usize) < TERNARY_TILE_MEMORY {
-                return Err(format!(
-                    "{name} has less than the {} KB of workgroup memory the kernels use",
-                    TERNARY_TILE_MEMORY / 1024
-                )
-                .into());
             }
             let extensions = instance.enumerate_device_extension_properties(physical)?;
             let budget = extensions
@@ -413,12 +368,8 @@ impl Vulkan {
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let kernels = Kernels {
                 matmul_bf16: spv!("matmul_bf16"),
-                matmul_ternary: spv!("matmul_ternary"),
-                matmul_ternary_batch: spv!("matmul_ternary_batch"),
-                matmul_ternary_tile: spv!("matmul_ternary_tile"),
-                matmul_ternary_tile_reduce: spv!("matmul_ternary_tile_reduce"),
-                matmul_ternary_sums: spv!("matmul_ternary_sums"),
-                pack_halves: spv!("pack_halves"),
+                matmul_q4_0: spv!("matmul_q4_0"),
+                matmul_q8_0: spv!("matmul_q8_0"),
                 add: spv!("add"),
                 rmsnorm: spv!("rmsnorm"),
                 l2norm: spv!("l2norm"),
@@ -428,8 +379,6 @@ impl Vulkan {
                 silu_mul: spv!("silu_mul"),
                 sigmoid_mul: spv!("sigmoid_mul"),
                 store_q8: spv!("store_q8"),
-                hadamard: spv!("hadamard"),
-                rmsnorm_hadamard: spv!("rmsnorm_hadamard"),
                 conv: spv!("conv"),
                 delta_net: spv!("delta_net"),
             };
@@ -462,7 +411,6 @@ impl Vulkan {
                     },
                 ],
                 partials: vk::Buffer::null(),
-                packed: vk::Buffer::null(),
                 max_groups: props.limits.max_compute_work_group_count[0],
                 name,
                 allocations: Mutex::new(Vec::new()),
@@ -479,9 +427,6 @@ impl Vulkan {
             gpu.staging = [gpu.map(STAGING)?, gpu.map(STAGING)?];
             gpu.partials = gpu
                 .buffer(PARTIALS * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
-                .0;
-            gpu.packed = gpu
-                .buffer(PACKED * 4, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
                 .0;
             Ok(gpu)
         }
@@ -874,13 +819,6 @@ struct RopeParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct HadamardParams {
-    width: u32,
-    inverse: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct ConvParams {
     n: u32,
     channels: u32,
@@ -895,16 +833,6 @@ struct DeltaNetParams {
     n_k_heads: u32,
     n_v_heads: u32,
     head_dim: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PackParams {
-    n: u32,
-    cols: u32,
-    /// Pairs of tokens laid out together by column: the four of a group of
-    /// eight tokens for the batch kernel, or all of them for the tile kernel.
-    group: u32,
 }
 
 #[repr(C)]
@@ -981,34 +909,57 @@ impl Device for Vulkan {
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
+        // The bytes of a vector of plain integers, in memory order: the
+        // kernels take the low half of a word as the first of its 16-bit
+        // weights or scales, as little-endian does.
+        fn bytes<T>(data: &[T]) -> &[u8] {
+            unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), size_of_val(data)) }
+        }
+        let with_bytes = |bytes: &[u8]| {
+            // A whole number of words, for the kernels' arrays of them.
+            let buf = self.device_buffer(bytes.len().next_multiple_of(4));
+            self.upload_bytes(buf, 0, bytes);
+            buf
+        };
         match tensor {
             Tensor::Bf16 { shape, data } => {
                 assert!(
                     data.len().is_multiple_of(8),
                     "weights must come in multiples of eight"
                 );
-                let buf = self.device_buffer(data.len() * 2);
-                // bf16 bits, two to a 32-bit word, in memory order: the
-                // kernels take the low half of a word as the first weight,
-                // as little-endian does.
-                let bytes =
-                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
-                self.upload_bytes(buf, 0, bytes);
                 Weight {
-                    buf,
+                    buf: with_bytes(bytes(&data)),
+                    scales: vk::Buffer::null(),
                     shape,
-                    ternary: false,
+                    format: Format::Bf16,
                 }
             }
-            Tensor::Ternary { shape, data } => {
-                assert_eq!(data.len(), shape[0] * ternary::row_bytes(shape[1]));
-                let data = ternary::block_major(&data, shape[0], shape[1]);
-                let buf = self.device_buffer(data.len());
-                self.upload_bytes(buf, 0, &data);
+            Tensor::Q4_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
                 Weight {
-                    buf,
+                    buf: with_bytes(&quants),
+                    scales: with_bytes(bytes(&scales)),
                     shape,
-                    ternary: true,
+                    format: Format::Q4_0,
+                }
+            }
+            Tensor::Q8_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1]);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                Weight {
+                    buf: with_bytes(bytes(&quants)),
+                    scales: with_bytes(bytes(&scales)),
+                    shape,
+                    format: Format::Q8_0,
                 }
             }
         }
@@ -1127,135 +1078,14 @@ impl Device for Vulkan {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
-        // A batch of many tokens through ternary weights is a tiled matrix
-        // product over the activations packed as half floats: a workgroup
-        // per tile of rows and tokens, the row tiles across the grid and
-        // down it as wide as the GPU allows, and each row of the grid
-        // repeated for every tile of tokens.
-        let pairs = n.div_ceil(2).next_multiple_of(4);
-        let pack = |group: usize| {
-            assert!(
-                pairs * cols <= PACKED,
-                "a batch of {n} tokens of {cols} is more than the kernels pack"
-            );
-            let params = PackParams {
-                n: n as u32,
-                cols: cols as u32,
-                group: group as u32,
-            };
-            let groups = (cols.div_ceil(256) as u32, pairs as u32);
-            self.dispatch(
-                self.kernels.pack_halves,
-                &[self.packed, x.buf],
-                &params,
-                groups,
-            );
-        };
-        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
-            pack(pairs);
-            let count = rows.div_ceil(TERNARY_TILE_ROWS);
-            let width = count.min(self.max_groups as usize);
-            let tiles = count.div_ceil(width) * n.div_ceil(TERNARY_TILE_TOKENS);
-            // A matrix of few rows makes too few tiles to fill the GPU: its
-            // columns are split among workgroups, whose partial results a
-            // second kernel adds up.
-            let blocks = cols / 128;
-            let splits = TILE_WORKGROUPS
-                .div_ceil(tiles)
-                .clamp(1, TILE_SPLITS.min(blocks));
-            let splits = if splits > 1 && splits * n * rows <= PARTIALS {
-                splits
-            } else {
-                1
-            };
-            let height = tiles * splits;
-            assert!(
-                height <= self.max_groups as usize,
-                "{height} rows of workgroups is more than the GPU allows"
-            );
-            let params = MatmulParams {
-                rows: rows as u32,
-                cols: cols as u32,
-                n: n as u32,
-                stride: width as u32,
-                splits: splits as u32,
-            };
-            self.dispatch(
-                self.kernels.matmul_ternary_tile,
-                &[out.buf, w.buf, self.packed, self.partials],
-                &params,
-                (width as u32, height as u32),
-            );
-            if splits > 1 {
-                let groups = self.groups(n * rows, 256);
-                self.dispatch(
-                    self.kernels.matmul_ternary_tile_reduce,
-                    &[out.buf, self.partials],
-                    &params,
-                    groups,
-                );
-            }
-            return;
-        }
-        // A single token through ternary weights looks each byte up in
-        // tables of its activations' sums, a workgroup per 1024 rows, with
-        // the blocks of a matrix of few rows split among workgroups whose
-        // partial sums are added up after.
-        if w.ternary && n == 1 && rows >= SUMS_MIN_ROWS {
-            let blocks = cols / 128;
-            let tiles = rows.div_ceil(SUMS_ROWS);
-            let splits = (SUMS_WORKGROUPS / tiles).clamp(1, blocks);
-            let splits = if splits > 1 && splits * rows <= PARTIALS {
-                splits
-            } else {
-                1
-            };
-            let count = tiles * splits;
-            let width = count.min(self.max_groups as usize);
-            let params = MatmulParams {
-                rows: rows as u32,
-                cols: cols as u32,
-                n: 1,
-                stride: width as u32,
-                splits: splits as u32,
-            };
-            self.dispatch(
-                self.kernels.matmul_ternary_sums,
-                &[out.buf, w.buf, x.buf, self.partials],
-                &params,
-                (width as u32, count.div_ceil(width) as u32),
-            );
-            if splits > 1 {
-                self.dispatch(
-                    self.kernels.matmul_ternary_tile_reduce,
-                    &[out.buf, self.partials],
-                    &params,
-                    self.groups(rows, 256),
-                );
-            }
-            return;
-        }
-        // One workgroup per row of bf16 weights, or per eight rows of
-        // ternary weights, in a grid as wide as the GPU allows, and the
-        // tokens eight at a time, each group of them a row of the grid. A
-        // few tokens through ternary weights are worth unpacking the
-        // weights once for eight, and go as half floats packed a group of
-        // eight tokens together.
-        let batch = w.ternary && n > 1;
-        if batch {
-            pack(TERNARY_TOKENS / 2);
-        }
-        let (kernel, per_group, tokens, x) = if batch {
-            (
-                self.kernels.matmul_ternary_batch,
-                TERNARY_ROWS,
-                TERNARY_TOKENS,
-                self.packed,
-            )
-        } else if w.ternary {
-            (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
-        } else {
-            (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf)
+        // One workgroup per row of bf16 or block-quantized weights, in a
+        // grid as wide as the GPU allows, and the tokens eight at a time,
+        // each group of them a row of the grid. The block-quantized kernels
+        // bind the scales after the quants.
+        let (kernel, per_group, tokens, x) = match w.format {
+            Format::Bf16 => (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf),
+            Format::Q4_0 => (self.kernels.matmul_q4_0, 1, BF16_TOKENS, x.buf),
+            Format::Q8_0 => (self.kernels.matmul_q8_0, 1, BF16_TOKENS, x.buf),
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
@@ -1270,7 +1100,11 @@ impl Device for Vulkan {
             stride: width as u32,
             splits: 1,
         };
-        self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
+        if w.scales == vk::Buffer::null() {
+            self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
+        } else {
+            self.dispatch(kernel, &[out.buf, w.buf, w.scales, x], &params, groups);
+        }
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -1411,41 +1245,6 @@ impl Device for Vulkan {
         );
     }
 
-    fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
-        let width = signs.len;
-        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
-        let params = HadamardParams {
-            width: width as u32,
-            inverse: inverse as u32,
-        };
-        let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
-        self.dispatch(self.kernels.hadamard, &[x.buf, signs.buf], &params, groups);
-    }
-
-    fn rmsnorm_hadamard(
-        &self,
-        out: &mut Buffer,
-        x: &Buffer,
-        weight: &Buffer,
-        signs: &Buffer,
-        eps: f32,
-    ) {
-        let width = signs.len;
-        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
-        assert!(out.len == x.len && weight.len == width);
-        let params = RmsnormParams {
-            dim: width as u32,
-            eps,
-        };
-        let groups = self.groups(x.len / HADAMARD_BLOCK, 1);
-        self.dispatch(
-            self.kernels.rmsnorm_hadamard,
-            &[out.buf, x.buf, weight.buf, signs.buf],
-            &params,
-            groups,
-        );
-    }
-
     fn conv(
         &self,
         q: &mut Buffer,
@@ -1527,13 +1326,23 @@ fn bytes<P: Copy>(params: &P) -> &[u8] {
 mod tests {
     check_against_cpu!(super::Vulkan::new());
 
-    /// Times the ternary matmul on the model's shapes; run with `--ignored
+    /// Times the Q4_0 matmul on the model's shapes; run with `--ignored
     /// --nocapture`.
     #[test]
     #[ignore]
-    fn ternary_matmul_speed() {
+    fn q4_0_matmul_speed() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::gpu::tests::ternary_matmul_speed(&gpu),
+            Ok(gpu) => crate::gpu::tests::q4_0_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the Q8_0 matmul likewise.
+    #[test]
+    #[ignore]
+    fn q8_0_matmul_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::gpu::tests::q8_0_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1550,15 +1359,6 @@ mod tests {
                     crate::gpu::tests::kernel_speed(&gpu, n);
                 }
             }
-            Err(e) => eprintln!("skipping: {e}"),
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn tile_error() {
-        match super::Vulkan::new() {
-            Ok(gpu) => crate::gpu::tests::tile_error(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }

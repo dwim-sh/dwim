@@ -27,7 +27,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host, ternary};
+use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, host, quant};
 
 /// Positions one threadgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -71,20 +71,10 @@ const THREADS: usize = 256;
 /// kernels and flash attention, four SIMD groups.
 const MATRIX_THREADS: usize = 128;
 
-/// Threads of a threadgroup of the sums kernel, the rows each takes, and
-/// the threadgroups it splits a matrix's blocks to reach.
-const SUMS_THREADS: usize = 256;
-const SUMS_PER: usize = 4;
-const SUMS_GROUPS: usize = 40;
-/// Most tokens that go through the sums kernel rather than the tile kernel:
-/// the threadgroups of a few tokens read the weights from the cache one
-/// after another, so that eight cost about what a tile of them does.
-const SUMS_TOKENS: usize = 8;
-
-/// Most floats of partial results the split matmul kernels or the attention
-/// kernel write, a chunk's maximum, sum, and weighted values per head of
-/// each token for attention: the size of the partials buffer. Longer
-/// batches of attention are dispatched a few tokens at a time.
+/// Most floats of partial results the attention kernel writes, a chunk's
+/// maximum, sum, and weighted values per head of each token: the size of
+/// the partials buffer. Longer batches of attention are dispatched a few
+/// tokens at a time.
 const PARTIALS: usize = 16 << 20;
 
 /// Rows of a tile of the tile kernels, the tokens of their three tiles,
@@ -96,6 +86,15 @@ const PACKED: usize = 4 << 20;
 
 /// Tokens a SIMD group of the bf16 matmul kernel takes at once.
 const BF16_TOKENS: usize = 8;
+
+/// Most tokens that go through the block-quantized row kernels rather than
+/// their tile kernels: the row kernels read the weights once for eight
+/// tokens but are bound by their arithmetic past two, so that on an M5
+/// four tokens through them cost what a tile of 64 does; and the columns
+/// a step of the tile kernels takes, which a matrix must be a whole number
+/// of.
+const QUANT_TOKENS: usize = 4;
+const QUANT_COLS: usize = 128;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
@@ -140,23 +139,43 @@ pub struct Cache {
     len: usize,
 }
 
-/// A weight matrix in memory shared with the GPU, bf16 or ternary.
+/// A weight matrix in memory shared with the GPU: its weights, and for
+/// the block-quantized formats their scales in a buffer of their own.
 pub struct Weight {
     buf: Object<dyn MTLBuffer>,
+    scales: Option<Object<dyn MTLBuffer>>,
     shape: Vec<usize>,
-    ternary: bool,
+    format: Format,
+}
+
+/// The formats weights come in, as [`Tensor`] has them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Bf16,
+    Q4_0,
+    Q8_0,
+}
+
+/// The index of a block-quantized format's kernels in their arrays.
+fn quant_index(format: Format) -> usize {
+    match format {
+        Format::Q4_0 => 0,
+        Format::Q8_0 => 1,
+        Format::Bf16 => unreachable!("not block-quantized"),
+    }
 }
 
 struct Kernels {
     matmul_bf16: Object<dyn MTLComputePipelineState>,
-    matmul_ternary_sums: Object<dyn MTLComputePipelineState>,
-    matmul_ternary_reduce: Object<dyn MTLComputePipelineState>,
-    /// The tile kernel on the matrix accelerators, where the GPU has them,
-    /// for tiles of 16, 32 and 64 tokens.
-    matmul_ternary_mma: Option<[Object<dyn MTLComputePipelineState>; 3]>,
-    /// The tile kernel on the SIMD groups' matrices, for the same tiles.
-    matmul_ternary_tile: [Object<dyn MTLComputePipelineState>; 3],
     pack_halves: Object<dyn MTLComputePipelineState>,
+    /// The row kernels for Q4_0 and Q8_0 weights, in that order, as
+    /// [`quant_index`] gives it; their tile kernels on the matrix
+    /// accelerators, where the GPU has them, for tiles of 16, 32 and 64
+    /// tokens; and their tile kernels on the SIMD groups' matrices for the
+    /// same tiles.
+    matmul_quant: [Object<dyn MTLComputePipelineState>; 2],
+    matmul_quant_mma: Option<[[Object<dyn MTLComputePipelineState>; 3]; 2]>,
+    matmul_quant_tile: [[Object<dyn MTLComputePipelineState>; 3]; 2],
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
     l2norm: Object<dyn MTLComputePipelineState>,
@@ -175,8 +194,6 @@ struct Kernels {
     sigmoid_mul: Object<dyn MTLComputePipelineState>,
     copy: Object<dyn MTLComputePipelineState>,
     store_q8: Object<dyn MTLComputePipelineState>,
-    hadamard: Object<dyn MTLComputePipelineState>,
-    rmsnorm_hadamard: Object<dyn MTLComputePipelineState>,
     conv: Object<dyn MTLComputePipelineState>,
     delta_net: Object<dyn MTLComputePipelineState>,
 }
@@ -277,27 +294,30 @@ impl Metal {
         // The matrix accelerators of an Apple GPU of the tenth family, which
         // Metal 4's tensor operations run on; a GPU without them takes the
         // tile kernel instead, as does a system without Metal 4. Where both
-        // are there, the kernel must compile.
-        let matmul_ternary_mma = if device.supportsFamily(MTLGPUFamily::Apple10)
+        // are there, the kernels must compile.
+        let matmul_quant_mma = if device.supportsFamily(MTLGPUFamily::Apple10)
             && device.supportsFamily(MTLGPUFamily::Metal4)
         {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let mma = |tokens| {
+            let quant = |bits, tokens| {
                 compile(
                     &device,
-                    "matmul_ternary_mma",
+                    "matmul_quant_mma",
                     MATRIX_THREADS,
-                    &[("TOKENS", tokens)],
-                    &[source!("trits"), source!("matmul_ternary_mma")],
+                    &[("BITS", bits), ("TOKENS", tokens)],
+                    &[source!("matmul_quant_mma")],
                     Some(&metal4),
                 )
             };
-            Some([mma(16)?, mma(32)?, mma(64)?])
+            Some([
+                [quant(4, 16)?, quant(4, 32)?, quant(4, 64)?],
+                [quant(8, 16)?, quant(8, 32)?, quant(8, 64)?],
+            ])
         } else {
             None
         };
-        let attention_mma = if matmul_ternary_mma.is_some() {
+        let attention_mma = if matmul_quant_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
             let mma = |dim, rows, threads| {
@@ -321,20 +341,51 @@ impl Metal {
         };
         let kernels = Kernels {
             matmul_bf16: msl!("matmul_bf16", THREADS),
-            matmul_ternary_sums: msl!(
-                "matmul_ternary_sums",
-                SUMS_THREADS,
-                "THREADS" = SUMS_THREADS,
-                "PER" = SUMS_PER
-            ),
-            matmul_ternary_reduce: msl!("matmul_ternary_reduce", THREADS),
-            matmul_ternary_tile: [
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 16; "trits"),
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 32; "trits"),
-                msl!("matmul_ternary_tile", MATRIX_THREADS, "TOKENS" = 64; "trits"),
-            ],
-            matmul_ternary_mma,
             attention_mma,
+            matmul_quant: [msl!("matmul_q4_0", THREADS), msl!("matmul_q8_0", THREADS)],
+            matmul_quant_mma,
+            matmul_quant_tile: [
+                [
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 4,
+                        "TOKENS" = 16
+                    ),
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 4,
+                        "TOKENS" = 32
+                    ),
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 4,
+                        "TOKENS" = 64
+                    ),
+                ],
+                [
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 8,
+                        "TOKENS" = 16
+                    ),
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 8,
+                        "TOKENS" = 32
+                    ),
+                    msl!(
+                        "matmul_quant_tile",
+                        MATRIX_THREADS,
+                        "BITS" = 8,
+                        "TOKENS" = 64
+                    ),
+                ],
+            ],
             pack_halves: msl!("pack_halves", THREADS),
             pack_queries: msl!("pack_queries", THREADS),
             add: msl!("add", THREADS),
@@ -361,8 +412,6 @@ impl Metal {
             sigmoid_mul: msl!("sigmoid_mul", THREADS),
             copy: msl!("copy", THREADS),
             store_q8: msl!("store_q8", THREADS),
-            hadamard: msl!("hadamard", THREADS; "butterfly"),
-            rmsnorm_hadamard: msl!("rmsnorm_hadamard", THREADS; "butterfly"),
             conv: msl!("conv", THREADS),
             delta_net: msl!("delta_net", THREADS),
         };
@@ -561,13 +610,6 @@ struct RopeParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct HadamardParams {
-    width: u32,
-    inverse: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct ConvParams {
     n: u32,
     channels: u32,
@@ -647,6 +689,13 @@ struct LenParams {
     len: u32,
 }
 
+/// The most of the machine's memory a model may take, as a fraction: the
+/// weights and caches are wired while the model runs, and the system and
+/// the applications beside it need the rest. Half leaves 16 GiB of a 32
+/// GiB Mac: with the kernel's own few gigabytes wired too, a model given
+/// nine sixteenths left the machine paging while a browser was open.
+const SHARE: (u64, u64) = (1, 2);
+
 impl Device for Metal {
     type Buffer = Buffer;
     type Weight = Weight;
@@ -660,7 +709,9 @@ impl Device for Metal {
         // Metal's estimate of the most the GPU can use without hurting
         // performance: with memory unified, a share of the host's. It
         // leaves out what other processes hold, so it is no more than the
-        // host has available.
+        // host has available; and since what a model takes is wired, it is
+        // no more than [`SHARE`] of the machine, so that the system and
+        // whatever else runs keep the rest and nothing is paged out.
         let allocated = self.device.currentAllocatedSize() as u64;
         let mut free = self
             .device
@@ -669,30 +720,14 @@ impl Device for Metal {
         if let Some(available) = host::available() {
             free = free.min(available);
         }
+        if let Some(total) = host::total() {
+            free = free.min((total / SHARE.1 * SHARE.0).saturating_sub(allocated));
+        }
         Some(free)
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
-        // Ternary blocks go block-major, so that the rows a SIMD group
-        // takes read adjacent blocks.
-        let block_major;
-        let (shape, bytes, ternary) = match &tensor {
-            Tensor::Bf16 { shape, data } => {
-                assert!(
-                    data.len().is_multiple_of(8),
-                    "weights must come in multiples of eight"
-                );
-                let bytes =
-                    unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2) };
-                (shape, bytes, false)
-            }
-            Tensor::Ternary { shape, data } => {
-                assert_eq!(data.len(), shape[0] * ternary::row_bytes(shape[1]));
-                block_major = ternary::block_major(data, shape[0], shape[1]);
-                (shape, block_major.as_slice(), true)
-            }
-        };
-        let buf = unsafe {
+        let with_bytes = |bytes: &[u8]| unsafe {
             self.device
                 .newBufferWithBytes_length_options(
                     NonNull::from(bytes).cast(),
@@ -701,10 +736,52 @@ impl Device for Metal {
                 )
                 .expect("out of GPU memory")
         };
+        // The bytes of a vector of plain integers, in memory order.
+        fn bytes<T>(data: &[T]) -> &[u8] {
+            unsafe { slice::from_raw_parts(data.as_ptr().cast::<u8>(), size_of_val(data)) }
+        }
+        let (shape, buf, scales, format) = match &tensor {
+            Tensor::Bf16 { shape, data } => {
+                assert!(
+                    data.len().is_multiple_of(8),
+                    "weights must come in multiples of eight"
+                );
+                (shape, with_bytes(bytes(data)), None, Format::Bf16)
+            }
+            Tensor::Q4_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                (
+                    shape,
+                    with_bytes(quants),
+                    Some(with_bytes(bytes(scales))),
+                    Format::Q4_0,
+                )
+            }
+            Tensor::Q8_0 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1]);
+                assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                (
+                    shape,
+                    with_bytes(bytes(quants)),
+                    Some(with_bytes(bytes(scales))),
+                    Format::Q8_0,
+                )
+            }
+        };
         Weight {
             buf,
+            scales,
             shape: shape.clone(),
-            ternary,
+            format,
         }
     }
 
@@ -837,74 +914,61 @@ impl Device for Metal {
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
         out.touch();
-        let mut params = MatmulParams {
+        let params = MatmulParams {
             rows: rows as u32,
             cols: cols as u32,
             n: n as u32,
             splits: 1,
         };
-        // A token or a few through ternary weights look each byte up in
-        // tables of their activations' sums, each token reading the weights
-        // for itself, with the blocks of a matrix of few rows split among
-        // threadgroups whose partial sums are added up after.
-        if w.ternary && n <= SUMS_TOKENS {
-            let tiles = rows.div_ceil(SUMS_THREADS * SUMS_PER);
-            let splits = (SUMS_GROUPS / tiles).clamp(1, cols / 128);
-            let splits = if splits * n * rows <= PARTIALS {
-                splits
-            } else {
-                1
-            };
-            params.splits = splits as u32;
+        // Each SIMD group takes one row of bf16 weights for eight tokens.
+        if w.format == Format::Bf16 {
             self.dispatch_grid(
-                &self.kernels.matmul_ternary_sums,
-                &[&out.buf, &w.buf, &x.buf, &self.partials],
+                &self.kernels.matmul_bf16,
+                &[&out.buf, &w.buf, &x.buf],
                 &params,
-                (tiles * splits, n),
-                SUMS_THREADS,
+                (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
+                THREADS,
             );
-            if splits > 1 {
-                self.dispatch(
-                    &self.kernels.matmul_ternary_reduce,
-                    &[&out.buf, &self.partials],
-                    &params,
-                    (n * rows).div_ceil(THREADS),
-                    THREADS,
-                );
-            }
             return;
         }
-        // A batch through ternary weights is a tiled matrix product, on
-        // the matrix accelerators where the GPU has them and on the SIMD
-        // groups' matrix units elsewhere, over the activations packed as
-        // half floats: a threadgroup per tile of rows and tokens, the
-        // smallest tile that takes the batch, or the largest.
-        if w.ternary {
-            let which = TILE_TOKENS
+        // The block-quantized kernels bind the scales after the quants.
+        let which = quant_index(w.format);
+        let scales = w
+            .scales
+            .as_ref()
+            .expect("block-quantized weights have scales");
+        // A batch through block-quantized weights is a tiled matrix product
+        // too, on the accelerators or the SIMD groups' matrix units, over
+        // the activations packed as half floats, where the matrix is a whole
+        // number of the steps the tile kernels take.
+        if n > QUANT_TOKENS && cols.is_multiple_of(QUANT_COLS) {
+            let size = TILE_TOKENS
                 .iter()
                 .position(|&tokens| n <= tokens)
                 .unwrap_or(TILE_TOKENS.len() - 1);
-            let tile_tokens = TILE_TOKENS[which];
+            let tile_tokens = TILE_TOKENS[size];
             let padded = n.next_multiple_of(tile_tokens);
             self.pack(x, n, cols, padded);
-            let kernel = match &self.kernels.matmul_ternary_mma {
-                Some(mma) => &mma[which],
-                None => &self.kernels.matmul_ternary_tile[which],
+            let kernel = match &self.kernels.matmul_quant_mma {
+                Some(mma) => &mma[which][size],
+                None => &self.kernels.matmul_quant_tile[which][size],
             };
             self.dispatch_grid(
                 kernel,
-                &[&out.buf, &w.buf, &self.packed],
+                &[&out.buf, &w.buf, scales, &self.packed],
                 &params,
                 (rows.div_ceil(TILE_ROWS), padded / tile_tokens),
                 MATRIX_THREADS,
             );
             return;
         }
-        self.dispatch_grid(
-            &self.kernels.matmul_bf16,
-            &[&out.buf, &w.buf, &x.buf],
+        // Each SIMD group takes one row of block-quantized weights, the
+        // tokens eight at a time.
+        self.dispatch(
+            &self.kernels.matmul_quant[which],
+            &[&out.buf, &w.buf, scales, &x.buf],
             &params,
-            (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
+            rows.div_ceil(self.matmul_rows),
             THREADS,
         );
     }
@@ -1181,49 +1245,6 @@ impl Device for Metal {
         );
     }
 
-    fn hadamard(&self, x: &mut Buffer, signs: &Buffer, inverse: bool) {
-        let width = signs.len;
-        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
-        x.touch();
-        let params = HadamardParams {
-            width: width as u32,
-            inverse: inverse as u32,
-        };
-        self.dispatch(
-            &self.kernels.hadamard,
-            &[&x.buf, &signs.buf],
-            &params,
-            x.len / HADAMARD_BLOCK,
-            THREADS,
-        );
-    }
-
-    fn rmsnorm_hadamard(
-        &self,
-        out: &mut Buffer,
-        x: &Buffer,
-        weight: &Buffer,
-        signs: &Buffer,
-        eps: f32,
-    ) {
-        let width = signs.len;
-        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
-        assert!(out.len == x.len && weight.len == width);
-        assert!(width <= 8192, "the kernel takes rows of up to 8192");
-        out.touch();
-        let params = RmsnormParams {
-            dim: width as u32,
-            eps,
-        };
-        self.dispatch(
-            &self.kernels.rmsnorm_hadamard,
-            &[&out.buf, &x.buf, &weight.buf, &signs.buf],
-            &params,
-            x.len / HADAMARD_BLOCK,
-            THREADS,
-        );
-    }
-
     fn conv(
         &self,
         q: &mut Buffer,
@@ -1314,26 +1335,34 @@ mod tests {
     use crate::gpu::Device;
     check_against_cpu!(super::Metal::new());
 
-    /// Checks the tile kernel a GPU without matrix accelerators takes, on
-    /// one that has them too.
+    /// Checks the tile kernels for block-quantized weights, which a GPU
+    /// without matrix accelerators takes, on one that has them too.
     #[test]
-    fn ternary_matmul_without_accelerators_matches_cpu() {
+    fn quant_matmul_without_accelerators_matches_cpu() {
         match super::Metal::new() {
             Ok(mut gpu) => {
-                gpu.kernels.matmul_ternary_mma = None;
-                crate::gpu::tests::ternary_matmul_matches_cpu(&gpu);
+                gpu.kernels.matmul_quant_mma = None;
+                crate::gpu::tests::q4_0_matmul_matches_cpu(&gpu);
+                crate::gpu::tests::q8_0_matmul_matches_cpu(&gpu);
             }
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
 
-    /// Times the ternary matmul on the model's shapes; run with `--ignored
-    /// --nocapture`.
     #[test]
     #[ignore]
-    fn ternary_matmul_speed() {
+    fn q4_0_matmul_speed() {
         match super::Metal::new() {
-            Ok(gpu) => crate::gpu::tests::ternary_matmul_speed(&gpu),
+            Ok(gpu) => crate::gpu::tests::q4_0_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn q8_0_matmul_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::gpu::tests::q8_0_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1487,20 +1516,6 @@ mod tests {
             .unwrap();
             eprintln!("{what}:");
             crate::gpu::tests::attention_speed(&gpu, 64);
-        }
-    }
-
-    /// Times the ternary matmul on the tile kernel, without the matrix
-    /// accelerators; run with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn ternary_matmul_tile_speed() {
-        match super::Metal::new() {
-            Ok(mut gpu) => {
-                gpu.kernels.matmul_ternary_mma = None;
-                crate::gpu::tests::ternary_matmul_speed(&gpu);
-            }
-            Err(e) => eprintln!("skipping: {e}"),
         }
     }
 

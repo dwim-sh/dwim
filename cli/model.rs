@@ -1,4 +1,4 @@
-//! The one model, Bonsai 2 27B: finding its files, the device it runs on,
+//! The one model, Qwen3.8-27B: finding its files, the device it runs on,
 //! how much conversation it has room for there, the state saved after the
 //! system prompt, and how it samples.
 
@@ -11,7 +11,7 @@ use std::{
 };
 
 use dwim::gpu::{Cpu, Device as _, Gpu};
-use dwim::models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+use dwim::models::{Chat, Gguf, LanguageModel, Sampler, qwen35};
 
 use crate::opts;
 
@@ -33,7 +33,7 @@ const MIN_CONTEXT: usize = 4096;
 const HEADROOM: u64 = 256 << 20;
 
 /// The model's name, as the command line gives it.
-pub const NAME: &str = bonsai::NAME;
+pub const NAME: &str = qwen35::NAME;
 
 /// The directory the files of the model called `name` are kept in, which
 /// is the one model's.
@@ -41,18 +41,18 @@ pub fn locate(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     if name != NAME {
         return Err(format!("unknown model '{name}' (known: {NAME})").into());
     }
-    bonsai::dir().ok_or_else(|| "cannot determine the home directory".into())
+    qwen35::dir().ok_or_else(|| "cannot determine the home directory".into())
 }
 
 /// Opens the model's weights in `dir`.
 pub fn open(dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
-    Ok(Arc::new(Gguf::open(&dir.join(bonsai::WEIGHTS))?))
+    Ok(Arc::new(Gguf::open(&dir.join(qwen35::WEIGHTS))?))
 }
 
 /// How much of the model is in `dir`: how many of its files, and their
 /// size in bytes.
 pub fn on_disk(dir: &Path) -> (usize, u64) {
-    bonsai::FILES
+    qwen35::FILES
         .iter()
         .filter_map(|file| fs::metadata(dir.join(file.name)).ok())
         .fold((0, 0), |(files, bytes), metadata| {
@@ -102,10 +102,10 @@ impl Opened {
     ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
         Ok(match self {
             Opened::Cpu(device) => {
-                Box::new(bonsai::Model::load(gguf, device, context, on_progress)?)
+                Box::new(qwen35::Model::load(gguf, device, context, on_progress)?)
             }
             Opened::Gpu(device) => {
-                Box::new(bonsai::Model::load(gguf, *device, context, on_progress)?)
+                Box::new(qwen35::Model::load(gguf, *device, context, on_progress)?)
             }
         })
     }
@@ -123,9 +123,9 @@ pub struct Size {
 /// conversation, or as many as fit in the memory it has free.
 pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
-    let config = bonsai::Config::load(gguf)?;
+    let config = qwen35::Config::load(gguf)?;
     let trained = config.context_length;
-    let memory = bonsai::Memory::of(&config, gguf)?;
+    let memory = qwen35::Memory::of(&config, gguf)?;
     let context = match context {
         Some(context) => context,
         None => fit(&memory, device, trained),
@@ -145,7 +145,7 @@ pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size
 /// Tokens of conversation that fit in the memory `device` has free,
 /// beside a model of `memory` and some headroom: a whole number of
 /// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
-fn fit(memory: &bonsai::Memory, device: &Opened, trained: usize) -> usize {
+fn fit(memory: &qwen35::Memory, device: &Opened, trained: usize) -> usize {
     let Some(free) = device.memory() else {
         return DEFAULT_CONTEXT.min(trained);
     };
@@ -158,7 +158,7 @@ fn fit(memory: &bonsai::Memory, device: &Opened, trained: usize) -> usize {
 /// default, if the model is downloaded and the device opens.
 pub fn default_size(device: opts::Device) -> Option<Size> {
     let dir = locate(NAME).ok()?;
-    if !dir.join(bonsai::WEIGHTS).exists() {
+    if !dir.join(qwen35::WEIGHTS).exists() {
         return None;
     }
     let gguf = open(&dir).ok()?;
@@ -253,8 +253,8 @@ fn prune(dir: &Path) {
 
 /// The sampler for the model, with the settings its file recommends where
 /// it has them, at `temperature` if one is given instead of the file's.
-/// Bonsai's file does not carry `min_p`; its model card recommends 0.05,
-/// which it found to follow instructions more reliably than none.
+/// The file does not carry `min_p`; 0.05 follows instructions more
+/// reliably than none.
 pub fn sampler(gguf: &Gguf, temperature: Option<f32>) -> Sampler {
     let number = |key: &str, default: f32| {
         gguf.f32(&format!("general.sampling.{key}"))

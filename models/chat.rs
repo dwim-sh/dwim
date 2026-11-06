@@ -78,7 +78,7 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 /// cannot end the turn or start another.
 ///
 /// The whole conversation, including earlier thoughts, stays in the model's
-/// state, as Bonsai's chat template preserves thinking by default. Each
+/// state, as the model's chat template preserves thinking by default. Each
 /// turn runs the model over only its new tokens.
 ///
 /// Qwen models call tools from inside the thought as well as after it: a
@@ -94,6 +94,11 @@ pub struct Chat<M: LanguageModel> {
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
     len: usize,
+    /// Tokens the model drafts after each token picked, for it to verify in
+    /// one pass with the token, where it has a drafter; and the batch being
+    /// verified, while the reply is picking its way through it.
+    drafts: usize,
+    speculation: Option<Speculation>,
     /// Tokens of the context kept free by stopping a reply short of them.
     reserve: usize,
     /// Most tokens a thought may run to, if they are limited, and what is
@@ -114,9 +119,22 @@ pub struct Chat<M: LanguageModel> {
     stats: Stats,
 }
 
+/// Tokens the model drafts after each token picked, by default.
+pub const DRAFTS: usize = 4;
+
+/// A batch the model is verifying: the token picked and the tokens
+/// drafted after it, the logits after each, and how many of them the
+/// reply has picked so far, the last of which it is at the logits after.
+struct Speculation {
+    tokens: Vec<u32>,
+    rows: Vec<Vec<f32>>,
+    at: usize,
+}
+
 /// Where a conversation's time has gone: the tokens the model read as
 /// prompts, the ones it generated while thinking, and the ones it
-/// generated as replies, with the time spent on each.
+/// generated as replies, with the time spent on each; and how many tokens
+/// were drafted, and how many of those the sampler accepted.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
     /// Tokens taken from a saved state rather than read.
@@ -124,6 +142,8 @@ pub struct Stats {
     pub prompt: Tally,
     pub thought: Tally,
     pub answer: Tally,
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 /// Tokens of one kind, and the seconds the model took over them.
@@ -235,6 +255,8 @@ impl<M: LanguageModel> Chat<M> {
             tokenizer,
             sampler,
             len: 0,
+            drafts: DRAFTS,
+            speculation: None,
             reserve: 0,
             thought_limit: None,
             closing: None,
@@ -260,6 +282,8 @@ impl<M: LanguageModel> Chat<M> {
     /// Forgets the conversation, so that a system prompt or a saved state
     /// can open another.
     pub fn clear(&mut self) {
+        // A batch being verified goes with the conversation.
+        self.speculation = None;
         self.model.reset();
         self.len = 0;
     }
@@ -325,6 +349,13 @@ impl<M: LanguageModel> Chat<M> {
     /// The sampler the model's tokens are picked with.
     pub fn sampler(&self) -> &Sampler {
         &self.sampler
+    }
+
+    /// Sets how many tokens the model drafts after each token picked, for
+    /// it to verify in one pass with the token: none decodes a token at a
+    /// time. A model without a drafter does regardless.
+    pub fn set_drafts(&mut self, drafts: usize) {
+        self.drafts = drafts;
     }
 
     /// Most tokens a thought may run to, if they are limited.
@@ -437,14 +468,14 @@ impl<M: LanguageModel> Chat<M> {
             for token in [self.think, self.think_end, self.tool_call] {
                 logits[token as usize] = f32::NEG_INFINITY;
             }
-            let token = self.sampler.sample(&logits);
+            let token = self.pick(&logits);
             if token == self.im_end || token == self.end_of_text {
                 break;
             }
             let chunk = text.push(self.tokenizer.decode(token));
             answer.push_str(&chunk);
             let flow = on_text(&chunk);
-            logits = self.feed(&[token], Kind::Answer)?;
+            logits = self.step(token, Kind::Answer)?;
             if flow.is_break() {
                 break;
             }
@@ -589,7 +620,7 @@ impl<M: LanguageModel> Chat<M> {
                     logits[token as usize] = f32::NEG_INFINITY;
                 }
             }
-            let mut token = self.sampler.sample(&logits);
+            let mut token = self.pick(&logits);
             let kind = if thinking {
                 Kind::Thought
             } else {
@@ -696,7 +727,7 @@ impl<M: LanguageModel> Chat<M> {
             };
             // Feed the token even if the reply ends here, so that the model
             // remembers the reply exactly as far as it was shown.
-            logits = self.feed(&[token], kind)?;
+            logits = self.step(token, kind)?;
             if flow.is_break() {
                 interrupted = true;
                 break;
@@ -717,22 +748,106 @@ impl<M: LanguageModel> Chat<M> {
     }
 
     /// Runs tokens through the model, returning the logits after the last
-    /// one, and counts them and their time as `kind`.
+    /// one, and counts them and their time as `kind`. A batch being
+    /// verified is committed first, as far as the reply got through it.
     fn feed(&mut self, tokens: &[u32], kind: Kind) -> Result<Vec<f32>> {
+        self.commit();
         if self.len + tokens.len() > self.model.max_len() {
             return Err("the conversation no longer fits in the context window".into());
         }
         let start = Instant::now();
         let logits = self.model.forward(tokens, self.len);
-        let tally = match kind {
-            Kind::Prompt => &mut self.stats.prompt,
-            Kind::Thought => &mut self.stats.thought,
-            Kind::Answer => &mut self.stats.answer,
-        };
+        let tally = self.tally(kind);
         tally.tokens += tokens.len();
         tally.seconds += start.elapsed().as_secs_f64();
         self.len += tokens.len();
         Ok(logits)
+    }
+
+    /// Picks the next token from `logits`: where the model drafted one for
+    /// this position, by checking the draft, which is accepted or replaced
+    /// as the sampler's own pick would have it, and otherwise by sampling.
+    /// A draft accepted counts once the reply runs it, in `step`: the reply
+    /// may yet put another token in its place.
+    fn pick(&mut self, logits: &[f32]) -> u32 {
+        if let Some(spec) = &self.speculation
+            && let Some(&draft) = spec.tokens.get(spec.at + 1)
+        {
+            return self.sampler.verify(logits, draft).0;
+        }
+        self.sampler.sample(logits)
+    }
+
+    /// Runs `token`, the one just picked, and returns the logits after it.
+    /// Where the token is the next of the drafts being verified, the
+    /// logits are at hand, and the reply moves on through the batch;
+    /// otherwise what was verified before it is committed, and the model
+    /// drafts after the token and verifies the drafts in one pass with it,
+    /// or runs the token alone where it does not draft or has no room to.
+    fn step(&mut self, token: u32, kind: Kind) -> Result<Vec<f32>> {
+        if let Some(spec) = &mut self.speculation {
+            if spec.tokens.get(spec.at + 1) == Some(&token) {
+                spec.at += 1;
+                let logits = spec.rows[spec.at].clone();
+                self.len += 1;
+                self.stats.accepted += 1;
+                self.tally(kind).tokens += 1;
+                return Ok(logits);
+            }
+            self.commit();
+        }
+        if self.len + 1 > self.model.max_len() {
+            return Err("the conversation no longer fits in the context window".into());
+        }
+        let start = Instant::now();
+        // Room past the token for the drafts, and the reserve's and the
+        // ending's worth of it kept back, as `room` keeps it.
+        let room = self
+            .model
+            .max_len()
+            .saturating_sub(self.len + 1 + self.ending + self.reserve);
+        let drafts = match self.drafts.min(room) {
+            0 => Vec::new(),
+            k => self.model.draft(token, self.len, k),
+        };
+        let logits = if drafts.is_empty() {
+            self.model.forward(&[token], self.len)
+        } else {
+            let mut tokens = vec![token];
+            tokens.extend(&drafts);
+            let rows = self.model.verify(&tokens, self.len);
+            let vocab = rows.len() / tokens.len();
+            let rows: Vec<Vec<f32>> = rows.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
+            self.stats.drafted += drafts.len();
+            let first = rows[0].clone();
+            self.speculation = Some(Speculation {
+                tokens,
+                rows,
+                at: 0,
+            });
+            first
+        };
+        let tally = self.tally(kind);
+        tally.tokens += 1;
+        tally.seconds += start.elapsed().as_secs_f64();
+        self.len += 1;
+        Ok(logits)
+    }
+
+    /// Commits the batch being verified, if there is one, as far as the
+    /// reply got through it: the rest of the drafts are dropped.
+    fn commit(&mut self) {
+        if let Some(spec) = self.speculation.take() {
+            self.model.rewind(spec.at + 1);
+        }
+    }
+
+    fn tally(&mut self, kind: Kind) -> &mut Tally {
+        match kind {
+            Kind::Prompt => &mut self.stats.prompt,
+            Kind::Thought => &mut self.stats.thought,
+            Kind::Answer => &mut self.stats.answer,
+        }
     }
 }
 

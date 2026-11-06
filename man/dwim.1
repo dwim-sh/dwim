@@ -31,7 +31,7 @@ times in a turn.
 .TP
 .BI \-\-model " model"
 Model to run (default:
-.BR bonsai\-2\-27b ).
+.BR qwen3.8\-27b ).
 .TP
 .BI \-\-device " device"
 Device to run the model on:
@@ -146,6 +146,10 @@ Sample at temperature
 instead of the one the model file recommends; 0 always picks the
 likeliest token.
 .TP
+.BI \-\-speculate " n"
+Tokens the model drafts ahead and verifies in one pass; 0 decodes a token
+at a time (default: 4).
+.TP
 .BI \-\-transcript " file"
 Write the session's transcript to
 .I file
@@ -223,14 +227,14 @@ on a line with text clears it.
 If present in the working directory, its contents are given to the agent as
 project instructions.
 .TP
-.I ~/.cache/huggingface/hub/models\-\-prism\-ml\-\-Ternary\-Bonsai\-2\-27B\-gguf/
+.I ~/.cache/huggingface/hub/models\-\-bartowski\-\-Qwen3.8\-27B\-GGUF/
 The model, downloaded on first use from its repository on Hugging Face at a
 pinned revision, and kept in the Hugging Face cache as the
 .B huggingface_hub
 library and the tools built on it keep theirs, so that a copy any of them
 downloaded is used, and the copy
 .B dwim
-downloads is theirs to use. The weights, 6 GB, and the licenses are in
+downloads is theirs to use. The weights, 16 GB, are in
 .IR snapshots/<revision>/ ,
 each a link to its content in
 .IR blobs/ ,

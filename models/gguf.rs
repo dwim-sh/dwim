@@ -20,8 +20,8 @@ use std::{
 };
 
 use crate::{
-    gpu::{Tensor, ternary},
-    models::Result,
+    gpu::{Tensor, bf16, quant},
+    models::{Result, quants},
 };
 
 /// A metadata value.
@@ -81,10 +81,66 @@ impl Value {
     }
 }
 
-/// The tensor types the model uses.
+/// The tensor types the models use: llama.cpp's numbering.
 pub const F32: u32 = 0;
+pub const Q4_0: u32 = 2;
+pub const Q4_1: u32 = 3;
+pub const Q8_0: u32 = 8;
+pub const Q6_K: u32 = 14;
 pub const BF16: u32 = 30;
-pub const PTQ1_0: u32 = 143;
+
+/// Bytes of a row of `cols` weights of a tensor type.
+pub fn row_bytes(dtype: u32, cols: usize) -> Result<usize> {
+    let blocks = |per_block: usize, bytes: usize| {
+        if cols.is_multiple_of(per_block) {
+            Ok(cols / per_block * bytes)
+        } else {
+            Err(format!("a row of {cols} is not whole blocks of {per_block}").into())
+        }
+    };
+    match dtype {
+        F32 => Ok(cols * 4),
+        BF16 => Ok(cols * 2),
+        Q4_0 => blocks(quant::BLOCK, quants::Q4_0_BYTES),
+        Q4_1 => blocks(quant::BLOCK, quants::Q4_1_BYTES),
+        Q8_0 => blocks(quant::BLOCK, quants::Q8_0_BYTES),
+        Q6_K => blocks(quants::Q6_K_BLOCK, quants::Q6_K_BYTES),
+        other => Err(format!("tensor type {other} is not supported").into()),
+    }
+}
+
+/// Rounds an f32 to the nearest bf16, ties to even: bf16 is the top half
+/// of an f32.
+fn to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let round = 0x7fff + ((bits >> 16) & 1);
+    ((bits.wrapping_add(round)) >> 16) as u16
+}
+
+/// Reconstructs a row of weights of a tensor type from its bytes.
+pub fn dequantize_row(dtype: u32, row: &[u8], out: &mut [f32]) -> Result<()> {
+    if row.len() != row_bytes(dtype, out.len())? {
+        return Err("a row of the wrong length".into());
+    }
+    match dtype {
+        F32 => {
+            for (o, b) in out.iter_mut().zip(row.chunks_exact(4)) {
+                *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        BF16 => {
+            for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *o = bf16(u16::from_le_bytes([b[0], b[1]]));
+            }
+        }
+        Q4_0 => quants::dequantize_q4_0(row, out),
+        Q4_1 => quants::dequantize_q4_1(row, out),
+        Q8_0 => quants::dequantize_q8_0(row, out),
+        Q6_K => quants::dequantize_q6_k(row, out),
+        _ => unreachable!("sized above"),
+    }
+    Ok(())
+}
 
 /// Where a tensor is and what it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,12 +161,7 @@ impl Info {
     pub fn size(&self) -> Result<usize> {
         let (cols, rest) = self.dims.split_first().ok_or("a tensor has dimensions")?;
         let rows: usize = rest.iter().product();
-        Ok(match self.dtype {
-            F32 => rows * cols * 4,
-            BF16 => rows * cols * 2,
-            PTQ1_0 => rows * ternary::row_bytes(*cols),
-            other => return Err(format!("tensor type {other} is not supported").into()),
-        })
+        Ok(rows * row_bytes(self.dtype, *cols)?)
     }
 }
 
@@ -339,15 +390,46 @@ impl Gguf {
         })
     }
 
-    pub fn ternary(&self, name: &str) -> Result<Tensor> {
+    /// Copies out a matrix in whichever format a device takes it in: bf16,
+    /// `Q4_0` and `Q8_0` as they are, f32 rounded to bf16, and `Q4_1` and
+    /// `Q6_K` quantized again as `Q8_0`.
+    pub fn matrix(&self, name: &str) -> Result<Tensor> {
         let info = self.info(name)?;
-        if info.dtype != PTQ1_0 || info.dims.len() != 2 {
-            return Err(format!("tensor '{name}' is not a ternary matrix").into());
+        if info.dims.len() != 2 {
+            return Err(format!("tensor '{name}' is not a matrix").into());
         }
-        Ok(Tensor::Ternary {
-            shape: info.shape(),
-            data: self.bytes(name)?.to_vec(),
+        let (rows, cols) = (info.dims[1], info.dims[0]);
+        let bytes = self.bytes(name)?;
+        Ok(match info.dtype {
+            BF16 => self.bf16(name)?,
+            F32 => Tensor::Bf16 {
+                shape: info.shape(),
+                data: self.f32s(name)?.into_iter().map(to_bf16).collect(),
+            },
+            Q4_0 => quants::q4_0(bytes, rows, cols),
+            Q8_0 => quants::q8_0(bytes, rows, cols),
+            Q4_1 | Q6_K => {
+                let row = row_bytes(info.dtype, cols)?;
+                quants::requantize_q8_0(rows, cols, |r, out| {
+                    dequantize_row(info.dtype, &bytes[r * row..][..row], out).expect("sized")
+                })
+            }
+            other => {
+                return Err(
+                    format!("tensor '{name}' is of type {other}, which no device takes").into(),
+                );
+            }
         })
+    }
+
+    /// Reconstructs row `index` of a matrix into `out`, as wide as a row.
+    pub fn row(&self, name: &str, index: usize, out: &mut [f32]) -> Result<()> {
+        let info = self.info(name)?;
+        if info.dims.len() != 2 || info.dims[0] != out.len() || index >= info.dims[1] {
+            return Err(format!("no row {index} of {} in tensor '{name}'", out.len()).into());
+        }
+        let row = row_bytes(info.dtype, out.len())?;
+        dequantize_row(info.dtype, &self.bytes(name)?[index * row..][..row], out)
     }
 }
 
@@ -464,11 +546,9 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         let bf16: Vec<u8> = (0..8u16).flat_map(|v| (v << 8).to_le_bytes()).collect();
-        let tern = vec![7u8; 2 * ternary::row_bytes(128)];
         let tensors = vec![
             ("norm".to_string(), vec![3], F32, f32s),
             ("w".to_string(), vec![4, 2], BF16, bf16),
-            ("t".to_string(), vec![128, 2], PTQ1_0, tern.clone()),
         ];
         write(&path, &meta, &tensors).unwrap();
 
@@ -486,9 +566,7 @@ mod tests {
             }
             _ => panic!("not bf16"),
         }
-        assert_eq!(g.info("t").unwrap().shape(), [2, 128]);
-        assert_eq!(g.bytes("t").unwrap(), tern);
-        assert!(g.bf16("t").is_err());
+        assert!(g.bf16("norm").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
