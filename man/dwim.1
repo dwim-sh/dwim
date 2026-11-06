@@ -94,7 +94,8 @@ prompts, generated while thinking, and generated as the reply, with the
 time and rate of each; and the tools run.
 .TP
 .B \-\-thinking
-Show the model's thinking in the shell from the start, as
+Show the model's thinking, and the files it reads, in the shell from the
+start, as
 .B Ctrl\-O
 does.
 .TP
@@ -198,6 +199,8 @@ The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O
 shows it: pressed while the model thinks, it prints the thought so far and
 what follows, and pressed again it hides the rest.
+The same key shows the files the model reads, of which the shell otherwise
+prints only the line that says what was read.
 .B Ctrl\-C
 or
 .B Esc

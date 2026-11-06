@@ -33,7 +33,8 @@ pub struct Opts {
     #[argh(switch)]
     pub bench: bool,
 
-    /// show the model's thinking in the shell, which ctrl+o toggles
+    /// show the model's thinking and the files it reads in the shell,
+    /// which ctrl+o toggles
     #[argh(switch)]
     pub thinking: bool,
 

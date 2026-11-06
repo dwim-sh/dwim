@@ -39,9 +39,9 @@ const TICK: Duration = Duration::from_millis(80);
 /// the turn in progress and end the transcript.
 const FINISH: Duration = Duration::from_secs(2);
 
-/// Runs the shell until the user quits, showing the model's thinking if
-/// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
-/// of the session in `log`.
+/// Runs the shell until the user quits, showing the model's thinking and
+/// what it reads if `verbose` is set, or once ctrl+o is pressed, and
+/// keeping a transcript of the session in `log`.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
@@ -51,7 +51,7 @@ pub fn run(
     effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
-    thinking: bool,
+    verbose: bool,
     log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
@@ -109,7 +109,8 @@ pub fn run(
         reply_width: 0,
         committed: 0,
         interrupted: false,
-        thinking,
+        call: String::new(),
+        verbose,
         thinking_budget,
         auto: false,
         lines: Vec::new(),
@@ -475,10 +476,13 @@ struct App {
     reply_width: usize,
     committed: usize,
     interrupted: bool,
-    /// Whether the model's thinking is shown. While it is hidden, the
-    /// thought is kept but none of it is printed, so showing it prints
-    /// all of it so far.
-    thinking: bool,
+    /// The name of the tool last called, whose output comes next.
+    call: String,
+    /// Whether the model's thinking and the files it reads are shown.
+    /// While the thought is hidden, it is kept but none of it is printed,
+    /// so showing it prints all of it so far; a read hidden shows only
+    /// its last line, which says what was read.
+    verbose: bool,
     /// Most tokens of a thought, if they are limited, as last set.
     thinking_budget: Option<usize>,
     /// Whether auto mode is on, as last set.
@@ -550,8 +554,8 @@ impl App {
             }
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
             KeyCode::Char('o') if ctrl => {
-                self.thinking = !self.thinking;
-                if self.thinking
+                self.verbose = !self.verbose;
+                if self.verbose
                     && self.segment == Segment::Thought
                     && matches!(self.status, Status::Generating { .. })
                 {
@@ -741,16 +745,25 @@ impl App {
                 let detail: Vec<&str> = detail.split_whitespace().collect();
                 self.lines.push(vec![
                     span("● "),
-                    span(name).bold(),
+                    span(&name).bold(),
                     span(format!("({})", detail.join(" "))).dark_grey(),
                 ]);
+                self.call = name;
                 self.status = Status::Reading(Instant::now());
             }
             Reply::Output(output) => {
                 let (columns, _) = self.screen.size();
                 let output = tui::sanitize(&output);
+                // A file read is long and the model's to read: unless
+                // asked, show only the note that ends it, which says what
+                // was read.
+                let lines = if self.call == "read" && !self.verbose {
+                    output.lines().last().into_iter().collect()
+                } else {
+                    output.lines().collect::<Vec<_>>()
+                };
                 let mut first = true;
-                for line in output.lines() {
+                for line in lines {
                     for text in tui::wrap(line, columns.saturating_sub(4)) {
                         let prefix = if first { "  ⎿ " } else { "    " };
                         first = false;
@@ -851,7 +864,7 @@ impl App {
     /// reply is done, and otherwise all but the last, which may still grow.
     /// Blank lines are held back until something follows them.
     fn commit(&mut self, done: bool) {
-        if self.segment == Segment::Thought && !self.thinking {
+        if self.segment == Segment::Thought && !self.verbose {
             return;
         }
         let lines = tui::wrap(&self.reply, self.reply_width);
@@ -922,7 +935,7 @@ impl App {
         // tool call, which is shown only once it is complete, and a bullet
         // alone would stand for either.
         if matches!(self.status, Status::Generating { .. })
-            && (self.segment == Segment::Text || self.thinking)
+            && (self.segment == Segment::Text || self.verbose)
             && !self.reply.is_empty()
         {
             let lines = tui::wrap(&self.reply, self.reply_width);
@@ -1038,7 +1051,7 @@ impl App {
                     } else {
                         String::new()
                     },
-                    match (self.segment, self.thinking) {
+                    match (self.segment, self.verbose) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
                         (Segment::Thought, true) => "ctrl+o to hide · ",
                         (Segment::Text | Segment::Note, _) => "",
@@ -1184,7 +1197,7 @@ fn help(columns: usize) -> Vec<Line> {
             "/thinking-budget N  cap the model's thinking at N tokens, 0 for no cap",
             "/auto on|off        go on by itself until it says it is done, or ask",
             "/help               this list",
-            "ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits",
+            "ctrl+o shows or hides the thought and what the model reads · esc interrupts · ctrl+d quits",
         ]
         .map(str::to_string),
         columns,
