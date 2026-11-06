@@ -423,6 +423,16 @@ enum Outcome {
     Cut,
 }
 
+/// A turn as the transcript keeps it: the turn, the tokens it takes read
+/// back, and whether a user turn is the harness's own prompt to the model
+/// rather than the user's message.
+#[derive(Clone)]
+struct Entry {
+    turn: Turn,
+    tokens: usize,
+    prompt: bool,
+}
+
 /// The loop around a [`Chat`] that runs the tools the model calls and feeds
 /// the results back, until the model replies with text alone.
 pub struct Harness<M: LanguageModel> {
@@ -436,8 +446,8 @@ pub struct Harness<M: LanguageModel> {
     calls: usize,
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
-    /// compacted: each turn, and the tokens it takes read back.
-    transcript: Vec<(Turn, usize)>,
+    /// compacted.
+    transcript: Vec<Entry>,
     /// Opens the conversation over with the system prompt, once the chat
     /// is cleared.
     restart: Restart<M>,
@@ -649,7 +659,7 @@ impl<M: LanguageModel> Harness<M> {
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
     pub fn transcript(&self) -> impl Iterator<Item = &Turn> {
-        self.transcript.iter().map(|(turn, _)| turn)
+        self.transcript.iter().map(|entry| &entry.turn)
     }
 
     /// Sends a message from the user, with where the agent is ahead of the
@@ -683,13 +693,13 @@ impl<M: LanguageModel> Harness<M> {
         self.steps = 0;
         self.unchanged = 0;
         self.went_on = 0;
-        let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
+        let mut outcome = self.run(Turn::User(message.to_string()), false, ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
                 return Ok(());
             }
             if self.compaction(on_event)? {
-                outcome = self.run(Turn::User(CONTINUE.to_string()), None, on_event)?;
+                outcome = self.run(Turn::User(CONTINUE.to_string()), true, None, on_event)?;
                 if outcome == Outcome::Cut {
                     let _ = on_event(Event::Cut);
                 }
@@ -703,10 +713,12 @@ impl<M: LanguageModel> Harness<M> {
     /// results back, until the model replies with text alone, is
     /// interrupted, or is stopped short for room; or until it has made
     /// [`MAX_CALLS`] calls in the turn, when it is asked to reply with
-    /// what it has.
+    /// what it has. A message that is the harness's own `prompt` rather
+    /// than the user's is kept as such.
     fn run(
         &mut self,
         mut input: Turn,
+        mut prompt: bool,
         mut ahead: Option<String>,
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<Outcome, Box<dyn Error>> {
@@ -734,13 +746,14 @@ impl<M: LanguageModel> Harness<M> {
                     return Err("the cap is reached by tool results".into());
                 };
                 self.chat.feed_results(outputs)?;
-                self.record(input)?;
+                self.record(input, prompt)?;
                 let outcome = self.account(on_event)?;
                 if outcome == Outcome::Cut || !self.go_on() {
                     return Ok(outcome);
                 }
                 self.steps = 0;
                 input = Turn::User(GO_ON.to_string());
+                prompt = true;
                 continue;
             }
             let budget = self.chat.thought_limit();
@@ -773,11 +786,14 @@ impl<M: LanguageModel> Harness<M> {
                 &before,
                 &self.chat.stats(),
             );
-            self.record(input)?;
-            self.record(Turn::Reply {
-                text,
-                calls: reply.calls.clone(),
-            })?;
+            self.record(input, prompt)?;
+            self.record(
+                Turn::Reply {
+                    text,
+                    calls: reply.calls.clone(),
+                },
+                false,
+            )?;
             if reply.cut {
                 return Ok(Outcome::Cut);
             }
@@ -786,6 +802,7 @@ impl<M: LanguageModel> Harness<M> {
                     return Ok(Outcome::Done);
                 }
                 input = Turn::User(GO_ON.to_string());
+                prompt = true;
                 continue;
             }
             let mut outputs = Vec::new();
@@ -842,6 +859,7 @@ impl<M: LanguageModel> Harness<M> {
                 self.unchanged = 0;
             }
             input = Turn::Results(outputs);
+            prompt = false;
         }
     }
 
@@ -851,7 +869,7 @@ impl<M: LanguageModel> Harness<M> {
     fn go_on(&mut self) -> bool {
         let done = matches!(
             self.transcript.last(),
-            Some((Turn::Reply { text, .. }, _)) if said_done(text)
+            Some(Entry { turn: Turn::Reply { text, .. }, .. }) if said_done(text)
         );
         if !self.auto || done || self.went_on >= AUTO_ROUNDS {
             return false;
@@ -882,11 +900,14 @@ impl<M: LanguageModel> Harness<M> {
             &before,
             &self.chat.stats(),
         );
-        self.record(Turn::User(prompt.to_string()))?;
-        self.record(Turn::Reply {
-            text: answer.text,
-            calls: Vec::new(),
-        })?;
+        self.record(Turn::User(prompt.to_string()), true)?;
+        self.record(
+            Turn::Reply {
+                text: answer.text,
+                calls: Vec::new(),
+            },
+            false,
+        )?;
         Ok(if answer.cut {
             Outcome::Cut
         } else {
@@ -905,11 +926,16 @@ impl<M: LanguageModel> Harness<M> {
         self.chat.answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
-    /// Adds a turn to the transcript, and returns the tokens it takes.
-    fn record(&mut self, turn: Turn) -> Result<usize, Box<dyn Error>> {
+    /// Adds a turn to the transcript, a user turn as the harness's own
+    /// `prompt` or the user's message.
+    fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
         let tokens = self.chat.measure(&turn)?;
-        self.transcript.push((turn, tokens));
-        Ok(tokens)
+        self.transcript.push(Entry {
+            turn,
+            tokens,
+            prompt,
+        });
+        Ok(())
     }
 
     /// Makes room for `input`, and for `more` tokens after it, compacting
@@ -998,19 +1024,20 @@ impl<M: LanguageModel> Harness<M> {
             &messages,
             start < self.transcript.len(),
         );
-        let mut kept = vec![Turn::User(head.clone())];
+        let mut kept = vec![(Turn::User(head.clone()), true)];
         kept.extend(
             self.transcript[start..]
                 .iter()
-                .map(|(turn, _)| turn.clone()),
+                .map(|entry| (entry.turn.clone(), entry.prompt)),
         );
+        let turns: Vec<Turn> = kept.iter().map(|(turn, _)| turn.clone()).collect();
 
         self.chat.clear();
         (self.restart)(&mut self.chat)?;
-        self.chat.replay(&kept)?;
+        self.chat.replay(&turns)?;
         self.transcript.clear();
-        for turn in kept {
-            self.record(turn)?;
+        for (turn, prompt) in kept {
+            self.record(turn, prompt)?;
         }
         let after = self.chat.tokens();
         self.log
@@ -1033,17 +1060,17 @@ impl<M: LanguageModel> Drop for Harness<M> {
 /// tokens, each starting at a reply, and always the last reply, which any
 /// pending tool results answer. The whole transcript's length if there is
 /// no reply yet.
-fn tail(transcript: &[(Turn, usize)], budget: usize) -> usize {
+fn tail(transcript: &[Entry], budget: usize) -> usize {
     let replies: Vec<usize> = (0..transcript.len())
-        .filter(|&i| matches!(transcript[i].0, Turn::Reply { .. }))
+        .filter(|&i| matches!(transcript[i].turn, Turn::Reply { .. }))
         .collect();
     let Some(&last) = replies.last() else {
         return transcript.len();
     };
     let mut start = last;
-    let mut total: usize = transcript[start..].iter().map(|(_, tokens)| tokens).sum();
+    let mut total: usize = transcript[start..].iter().map(|entry| entry.tokens).sum();
     for &i in replies.iter().rev().skip(1) {
-        let more: usize = transcript[i..start].iter().map(|(_, tokens)| tokens).sum();
+        let more: usize = transcript[i..start].iter().map(|entry| entry.tokens).sum();
         if total + more > budget {
             break;
         }
@@ -1062,26 +1089,23 @@ fn said_done(text: &str) -> bool {
         .is_some_and(|line| line.trim_matches(|c: char| !c.is_alphanumeric()) == DONE)
 }
 
-/// The user's own messages among `turns`, oldest first, as many of the
-/// most recent as fit in `budget` tokens: not the notes of earlier
-/// compactions, nor the prompts to go on after a reply was cut, nor
-/// those for an account of a turn.
-fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
+/// The user's own messages among `entries`, oldest first, as many of the
+/// most recent as fit in `budget` tokens: not the harness's prompts, such
+/// as the notes of earlier compactions.
+fn messages(entries: &[Entry], budget: usize) -> Vec<&str> {
     let mut kept = Vec::new();
     let mut total = 0;
-    for (turn, tokens) in turns.iter().rev() {
-        let Turn::User(message) = turn else {
+    for entry in entries.iter().rev() {
+        let Turn::User(message) = &entry.turn else {
             continue;
         };
-        if message.contains(NOTE_HEAD)
-            || [CONTINUE, STEPS_PROMPT, GO_ON].contains(&message.as_str())
-        {
+        if entry.prompt {
             continue;
         }
-        if total + tokens > budget {
+        if total + entry.tokens > budget {
             break;
         }
-        total += tokens;
+        total += entry.tokens;
         kept.push(message.as_str());
     }
     kept.reverse();
@@ -1786,9 +1810,19 @@ mod tests {
 
     #[test]
     fn keeps_the_most_recent_exchanges_from_a_reply() {
-        let user = |i: usize| (Turn::User(format!("message {i}")), 10);
+        let entry = |turn: Turn, tokens: usize| Entry {
+            turn,
+            tokens,
+            prompt: false,
+        };
+        let prompt = |text: &str| Entry {
+            turn: Turn::User(text.to_string()),
+            tokens: 10,
+            prompt: true,
+        };
+        let user = |i: usize| entry(Turn::User(format!("message {i}")), 10);
         let reply = |n: usize| {
-            (
+            entry(
                 Turn::Reply {
                     text: "Ok.".to_string(),
                     calls: Vec::new(),
@@ -1796,7 +1830,7 @@ mod tests {
                 n,
             )
         };
-        let results = |n: usize| (Turn::Results(vec!["ok".to_string()]), n);
+        let results = |n: usize| entry(Turn::Results(vec!["ok".to_string()]), n);
         let transcript = vec![
             user(1),
             reply(50),
@@ -1831,11 +1865,11 @@ mod tests {
         let turns = vec![
             user(1),
             reply(50),
-            (Turn::User(CONTINUE.to_string()), 10),
+            prompt(CONTINUE),
             reply(10),
-            (Turn::User(format!("# Environment\n\n{NOTE_HEAD} x")), 10),
+            prompt(&format!("# Environment\n\n{NOTE_HEAD} x")),
             user(2),
-            (Turn::User(STEPS_PROMPT.to_string()), 10),
+            prompt(STEPS_PROMPT),
             reply(10),
             user(3),
         ];
