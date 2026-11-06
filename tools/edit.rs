@@ -32,59 +32,84 @@
 //! is done. A long span removed, or replaced by lines of its own, gets no
 //! note: the lines the new string does not keep are written once.
 
-use std::{borrow::Cow, collections::HashMap, fs};
+use std::{borrow::Cow, collections::HashMap, fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{number, plural, read, string};
+use crate::{
+    Parameter, Signature, Tool, number, optional_number, plural, read, required, string,
+    without_ending,
+};
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "edit", "description": "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to edit."}, "old_string": {"type": "string", "description": "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them."}, "new_string": {"type": "string", "description": "The lines to put in their place."}, "start": {"type": "integer", "description": "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional."}}, "required": ["path", "old_string", "new_string"]}}}"#;
+const NAME: &str = "edit";
+
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: true,
+    describe,
+    run: |tools, arguments| run(&tools.dir, arguments),
+};
+
+fn signature() -> Signature {
+    Signature {
+        description: "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.".to_string(),
+        parameters: vec![
+            Parameter::string("path", "The file to edit."),
+            Parameter::string(
+                "old_string",
+                "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them.",
+            ),
+            Parameter::string("new_string", "The lines to put in their place."),
+            Parameter::integer(
+                "start",
+                "The line old_string begins at, counting from 1, to say which occurrence when it matches more than once. Optional.",
+            )
+            .optional(),
+        ],
+    }
+}
+
+/// How a call reads on screen: the file, and the line in it if given.
+fn describe(arguments: &Value) -> Option<String> {
+    let path = string(arguments, "path")?;
+    Some(match number(arguments, "start") {
+        Some(start) => format!("{path} at line {start}"),
+        None => path.to_string(),
+    })
+}
 
 /// Lines around an edit shown on each side of it.
 const CONTEXT: usize = 2;
 
 /// Most lines of an old string the new string may keep without a note.
-pub const MOST: usize = 30;
+const MOST: usize = 30;
 
 /// Most lines of a range shown: its start and end, half each, past this.
 const SHOWN: usize = 40;
 
-/// Makes the edit in `arguments`, returning what the model should see.
-pub fn run(arguments: &Value) -> String {
-    let Some(path) = string(arguments, "path") else {
-        return "error: edit needs a 'path' string".to_string();
-    };
-    let Some(old) = string(arguments, "old_string") else {
-        return "error: edit needs an 'old_string', the lines to replace".to_string();
-    };
-    let Some(new) = string(arguments, "new_string") else {
-        return "error: edit needs a 'new_string', the lines to put in their place".to_string();
-    };
+/// Makes the edit in `arguments`, to a path taken from `dir`, returning
+/// what the model should see.
+fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
+    let path = required(arguments, NAME, "path")?;
+    let old = required(arguments, NAME, "old_string")?;
+    let new = required(arguments, NAME, "new_string")?;
     if old.trim().is_empty() {
-        return "error: old_string is empty; to add lines, give the line before them as old_string and that line with the new ones as new_string".to_string();
+        return Err("old_string is empty; to add lines, give the line before them as old_string and that line with the new ones as new_string".to_string());
     }
     if old == new {
-        return "error: old_string and new_string are the same; nothing changed".to_string();
+        return Err("old_string and new_string are the same; nothing changed".to_string());
     }
     let wanted = split(old);
     let copied = kept(&wanted, &split(new));
-    let start = match arguments.get("start") {
-        None => None,
-        Some(_) => match number(arguments, "start") {
-            Some(start) => Some(start as usize),
-            None => return "error: 'start' is a line number".to_string(),
-        },
-    };
-    let content = match fs::read(path) {
-        Ok(content) => content,
-        Err(e) => return format!("error: cannot read {path}: {e}"),
-    };
+    let start = optional_number(arguments, "start", "a line number")?.map(|start| start as usize);
+    let file = dir.join(path);
+    let content = fs::read(&file).map_err(|e| format!("cannot read {path}: {e}"))?;
     let lines: Vec<&[u8]> = content.split_inclusive(|&byte| byte == b'\n').collect();
     let count = lines.len();
     let texts: Vec<Cow<str>> = lines
         .iter()
-        .map(|line| String::from_utf8_lossy(read::content(line)))
+        .map(|line| String::from_utf8_lossy(without_ending(line)))
         .collect();
     let (found, tier) = find(&texts, &wanted);
     let at = match (found.as_slice(), start) {
@@ -100,43 +125,40 @@ pub fn run(arguments: &Value) -> String {
                 ),
                 _ => "; read the lines and copy them".to_string(),
             };
-            return format!("error: old_string not found in {path}; nothing changed{around}");
+            return Err(format!(
+                "old_string not found in {path}; nothing changed{around}"
+            ));
         }
         ([at], _) => *at,
         (many, Some(start)) => match many.iter().find(|&&at| at + 1 == start) {
             Some(&at) => at,
             None => {
-                return format!(
-                    "error: old_string matches {} times in {path}, at lines {}, and none begins at line {start}; nothing changed",
+                return Err(format!(
+                    "old_string matches {} times in {path}, at lines {}, and none begins at line {start}; nothing changed",
                     many.len(),
                     list(many)
-                );
+                ));
             }
         },
         (many, None) => {
-            return format!(
-                "error: old_string matches {} times in {path}, at lines {}; give start, the line of the one you mean; nothing changed",
+            return Err(format!(
+                "old_string matches {} times in {path}, at lines {}; give start, the line of the one you mean; nothing changed",
                 many.len(),
                 list(many)
-            );
+            ));
         }
     };
     let (first, last) = (at + 1, at + wanted.len());
-    let new = match fitted(&lines[at..last], &wanted, new, tier) {
-        Ok(new) => new,
-        Err(line) => {
-            return format!(
-                "error: line {} of {path} is longer than read shows, cut at {} bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
-                at + line + 1,
-                read::LINE
-            );
-        }
-    };
+    let new = fitted(&lines[at..last], &wanted, new, tier).map_err(|line| {
+        format!(
+            "line {} of {path} is longer than read shows, cut at {} bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
+            at + line + 1,
+            read::LINE
+        )
+    })?;
 
     let updated = replaced(&lines, first, last, &new);
-    if let Err(e) = fs::write(path, &updated) {
-        return format!("error: cannot write {path}: {e}");
-    }
+    fs::write(&file, &updated).map_err(|e| format!("cannot write {path}: {e}"))?;
     let now: Vec<&[u8]> = updated.split_inclusive(|&byte| byte == b'\n').collect();
     let added = now.len() + last + 1 - first - count;
     let shown = numbered(
@@ -169,11 +191,11 @@ pub fn run(arguments: &Value) -> String {
     } else {
         String::new()
     };
-    format!(
+    Ok(format!(
         "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]{note}",
         now.len(),
         plural(now.len() as u64, "line")
-    )
+    ))
 }
 
 /// The lines of `text`, without their endings.
@@ -284,7 +306,7 @@ fn fitted(old: &[&[u8]], wanted: &[&str], text: &str, tier: Tier) -> Result<Vec<
     let (from, to) = match (tier, first(wanted), first(&new)) {
         (Tier::Trimmed, Some(k), Some(n)) if indent(wanted[k]) == indent(new[n]) => (
             indent(wanted[k]),
-            indent(&String::from_utf8_lossy(read::content(old[k]))).to_string(),
+            indent(&String::from_utf8_lossy(without_ending(old[k]))).to_string(),
         ),
         _ => ("", String::new()),
     };
@@ -306,7 +328,7 @@ fn fitted(old: &[&[u8]], wanted: &[&str], text: &str, tier: Tier) -> Result<Vec<
         match same {
             Some(i) => {
                 kept[i] = true;
-                lines.push(read::content(old[cut[i].0]).to_vec());
+                lines.push(without_ending(old[cut[i].0]).to_vec());
             }
             None if !line.trim().is_empty() && line.starts_with(from) => {
                 lines.push(format!("{to}{}", &line[from.len()..]).into_bytes());
@@ -389,6 +411,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Runs the call in `arguments`, as the model sees the result.
+    fn run(arguments: &Value) -> String {
+        crate::Output::of(super::run(Path::new("."), arguments), false).text
+    }
 
     /// A file with `text` that goes when it is dropped.
     struct File(PathBuf);

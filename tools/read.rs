@@ -16,11 +16,22 @@
 use std::{
     fs::File,
     io::{self, BufRead, BufReader},
+    path::Path,
 };
 
 use serde_json::Value;
 
-use crate::{number, plural, string};
+use crate::{Parameter, Signature, Tool, cut, optional_number, plural, required, string};
+
+const NAME: &str = "read";
+
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: false,
+    describe,
+    run: |tools, arguments| run(&tools.dir, arguments),
+};
 
 /// Most lines in a page. A page is what the model gets of a file in one
 /// call: a page too small has it read a file in slices, each a round
@@ -30,85 +41,89 @@ pub const PAGE: usize = 1000;
 
 /// Most bytes in a page: a page of long lines ends early, so that one
 /// page can't take up much of the context.
-pub const BYTES: usize = 48 << 10;
+const BYTES: usize = 48 << 10;
 
 /// Most bytes of a line shown; a longer line is cut there, with a mark.
 pub const LINE: usize = 1000;
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "read", "description": "Read a file from a line, a page of up to 1000 numbered lines (or 48 KB) at a time, or as many lines as asked for. The result says how many lines the file has and where the next page starts. Prefer one larger read over many small slices, and use grep to find specific content in a large file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to read."}, "start": {"type": "integer", "description": "The line to start from, counting from 1. Left out, the first line."}, "lines": {"type": "integer", "description": "How many lines to read from start, up to 1000, or from the first line without a start. Left out, a page."}}, "required": ["path"]}}}"#;
+fn signature() -> Signature {
+    Signature {
+        description: format!(
+            "Read a file from a line, a page of up to {PAGE} numbered lines (or {} KB) at a time, or as many lines as asked for. The result says how many lines the file has and where the next page starts. Prefer one larger read over many small slices, and use grep to find specific content in a large file.",
+            BYTES >> 10
+        ),
+        parameters: vec![
+            Parameter::string("path", "The file to read."),
+            Parameter::integer(
+                "start",
+                "The line to start from, counting from 1. Left out, the first line.",
+            )
+            .optional(),
+            Parameter::integer(
+                "lines",
+                format!(
+                    "How many lines to read from start, up to {PAGE}, or from the first line without a start. Left out, a page."
+                ),
+            )
+            .optional(),
+        ],
+    }
+}
 
-/// Reads the page of the file in `arguments`, returning what the model
-/// should see.
-pub fn run(arguments: &Value) -> String {
-    let Some(path) = string(arguments, "path") else {
-        return "error: read needs a 'path' string".to_string();
-    };
-    let (start, lines) = match range(arguments) {
-        Ok(range) => range,
-        Err(e) => return e,
-    };
+/// How a call reads on screen: the file, and where in it; nothing for a
+/// read the tool will refuse.
+fn describe(arguments: &Value) -> Option<String> {
+    let path = string(arguments, "path")?;
+    let (start, lines) = range(arguments).ok()?;
+    Some(match (start, lines) {
+        (Some(start), Some(1)) => format!("{path} line {start}"),
+        (Some(start), Some(lines)) => {
+            let end = start.saturating_add(lines as u64 - 1);
+            format!("{path} lines {start}–{end}")
+        }
+        (Some(start), None) if start > 1 => format!("{path} from line {start}"),
+        _ => path.to_string(),
+    })
+}
+
+/// Reads the page of the file in `arguments`, a path taken from `dir`,
+/// returning what the model should see.
+fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
+    let path = required(arguments, NAME, "path")?;
+    let (start, lines) = range(arguments)?;
     let most = lines.unwrap_or(PAGE);
-    let open = || File::open(path).map(BufReader::new);
-    let file = match open() {
-        Ok(file) => file,
-        Err(e) => return format!("error: cannot read {path}: {e}"),
-    };
+    let file = File::open(dir.join(path))
+        .map(BufReader::new)
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
     let directory = file
         .get_ref()
         .metadata()
         .is_ok_and(|metadata| metadata.is_dir());
     if directory {
-        return format!("error: {path} is a directory; list it with ls");
+        return Err(format!("{path} is a directory; list it with glob"));
     }
-    let result = page(file, path, start.unwrap_or(1), most);
-    match result {
-        Ok(text) => text,
-        Err(e) => format!("error: reading {path}: {e}"),
-    }
+    page(file, path, start.unwrap_or(1), most).map_err(|e| format!("reading {path}: {e}"))
 }
 
 /// What the arguments ask for: the line to start from, and how many lines,
 /// each where given, or the error the model is shown for one that is not
 /// a number. More lines than a page is a page, and lines asked for without
 /// a start are from the first.
-pub fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
-    let start = match arguments.get("start") {
+fn range(arguments: &Value) -> Result<(Option<u64>, Option<usize>), String> {
+    let start = optional_number(arguments, "start", "a line number")?.map(|start| start.max(1));
+    let lines = match optional_number(arguments, "lines", "a number of lines, 1 or more")? {
         None => None,
-        Some(_) => match number(arguments, "start") {
-            Some(start) => Some(start.max(1)),
-            None => return Err("error: 'start' is a line number".to_string()),
-        },
-    };
-    let lines = match arguments.get("lines") {
-        None => None,
-        Some(_) => match number(arguments, "lines") {
-            Some(lines) if lines >= 1 => Some((lines as usize).min(PAGE)),
-            _ => return Err("error: 'lines' is a number of lines, 1 or more".to_string()),
-        },
+        Some(0) => return Err("'lines' is a number of lines, 1 or more".to_string()),
+        Some(lines) => Some((lines as usize).min(PAGE)),
     };
     Ok((start.or(lines.map(|_| 1)), lines))
-}
-
-/// The line `line` without its ending, whether that is `\n` or `\r\n`.
-pub fn content(line: &[u8]) -> &[u8] {
-    let content = line.strip_suffix(b"\n").unwrap_or(line);
-    content.strip_suffix(b"\r").unwrap_or(content)
 }
 
 /// The line `line` as a page shows it, without its line ending, cut at
 /// [`LINE`] bytes with a mark, and whether it was cut.
 pub fn shown_line(line: &[u8]) -> (String, bool) {
-    let mut content = String::from_utf8_lossy(content(line)).into_owned();
-    let long = content.len() > LINE;
-    if long {
-        let end = (0..=LINE)
-            .rev()
-            .find(|&i| content.is_char_boundary(i))
-            .unwrap_or(0);
-        content.truncate(end);
-        content.push('…');
-    }
+    let mut content = String::from_utf8_lossy(crate::without_ending(line)).into_owned();
+    let long = cut(&mut content, LINE);
     (content, long)
 }
 
@@ -201,6 +216,11 @@ mod tests {
         fs::write(&path, text).unwrap();
         let text = path.to_str().unwrap().to_string();
         (dir, text)
+    }
+
+    /// Runs the call in `arguments`, as the model sees the result.
+    fn run(arguments: &Value) -> String {
+        crate::Output::of(super::run(Path::new("."), arguments), false).text
     }
 
     fn read(path: &str, start: Option<u64>) -> String {

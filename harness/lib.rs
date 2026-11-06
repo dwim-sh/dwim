@@ -550,7 +550,7 @@ impl<M: LanguageModel> Harness<M> {
         chat.reserve(reserve);
         let mut harness = Self {
             chat,
-            tools: Tools::new(),
+            tools: Tools::new(dir),
             environment: Some(environment(dir)),
             dir: dir.to_path_buf(),
             calls: 0,
@@ -811,7 +811,6 @@ impl<M: LanguageModel> Harness<M> {
                         {
                             return Ok(Outcome::Done);
                         }
-                        changes = matches!(call.name.as_str(), "edit" | "write");
                         let this = Some((call.name.clone(), call.arguments.to_string()));
                         if this == last {
                             REPEATED.to_string()
@@ -830,7 +829,8 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            output
+                            changes = output.changed;
+                            output.text
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
@@ -839,7 +839,7 @@ impl<M: LanguageModel> Harness<M> {
                 if on_event(Event::Output(&output)).is_break() {
                     return Ok(Outcome::Done);
                 }
-                if changes && !output.starts_with("error:") {
+                if changes {
                     self.unchanged = 0;
                 } else {
                     self.unchanged += 1;
