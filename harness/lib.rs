@@ -315,14 +315,11 @@ pub fn environment(dir: &Path) -> String {
         "linux" => "Linux",
         os => os,
     };
-    let days = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() / 86400);
     format!(
         "# Environment\n\nWorking directory: {}\nEvery command runs in the working directory, and every path is relative to it; do not cd there or spell it out.\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
         dir.display(),
         files(dir),
-        date(days as i64),
+        now().0,
     )
 }
 
@@ -349,6 +346,18 @@ fn files(dir: &Path) -> String {
         names.push("…".to_string());
     }
     names.join(" ")
+}
+
+/// The date and the time of day now, in UTC.
+fn now() -> (String, String) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let day = secs % 86400;
+    (
+        date((secs / 86400) as i64),
+        format!("{:02}:{:02}:{:02}", day / 3600, day / 60 % 60, day % 60),
+    )
 }
 
 /// The date `days` after 1970-01-01, as year-month-day.

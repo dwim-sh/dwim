@@ -17,14 +17,14 @@ use std::{
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use dwim_models::Sampler;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Stats, date};
+use crate::{Stats, now};
 
 /// Longest the streamed text being gathered goes without being written.
 const REWRITE: Duration = Duration::from_secs(1);
@@ -346,18 +346,6 @@ fn line(start: Instant, kind: &str, fields: Value) -> String {
     let mut line = serde_json::to_string(&record).unwrap_or_default();
     line.push('\n');
     line
-}
-
-/// The date and the time of day now, in UTC.
-fn now() -> (String, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    let day = secs % 86400;
-    (
-        date((secs / 86400) as i64),
-        format!("{:02}:{:02}:{:02}", day / 3600, day / 60 % 60, day % 60),
-    )
 }
 
 /// `x` as the double with the same shortest decimal, so that it is written
