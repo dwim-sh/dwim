@@ -416,6 +416,9 @@ pub enum Event {
     },
 }
 
+/// What a turn's events go to, which ends the turn early by breaking.
+type OnEvent<'a> = &'a mut dyn FnMut(Event) -> ControlFlow<()>;
+
 /// What opens the conversation over with the system prompt, once the chat
 /// is cleared: from a saved state, or by reading the prompt again.
 type Restart<M> = Box<dyn FnMut(&mut Chat<M>) -> Result<(), Box<dyn Error>>>;
@@ -675,10 +678,37 @@ impl<M: LanguageModel> Harness<M> {
     pub fn send(
         &mut self,
         message: &str,
-        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
+        on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
+        self.ended(on_event, |harness, on_event| {
+            harness.converse(message, on_event)
+        })
+    }
+
+    /// Compacts the conversation to make room in the context: has the
+    /// model write a note to go on from, reported as `Note` pieces, starts
+    /// the conversation over from the system prompt, and reads back where
+    /// the agent is, the note, the user's earlier messages, and the most
+    /// recent exchanges without their thoughts. Returns whether it did: not
+    /// when there is nothing to compact yet, nor when `on_event` breaks
+    /// while the note is written, which leaves the conversation as it was
+    /// but for the note.
+    pub fn compact(
+        &mut self,
+        on_event: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<bool, Box<dyn Error>> {
+        self.ended(on_event, |harness, on_event| harness.compaction(on_event))
+    }
+
+    /// Runs `work`, reporting to `on_event`, and records in the log how it
+    /// ended, if not on its own: with an error, or interrupted.
+    fn ended<T>(
+        &mut self,
+        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
+        work: impl FnOnce(&mut Self, OnEvent) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
         let mut interrupted = false;
-        let result = self.converse(message, &mut |event| {
+        let result = work(self, &mut |event| {
             let flow = on_event(event);
             interrupted |= flow.is_break();
             flow
@@ -689,11 +719,7 @@ impl<M: LanguageModel> Harness<M> {
     }
 
     /// Sends a message from the user, as [`Harness::send`] does.
-    fn converse(
-        &mut self,
-        message: &str,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn converse(&mut self, message: &str, on_event: OnEvent) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
         self.steps = 0;
         self.unchanged = 0;
@@ -725,7 +751,7 @@ impl<M: LanguageModel> Harness<M> {
         mut input: Turn,
         mut prompt: bool,
         mut ahead: Option<String>,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+        on_event: OnEvent,
     ) -> Result<Outcome, Box<dyn Error>> {
         let mut last = None;
         loop {
@@ -886,17 +912,15 @@ impl<M: LanguageModel> Harness<M> {
     /// Asks the model, once it has made [`MAX_CALLS`] calls in a turn, for
     /// an account of the turn, which it gives without tools, reported as
     /// `Text` pieces, and records the exchange. The turn ends with it.
-    fn account(
-        &mut self,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<Outcome, Box<dyn Error>> {
-        let prompt = STEPS_PROMPT;
-        self.log.user(prompt, None, self.chat.tokens());
+    fn account(&mut self, on_event: OnEvent) -> Result<Outcome, Box<dyn Error>> {
+        self.log.user(STEPS_PROMPT, None, self.chat.tokens());
         let before = self.chat.stats();
-        let answer = self.chat.answer(prompt, self.account_limit(), |text| {
-            self.log.stream("text", text);
-            on_event(Event::Text(text.to_string()))
-        })?;
+        let answer = self
+            .chat
+            .answer(STEPS_PROMPT, self.account_limit(), |text| {
+                self.log.stream("text", text);
+                on_event(Event::Text(text.to_string()))
+            })?;
         self.log.reply(
             &[],
             false,
@@ -905,7 +929,7 @@ impl<M: LanguageModel> Harness<M> {
             &before,
             &self.chat.stats(),
         );
-        self.record(Turn::User(prompt.to_string()), true)?;
+        self.record(Turn::User(STEPS_PROMPT.to_string()), true)?;
         self.record(
             Turn::Reply {
                 text: answer.text,
@@ -952,7 +976,7 @@ impl<M: LanguageModel> Harness<M> {
         &mut self,
         input: &Turn,
         more: usize,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+        on_event: OnEvent,
     ) -> Result<bool, Box<dyn Error>> {
         let needed = self.chat.measure(input)? + more;
         let capacity = self.chat.capacity();
@@ -970,34 +994,8 @@ impl<M: LanguageModel> Harness<M> {
         Ok(true)
     }
 
-    /// Compacts the conversation to make room in the context: has the
-    /// model write a note to go on from, reported as `Note` pieces, starts
-    /// the conversation over from the system prompt, and reads back where
-    /// the agent is, the note, the user's earlier messages, and the most
-    /// recent exchanges without their thoughts. Returns whether it did: not when there is
-    /// nothing to compact yet, nor when `on_event` breaks while the note
-    /// is written, which leaves the conversation as it was but for the
-    /// note.
-    pub fn compact(
-        &mut self,
-        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<bool, Box<dyn Error>> {
-        let mut interrupted = false;
-        let result = self.compaction(&mut |event| {
-            let flow = on_event(event);
-            interrupted |= flow.is_break();
-            flow
-        });
-        self.log
-            .end(result.as_ref().err().map(|e| e as _), interrupted);
-        result
-    }
-
     /// Compacts the conversation, as [`Harness::compact`] does.
-    fn compaction(
-        &mut self,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<bool, Box<dyn Error>> {
+    fn compaction(&mut self, on_event: OnEvent) -> Result<bool, Box<dyn Error>> {
         if self.transcript.is_empty() {
             return Ok(false);
         }
