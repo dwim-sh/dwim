@@ -1,16 +1,20 @@
-//! Downloading the model's files into its directory, resuming what an
-//! interrupted run left.
+//! Downloading the model's files into the Hugging Face cache, resuming what
+//! an interrupted run left.
 
 use std::{
     error::Error,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::symlink,
     path::Path,
     thread,
     time::Duration,
 };
 
-use crate::model;
+use dwim::models::{
+    bonsai::{self, File},
+    hub,
+};
 
 /// How long a partial download can go without being written to before it is
 /// taken for the leftover of an interrupted run, to be resumed, rather than
@@ -28,43 +32,63 @@ pub struct Progress {
     pub total: Option<u64>,
 }
 
-/// Downloads the model's files into `dir`, skipping any that are already
-/// there, and reporting progress on each one as it comes in.
+/// Downloads the model's files into `dir`, its snapshot in the cache,
+/// skipping any that are already there, and reporting progress on each
+/// one as it comes in. A file's content goes in the repository's blobs,
+/// named by its digest, and the file in the snapshot is a link to it, as
+/// the cache's other users lay them out; a blob one of them downloaded is
+/// linked to without downloading it again.
 pub fn fetch(dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(dir)?;
-    for file in model::FILES {
-        let path = dir.join(file);
+    let blobs = hub::blobs_dir(bonsai::REPO).ok_or("cannot determine the home directory")?;
+    for file in &bonsai::FILES {
+        let path = dir.join(file.name);
         if path.exists() {
             continue;
         }
-        download(file, &path, &mut progress)?;
+        let blob = blobs.join(file.digest);
+        if !blob.exists() {
+            if hub::offline() {
+                return Err("the model is not downloaded, and HF_HUB_OFFLINE is set: \
+                            run `dwim --download` where there is network"
+                    .into());
+            }
+            fs::create_dir_all(&blobs)?;
+            download(file, &blob, &mut progress)?;
+        }
+        fs::create_dir_all(dir)?;
+        // A link left pointing at a blob that was removed is replaced.
+        if fs::symlink_metadata(&path).is_ok() {
+            fs::remove_file(&path)?;
+        }
+        symlink(hub::blob_link(file.digest), &path)?;
     }
     Ok(())
 }
 
-/// Downloads one of the model's files to `path`.
+/// Downloads one of the model's files to `blob`.
 ///
-/// The file is written under a `.part` name and renamed into place once
-/// complete, so an interrupted download never looks like a finished one.
-/// A partial file another run is still writing is waited for; one nobody is
-/// writing is picked up where it left off, which matters for a model of
-/// several gigabytes on a slow link.
+/// The file is written under an `.incomplete` name, as the cache's other
+/// users write theirs, and renamed into place once complete, so an
+/// interrupted download never looks like a finished one. A partial file
+/// another run is still writing is waited for; one nobody is writing is
+/// picked up where it left off, which matters for a model of several
+/// gigabytes on a slow link.
 fn download(
-    file: &'static str,
-    path: &Path,
+    file: &File,
+    blob: &Path,
     progress: &mut impl FnMut(Progress),
 ) -> Result<(), Box<dyn Error>> {
-    let partial = path.with_file_name(format!("{file}.part"));
+    let partial = blob.with_file_name(format!("{}.incomplete", file.digest));
     let mut done = loop {
         match fs::metadata(&partial) {
             Ok(meta) if meta.modified()?.elapsed().is_ok_and(|age| age < STALE) => {
                 progress(Progress {
-                    file,
+                    file: file.name,
                     done: meta.len(),
                     total: None,
                 });
                 thread::sleep(Duration::from_secs(2));
-                if path.exists() {
+                if blob.exists() {
                     return Ok(());
                 }
             }
@@ -73,11 +97,11 @@ fn download(
         }
     };
     progress(Progress {
-        file,
+        file: file.name,
         done,
         total: None,
     });
-    let mut request = ureq::get(&model::url(file));
+    let mut request = ureq::get(&hub::url(bonsai::REPO, bonsai::REVISION, file.name));
     if done > 0 {
         request = request.header("Range", &format!("bytes={done}-"));
     }
@@ -86,7 +110,7 @@ fn download(
     if done > 0 && response.status() != 206 {
         done = 0;
     }
-    let result = save(response, &partial, done, file, progress);
+    let result = save(response, &partial, done, file.name, progress);
     if result.is_err() {
         // Left for the next run to resume, unless nothing arrived.
         if fs::metadata(&partial).is_ok_and(|meta| meta.len() == 0) {
@@ -94,7 +118,7 @@ fn download(
         }
     }
     result?;
-    fs::rename(&partial, path)?;
+    fs::rename(&partial, blob)?;
     Ok(())
 }
 
@@ -120,7 +144,7 @@ fn save(
         .truncate(false)
         .open(partial)?;
     writer.set_len(done)?;
-    std::io::Seek::seek(&mut writer, std::io::SeekFrom::Start(done))?;
+    writer.seek(SeekFrom::Start(done))?;
     let mut buf = vec![0; 1 << 20];
     loop {
         let n = reader.read(&mut buf)?;

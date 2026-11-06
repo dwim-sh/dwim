@@ -20,6 +20,11 @@ pub struct Opts {
     #[argh(option)]
     pub context: Option<usize>,
 
+    /// download the model if it is not yet, print the path of its weights,
+    /// and exit
+    #[argh(switch)]
+    pub download: bool,
+
     /// print the version and exit
     #[argh(switch)]
     pub version: bool,

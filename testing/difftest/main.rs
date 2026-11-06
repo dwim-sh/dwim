@@ -153,11 +153,15 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let model = bonsai::cache_dir()
-        .ok_or("no cache directory")?
+    let model = bonsai::dir()
+        .ok_or("no home directory")?
         .join(bonsai::WEIGHTS);
     if !model.exists() {
-        return Err(format!("no model at {}: run dwim once to fetch it", model.display()).into());
+        return Err(format!(
+            "no model at {}: run `dwim --download` to fetch it",
+            model.display()
+        )
+        .into());
     }
     let gguf = Arc::new(Gguf::open(&model)?);
     let dir = root
