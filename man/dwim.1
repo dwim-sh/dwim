@@ -21,6 +21,12 @@ is given,
 answers it without the shell and exits: the reply goes to standard output and
 nothing else does, while progress, the model's thinking, the commands it runs,
 and their output go to standard error.
+As no one is there to answer the model, it runs in auto mode: a reply
+with no command that does not end with
+.B DONE
+on a line of its own, and the account the model gives after a hundred
+tool calls, are answered with word to go on, with the tools on, up to ten
+times in a turn.
 .SH OPTIONS
 .TP
 .BI \-\-model " model"
@@ -175,6 +181,15 @@ end of the context window.
 Set the most tokens the model may think before it is made to act, as
 .B \-\-thinking\-budget
 does, with 0 for no limit; alone, show it.
+.TP
+.BR /auto " on | off"
+Turn auto mode on or off; alone, show which it is.
+In it, the model goes on by itself as it does when answering a prompt
+given on the command line: a reply that does not end with
+.B DONE
+on a line of its own, and the account it gives after a hundred tool
+calls, are answered with word to go on, up to ten times in a turn.
+It is off in the shell unless turned on.
 .TP
 .B /help
 List the commands and the keys.

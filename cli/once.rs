@@ -142,6 +142,8 @@ fn answer<D: dwim_gpu::Device + 'static>(
         move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(thinking_budget);
+    // No one is here to answer the model, so it goes on by itself.
+    harness.set_auto(true);
     if let Some(shell) = shell {
         harness.set_shell(shell);
     }

@@ -111,6 +111,7 @@ pub fn run(
         interrupted: false,
         thinking,
         thinking_budget,
+        auto: false,
         lines: Vec::new(),
         blank: false,
         requests,
@@ -159,6 +160,16 @@ fn budget_set(tokens: Option<usize>) -> String {
     }
 }
 
+/// What the `/auto` command says of auto mode, and how setting it is
+/// acknowledged.
+fn auto_notice(auto: bool) -> String {
+    if auto {
+        "Auto mode on: the model goes on by itself until it says it is done".to_string()
+    } else {
+        "Auto mode off: the model asks when it has something to ask".to_string()
+    }
+}
+
 /// What the shell asks of the model thread.
 enum Request {
     /// A message from the user.
@@ -168,6 +179,8 @@ enum Request {
     /// Limit a thought to this many tokens, or lift the limit, as the
     /// `/thinking-budget` command asks.
     ThinkingBudget(Option<usize>),
+    /// Turn auto mode on or off, as the `/auto` command asks.
+    Auto(bool),
 }
 
 /// What the model thread reports back.
@@ -360,6 +373,11 @@ fn serve<D: dwim_gpu::Device + 'static>(
                 let _ = replies.send(Reply::Notice(budget_set(tokens)));
                 Ok(())
             }
+            Request::Auto(auto) => {
+                harness.set_auto(auto);
+                let _ = replies.send(Reply::Notice(auto_notice(auto)));
+                Ok(())
+            }
         };
         if let Err(e) = result {
             let _ = replies.send(Reply::Error(e.to_string()));
@@ -463,6 +481,8 @@ struct App {
     thinking: bool,
     /// Most tokens of a thought, if they are limited, as last set.
     thinking_budget: Option<usize>,
+    /// Whether auto mode is on, as last set.
+    auto: bool,
     /// Lines waiting to be printed above the live region, and whether the
     /// last line printed there was blank.
     lines: Vec<Line>,
@@ -618,6 +638,14 @@ impl App {
 
         let request = match message.strip_prefix('/') {
             Some("compact") => Request::Compact,
+            Some("auto on") => {
+                self.auto = true;
+                Request::Auto(true)
+            }
+            Some("auto off") => {
+                self.auto = false;
+                Request::Auto(false)
+            }
             Some(command) if command.starts_with("thinking-budget ") => {
                 match command["thinking-budget ".len()..].trim().parse::<usize>() {
                     Ok(tokens) => {
@@ -876,6 +904,8 @@ impl App {
             command if command.starts_with("thinking-budget ") => {
                 notice("/thinking-budget takes a number of tokens, or 0 for no cap")
             }
+            "auto" => notice(auto_notice(self.auto)),
+            command if command.starts_with("auto ") => notice("/auto takes on or off"),
             other => notice(format!("Unknown command /{other} · /help lists them")),
         };
         self.lines
@@ -1152,6 +1182,7 @@ fn help(columns: usize) -> Vec<Line> {
             "/transcript         where this session's transcript is",
             "/compact            compact the conversation now",
             "/thinking-budget N  cap the model's thinking at N tokens, 0 for no cap",
+            "/auto on|off        go on by itself until it says it is done, or ask",
             "/help               this list",
             "ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits",
         ]
