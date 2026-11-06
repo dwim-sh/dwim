@@ -41,7 +41,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
+use crate::tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
 
 const NAME: &str = "bash";
 
@@ -594,7 +594,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
 
     use super::*;
-    use crate::ToolCall;
+    use crate::tools::ToolCall;
 
     fn call(text: &str) -> ToolCall {
         ToolCall::parse(text).unwrap()
@@ -603,7 +603,7 @@ mod tests {
     /// Runs the call in `arguments` in the working directory, as the model
     /// sees the result.
     fn run(bash: &mut Bash, arguments: &Value) -> String {
-        crate::Output::of(bash.run(Path::new("."), arguments), false).text
+        crate::tools::Output::of(bash.run(Path::new("."), arguments), false).text
     }
 
     /// Runs `command` through the tool.

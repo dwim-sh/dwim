@@ -21,8 +21,8 @@ use crossterm::{
     event::{self, Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim_gpu::BACKEND;
-use dwim_harness::{self as harness, Event, Log};
+use dwim::gpu::BACKEND;
+use dwim::harness::{self, Event, Log};
 
 use crate::{
     fetch::Progress,

@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 
-use dwim_harness::{Event, Log};
+use dwim::harness::{Event, Log};
 
 use crate::session::{self, Settings, Stderr};
 

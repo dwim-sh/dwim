@@ -296,66 +296,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "dwim-cli"
+name = "dwim"
 version = "0.0.8"
 dependencies = [
  "argh",
+ "ash",
  "crossterm",
  "dirs",
- "dwim-gpu",
- "dwim-harness",
- "dwim-models",
- "unicode-width",
- "ureq",
-]
-
-[[package]]
-name = "dwim-difftest"
-version = "0.0.8"
-dependencies = [
- "dwim-gpu",
- "dwim-models",
-]
-
-[[package]]
-name = "dwim-gpu"
-version = "0.0.8"
-dependencies = [
- "ash",
+ "fancy-regex",
+ "libc",
  "naga",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "rayon",
-]
-
-[[package]]
-name = "dwim-harness"
-version = "0.0.8"
-dependencies = [
- "dwim-models",
- "dwim-tools",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "dwim-models"
-version = "0.0.8"
-dependencies = [
- "dirs",
- "dwim-gpu",
- "fancy-regex",
- "libc",
-]
-
-[[package]]
-name = "dwim-tools"
-version = "0.0.8"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
+ "unicode-width",
+ "ureq",
 ]
 
 [[package]]

@@ -36,7 +36,7 @@ use std::{borrow::Cow, collections::HashMap, fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{
+use crate::tools::{
     Parameter, Signature, Tool, number, optional_number, plural, read, required, string,
     without_ending,
 };
@@ -428,7 +428,7 @@ mod tests {
 
     /// Runs the call in `arguments`, as the model sees the result.
     fn run(arguments: &Value) -> String {
-        crate::Output::of(super::run(Path::new("."), arguments), false).text
+        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
     }
 
     /// A file with `text` that goes when it is dropped.

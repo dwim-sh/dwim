@@ -10,7 +10,7 @@
 //!
 //! A [`Harness`] wraps a [`Chat`] and reports each turn's thoughts, text,
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
-//! them as they happen. The tools live in `dwim_tools`. The system prompt
+//! them as they happen. The tools live in `crate::tools`. The system prompt
 //! pushes the model to use them rather than answer from memory or ask the
 //! user for a command, and carries the project's own instructions. Where
 //! the model is, and what the project looks like, go ahead of the first
@@ -44,10 +44,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use dwim_models::{Chat, Chunk, LanguageModel, Turn};
-use dwim_tools::{ToolCall, Tools, bash, read};
+use crate::models::{Chat, Chunk, LanguageModel, Turn};
+use crate::tools::{ToolCall, Tools, bash, read};
 
-pub use crate::log::Log;
+pub use crate::harness::log::Log;
 
 /// Most of a project's `AGENTS.md` that goes into the system prompt.
 const MAX_INSTRUCTIONS: usize = 32 << 10;
@@ -292,7 +292,7 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
 fn tools() -> String {
     format!(
         "# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}\n</tools>\n\n{CALLING}",
-        dwim_tools::signatures()
+        crate::tools::signatures()
     )
 }
 
@@ -493,7 +493,7 @@ pub struct Harness<M: LanguageModel> {
 /// doing, and the tools'.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
-    pub model: dwim_models::Stats,
+    pub model: crate::models::Stats,
     /// Tool calls run, and the time they took.
     pub calls: usize,
     pub tool_seconds: f64,
@@ -508,7 +508,7 @@ impl Stats {
         let row = |name: &str, count: String, seconds: f64, rate: String| {
             format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}")
         };
-        let tokens = |name: &str, tally: &dwim_models::Tally| {
+        let tokens = |name: &str, tally: &crate::models::Tally| {
             row(
                 name,
                 format!("{} tokens", tally.tokens),
@@ -852,7 +852,7 @@ impl<M: LanguageModel> Harness<M> {
                 self.steps += 1;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
-                        let detail = dwim_tools::describe(&call);
+                        let detail = crate::tools::describe(&call);
                         self.log.call(&call.name, &detail);
                         if on_event(Event::Call {
                             name: call.name.clone(),
@@ -1172,7 +1172,7 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use dwim_models::{Sampler, Tokenizer, testing::Scripted};
+    use crate::models::{Sampler, Tokenizer, testing::Scripted};
 
     use super::*;
 
@@ -1206,7 +1206,7 @@ mod tests {
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
         let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap()
     }
 
@@ -1916,20 +1916,20 @@ mod tests {
     #[test]
     fn reports_where_the_time_went() {
         let stats = Stats {
-            model: dwim_models::Stats {
-                cached: dwim_models::Tally {
+            model: crate::models::Stats {
+                cached: crate::models::Tally {
                     tokens: 1500,
                     seconds: 0.5,
                 },
-                prompt: dwim_models::Tally {
+                prompt: crate::models::Tally {
                     tokens: 1200,
                     seconds: 15.0,
                 },
-                thought: dwim_models::Tally {
+                thought: crate::models::Tally {
                     tokens: 900,
                     seconds: 30.0,
                 },
-                answer: dwim_models::Tally {
+                answer: crate::models::Tally {
                     tokens: 300,
                     seconds: 10.0,
                 },
@@ -1976,7 +1976,7 @@ mod tests {
 
     #[test]
     fn describes_the_project() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let prompt = system_prompt(dir, Effort::Medium);
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
@@ -1997,7 +1997,7 @@ mod tests {
 
     #[test]
     fn describes_the_environment() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let environment = environment(dir);
         assert!(environment.starts_with("# Environment\n"));
         assert!(environment.contains(&format!("Working directory: {}\n", dir.display())));

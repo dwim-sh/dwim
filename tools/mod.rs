@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::bash::Bash;
-pub use crate::call::ToolCall;
+use crate::tools::bash::Bash;
+pub use crate::tools::call::ToolCall;
 
 /// A tool: what the model is told of it, and what it does.
 pub struct Tool {

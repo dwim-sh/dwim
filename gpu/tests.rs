@@ -1,6 +1,8 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary};
+use crate::gpu::{
+    CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary,
+};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -32,7 +34,7 @@ macro_rules! check_against_cpu {
             #[test]
             fn $check() {
                 match $open {
-                    Ok(gpu) => crate::tests::$check(&gpu),
+                    Ok(gpu) => crate::gpu::tests::$check(&gpu),
                     Err(e) => eprintln!("skipping: {e}"),
                 }
             }
@@ -270,7 +272,7 @@ pub fn tile_error<D: Device>(gpu: &D) {
         let x = rng.floats(n * cols);
         let halved: Vec<f32> = x
             .iter()
-            .map(|&v| crate::from_f16(crate::to_f16(v)))
+            .map(|&v| crate::gpu::from_f16(crate::gpu::to_f16(v)))
             .collect();
         let mut want = vec![0.0; n * rows];
         let mut want_half = vec![0.0; n * rows];
@@ -754,7 +756,7 @@ pub fn cache_round_trips<D: Device>(gpu: &D) {
     let mut c = cache(gpu, &data, 7 * CACHE_BLOCK);
     let blocks: Vec<_> = data
         .chunks_exact(CACHE_BLOCK)
-        .map(crate::quantize)
+        .map(crate::gpu::quantize)
         .collect();
     let bytes = |blocks: &[(u16, [i8; CACHE_BLOCK])]| -> Vec<u8> {
         let quants = blocks.iter().flat_map(|(_, q)| q.map(|q| q as u8));

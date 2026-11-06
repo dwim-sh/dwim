@@ -15,7 +15,7 @@ use ash::{
     vk,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host};
+use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host, ternary};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
@@ -1001,8 +1001,8 @@ impl Device for Vulkan {
                 }
             }
             Tensor::Ternary { shape, data } => {
-                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
-                let data = crate::ternary::block_major(&data, shape[0], shape[1]);
+                assert_eq!(data.len(), shape[0] * ternary::row_bytes(shape[1]));
+                let data = ternary::block_major(&data, shape[0], shape[1]);
                 let buf = self.device_buffer(data.len());
                 self.upload_bytes(buf, 0, &data);
                 Weight {
@@ -1106,7 +1106,7 @@ impl Device for Vulkan {
 
     fn read_cache(&self, cache: &Cache, len: usize) -> Vec<u8> {
         assert!(len <= cache.len);
-        let mut out = vec![0; crate::cache_bytes(len)];
+        let mut out = vec![0; crate::gpu::cache_bytes(len)];
         let (quants, scales) = out.split_at_mut(len);
         self.download_bytes(cache.quants, quants);
         self.download_bytes(cache.scales, scales);
@@ -1115,7 +1115,7 @@ impl Device for Vulkan {
 
     fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
         let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
-        assert!(len <= cache.len && data.len() == crate::cache_bytes(len));
+        assert!(len <= cache.len && data.len() == crate::gpu::cache_bytes(len));
         let (quants, scales) = data.split_at(len);
         self.upload_bytes(cache.quants, 0, quants);
         self.upload_bytes(cache.scales, 0, scales);
@@ -1533,7 +1533,7 @@ mod tests {
     #[ignore]
     fn ternary_matmul_speed() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Ok(gpu) => crate::gpu::tests::ternary_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1547,7 +1547,7 @@ mod tests {
             Ok(gpu) => {
                 for n in [1, 64] {
                     eprintln!("batch of {n}:");
-                    crate::tests::kernel_speed(&gpu, n);
+                    crate::gpu::tests::kernel_speed(&gpu, n);
                 }
             }
             Err(e) => eprintln!("skipping: {e}"),
@@ -1558,7 +1558,7 @@ mod tests {
     #[ignore]
     fn tile_error() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::tests::tile_error(&gpu),
+            Ok(gpu) => crate::gpu::tests::tile_error(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1569,7 +1569,7 @@ mod tests {
     #[ignore]
     fn attention_speed() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::tests::attention_speed(&gpu, 64),
+            Ok(gpu) => crate::gpu::tests::attention_speed(&gpu, 64),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1579,7 +1579,7 @@ mod tests {
     #[ignore]
     fn dispatch_overhead() {
         match super::Vulkan::new() {
-            Ok(gpu) => crate::tests::dispatch_overhead(&gpu),
+            Ok(gpu) => crate::gpu::tests::dispatch_overhead(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }

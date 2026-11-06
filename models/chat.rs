@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{LanguageModel, Result, Sampler, Tokenizer};
+use crate::models::{LanguageModel, Result, Sampler, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -38,7 +38,7 @@ const TOOL_RESPONSE_END: &str = "</tool_response>";
 
 /// The chat format's tags, as a vocabulary for it has them: the ones
 /// starting with `<|` are control tokens, the rest user-defined.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub const SPECIAL_TOKENS: [&str; 9] = [
     END_OF_TEXT,
     IM_START,
@@ -785,7 +785,7 @@ impl Utf8Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::Scripted;
+    use crate::models::testing::Scripted;
 
     /// A chat with a scripted model over the tiny vocabulary, its scripts
     /// given as text with special tokens in it.

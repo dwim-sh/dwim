@@ -5,6 +5,10 @@ runs it, in one program.
 
 ## Layout
 
+One package: `lib.rs` is the library, with the directories below as its
+modules, `cli/` and `testing/difftest/` are its two binaries, and `build.rs`
+compiles the Vulkan kernels.
+
 * `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI,
   and `bench`, which times the model at depths of context.
 * `models/`: the language model: `gguf` reads the weights file, `tokenizer`
@@ -42,11 +46,10 @@ are fetched into the user's cache directory on first use.
 
 ## Verifying
 
-* `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D
-  warnings`, and `cargo fmt --check`, as CI runs them. GPU tests skip a
-  backend whose GPU is not available.
-* `cargo test -p dwim-models real_model -- --ignored --nocapture` and
-  `cargo run -p dwim-difftest` check the real model if it is in the cache.
+* `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`,
+  as CI runs them. GPU tests skip a backend whose GPU is not available.
+* `cargo test real_model -- --ignored --nocapture` and
+  `cargo run --bin difftest` check the real model if it is in the cache.
 * Exercise `./target/debug/dwim` in a terminal and ask the model something
   before calling a change done.
 * `CONTRIBUTING.md` has the longer version, and how to run SWE-bench Lite.

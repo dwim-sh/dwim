@@ -9,7 +9,7 @@ use naga::{
 };
 
 fn main() {
-    let kernels = PathBuf::from("vulkan/kernels");
+    let kernels = PathBuf::from("gpu/vulkan/kernels");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", kernels.display());
 

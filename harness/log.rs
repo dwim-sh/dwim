@@ -20,11 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim_models::Sampler;
+use crate::models::Sampler;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Stats, now};
+use crate::harness::{Stats, now};
 
 /// Longest the streamed text being gathered goes without being written.
 const REWRITE: Duration = Duration::from_secs(1);
@@ -186,8 +186,8 @@ impl Log {
         thought_ended: bool,
         cut: bool,
         tokens: usize,
-        before: &dwim_models::Stats,
-        after: &dwim_models::Stats,
+        before: &crate::models::Stats,
+        after: &crate::models::Stats,
     ) {
         let seconds = (after.prompt.seconds + after.thought.seconds + after.answer.seconds)
             - (before.prompt.seconds + before.thought.seconds + before.answer.seconds);
@@ -265,7 +265,7 @@ impl Log {
     /// tokens and seconds of each kind and the tool calls and their
     /// seconds.
     pub fn finish(&mut self, tokens: usize, stats: &Stats) {
-        let tally = |tally: &dwim_models::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
+        let tally = |tally: &crate::models::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
         let model = &stats.model;
         self.write(
             "end",

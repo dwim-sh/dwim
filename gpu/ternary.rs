@@ -64,7 +64,7 @@ pub fn quantize_row(x: &[f32], out: &mut [u8]) {
             // Scaled to fill the byte: 243 is 3 to the fifth.
             *byte = ((q * 256).div_ceil(243)) as u8;
         }
-        out[26..].copy_from_slice(&crate::to_f16(d).to_le_bytes());
+        out[26..].copy_from_slice(&crate::gpu::to_f16(d).to_le_bytes());
     }
 }
 
@@ -81,7 +81,7 @@ pub fn unpack(block: &[u8]) -> ([i8; BLOCK], f32) {
     }
     (
         trits,
-        crate::from_f16(u16::from_le_bytes([block[26], block[27]])),
+        crate::gpu::from_f16(u16::from_le_bytes([block[26], block[27]])),
     )
 }
 
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(q[1], code(&[1, 1, 1, 1, 1]));
         assert_eq!(q[16], code(&[2, 1, 1, 1, 1]));
         assert_eq!(q[25], code(&[0, 1, 1, 2, 0]));
-        assert_eq!(u16::from_le_bytes([q[26], q[27]]), crate::to_f16(1.0));
+        assert_eq!(u16::from_le_bytes([q[26], q[27]]), crate::gpu::to_f16(1.0));
         let (trits, d) = unpack(&q);
         assert_eq!(d, 1.0);
         assert_eq!(trits[0], 1);

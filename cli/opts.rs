@@ -40,13 +40,13 @@ pub struct Opts {
 
     /// most tokens the model may think at a time before it is made to act,
     /// or 0 for no limit (default: 2048)
-    #[argh(option, default = "dwim_harness::THINKING_BUDGET.unwrap_or(0)")]
+    #[argh(option, default = "dwim::harness::THINKING_BUDGET.unwrap_or(0)")]
     pub thinking_budget: usize,
 
     /// how much the model reasons before it replies, as its chat template
     /// asks it to: xhigh, medium or low (default: medium)
-    #[argh(option, default = "dwim_harness::Effort::Medium")]
-    pub reasoning_effort: dwim_harness::Effort,
+    #[argh(option, default = "dwim::harness::Effort::Medium")]
+    pub reasoning_effort: dwim::harness::Effort,
 
     /// sampling temperature (default: what the model file recommends; 0
     /// always picks the likeliest token)

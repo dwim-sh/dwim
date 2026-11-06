@@ -14,8 +14,8 @@ BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 
 BINARY = target/release/dwim
-SOURCES = Cargo.toml Cargo.lock rust-toolchain.toml \
-	$(wildcard */Cargo.toml */*.rs */*/*.rs */*/*/*.rs gpu/*/kernels/*)
+SOURCES = Cargo.toml Cargo.lock rust-toolchain.toml build.rs lib.rs \
+	$(wildcard */*.rs */*/*.rs */*/*/*.rs gpu/*/kernels/*)
 
 # $(Q) hides a command, and $(call msg,VERB,what) announces it. With V=1
 # the command is shown instead; with `make -s` nothing is.
@@ -34,7 +34,7 @@ all: $(BINARY)
 
 $(BINARY): $(SOURCES)
 	$(call msg,CARGO,$@)
-	$(Q)cargo build --release --locked -p dwim-cli
+	$(Q)cargo build --release --locked
 	$(Q)touch $@
 
 install: all
@@ -52,7 +52,7 @@ uninstall:
 	$(Q)rm -f $(DESTDIR)$(MANDIR)/man1/dwim.1
 
 test:
-	$(call msg,TEST,workspace)
+	$(call msg,TEST,dwim)
 	$(Q)cargo test
 
 clean:

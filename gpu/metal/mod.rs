@@ -27,7 +27,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host};
+use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host, ternary};
 
 /// Positions one threadgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -687,8 +687,8 @@ impl Device for Metal {
                 (shape, bytes, false)
             }
             Tensor::Ternary { shape, data } => {
-                assert_eq!(data.len(), shape[0] * crate::ternary::row_bytes(shape[1]));
-                block_major = crate::ternary::block_major(data, shape[0], shape[1]);
+                assert_eq!(data.len(), shape[0] * ternary::row_bytes(shape[1]));
+                block_major = ternary::block_major(data, shape[0], shape[1]);
                 (shape, block_major.as_slice(), true)
             }
         };
@@ -815,7 +815,7 @@ impl Device for Metal {
 
     fn write_cache(&self, cache: &mut Cache, data: &[u8]) {
         let len = data.len() / (CACHE_BLOCK + 2) * CACHE_BLOCK;
-        assert!(len <= cache.len && data.len() == crate::cache_bytes(len));
+        assert!(len <= cache.len && data.len() == crate::gpu::cache_bytes(len));
         let (quants, scales) = data.split_at(len);
         // The pending commands may use what the cache holds now.
         self.flush();
@@ -1311,7 +1311,7 @@ impl Device for Metal {
 mod tests {
     use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
 
-    use crate::Device;
+    use crate::gpu::Device;
     check_against_cpu!(super::Metal::new());
 
     /// Checks the tile kernel a GPU without matrix accelerators takes, on
@@ -1321,7 +1321,7 @@ mod tests {
         match super::Metal::new() {
             Ok(mut gpu) => {
                 gpu.kernels.matmul_ternary_mma = None;
-                crate::tests::ternary_matmul_matches_cpu(&gpu);
+                crate::gpu::tests::ternary_matmul_matches_cpu(&gpu);
             }
             Err(e) => eprintln!("skipping: {e}"),
         }
@@ -1333,7 +1333,7 @@ mod tests {
     #[ignore]
     fn ternary_matmul_speed() {
         match super::Metal::new() {
-            Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Ok(gpu) => crate::gpu::tests::ternary_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1347,7 +1347,7 @@ mod tests {
             Ok(gpu) => {
                 for n in [1, 64] {
                     eprintln!("batch of {n}:");
-                    crate::tests::kernel_speed(&gpu, n);
+                    crate::gpu::tests::kernel_speed(&gpu, n);
                 }
             }
             Err(e) => eprintln!("skipping: {e}"),
@@ -1409,7 +1409,7 @@ mod tests {
     #[ignore]
     fn decode_attention_speed() {
         match super::Metal::new() {
-            Ok(gpu) => crate::tests::attention_speed(&gpu, 1),
+            Ok(gpu) => crate::gpu::tests::attention_speed(&gpu, 1),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
@@ -1421,7 +1421,7 @@ mod tests {
         match super::Metal::new() {
             Ok(mut gpu) => {
                 gpu.kernels.attention_mma = None;
-                crate::tests::attention_matches_cpu(&gpu);
+                crate::gpu::tests::attention_matches_cpu(&gpu);
             }
             Err(e) => eprintln!("skipping: {e}"),
         }
@@ -1460,7 +1460,7 @@ mod tests {
                 .unwrap();
                 gpu.kernels.attention_mma.as_mut().unwrap()[1] = mma;
                 eprintln!("on the matrix accelerators, {what}:");
-                crate::tests::attention_speed(&gpu, 64);
+                crate::gpu::tests::attention_speed(&gpu, 64);
             }
             gpu.kernels.attention_mma = None;
         }
@@ -1486,7 +1486,7 @@ mod tests {
             )
             .unwrap();
             eprintln!("{what}:");
-            crate::tests::attention_speed(&gpu, 64);
+            crate::gpu::tests::attention_speed(&gpu, 64);
         }
     }
 
@@ -1498,7 +1498,7 @@ mod tests {
         match super::Metal::new() {
             Ok(mut gpu) => {
                 gpu.kernels.matmul_ternary_mma = None;
-                crate::tests::ternary_matmul_speed(&gpu);
+                crate::gpu::tests::ternary_matmul_speed(&gpu);
             }
             Err(e) => eprintln!("skipping: {e}"),
         }
@@ -1509,7 +1509,7 @@ mod tests {
     #[ignore]
     fn dispatch_overhead() {
         match super::Metal::new() {
-            Ok(gpu) => crate::tests::dispatch_overhead(&gpu),
+            Ok(gpu) => crate::gpu::tests::dispatch_overhead(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
