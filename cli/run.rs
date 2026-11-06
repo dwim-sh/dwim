@@ -1134,7 +1134,11 @@ fn models_listing(
     let mut lines = Vec::new();
     for (i, model) in models::MODELS.iter().enumerate() {
         let bullet = if i == 0 { "● " } else { "  " };
-        let header = vec![span(bullet), span(model.name).bold()];
+        let header = vec![
+            span(bullet),
+            span(model.name).bold(),
+            span(format!("  {}", model.about)).dark_grey(),
+        ];
         let weights = match model.dir() {
             Some(dir) => {
                 let (files, bytes) = fetch::on_disk(model, &dir);

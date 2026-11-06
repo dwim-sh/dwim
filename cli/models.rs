@@ -7,7 +7,7 @@ use std::{
 };
 
 use dwim_gpu::{Cpu, Device, Gpu};
-use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+use dwim_models::{Chat, Gguf, LanguageModel, Sampler, qwen35};
 
 use crate::{fetch, opts};
 
@@ -31,14 +31,33 @@ const MIN_CONTEXT: usize = 4096;
 /// driver, and whatever else starts in the meantime.
 const HEADROOM: u64 = 256 << 20;
 
-/// Models `dwim` knows how to fetch.
-pub const MODELS: &[Model] = &[Model {
-    name: "bonsai-2-27b",
-    repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
-    revision: "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
-    files: &["LICENSE", "NOTICE.txt", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
-    weights: "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-}];
+/// Models `dwim` knows how to fetch. The first is the default.
+pub const MODELS: &[Model] = &[
+    Model {
+        name: "bonsai-2-27b",
+        about: "Qwen3.8-27B made ternary by PrismML, 6 GB",
+        repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        revision: "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
+        files: &["LICENSE", "NOTICE.txt", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
+        weights: "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+        memory: 16 << 30,
+    },
+    // Qwen ships no GGUF of its own; bartowski's is a conversion of
+    // `Qwen/Qwen3.8-27B` quantized with an importance matrix, whose Q4_0 file
+    // holds most matrices in 4-bit blocks of 32 with an f16 scale, the
+    // first layers' down projections as Q4_1, the linear attention's output
+    // projections as Q8_0, and the output and a few query projections as
+    // Q6_K; the norms and the small linear attention tensors are f32.
+    Model {
+        name: "qwen3.8-27b",
+        about: "Qwen3.8-27B at four bits, 16 GB",
+        repo: "bartowski/Qwen3.8-27B-GGUF",
+        revision: "87410e7b9a5c21e6ca70c0c9cc5237de909fe621",
+        files: &["Qwen3.8-27B-Q4_0.gguf"],
+        weights: "Qwen3.8-27B-Q4_0.gguf",
+        memory: 32 << 30,
+    },
+];
 
 /// A model hosted on Hugging Face.
 ///
@@ -46,6 +65,8 @@ pub const MODELS: &[Model] = &[Model {
 /// outputs stay reproducible.
 pub struct Model {
     pub name: &'static str,
+    /// What the model is, in a few words, for the `/model` listing.
+    pub about: &'static str,
     pub repo: &'static str,
     pub revision: &'static str,
     /// The files fetched.
@@ -53,6 +74,10 @@ pub struct Model {
     /// The one among them holding the model: a GGUF file, which carries
     /// the tokenizer and the sampling settings too.
     pub weights: &'static str,
+    /// Least memory, in bytes, a machine whose CPU and GPU share it needs
+    /// to run the model: the weights, with room left for the caches, the
+    /// activations, and everything else running.
+    pub memory: u64,
 }
 
 impl Model {
@@ -98,8 +123,8 @@ pub fn size<D: Device>(
     context: Option<usize>,
 ) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
-    let trained = bonsai::Config::load(gguf)?.context_length;
-    let memory = bonsai::Memory::of(gguf)?;
+    let trained = qwen35::Config::load(gguf)?.context_length;
+    let memory = qwen35::Memory::of(gguf)?;
     let context = match context {
         Some(context) => context,
         None => fit(&memory, device, trained),
@@ -116,27 +141,22 @@ pub fn size<D: Device>(
     })
 }
 
-/// Loads the model onto `device`, with room for `context` tokens of
-/// conversation, reporting how many of its tensors are loaded, out of how
-/// many, as it goes.
+/// Loads the model whose weights are `gguf` onto `device`, with room for
+/// `context` tokens of conversation, reporting how many of its tensors are
+/// loaded, out of how many, as it goes.
 pub fn load<D: Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     context: usize,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
-    Ok(Box::new(bonsai::Model::load(
-        gguf,
-        device,
-        context,
-        on_progress,
-    )?))
+    dwim_models::load(gguf, device, context, on_progress)
 }
 
 /// Tokens of conversation that fit in the memory `device` has free,
 /// beside a model of `memory` and some headroom: a whole number of
 /// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
-fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize {
+fn fit<D: Device>(memory: &qwen35::Memory, device: &D, trained: usize) -> usize {
     let Some(free) = device.memory() else {
         return DEFAULT_CONTEXT.min(trained);
     };

@@ -10,7 +10,8 @@
 //! changes. The GPU then runs the same tokens: the prompt in pieces of
 //! every size its kernels tell apart, and the continuation a token at a
 //! time, as when the model writes; after every piece, its next-token
-//! distribution must agree with the CPU's.
+//! distribution must agree with the CPU's. Bonsai is run unless `--model`
+//! names the other model.
 
 use std::{
     error::Error,
@@ -22,7 +23,7 @@ use std::{
 };
 
 use dwim_gpu::{Cpu, Gpu};
-use dwim_models::{Device, Gguf, LanguageModel, bonsai::Model};
+use dwim_models::{Device, Gguf, LanguageModel, qwen35::Model};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention
@@ -112,15 +113,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// What the command line asks for: the prompts named, or all, and how many
-/// times the GPU runs them.
+/// The models, by name, and their files under the cache directory, as
+/// `dwim` fetches them.
+const MODELS: &[(&str, &str)] = &[
+    (
+        "bonsai-2-27b",
+        "bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    ),
+    ("qwen3.8-27b", "qwen3.8-27b/Qwen3.8-27B-Q4_0.gguf"),
+];
+
+/// What the command line asks for: the model, the prompts named, or all,
+/// and how many times the GPU runs them.
 struct Args {
+    model: &'static str,
     prompts: Vec<(&'static str, &'static str)>,
     repeat: usize,
 }
 
 impl Args {
     fn parse() -> Result<Self> {
+        let mut model = MODELS[0].1;
         let mut prompts = Vec::new();
         let mut repeat = 1;
         let mut args = std::env::args().skip(1);
@@ -130,6 +143,13 @@ impl Args {
                     .next()
                     .and_then(|n| n.parse().ok())
                     .ok_or("--repeat takes a number")?;
+            } else if arg == "--model" {
+                let name = args.next().ok_or("--model takes a name")?;
+                model = MODELS
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .ok_or_else(|| format!("no model is named '{name}'"))?
+                    .1;
             } else {
                 let prompt = PROMPTS
                     .iter()
@@ -141,7 +161,11 @@ impl Args {
         if prompts.is_empty() {
             prompts = PROMPTS.to_vec();
         }
-        Ok(Self { prompts, repeat })
+        Ok(Self {
+            model,
+            prompts,
+            repeat,
+        })
     }
 }
 
@@ -152,9 +176,14 @@ fn run() -> Result<bool> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let model = dirs::cache_dir()
         .ok_or("no cache directory")?
-        .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        .join("dwim/models")
+        .join(args.model);
     if !model.exists() {
-        return Err(format!("no model at {}: run dwim once to fetch it", model.display()).into());
+        return Err(format!(
+            "no model at {}: run dwim with it once to fetch it",
+            model.display()
+        )
+        .into());
     }
     let gguf = Arc::new(Gguf::open(&model)?);
     let dir = root

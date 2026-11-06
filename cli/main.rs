@@ -15,6 +15,7 @@ use std::{
 use argh::{EarlyExit, FromArgs};
 use dwim_harness::Log;
 
+use models::Model;
 use opts::{Device, Opts};
 
 fn main() {
@@ -37,8 +38,9 @@ fn main() {
     }
 
     if opts.bench {
-        if let Err(e) =
-            check_memory().and_then(|()| bench::bench(&opts.model, opts.device, opts.context))
+        if let Err(e) = fetch::locate(&opts.model)
+            .and_then(|(model, _)| check_memory(model))
+            .and_then(|()| bench::bench(&opts.model, opts.device, opts.context))
         {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -51,7 +53,8 @@ fn main() {
     let prompt = opts.prompt.join(" ");
     // A budget of zero is no limit.
     let thinking_budget = (opts.thinking_budget > 0).then_some(opts.thinking_budget);
-    let result = check_memory()
+    let result = fetch::locate(&opts.model)
+        .and_then(|(model, _)| check_memory(model))
         .and_then(|()| log(opts.transcript))
         .and_then(|log| match prompt.trim() {
             "" => run::run(
@@ -166,15 +169,11 @@ fn help(output: String, args: &[&str]) -> String {
     lines.join("\n") + "\n"
 }
 
-/// Memory a Mac needs to run the model: its CPU and GPU share it, and the
-/// weights alone take 6 GB of it.
-#[cfg(target_os = "macos")]
-const MIN_MEMORY: u64 = 16 << 30;
-
 /// Refuses to go on, before any weights are downloaded, on a Mac with too
-/// little memory to run the model.
+/// little memory to run `model`: its CPU and GPU share the memory, so the
+/// model needs all of what it takes from it.
 #[cfg(target_os = "macos")]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
+fn check_memory(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
     let mut memory: u64 = 0;
     let mut len = size_of::<u64>();
     let ret = unsafe {
@@ -193,9 +192,11 @@ fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if memory < MIN_MEMORY {
+    if memory < model.memory {
         return Err(format!(
-            "dwim requires 16 GiB or more DRAM on a Mac, and this one has {} GiB",
+            "{} requires {} GiB or more DRAM on a Mac, and this one has {} GiB",
+            model.name,
+            model.memory >> 30,
             memory >> 30
         )
         .into());
@@ -204,6 +205,6 @@ fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn check_memory() -> Result<(), Box<dyn std::error::Error>> {
+fn check_memory(_model: &Model) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
