@@ -63,6 +63,12 @@ earlier messages, and the most recent exchanges without their thoughts.
 A reply that runs out of room is stopped short and goes on after a
 compaction.
 .TP
+.B \-\-download
+Download the model if it is not yet, print the path of its weights, and
+exit. Does nothing but print the path when the model is there, so it can
+provision a machine or a container ahead of the first session, and name
+the weights for another program.
+.TP
 .B \-\-bench
 Instead of a session, time the model at several depths of context and
 print a table of tokens a second: at each of 1k, 8k, 32k, 64k and 128k
@@ -217,6 +223,25 @@ on a line with text clears it.
 If present in the working directory, its contents are given to the agent as
 project instructions.
 .TP
+.I ~/.cache/huggingface/hub/models\-\-prism\-ml\-\-Ternary\-Bonsai\-2\-27B\-gguf/
+The model, downloaded on first use from its repository on Hugging Face at a
+pinned revision, and kept in the Hugging Face cache as the
+.B huggingface_hub
+library and the tools built on it keep theirs, so that a copy any of them
+downloaded is used, and the copy
+.B dwim
+downloads is theirs to use. The weights, 6 GB, and the licenses are in
+.IR snapshots/<revision>/ ,
+each a link to its content in
+.IR blobs/ ,
+named by its digest; a file still downloading is
+.IR blobs/<digest>.incomplete ,
+and an interrupted download resumes on the next run. Remove the directory
+to free the space;
+.B dwim
+downloads the model again on the next run. The cache is in the same place
+on every system.
+.TP
 .I ~/.cache/dwim/states/
 The model's state after the system prompt, saved when a prompt is first
 read and taken up by later runs with the same model and prompt in place of
@@ -286,6 +311,29 @@ The result the model sees names the file. The directory is removed when
 exits, and any left by an earlier
 .B dwim
 that is no longer running are removed by the next one to start.
+.SH ENVIRONMENT
+.TP
+.B HF_HUB_CACHE
+Where the Hugging Face cache is, instead of
+.IR ~/.cache/huggingface/hub .
+.TP
+.B HF_HOME
+Where Hugging Face keeps its files, instead of
+.IR ~/.cache/huggingface ;
+the cache is
+.I hub
+under it unless
+.B HF_HUB_CACHE
+says otherwise.
+.TP
+.B HF_HUB_OFFLINE
+If set to 1, never download: a model that is not in the cache is an error
+that says so.
+.TP
+.B HF_ENDPOINT
+The server to download from, instead of
+.IR https://huggingface.co ,
+such as a mirror.
 .SH EXIT STATUS
 .TP
 .B 0

@@ -70,14 +70,24 @@ pub struct Loaded {
     pub loading: Duration,
 }
 
+/// Fetches the model's files if they are not yet there, reporting the
+/// download to `on_loading`, and returns the directory they are in.
+pub fn fetch_model(
+    settings: &Settings,
+    mut on_loading: impl FnMut(Loading),
+) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = model::locate(&settings.model)?;
+    fetch::fetch(&dir, |progress| on_loading(Loading::Downloading(progress)))?;
+    Ok(dir)
+}
+
 /// Fetches the model if needed, opens the device, and loads the model
 /// onto it, reporting each stage to `on_loading`.
 pub fn load_model(
     settings: &Settings,
     mut on_loading: impl FnMut(Loading),
 ) -> Result<LoadedModel, Box<dyn Error>> {
-    let dir = model::locate(&settings.model)?;
-    fetch::fetch(&dir, |progress| on_loading(Loading::Downloading(progress)))?;
+    let dir = fetch_model(settings, &mut on_loading)?;
     let gguf = model::open(&dir)?;
     let device = Opened::open(settings.device)?;
     let name = device.name();

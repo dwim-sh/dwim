@@ -40,7 +40,10 @@ make install                     # in ~/.local
 make install PREFIX=/usr/local   # system-wide, which may need sudo
 ```
 
-Either way, the model (about 6 GB) is downloaded on first use.
+Either way, the model (about 6 GB) is downloaded on first use into your
+Hugging Face cache, where `hf download` and other tools would put it, and
+used from there if one of them already did. `dwim --download` fetches it
+ahead of time.
 
 ## Features
 

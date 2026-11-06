@@ -15,8 +15,10 @@ use std::{
 
 use argh::{EarlyExit, FromArgValue, FromArgs};
 use dwim::harness::Log;
+use dwim::models::bonsai;
 
 use opts::{Device, Opts};
+use session::Stderr;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -39,6 +41,12 @@ fn main() {
     let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
     let result = check_memory().and_then(|()| {
+        if opts.download {
+            let mut stderr = Stderr::new();
+            let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
+            println!("{}", dir.join(bonsai::WEIGHTS).display());
+            return Ok(());
+        }
         if opts.bench {
             return bench::bench(&settings);
         }

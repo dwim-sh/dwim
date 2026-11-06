@@ -18,9 +18,13 @@ make install             # a release build and the manual page, in ~/.local
 Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
 driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 
-The weights are downloaded on first use into `~/Library/Caches/dwim/models`
-on macOS, and `~/.cache/dwim/models` elsewhere. Bonsai 2 27B, the one model,
-is a 6 GB file; an interrupted download resumes on the next run.
+The weights are downloaded on first use into the Hugging Face cache,
+`~/.cache/huggingface/hub`, in the layout the `huggingface_hub` library
+uses, so a copy that `hf download` or another tool fetched is used as it
+is. Bonsai 2 27B, the one model, is a 6 GB file; an interrupted download
+resumes on the next run, and `dwim --download` fetches it ahead of a
+session and prints where it is. `HF_HOME`, `HF_HUB_CACHE`, `HF_HUB_OFFLINE`
+and `HF_ENDPOINT` mean what they mean to the library.
 
 ## Running
 

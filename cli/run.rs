@@ -23,6 +23,7 @@ use crossterm::{
 };
 use dwim::gpu::BACKEND;
 use dwim::harness::{self, Event, Log};
+use dwim::models::bonsai;
 
 use crate::{
     fetch::Progress,
@@ -1026,12 +1027,12 @@ fn model_listing(
             let (files, bytes) = model::on_disk(&dir);
             match files {
                 0 => "not fetched".to_string(),
-                n if n == model::FILES.len() => {
+                n if n == bonsai::FILES.len() => {
                     format!("{} in {}", model::bytes(bytes), tilde(&dir))
                 }
                 n => format!(
                     "{n}/{} files, {} in {}",
-                    model::FILES.len(),
+                    bonsai::FILES.len(),
                     model::bytes(bytes),
                     tilde(&dir)
                 ),
@@ -1045,7 +1046,10 @@ fn model_listing(
         (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
     };
     let mut rows = vec![
-        ("source", model::REPO.to_string()),
+        (
+            "source",
+            format!("{} at {}", bonsai::REPO, &bonsai::REVISION[..7]),
+        ),
         ("weights", weights),
         ("device", on),
     ];

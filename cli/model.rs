@@ -1,6 +1,6 @@
-//! The one model, Bonsai 2 27B: where its files come from and are kept, the
-//! device it runs on, how much conversation it has room for there, the
-//! state saved after the system prompt, and how it samples.
+//! The one model, Bonsai 2 27B: finding its files, the device it runs on,
+//! how much conversation it has room for there, the state saved after the
+//! system prompt, and how it samples.
 
 use std::{
     error::Error,
@@ -35,27 +35,13 @@ const HEADROOM: u64 = 256 << 20;
 /// The model's name, as the command line gives it.
 pub const NAME: &str = bonsai::NAME;
 
-/// Where the model's files come from: PrismML's repository on Hugging
-/// Face, at a pinned commit, so the weights can't change underneath us and
-/// outputs stay reproducible.
-pub const REPO: &str = "prism-ml/Ternary-Bonsai-2-27B-gguf";
-const REVISION: &str = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
-
-/// The files fetched: the licenses, and the weights.
-pub const FILES: [&str; 3] = ["LICENSE", "NOTICE.txt", bonsai::WEIGHTS];
-
-/// URL to download one of the model's files from.
-pub fn url(file: &str) -> String {
-    format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{file}")
-}
-
 /// The directory the files of the model called `name` are kept in, which
 /// is the one model's.
 pub fn locate(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     if name != NAME {
         return Err(format!("unknown model '{name}' (known: {NAME})").into());
     }
-    bonsai::cache_dir().ok_or_else(|| "cannot determine the cache directory".into())
+    bonsai::dir().ok_or_else(|| "cannot determine the home directory".into())
 }
 
 /// Opens the model's weights in `dir`.
@@ -66,9 +52,9 @@ pub fn open(dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
 /// How much of the model is in `dir`: how many of its files, and their
 /// size in bytes.
 pub fn on_disk(dir: &Path) -> (usize, u64) {
-    FILES
+    bonsai::FILES
         .iter()
-        .filter_map(|file| fs::metadata(dir.join(file)).ok())
+        .filter_map(|file| fs::metadata(dir.join(file.name)).ok())
         .fold((0, 0), |(files, bytes), metadata| {
             (files + 1, bytes + metadata.len())
         })

@@ -21,7 +21,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary},
-    models::{Gguf, LanguageModel, Result, gguf::PTQ1_0, rope_table},
+    models::{Gguf, LanguageModel, Result, gguf::PTQ1_0, hub, rope_table},
 };
 
 /// The model as `dwim` names it.
@@ -31,11 +31,41 @@ pub const NAME: &str = "bonsai-2-27b";
 /// and the sampling settings too.
 pub const WEIGHTS: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
 
-/// Where the model's files are kept: under the platform's cache directory
-/// (`~/.cache` on Linux, `~/Library/Caches` on macOS), since they can
-/// always be fetched again.
-pub fn cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(NAME))
+/// Where the model's files come from: PrismML's repository on Hugging
+/// Face, at a pinned commit, so the weights can't change underneath us and
+/// outputs stay reproducible.
+pub const REPO: &str = "prism-ml/Ternary-Bonsai-2-27B-gguf";
+pub const REVISION: &str = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
+
+/// A file of the model in its repository.
+pub struct File {
+    pub name: &'static str,
+    /// What the Hugging Face cache names its content by: the SHA-256 of a
+    /// file in LFS storage, and the git blob SHA-1 of a small one.
+    pub digest: &'static str,
+}
+
+/// The files fetched: the licenses, and the weights.
+pub const FILES: [File; 3] = [
+    File {
+        name: "LICENSE",
+        digest: "66a27ec5ff940d3a9652d2948746ebac4c9d0188",
+    },
+    File {
+        name: "NOTICE.txt",
+        digest: "275696b5038dd830e97ab15134cac6146322baf9",
+    },
+    File {
+        name: WEIGHTS,
+        digest: "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3",
+    },
+];
+
+/// Where the model's files are kept: its repository's snapshot at the
+/// pinned revision in the Hugging Face cache, shared with every other
+/// tool that uses it. See [`hub`].
+pub fn dir() -> Option<PathBuf> {
+    hub::snapshot_dir(REPO, REVISION)
 }
 
 /// Most tokens a forward pass runs through the model at once. Running a
@@ -1248,7 +1278,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = cache_dir().unwrap().join(WEIGHTS);
+        let path = dir().unwrap().join(WEIGHTS);
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;

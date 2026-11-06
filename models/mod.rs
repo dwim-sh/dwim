@@ -4,6 +4,7 @@
 pub mod bonsai;
 mod chat;
 pub mod gguf;
+pub mod hub;
 mod sampler;
 #[cfg(test)]
 pub mod testing;

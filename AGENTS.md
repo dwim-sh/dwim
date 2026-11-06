@@ -13,7 +13,8 @@ compiles the Vulkan kernels.
   and `bench`, which times the model at depths of context.
 * `models/`: the language model: `gguf` reads the weights file, `tokenizer`
   builds the BPE tokenizer from it, `bonsai` is the transformer as operations
-  on a device, `chat` is the conversation around it.
+  on a device, `chat` is the conversation around it, and `hub` is the
+  Hugging Face cache the weights are kept in.
 * `harness/`: the agent around the model: the system prompt (which includes
   this file), the tool loop, compaction near the end of the context, the
   thinking budget if one is set and the cap on a turn's calls, and the
@@ -42,7 +43,8 @@ tools as `<tool_call><function=bash>…`. Its details are documented in
 
 `cargo build` needs nothing beyond Rust. The GPU needs Metal on macOS or a
 Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights (6 GB)
-are fetched into the user's cache directory on first use.
+are fetched into the user's Hugging Face cache on first use, or by
+`dwim --download`.
 
 ## Verifying
 
