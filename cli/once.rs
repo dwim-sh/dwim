@@ -31,6 +31,7 @@ pub fn once(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
     prompt: &str,
@@ -57,6 +58,7 @@ pub fn once(
             "cpu",
             context,
             thinking_budget,
+            effort,
             temperature,
             shell,
             prompt,
@@ -78,6 +80,7 @@ pub fn once(
                 &device,
                 context,
                 thinking_budget,
+                effort,
                 temperature,
                 shell,
                 prompt,
@@ -105,6 +108,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     on: &str,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
     prompt: &str,
@@ -124,7 +128,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    let system = harness::system_prompt(&cwd);
+    let system = harness::system_prompt(&cwd, effort);
     models::start(&mut chat, which, &system, |read, total| {
         progress.report("reading the system prompt".to_string(), read, total);
     })?;

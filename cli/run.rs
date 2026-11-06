@@ -48,6 +48,7 @@ pub fn run(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
     thinking: bool,
@@ -71,6 +72,7 @@ pub fn run(
                 device,
                 context,
                 thinking_budget,
+                effort,
                 temperature,
                 shell,
                 log,
@@ -235,6 +237,7 @@ fn work(
     device: Device,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
     log: Log,
@@ -254,6 +257,7 @@ fn work(
             model,
             context,
             thinking_budget,
+            effort,
             temperature,
             shell,
             log,
@@ -278,6 +282,7 @@ fn work(
                 model,
                 context,
                 thinking_budget,
+                effort,
                 temperature,
                 shell,
                 log,
@@ -299,6 +304,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     which: &'static models::Model,
     context: Option<usize>,
     thinking_budget: Option<usize>,
+    effort: harness::Effort,
     temperature: Option<f32>,
     shell: Option<PathBuf>,
     log: Log,
@@ -315,7 +321,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
-    let system = harness::system_prompt(&cwd);
+    let system = harness::system_prompt(&cwd, effort);
     models::start(&mut chat, which, &system, |read, total| {
         let _ = replies.send(Reply::Prompting { read, total });
     })?;
