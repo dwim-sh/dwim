@@ -808,7 +808,9 @@ impl<M: LanguageModel> Harness<M> {
                         if this == last {
                             REPEATED.to_string()
                         } else if call.name == "bash"
-                            && call.arguments["command"].as_str().is_some_and(discards)
+                            && call.arguments["command"]
+                                .as_str()
+                                .is_some_and(|command| discards(command, &self.dir))
                             && changed(&self.dir)
                         {
                             DISCARDS.to_string()
@@ -1066,11 +1068,12 @@ fn said_done(text: &str) -> bool {
         .is_some_and(|line| line.trim_matches(|c: char| !c.is_alphanumeric()) == DONE)
 }
 
-/// Whether a shell command would take away changes to a git work tree's
-/// files: `git stash` that saves them, `git checkout` or `git restore` of
-/// files, `git reset --hard`, or `git clean` with force, in any of the
-/// commands it chains.
-fn discards(command: &str) -> bool {
+/// Whether a shell command would take away changes to the files of the git
+/// work tree at `dir`: `git stash` that saves them, `git checkout` of files,
+/// named with `--`, as `.`, or by a path that is there, or forced, `git
+/// restore` of files, `git reset --hard`, or `git clean` with force, in any
+/// of the commands it chains.
+fn discards(command: &str, dir: &Path) -> bool {
     command.split(['\n', ';', '&', '|', '(', ')']).any(|part| {
         let words: Vec<&str> = part.split_whitespace().collect();
         let Some(at) = words.iter().position(|word| *word == "git") else {
@@ -1092,9 +1095,10 @@ fn discards(command: &str) -> bool {
             Some("stash") => args
                 .first()
                 .is_none_or(|first| ["push", "save"].contains(first) || first.starts_with('-')),
-            Some("checkout") => args
-                .iter()
-                .any(|arg| ["--", ".", "-f", "--force"].contains(arg)),
+            Some("checkout") => args.iter().any(|arg| {
+                ["--", ".", "-f", "--force"].contains(arg)
+                    || !arg.starts_with('-') && dir.join(arg).exists()
+            }),
             Some("restore") => {
                 !args.contains(&"--staged")
                     || args.iter().any(|arg| ["--worktree", "-W"].contains(arg))
@@ -1709,6 +1713,11 @@ mod tests {
 
     #[test]
     fn knows_the_commands_that_discard_changes() {
+        // A checkout of a path that is there discards it, as the model ran
+        // it on django-11797; one of a branch, which is not a path, doesn't.
+        let dir = scratch();
+        fs::create_dir_all(dir.join("django/db/models")).unwrap();
+        fs::write(dir.join("django/db/models/lookups.py"), "").unwrap();
         for command in [
             "git stash",
             "cd /x && git stash && python3 tests/runtests.py lookup",
@@ -1718,6 +1727,8 @@ mod tests {
             "git checkout -- django/db/models/lookups.py",
             "git checkout .",
             "git checkout -f main",
+            "cp lookups.py /tmp/b && git checkout django/db/models/lookups.py && echo reverted",
+            "git checkout HEAD django/db/models/lookups.py",
             "git restore lookups.py",
             "git restore --staged --worktree lookups.py",
             "git reset --hard",
@@ -1725,7 +1736,7 @@ mod tests {
             "git clean -fd",
             "git clean --force",
         ] {
-            assert!(discards(command), "{command}");
+            assert!(discards(command, &dir), "{command}");
         }
         for command in [
             "git status",
@@ -1734,14 +1745,16 @@ mod tests {
             "git stash show -p",
             "git stash pop",
             "git checkout -b fix",
+            "git checkout main",
             "git restore --staged lookups.py",
             "git reset HEAD lookups.py",
             "git clean -n",
             "git log --oneline -5 && git show HEAD",
             "echo git stash is not run here > notes.txt",
         ] {
-            assert!(!discards(command), "{command}");
+            assert!(!discards(command, &dir), "{command}");
         }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
