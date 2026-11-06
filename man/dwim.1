@@ -107,6 +107,25 @@ After twenty calls in a row that change no file, a call's result ends with
 a reminder to make the change it has found and check it, or to say what it
 still needs to find out.
 .TP
+.BI \-\-reasoning\-effort " effort"
+How much the model reasons before it replies:
+.BR xhigh ,
+.B medium
+(default), or
+.BR low .
+The model's chat template asks for it with a line at the start of the
+system prompt, for
+.B xhigh
+and
+.B low
+only.
+The model's makers advise
+.B medium
+for the model's long reasoning, and find that
+.B low
+thinks about as long as
+.BR xhigh .
+.TP
 .BI \-\-temperature " t"
 Sample at temperature
 .I t

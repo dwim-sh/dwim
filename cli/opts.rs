@@ -42,6 +42,11 @@ pub struct Opts {
     #[argh(option, default = "dwim_harness::THINKING_BUDGET.unwrap_or(0)")]
     pub thinking_budget: usize,
 
+    /// how much the model reasons before it replies, as its chat template
+    /// asks it to: xhigh, medium or low (default: medium)
+    #[argh(option, default = "dwim_harness::Effort::Medium")]
+    pub reasoning_effort: dwim_harness::Effort,
+
     /// sampling temperature (default: what the model file recommends; 0
     /// always picks the likeliest token)
     #[argh(option)]
