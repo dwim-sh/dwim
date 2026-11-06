@@ -248,15 +248,10 @@ fn search(arguments: &Value) -> Option<String> {
     })
 }
 
-/// `word`, or its plural if `n` is not one.
-fn plural(n: u64, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else if word.ends_with(['h', 's', 'x']) {
-        format!("{word}es")
-    } else {
-        format!("{word}s")
-    }
+/// `one` if `n` is one, and otherwise `many`: the word for `n` of
+/// something.
+fn plural<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
 }
 
 /// Cuts `text` to at most `max` bytes, on a character boundary, with a
@@ -465,9 +460,9 @@ mod tests {
         let mut short = "abc".to_string();
         assert!(!cut(&mut short, 3));
         assert_eq!(short, "abc");
-        assert_eq!(plural(1, "match"), "match");
-        assert_eq!(plural(2, "match"), "matches");
-        assert_eq!(plural(0, "line"), "lines");
+        assert_eq!(plural(1, "match", "matches"), "match");
+        assert_eq!(plural(2, "match", "matches"), "matches");
+        assert_eq!(plural(0, "line", "lines"), "lines");
         let mut long = "ääää".to_string();
         assert!(cut(&mut long, 5));
         assert_eq!(long, "ää…");

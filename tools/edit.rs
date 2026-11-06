@@ -170,7 +170,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         0 => format!("lines {first}–{last} removed"),
         added => format!(
             "lines {first}–{last} replaced by {added} {}",
-            plural(added as u64, "line")
+            plural(added as u64, "line", "lines")
         ),
     };
     let moved = if last < count && first + added != last + 1 {
@@ -194,7 +194,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     Ok(format!(
         "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]{note}",
         now.len(),
-        plural(now.len() as u64, "line")
+        plural(now.len() as u64, "line", "lines")
     ))
 }
 

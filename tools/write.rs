@@ -65,7 +65,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     Ok(format!(
         "[{} {path}: {lines} {}, {} bytes]",
         if existed { "replaced" } else { "wrote" },
-        plural(lines, "line"),
+        plural(lines, "line", "lines"),
         content.len()
     ))
 }
