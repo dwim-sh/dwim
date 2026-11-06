@@ -98,8 +98,9 @@ pub fn size<D: Device>(
     context: Option<usize>,
 ) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
-    let trained = bonsai::Config::load(gguf)?.context_length;
-    let memory = bonsai::Memory::of(gguf)?;
+    let config = bonsai::Config::load(gguf)?;
+    let trained = config.context_length;
+    let memory = bonsai::Memory::of(&config, gguf)?;
     let context = match context {
         Some(context) => context,
         None => fit(&memory, device, trained),

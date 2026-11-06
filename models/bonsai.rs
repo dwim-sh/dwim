@@ -214,9 +214,9 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// The memory the model in `gguf` takes on a device.
-    pub fn of(gguf: &Gguf) -> Result<Self> {
-        let c = Config::load(gguf)?;
+    /// The memory the model in `gguf`, configured as `c`, takes on a
+    /// device.
+    pub fn of(c: &Config, gguf: &Gguf) -> Result<Self> {
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host.
         let mut weights = 0;
