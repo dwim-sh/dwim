@@ -126,14 +126,19 @@ fn project(dir: &Path) -> String {
         .collect()
 }
 
-/// The help text, with the default context worked out for the device the
-/// arguments name, if the model is downloaded and the device opens.
+/// The help text, with the default context worked out for the model and
+/// the device the arguments name, if the model is downloaded and the
+/// device opens.
 fn help(output: String, args: &[&str]) -> String {
     let device = match args.iter().position(|&arg| arg == "--device") {
         Some(i) if args.get(i + 1) == Some(&"cpu") => Device::Cpu,
         _ => Device::Gpu,
     };
-    let Some(size) = models::default_size(device) else {
+    let model = match args.iter().position(|&arg| arg == "--model") {
+        Some(i) => args.get(i + 1).copied().unwrap_or(models::DEFAULT),
+        None => models::DEFAULT,
+    };
+    let Some(size) = models::default_size(model, device) else {
         return output;
     };
     let default = format!(

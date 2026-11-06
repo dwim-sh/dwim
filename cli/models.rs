@@ -165,10 +165,10 @@ fn fit<D: Device>(memory: &qwen35::Memory, device: &D, trained: usize) -> usize 
     tokens.max(MIN_CONTEXT).min(trained)
 }
 
-/// The size of the model on `device` with the context it gets by
+/// The size of the model `name` on `device` with the context it gets by
 /// default, if the model is downloaded and the device opens.
-pub fn default_size(device: opts::Device) -> Option<Size> {
-    let (model, dir) = fetch::locate(DEFAULT).ok()?;
+pub fn default_size(name: &str, device: opts::Device) -> Option<Size> {
+    let (model, dir) = fetch::locate(name).ok()?;
     if !dir.join(model.weights).exists() {
         return None;
     }

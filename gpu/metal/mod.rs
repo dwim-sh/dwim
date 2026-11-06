@@ -777,6 +777,13 @@ fn sysctl<T: Default>(name: &CStr) -> Option<T> {
     (status == 0 && len == size_of::<T>()).then_some(value)
 }
 
+/// The most of the machine's memory a model may take, as a fraction: the
+/// weights and caches are wired while the model runs, and the system and
+/// the applications beside it need the rest. Half leaves 16 GiB of a 32
+/// GiB Mac: with the kernel's own few gigabytes wired too, a model given
+/// nine sixteenths left the machine paging while a browser was open.
+const SHARE: (u64, u64) = (1, 2);
+
 /// What the host can give without swapping: the share of its memory the
 /// kernel counts as available, as `memory_pressure` reports it, the
 /// counterpart of Linux's `MemAvailable`.
@@ -795,7 +802,9 @@ impl Device for Metal {
         // Metal's estimate of the most the GPU can use without hurting
         // performance: with memory unified, a share of the host's. It
         // leaves out what other processes hold, so it is no more than the
-        // host has available.
+        // host has available; and since what a model takes is wired, it is
+        // no more than [`SHARE`] of the machine, so that the system and
+        // whatever else runs keep the rest and nothing is paged out.
         let allocated = self.device.currentAllocatedSize() as u64;
         let mut free = self
             .device
@@ -803,6 +812,9 @@ impl Device for Metal {
             .saturating_sub(allocated);
         if let Some(available) = available() {
             free = free.min(available);
+        }
+        if let Some(total) = sysctl::<u64>(c"hw.memsize") {
+            free = free.min((total / SHARE.1 * SHARE.0).saturating_sub(allocated));
         }
         Some(free)
     }
