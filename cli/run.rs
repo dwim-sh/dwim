@@ -912,6 +912,11 @@ impl App {
         if !live.is_empty() || !blank {
             live.push(Line::new());
         }
+        // What the model is doing, while it is busy, just above the input
+        // box.
+        if let Some(status) = self.status() {
+            live.push(status);
+        }
 
         // The input box, as tall as its text but no taller than the screen,
         // scrolled to show the cursor.
@@ -943,7 +948,7 @@ impl App {
             live.push(tui::boxed(vec![prompt, content], columns));
         }
         live.push(border("╰", "╯"));
-        live.push(self.footer(columns));
+        live.push(self.footer());
 
         let lines = std::mem::take(&mut self.lines);
         if let Some(last) = lines.last() {
@@ -954,8 +959,8 @@ impl App {
     }
 
     /// What the model is doing, with a spinner, while it's busy. Every
-    /// number is padded to a fixed width, so the status, which sits at the
-    /// right of the footer, does not shift as the numbers change.
+    /// number is padded to a fixed width, so the line does not shift as the
+    /// numbers change.
     fn status(&self) -> Option<Line> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
         let seconds = |since: Instant| format!("{:>3}s", since.elapsed().as_secs());
@@ -1013,21 +1018,15 @@ impl App {
         };
         let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
         Some(vec![
-            span(format!("  {frame} {verb}")).bold(),
+            span(format!("{frame} {verb}")).bold(),
             span(format!(" {details}")).dark_grey(),
         ])
     }
 
-    /// The line under the input box: what the model is doing, while it is
-    /// busy, at the left, and the directory the agent works in at the
-    /// right, where it stays put whether the model is busy or not.
-    fn footer(&self, columns: usize) -> Line {
-        let mut line = self.status().unwrap_or_default();
-        let cwd = span(format!("{}  ", tilde(&self.cwd))).dark_grey();
-        let gap = columns.saturating_sub(tui::width(&line) + tui::width(&vec![cwd.clone()]));
-        line.push(span(" ".repeat(gap.max(2))));
-        line.push(cwd);
-        line
+    /// The line under the input box: the directory the agent works in, at
+    /// the left.
+    fn footer(&self) -> Line {
+        vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()]
     }
 }
 
