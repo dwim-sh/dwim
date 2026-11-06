@@ -30,6 +30,20 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # under Rosetta or QEMU, if asked for that platform.
 PLATFORM = "linux/amd64"
 
+# How the issue is put to the model. SWE-bench leaves that to the scaffold,
+# and given the raw issue of a project it knows, the model takes it for the
+# commit that closed it and spends its turns recalling that commit's tests
+# and trying to fetch the project's history to reproduce them, rather than
+# making the fix: on pallets__flask-4045 it had the change worked out in
+# four minutes and had not made it after thirteen. So say what is wanted,
+# as the leaderboard's scaffolds do.
+TASK = """Fix the issue below in this checkout. Make the smallest change that fixes it, update the tests the change breaks, and run them. Don't try to recall or reproduce how the project fixed it upstream; make the fix from this code.
+
+<issue>
+{issue}
+</issue>
+"""
+
 # What `dwim --shell` runs each command through: `docker exec` in the
 # instance's container, in the same directory, which is mounted there at
 # the same path, with the project's conda environment active.
@@ -145,7 +159,7 @@ def solve(row, args, dwim, work, clone):
             subprocess.run(
                 [
                     dwim, "--model", args.model, "--shell", str(shell), "--transcript", str(transcript),
-                    row["problem_statement"],
+                    TASK.format(issue=row["problem_statement"]),
                 ],
                 cwd=clone,
                 stdout=output,
