@@ -1,8 +1,6 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::gpu::{
-    CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary,
-};
+use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, Tensor, cache_bytes, quant};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -13,8 +11,8 @@ macro_rules! check_against_cpu {
             write_and_read_round_trip,
             alloc_is_zeroed_and_copy_moves_ranges,
             matmul_matches_cpu,
-            ternary_matmul_matches_cpu,
-            ternary_matmul_follows_writes,
+            q4_0_matmul_matches_cpu,
+            q8_0_matmul_matches_cpu,
             rmsnorm_matches_cpu,
             l2norm_matches_cpu,
             rope_matches_cpu,
@@ -22,8 +20,6 @@ macro_rules! check_against_cpu {
             store_quantizes_like_cpu,
             cache_round_trips,
             elementwise_match_cpu,
-            hadamard_matches_cpu,
-            rmsnorm_hadamard_matches_cpu,
             conv_matches_cpu,
             delta_net_matches_cpu,
             resize_keeps_capacity
@@ -68,15 +64,37 @@ impl Rng {
         }
     }
 
-    fn ternary(&mut self, shape: &[usize]) -> Tensor {
+    fn q4_0(&mut self, shape: &[usize]) -> Tensor {
         let (rows, cols) = (shape[0], shape[1]);
-        let mut data = vec![0; rows * ternary::row_bytes(cols)];
-        for row in data.chunks_exact_mut(ternary::row_bytes(cols)) {
-            ternary::quantize_row(&self.floats(cols), row);
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols / 2]);
+        for (scales, quants) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols / 2))
+        {
+            quant::quantize_q4_0_row(&self.floats(cols), scales, quants);
         }
-        Tensor::Ternary {
+        Tensor::Q4_0 {
             shape: shape.to_vec(),
-            data,
+            scales,
+            quants,
+        }
+    }
+
+    fn q8_0(&mut self, shape: &[usize]) -> Tensor {
+        let (rows, cols) = (shape[0], shape[1]);
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols]);
+        for (scales, quants) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols))
+        {
+            quant::quantize_q8_0_row(&self.floats(cols), scales, quants);
+        }
+        Tensor::Q8_0 {
+            shape: shape.to_vec(),
+            scales,
+            quants,
         }
     }
 }
@@ -87,9 +105,23 @@ fn clone(t: &Tensor) -> Tensor {
             shape: shape.clone(),
             data: data.clone(),
         },
-        Tensor::Ternary { shape, data } => Tensor::Ternary {
+        Tensor::Q4_0 {
+            shape,
+            scales,
+            quants,
+        } => Tensor::Q4_0 {
             shape: shape.clone(),
-            data: data.clone(),
+            scales: scales.clone(),
+            quants: quants.clone(),
+        },
+        Tensor::Q8_0 {
+            shape,
+            scales,
+            quants,
+        } => Tensor::Q8_0 {
+            shape: shape.clone(),
+            scales: scales.clone(),
+            quants: quants.clone(),
         },
     }
 }
@@ -155,158 +187,99 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
     }
 }
 
-pub fn ternary_matmul_matches_cpu<D: Device>(gpu: &D) {
-    let mut rng = Rng(14);
-    // Single tokens through matrices of few rows and of the model's shapes,
-    // whose blocks the Vulkan sums kernel splits among workgroups or takes
-    // in one range; small batches; batches short of the tiles of 16 and 32
-    // tokens a device may have for them; and batches of half a tile of
-    // tokens or more at the edges of the tiles: a whole one, partial row
-    // and token tiles, and the model's width. A device may multiply a
-    // batch in half precision, as the Vulkan batch kernels do, so a batch
-    // is held to an
-    // error of a thousandth of the outputs' typical magnitude in root mean
-    // square and a hundredth at worst, which is a tenth of what eight-bit
-    // activations would cost; a single token to the usual.
+/// Checks a batch's results against the CPU's as a device that multiplies a
+/// batch in half precision, as the tile kernels do, can meet them: to an
+/// error of a thousandth of the outputs' typical magnitude in root mean
+/// square and a hundredth at worst, which is a tenth of what eight-bit
+/// activations would cost.
+fn close_batch(got: &[f32], want: &[f32], what: &str) {
+    let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+    let (mut worst, mut sum) = (0.0f64, 0.0f64);
+    for (g, w) in got.iter().zip(want) {
+        let e = (g - w).abs() as f64;
+        worst = worst.max(e);
+        sum += e * e;
+    }
+    let rms = (sum / got.len() as f64).sqrt();
+    assert!(
+        rms <= 1e-3 * typical && worst <= 1e-2 * typical,
+        "{what}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
+    );
+}
+
+/// Single tokens and batches, at the edges of the groups of eight tokens
+/// the row kernels take, at the model's shapes, and at the edges of the
+/// tiles of the tile kernels, which a batch of more than a few tokens goes
+/// through where the matrix is a whole number of their steps of 128
+/// columns, through `quantized` matrices: a single token is held to the
+/// usual error, a batch to a batch's.
+fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usize]) -> Tensor) {
     for (rows, cols, n) in [
-        (1, 128, 1),
+        (1, 32, 1),
         (200, 5120, 1),
-        (2500, 5120, 1),
-        (17408, 5120, 1),
-        (5120, 17408, 1),
-        (100_000, 256, 1),
-        (77, 1024, 3),
-        (70_000, 128, 2),
+        (70_000, 32, 2),
+        (77, 1056, 3),
         (200, 5120, 8),
+        (64, 160, 9),
         (64, 128, 16),
-        (100, 256, 12),
-        (1030, 1152, 24),
         (100, 256, 47),
         (1030, 1152, 33),
         (300, 1152, 130),
         (2500, 5120, 64),
     ] {
-        let w = rng.ternary(&[rows, cols]);
-        let x = rng.floats(n * cols);
+        let w = quantized(&[rows, cols]);
+        let x = Rng(rows as u64 + n as u64).floats(n * cols);
         let mut want = vec![0.0; n * rows];
         Cpu.matmul(&mut want, &clone(&w), &x);
         let weight = gpu.upload(w);
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
         let got = gpu.read(&out);
-        if n >= 2 {
-            let typical =
-                (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
-            let (mut worst, mut sum) = (0.0f64, 0.0f64);
-            for (g, w) in got.iter().zip(&want) {
-                let e = (g - w).abs() as f64;
-                worst = worst.max(e);
-                sum += e * e;
-            }
-            let rms = (sum / got.len() as f64).sqrt();
-            assert!(
-                rms <= 1e-3 * typical && worst <= 1e-2 * typical,
-                "{rows}x{cols} n={n}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
-            );
+        if n > 1 {
+            close_batch(&got, &want, &format!("{rows}x{cols} n={n}"));
         } else {
             close(&got, &want, 1e-4);
         }
     }
 }
 
-/// A batch through ternary weights again after its activations change
-/// must see the change, whichever operation made it, and so must one from
-/// a buffer allocated where a freed one was: a device that keeps a batch's
-/// activations packed for its matmuls must know what it has packed.
-pub fn ternary_matmul_follows_writes<D: Device>(gpu: &D) {
-    let mut rng = Rng(16);
-    let (rows, cols, n) = (300, HADAMARD_BLOCK, 16);
-    let w = rng.ternary(&[rows, cols]);
-    let weight = gpu.upload(clone(&w));
-    let signs: Vec<f32> = (0..cols)
-        .map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 })
-        .collect();
-    let check = |x: &D::Buffer, want_x: &Vec<f32>| {
-        let mut want = vec![0.0; n * rows];
-        Cpu.matmul(&mut want, &clone(&w), want_x);
-        let mut out = gpu.alloc(n * rows);
-        gpu.matmul(&mut out, &weight, x);
-        let got = gpu.read(&out);
-        let typical = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
-        for (g, w) in got.iter().zip(&want) {
-            assert!(
-                ((g - w).abs() as f64) <= 1e-2 * typical,
-                "got {g}, want {w}, typical {typical:.2e}"
-            );
-        }
-    };
-    let mut want_x = rng.floats(n * cols);
-    let mut x = buffer(gpu, &want_x);
-    check(&x, &want_x);
-    let y = rng.floats(n * cols);
-    Cpu.add(&mut want_x, &y);
-    gpu.add(&mut x, &buffer(gpu, &y));
-    check(&x, &want_x);
-    Cpu.hadamard(&mut want_x, &signs, false);
-    gpu.hadamard(&mut x, &buffer(gpu, &signs), false);
-    check(&x, &want_x);
-    want_x[..cols].copy_from_slice(&y[..cols]);
-    gpu.copy(&mut x, 0, &buffer(gpu, &y), 0, cols);
-    check(&x, &want_x);
-    want_x = rng.floats(n * cols);
-    gpu.write(&mut x, &want_x);
-    check(&x, &want_x);
-    drop(x);
-    let want_x = rng.floats(n * cols);
-    let x = buffer(gpu, &want_x);
-    check(&x, &want_x);
+pub fn q4_0_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(40);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape));
 }
 
-/// Prints how far the tile kernel is from the CPU on a batch: the largest
-/// and root-mean-square error against the CPU on the activations as given,
-/// and on them rounded to half floats first.
-pub fn tile_error<D: Device>(gpu: &D) {
-    let mut rng = Rng(14);
-    for (rows, cols, n) in [(100, 256, 47), (1030, 1152, 33), (2500, 5120, 64)] {
-        let w = rng.ternary(&[rows, cols]);
-        let x = rng.floats(n * cols);
-        let halved: Vec<f32> = x
-            .iter()
-            .map(|&v| crate::gpu::from_f16(crate::gpu::to_f16(v)))
-            .collect();
-        let mut want = vec![0.0; n * rows];
-        let mut want_half = vec![0.0; n * rows];
-        Cpu.matmul(&mut want, &clone(&w), &x);
-        Cpu.matmul(&mut want_half, &clone(&w), &halved);
-        let weight = gpu.upload(w);
-        let x = buffer(gpu, &x);
-        let mut out = gpu.alloc(n * rows);
-        gpu.matmul(&mut out, &weight, &x);
-        let got = gpu.read(&out);
-        for (name, want) in [("f32", &want), ("f16", &want_half)] {
-            let (mut worst, mut sum) = (0.0f32, 0.0f64);
-            for (g, w) in got.iter().zip(want) {
-                let e = (g - w).abs();
-                worst = worst.max(e);
-                sum += (e * e) as f64;
-            }
-            let rms = (sum / got.len() as f64).sqrt();
-            let typical =
-                (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
-            eprintln!(
-                "{rows}x{cols} n={n} vs {name}: worst {worst:.2e} rms {rms:.2e} typical {typical:.2e}"
-            );
-        }
-    }
+pub fn q8_0_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(80);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape));
 }
 
-/// Times the ternary matmul on the model's 17408x5120 for batches of
-/// tokens, and prints each batch's rate.
-pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
+/// Times the Q4_0 matmul likewise.
+pub fn q4_0_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(41);
+    matmul_speed(gpu, &mut |shape| rng.q4_0(shape), |cols| {
+        cols / 2 + 2 * quant::blocks(cols)
+    });
+}
+
+/// Times the Q8_0 matmul likewise.
+pub fn q8_0_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(81);
+    matmul_speed(gpu, &mut |shape| rng.q8_0(shape), |cols| {
+        cols + 2 * quant::blocks(cols)
+    });
+}
+
+/// Times a matmul through `quantized` matrices, whose rows take
+/// `row_bytes` of their columns, on the model's shapes.
+fn matmul_speed<D: Device>(
+    gpu: &D,
+    quantized: &mut dyn FnMut(&[usize]) -> Tensor,
+    row_bytes: impl Fn(usize) -> usize,
+) {
     let mut rng = Rng(21);
     let (rows, cols) = (17408, 5120);
-    let weight = gpu.upload(rng.ternary(&[rows, cols]));
-    for n in [1, 4, 8, 16, 32, 64, 96, 128, 256] {
+    let weight = gpu.upload(quantized(&[rows, cols]));
+    for n in [1, 2, 4, 8, 12, 16, 32, 64, 96, 128, 256] {
         let x = buffer(gpu, &rng.floats(n * cols));
         let mut out = gpu.alloc(n * rows);
         // Warm up until the clocks are up.
@@ -332,7 +305,7 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
     // The model's other shapes, for a single token: the ones with fewer
     // rows take the other kernels.
     for (rows, cols) in [(5120, 17408), (6144, 5120), (10240, 5120), (1024, 5120)] {
-        let weight = gpu.upload(rng.ternary(&[rows, cols]));
+        let weight = gpu.upload(quantized(&[rows, cols]));
         let x = buffer(gpu, &rng.floats(cols));
         let mut out = gpu.alloc(rows);
         for _ in 0..2000 {
@@ -346,7 +319,7 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
         }
         gpu.read(&out);
         let each = start.elapsed().as_secs_f64() / runs as f64;
-        let bytes = rows * ternary::row_bytes(cols);
+        let bytes = rows * row_bytes(cols);
         eprintln!(
             "{rows}x{cols} n=1   {:8.3} ms  {:6.0} GB/s",
             each * 1e3,
@@ -424,8 +397,8 @@ pub fn dispatch_overhead<D: Device>(gpu: &D) {
 }
 
 /// Times every kernel at the model's shapes for a batch of `n` tokens, the
-/// ternary matmuls other than the largest included, and prints each one's
-/// cost and, times its calls a batch, its share of a token.
+/// matmuls other than the largest included, and prints each one's cost
+/// and, times its calls a batch, its share of a token.
 pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
     let mut rng = Rng(23);
     let (hidden, inter, heads, head_dim, rot_dim, kv_heads) = (5120, 17408, 24, 256, 64, 4);
@@ -468,26 +441,11 @@ pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
         buffer(gpu, &rng.floats(n * inter)),
         buffer(gpu, &rng.floats(n * v_dim)),
     );
-    let (signs_h, signs_i, signs_v) = (
-        buffer(gpu, &rng.floats(hidden)),
-        buffer(gpu, &rng.floats(inter)),
-        buffer(gpu, &rng.floats(v_dim)),
-    );
     let (norm_h, norm_head, norm_state) = (
         buffer(gpu, &rng.floats(hidden)),
         buffer(gpu, &rng.floats(head_dim)),
         buffer(gpu, &rng.floats(state_dim)),
     );
-    let mut out_h = gpu.alloc(n * hidden);
-    time("rmsnorm_hadamard 5120", 129, &mut || {
-        gpu.rmsnorm_hadamard(&mut out_h, &h, &norm_h, &signs_h, 1e-6)
-    });
-    time("hadamard 6144", 64, &mut || {
-        gpu.hadamard(&mut vd, &signs_v, false)
-    });
-    time("hadamard 17408", 64, &mut || {
-        gpu.hadamard(&mut i, &signs_i, false)
-    });
     time("rmsnorm 5120", 48, &mut || {
         gpu.rmsnorm(&mut h, &norm_h, 1e-6)
     });
@@ -613,7 +571,7 @@ pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
         (10240, 5120, 48),
         (1024, 5120, 32),
     ] {
-        let weight = gpu.upload(rng.ternary(&[rows, cols]));
+        let weight = gpu.upload(rng.q4_0(&[rows, cols]));
         let x = buffer(gpu, &rng.floats(n * cols));
         let mut out = gpu.alloc(n * rows);
         time(&format!("matmul {rows}x{cols}"), calls, &mut || {
@@ -796,50 +754,6 @@ pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
     let mut x = buffer(gpu, &a);
     gpu.add(&mut x, &up);
     close(&gpu.read(&x), &want, 1e-6);
-}
-
-pub fn hadamard_matches_cpu<D: Device>(gpu: &D) {
-    let mut rng = Rng(10);
-    for (width, rows) in [(HADAMARD_BLOCK, 1), (5 * HADAMARD_BLOCK, 3)] {
-        let signs: Vec<f32> = (0..width)
-            .map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 })
-            .collect();
-        let x = rng.floats(width * rows);
-        for inverse in [false, true] {
-            let mut want = x.clone();
-            Cpu.hadamard(&mut want, &signs, inverse);
-            let signs = buffer(gpu, &signs);
-            let mut buf = buffer(gpu, &x);
-            gpu.hadamard(&mut buf, &signs, inverse);
-            close(&gpu.read(&buf), &want, 1e-5);
-        }
-        let mut back = x.clone();
-        Cpu.hadamard(&mut back, &signs, false);
-        Cpu.hadamard(&mut back, &signs, true);
-        close(&back, &x, 1e-5);
-    }
-}
-
-pub fn rmsnorm_hadamard_matches_cpu<D: Device>(gpu: &D) {
-    let mut rng = Rng(13);
-    for (width, rows) in [(HADAMARD_BLOCK, 1), (5 * HADAMARD_BLOCK, 3)] {
-        let signs: Vec<f32> = (0..width)
-            .map(|_| if rng.next() < 0.0 { -1.0 } else { 1.0 })
-            .collect();
-        let weight: Vec<f32> = (0..width).map(|_| 1.0 + 0.2 * rng.next()).collect();
-        let x = rng.floats(width * rows);
-        let mut want = vec![0.0; x.len()];
-        Cpu.rmsnorm_hadamard(&mut want, &x, &weight, &signs, 1e-6);
-        let mut out = gpu.alloc(x.len());
-        gpu.rmsnorm_hadamard(
-            &mut out,
-            &buffer(gpu, &x),
-            &buffer(gpu, &weight),
-            &buffer(gpu, &signs),
-            1e-6,
-        );
-        close(&gpu.read(&out), &want, 1e-5);
-    }
 }
 
 pub fn conv_matches_cpu<D: Device>(gpu: &D) {

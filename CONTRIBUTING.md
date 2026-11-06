@@ -21,7 +21,7 @@ driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 The weights are downloaded on first use into the Hugging Face cache,
 `~/.cache/huggingface/hub`, in the layout the `huggingface_hub` library
 uses, so a copy that `hf download` or another tool fetched is used as it
-is. Bonsai 2 27B, the one model, is a 6 GB file; an interrupted download
+is. Qwen3.8-27B, the one model, is a 16 GB file; an interrupted download
 resumes on the next run, and `dwim --download` fetches it ahead of a
 session and prints where it is. `HF_HOME`, `HF_HUB_CACHE`, `HF_HUB_OFFLINE`
 and `HF_ENDPOINT` mean what they mean to the library.
@@ -53,7 +53,8 @@ picks up here too.
 `cargo test gpu::` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the
 model in the cache, `cargo test real_model -- --ignored --nocapture`
-completes a prompt with it and reports the speed, and
+completes a prompt with it and reports the speed, with and without the
+drafter, and
 `cargo run --bin difftest` checks the GPU against the CPU with it, on a
 few prompts run in pieces of different sizes and on their continuations
 run a token at a time. The CPU's side is

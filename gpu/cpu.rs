@@ -4,8 +4,7 @@
 use rayon::prelude::*;
 
 use crate::gpu::{
-    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quantize, sigmoid,
-    softplus, ternary,
+    CACHE_BLOCK, CONV_KERNEL, Device, Tensor, bf16, from_f16, quant, quantize, sigmoid, softplus,
 };
 
 pub struct Cpu;
@@ -125,10 +124,20 @@ impl Device for Cpu {
                 .par_chunks_exact_mut(n)
                 .zip(data.par_chunks_exact(cols))
                 .for_each(|(results, row)| row_dot(results, &|x| dot(row, x))),
-            Tensor::Ternary { data, .. } => by_row
+            Tensor::Q4_0 { scales, quants, .. } => by_row
                 .par_chunks_exact_mut(n)
-                .zip(data.par_chunks_exact(ternary::row_bytes(cols)))
-                .for_each(|(results, row)| row_dot(results, &|x| ternary::dot(row, x))),
+                .zip(scales.par_chunks_exact(quant::blocks(cols)))
+                .zip(quants.par_chunks_exact(cols / 2))
+                .for_each(|((results, scales), quants)| {
+                    row_dot(results, &|x| quant::dot_q4_0(scales, quants, x))
+                }),
+            Tensor::Q8_0 { scales, quants, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(scales.par_chunks_exact(quant::blocks(cols)))
+                .zip(quants.par_chunks_exact(cols))
+                .for_each(|((results, scales), quants)| {
+                    row_dot(results, &|x| quant::dot_q8_0(scales, quants, x))
+                }),
         }
         for (r, results) in by_row.chunks_exact(n).enumerate() {
             for (t, &result) in results.iter().enumerate() {
@@ -234,43 +243,6 @@ impl Device for Cpu {
         for (x, &g) in x.iter_mut().zip(gate) {
             *x *= sigmoid(g);
         }
-    }
-
-    fn hadamard(&self, x: &mut Vec<f32>, signs: &Vec<f32>, inverse: bool) {
-        let width = signs.len();
-        assert!(x.len().is_multiple_of(width) && width.is_multiple_of(HADAMARD_BLOCK));
-        for row in x.chunks_exact_mut(width) {
-            for (block, signs) in row
-                .chunks_exact_mut(HADAMARD_BLOCK)
-                .zip(signs.chunks_exact(HADAMARD_BLOCK))
-            {
-                if !inverse {
-                    for (v, &s) in block.iter_mut().zip(signs) {
-                        *v *= s;
-                    }
-                }
-                walsh_hadamard(block);
-                if inverse {
-                    for (v, &s) in block.iter_mut().zip(signs) {
-                        *v *= s;
-                    }
-                }
-            }
-        }
-    }
-
-    fn rmsnorm_hadamard(
-        &self,
-        out: &mut Vec<f32>,
-        x: &Vec<f32>,
-        weight: &Vec<f32>,
-        signs: &Vec<f32>,
-        eps: f32,
-    ) {
-        assert_eq!(out.len(), x.len());
-        out.copy_from_slice(x);
-        self.rmsnorm(out, weight, eps);
-        self.hadamard(out, signs, false);
     }
 
     fn conv(
@@ -389,27 +361,6 @@ impl Device for Cpu {
     }
 }
 
-/// The normalized Walsh-Hadamard transform of a block, in place: the sums
-/// and differences of pairs one, two, four, and so on apart, over 1/√n.
-fn walsh_hadamard(x: &mut [f32]) {
-    let n = x.len();
-    let mut h = 1;
-    while h < n {
-        for i in (0..n).step_by(2 * h) {
-            for j in i..i + h {
-                let (a, b) = (x[j], x[j + h]);
-                x[j] = a + b;
-                x[j + h] = a - b;
-            }
-        }
-        h *= 2;
-    }
-    let scale = 1.0 / (n as f32).sqrt();
-    for v in x {
-        *v *= scale;
-    }
-}
-
 /// Dot product of a row of bf16 weights with f32 activations.
 ///
 /// Accumulating into eight independent sums lets the compiler vectorize the
@@ -471,8 +422,75 @@ fn softmax(x: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::walsh_hadamard;
-    use crate::gpu::{CACHE_BLOCK, F16_MAX, from_f16, quantize, to_f16};
+    use crate::gpu::{CACHE_BLOCK, F16_MAX, Tensor, from_f16, quant, quantize, to_f16};
+
+    /// Values in [-1, 1) from a seed.
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selecting_rows_and_column_groups_reorders_every_format() {
+        let (rows, cols) = (3, 256);
+        let w = values(rows * cols, 5);
+        let mut tensors = vec![Tensor::Bf16 {
+            shape: vec![rows, cols],
+            data: w.iter().map(|v| (v.to_bits() >> 16) as u16).collect(),
+        }];
+        let blocks = quant::blocks(cols);
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols / 2]);
+        for ((scales, quants), w) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols / 2))
+            .zip(w.chunks_exact(cols))
+        {
+            quant::quantize_q4_0_row(w, scales, quants);
+        }
+        tensors.push(Tensor::Q4_0 {
+            shape: vec![rows, cols],
+            scales,
+            quants,
+        });
+        let (mut scales, mut quants) = (vec![0; rows * blocks], vec![0; rows * cols]);
+        for ((scales, quants), w) in scales
+            .chunks_exact_mut(blocks)
+            .zip(quants.chunks_exact_mut(cols))
+            .zip(w.chunks_exact(cols))
+        {
+            quant::quantize_q8_0_row(w, scales, quants);
+        }
+        tensors.push(Tensor::Q8_0 {
+            shape: vec![rows, cols],
+            scales,
+            quants,
+        });
+        for t in &tensors {
+            let whole = t.dequantize();
+            // Rows 2, 0 and 2 again; then the second half of the columns
+            // before the first.
+            let picked = t.select_rows(&[2, 0, 2]);
+            assert_eq!(picked.shape(), [3, cols]);
+            let got = picked.dequantize();
+            for (i, r) in [2, 0, 2].into_iter().enumerate() {
+                assert_eq!(got[i * cols..][..cols], whole[r * cols..][..cols]);
+            }
+            let swapped = t.select_column_groups(128, &[1, 0]);
+            assert_eq!(swapped.shape(), [rows, cols]);
+            let got = swapped.dequantize();
+            for r in 0..rows {
+                assert_eq!(got[r * cols..][..128], whole[r * cols + 128..][..128]);
+                assert_eq!(got[r * cols + 128..][..128], whole[r * cols..][..128]);
+            }
+        }
+    }
 
     #[test]
     fn f16_round_trips_what_it_can_represent() {
@@ -539,29 +557,5 @@ mod tests {
         assert_eq!(from_f16(to_f16(1e6)), F16_MAX);
         assert_eq!(from_f16(to_f16(-1e6)), -F16_MAX);
         assert_eq!(from_f16(to_f16(1e-9)), 0.0);
-    }
-
-    #[test]
-    fn walsh_hadamard_is_sylvesters_matrix_and_its_own_inverse() {
-        // Row i of the matrix is the transform of the ith unit vector, and
-        // has the sign of the parity of i & j in column j.
-        let n = 16;
-        for i in 0..n {
-            let mut x = vec![0.0; n];
-            x[i] = 1.0;
-            walsh_hadamard(&mut x);
-            for (j, &v) in x.iter().enumerate() {
-                let sign = if (i & j).count_ones() % 2 == 0 {
-                    1.0
-                } else {
-                    -1.0
-                };
-                assert_eq!(v, sign / 4.0, "row {i} column {j}");
-            }
-            walsh_hadamard(&mut x);
-            for (j, &v) in x.iter().enumerate() {
-                assert!((v - if i == j { 1.0 } else { 0.0 }).abs() < 1e-6);
-            }
-        }
     }
 }

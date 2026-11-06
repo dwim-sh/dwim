@@ -1,16 +1,17 @@
-//! Language models: Bonsai, its tokenizer and weights, and a chat around
-//! it.
+//! Language models: Qwen3.8-27B, its tokenizer and weights, and a chat
+//! around it.
 
-pub mod bonsai;
 mod chat;
 pub mod gguf;
 pub mod hub;
+pub mod quants;
+pub mod qwen35;
 mod sampler;
 #[cfg(test)]
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Answer, Chat, Chunk, Reply, Stats, Tally, Turn};
+pub use chat::{Answer, Chat, Chunk, DRAFTS, Reply, Stats, Tally, Turn};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
@@ -37,6 +38,31 @@ pub trait LanguageModel {
     /// returns the logits for the token that follows the last of them.
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
 
+    /// Drafts up to `k` tokens to follow `token`, which was picked at
+    /// position `pos` from the logits the latest run gave: the most likely
+    /// token after each by the drafter's reckoning, if the model has a
+    /// drafter and nothing is being verified, and none otherwise. The
+    /// token and the drafts are then run as one batch by
+    /// [`verify`](Self::verify).
+    fn draft(&mut self, _token: u32, _pos: usize, _k: usize) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Runs `tokens`, the first at position `pos`, as a batch to be
+    /// verified: a token picked and the tokens drafted after it. Returns
+    /// the logits after each, a row per token, and commits none of them
+    /// until [`rewind`](Self::rewind) says how many to keep. Only for a
+    /// model that drafted them.
+    fn verify(&mut self, _tokens: &[u32], _pos: usize) -> Vec<f32> {
+        unreachable!("the model does not draft")
+    }
+
+    /// Commits the first `keep` tokens of the batch being verified, one at
+    /// least, and drops the rest.
+    fn rewind(&mut self, _keep: usize) {
+        unreachable!("the model does not draft")
+    }
+
     /// Forgets the sequence so far, so that the next tokens start at
     /// position 0.
     fn reset(&mut self);
@@ -56,6 +82,18 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         (**self).forward(tokens, pos)
+    }
+
+    fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
+        (**self).draft(token, pos, k)
+    }
+
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        (**self).verify(tokens, pos)
+    }
+
+    fn rewind(&mut self, keep: usize) {
+        (**self).rewind(keep)
     }
 
     fn reset(&mut self) {

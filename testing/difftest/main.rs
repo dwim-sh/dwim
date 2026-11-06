@@ -24,7 +24,7 @@ use std::{
 use dwim::gpu::{Cpu, Device, Gpu};
 use dwim::models::{
     Gguf, LanguageModel,
-    bonsai::{self, Model},
+    qwen35::{self, Model},
 };
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
@@ -153,9 +153,9 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let model = bonsai::dir()
+    let model = qwen35::dir()
         .ok_or("no home directory")?
-        .join(bonsai::WEIGHTS);
+        .join(qwen35::WEIGHTS);
     if !model.exists() {
         return Err(format!(
             "no model at {}: run `dwim --download` to fetch it",
@@ -358,7 +358,7 @@ impl Run {
 /// of the model, the prompts and how they run, and the model file, by its
 /// size and when it was written.
 fn key(root: &Path, model: &Path) -> Result<u64> {
-    let mut files: Vec<PathBuf> = ["cpu.rs", "lib.rs", "ternary.rs"]
+    let mut files: Vec<PathBuf> = ["cpu.rs", "mod.rs", "quant.rs"]
         .iter()
         .map(|f| root.join("gpu").join(f))
         .collect();

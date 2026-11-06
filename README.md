@@ -8,7 +8,7 @@
 The agent, the model, and the engine that runs it, in one Rust program:
 no API key, no server, and nothing leaves your machine.
 
-[![Model: Bonsai 2 27B](https://img.shields.io/badge/Model-Bonsai_2_27B-3ec98a)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+[![Model: Qwen3.8-27B](https://img.shields.io/badge/Model-Qwen3.8--27B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-27B)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
 </div>
@@ -40,7 +40,7 @@ make install                     # in ~/.local
 make install PREFIX=/usr/local   # system-wide, which may need sudo
 ```
 
-Either way, the model (about 6 GB) is downloaded on first use into your
+Either way, the model (16 GB) is downloaded on first use into your
 Hugging Face cache, where `hf download` and other tools would put it, and
 used from there if one of them already did. `dwim --download` fetches it
 ahead of time.
@@ -49,8 +49,9 @@ ahead of time.
 
 - **Fully local coding agent.** Runs commands, reads their output, and keeps
   going.
-- **Bonsai 2 27B model.** Qwen3.8-27B compressed to 6 GB with ternary
-  weights.
+- **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
+  or more, decoding several tokens at a time with the drafter its file
+  ships.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.

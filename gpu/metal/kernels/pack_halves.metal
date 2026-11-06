@@ -1,5 +1,5 @@
-// The activations of a batch of tokens as half floats, for
-// `matmul_ternary_tile.metal`: out[t][k] = half(x[t][k]), rounded to the
+// The activations of a batch of tokens as half floats, for the tile
+// kernels: out[t][k] = half(x[t][k]), rounded to the
 // nearest, with the tokens padded to whole tiles with zeros.
 
 #include <metal_stdlib>
