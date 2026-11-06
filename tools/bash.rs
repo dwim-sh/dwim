@@ -14,6 +14,11 @@
 //! output short, and with the shell's own rule every one of them ended
 //! with `head`'s zero, so a failed build read as a success to the model
 //! and to the harness alike.
+//!
+//! A command that would take away changes the model has made to the
+//! project's tracked files is not run: on SWE-bench's django-11797 the
+//! model made the fix, then ran `git stash` to see its new test fail
+//! without it, and the run ended with nothing changed.
 
 use std::{
     collections::VecDeque,
@@ -83,6 +88,10 @@ fn run(tools: &mut Tools, arguments: &Value) -> Result<String, String> {
 /// a server that was never going to end, does not hold the session long.
 pub const TIMEOUT: u64 = 300;
 
+/// What the model is told for a command that would take away changes it
+/// has made to the project's tracked files.
+const DISCARDS: &str = "not run: this would take away the changes you have made to the project's files (git stash, checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your change, undo it with edit, run what you want, and then make the change again with edit. git diff shows your changes.";
+
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
 /// stream is shown by its first and last [`HALF`] bytes, cut at line ends
@@ -150,7 +159,8 @@ impl Bash {
     }
 
     /// Runs the command in `arguments` in `dir`, or in the directory the
-    /// call names, returning what the model should see.
+    /// call names, returning what the model should see; not one that would
+    /// discard the model's changes to the project at `dir`.
     fn run(&mut self, dir: &Path, arguments: &Value) -> Result<String, String> {
         let command = required(arguments, NAME, "command")?;
         let timeout = match optional_number(
@@ -167,6 +177,9 @@ impl Bash {
             && !dir.is_dir()
         {
             return Err(format!("workdir {} is not a directory", dir.display()));
+        }
+        if discards(command, dir) && changed(dir) {
+            return Err(DISCARDS.to_string());
         }
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
@@ -227,6 +240,61 @@ impl Drop for Bash {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.outputs);
     }
+}
+
+/// Whether a shell command would take away changes to the files of the git
+/// work tree at `dir`: `git stash` that saves them, `git checkout` of files,
+/// named with `--`, as `.`, or by a path that is there, or forced, `git
+/// restore` of files, `git reset --hard`, or `git clean` with force, in any
+/// of the commands it chains.
+fn discards(command: &str, dir: &Path) -> bool {
+    command.split(['\n', ';', '&', '|', '(', ')']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        let Some(at) = words.iter().position(|word| *word == "git") else {
+            return false;
+        };
+        // The subcommand, past git's own options and their values.
+        let mut rest = words[at + 1..].iter().copied();
+        let subcommand = loop {
+            match rest.next() {
+                Some("-C" | "-c" | "--git-dir" | "--work-tree") => {
+                    rest.next();
+                }
+                Some(word) if word.starts_with('-') => {}
+                other => break other,
+            }
+        };
+        let args: Vec<&str> = rest.collect();
+        match subcommand {
+            Some("stash") => args
+                .first()
+                .is_none_or(|first| ["push", "save"].contains(first) || first.starts_with('-')),
+            Some("checkout") => args.iter().any(|arg| {
+                ["--", ".", "-f", "--force"].contains(arg)
+                    || !arg.starts_with('-') && dir.join(arg).exists()
+            }),
+            Some("restore") => {
+                !args.contains(&"--staged")
+                    || args.iter().any(|arg| ["--worktree", "-W"].contains(arg))
+            }
+            Some("reset") => args.contains(&"--hard"),
+            Some("clean") => args.iter().any(|arg| {
+                arg.starts_with('-') && !arg.starts_with("--") && arg.contains('f')
+                    || *arg == "--force"
+            }),
+            _ => false,
+        }
+    })
+}
+
+/// Whether the git work tree at `dir` has changes to its tracked files; not
+/// if it is not one.
+fn changed(dir: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
 /// Removes the output directories in `tmp` of dwim processes that are no
@@ -853,6 +921,89 @@ mod tests {
     #[test]
     fn needs_a_command() {
         assert!(run(&mut Bash::default(), &serde_json::json!({})).starts_with("error: bash needs"));
+    }
+
+    #[test]
+    fn knows_the_commands_that_discard_changes() {
+        // A checkout of a path that is there discards it, as the model ran
+        // it on django-11797; one of a branch, which is not a path, doesn't.
+        let dir = env::temp_dir().join(format!("dwim-discards-{}", process::id()));
+        fs::create_dir_all(dir.join("django/db/models")).unwrap();
+        fs::write(dir.join("django/db/models/lookups.py"), "").unwrap();
+        for command in [
+            "git stash",
+            "cd /x && git stash && python3 tests/runtests.py lookup",
+            "git stash push -m wip",
+            "git stash -u",
+            "git -C /x stash",
+            "git checkout -- django/db/models/lookups.py",
+            "git checkout .",
+            "git checkout -f main",
+            "cp lookups.py /tmp/b && git checkout django/db/models/lookups.py && echo reverted",
+            "git checkout HEAD django/db/models/lookups.py",
+            "git restore lookups.py",
+            "git restore --staged --worktree lookups.py",
+            "git reset --hard",
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git clean --force",
+        ] {
+            assert!(discards(command, &dir), "{command}");
+        }
+        for command in [
+            "git status",
+            "git diff",
+            "git stash list",
+            "git stash show -p",
+            "git stash pop",
+            "git checkout -b fix",
+            "git checkout main",
+            "git restore --staged lookups.py",
+            "git reset HEAD lookups.py",
+            "git clean -n",
+            "git log --oneline -5 && git show HEAD",
+            "echo git stash is not run here > notes.txt",
+        ] {
+            assert!(!discards(command, &dir), "{command}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_discard_changes_to_the_project() {
+        // With a tracked file changed, git stash is refused and the change
+        // stays; with none changed, it runs.
+        let dir = env::temp_dir().join(format!("dwim-refuses-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        fs::write(dir.join("a.txt"), "old\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "a"]);
+        assert!(!changed(&dir));
+        fs::write(dir.join("a.txt"), "new\n").unwrap();
+        assert!(changed(&dir));
+        let mut bash = Bash::default();
+        let stash = serde_json::json!({ "command": "git stash" });
+        assert_eq!(bash.run(&dir, &stash), Err(DISCARDS.to_string()));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        fs::write(dir.join("a.txt"), "old\n").unwrap();
+        assert_eq!(
+            bash.run(&dir, &stash),
+            Ok("No local changes to save\n[exit code 0]".to_string())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
