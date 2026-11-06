@@ -3,7 +3,10 @@
 //! under the directory, `src/*.rs` those right in `src/`, and
 //! `src/**/*_test.go` those anywhere below it. Left with `bash` alone, the
 //! model ran `find` and `ls -R` over `target/` and `node_modules/`, and
-//! its preview was full before it reached the project's own files.
+//! its preview was full before it reached the project's own files. The
+//! search stays within the working directory: asked for `README*` in `/`,
+//! the model once had the tool walk the whole disk for a minute and got
+//! back a page of other projects' READMEs.
 
 use std::{fs, path::Path, process::Command};
 
@@ -33,7 +36,7 @@ fn signature() -> Signature {
             ),
             Parameter::string(
                 "path",
-                "The directory to search (default: the working directory).",
+                "The directory to search, the working directory or one below it (default: the working directory).",
             )
             .optional(),
         ],
@@ -43,14 +46,23 @@ fn signature() -> Signature {
 /// Most files shown.
 const MOST: usize = 100;
 
+/// Most entries the walk visits where there is no git to list the files.
+const CAP: usize = 5000;
+
 /// Lists the files `arguments` ask for, under `dir` or a path taken from
-/// it, returning what the model should see.
+/// it, which must be `dir` or below it, returning what the model should
+/// see.
 fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     let pattern = required(arguments, NAME, "pattern")?;
     let path = directory(arguments).unwrap_or(".");
     let root = dir.join(path);
     if !root.is_dir() {
         return Err(format!("{path} is not a directory"));
+    }
+    if !within(&root, dir) {
+        return Err(format!(
+            "glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
+        ));
     }
     let segments: Vec<&str> = pattern
         .trim_start_matches("./")
@@ -60,12 +72,13 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     if segments.is_empty() {
         return Err("the pattern is empty".to_string());
     }
+    // A name alone is a name anywhere.
     let segments = if segments.len() == 1 {
         vec!["**", segments[0]]
     } else {
         segments
     };
-    let files = files(&root);
+    let (files, complete) = files(&root);
     let found: Vec<&String> = files
         .iter()
         .filter(|file| matches(&segments, &file.split('/').collect::<Vec<_>>()))
@@ -74,8 +87,17 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         "." => pattern.to_string(),
         path => format!("{pattern} in {path}"),
     };
+    let among = if complete {
+        String::new()
+    } else {
+        format!(" among the first {CAP} entries walked")
+    };
     if found.is_empty() {
-        return Ok(format!("[no files match {what}]"));
+        return Ok(if complete {
+            format!("[no files match {what}]")
+        } else {
+            format!("[no files match {what}{among}; narrow the path to search further]")
+        });
     }
     let shown: Vec<String> = found
         .iter()
@@ -87,8 +109,15 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         .collect();
     let note = if found.len() > MOST {
         format!(
-            "[the first {MOST} of {} files matching {what}; narrow the pattern for the rest]",
-            found.len()
+            "[the first {MOST} of {} files matching {what}{among}; narrow the pattern{} for the rest]",
+            found.len(),
+            if complete { "" } else { " or the path" }
+        )
+    } else if !complete {
+        format!(
+            "[{} {} matching {what}{among}; narrow the path for the rest]",
+            found.len(),
+            plural(found.len() as u64, "file", "files")
         )
     } else {
         format!(
@@ -100,11 +129,21 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     Ok(format!("{}\n{note}", shown.join("\n")))
 }
 
+/// Whether the directory `dir` is `root` or below it, symbolic links
+/// resolved.
+fn within(dir: &Path, root: &Path) -> bool {
+    match (fs::canonicalize(dir), fs::canonicalize(root)) {
+        (Ok(dir), Ok(root)) => dir.starts_with(root),
+        _ => false,
+    }
+}
+
 /// The files under `dir`, as paths relative to it with `/` between their
 /// parts, in order, hidden files and directories left out: what git lists
 /// where `dir` is in a repository, which leaves out what it ignores too,
-/// and otherwise everything.
-fn files(dir: &Path) -> Vec<String> {
+/// and otherwise everything up to `CAP` entries. The flag says whether the
+/// list is complete, which it is not when the walk hit the cap.
+fn files(dir: &Path) -> (Vec<String>, bool) {
     let listed = Command::new("git")
         .args([
             "ls-files",
@@ -117,34 +156,42 @@ fn files(dir: &Path) -> Vec<String> {
         .output()
         .ok()
         .filter(|output| output.status.success());
-    let mut files = match listed {
-        Some(output) => output
-            .stdout
-            .split(|&byte| byte == 0)
-            .filter(|file| !file.is_empty())
-            .map(|file| String::from_utf8_lossy(file).into_owned())
-            .filter(|file| !file.split('/').any(|part| part.starts_with('.')))
-            // A file deleted but not yet committed is still listed.
-            .filter(|file| dir.join(file).is_file())
-            .collect(),
+    let (mut files, complete) = match listed {
+        Some(output) => (
+            output
+                .stdout
+                .split(|&byte| byte == 0)
+                .filter(|file| !file.is_empty())
+                .map(|file| String::from_utf8_lossy(file).into_owned())
+                .filter(|file| !file.split('/').any(|part| part.starts_with('.')))
+                // A file deleted but not yet committed is still listed.
+                .filter(|file| dir.join(file).is_file())
+                .collect(),
+            true,
+        ),
         None => {
             let mut files = Vec::new();
-            walk(dir, "", &mut files);
-            files
+            let mut entries = 0;
+            let complete = walk(dir, "", &mut files, &mut entries);
+            (files, complete)
         }
     };
     files.sort();
     files.dedup();
-    files
+    (files, complete)
 }
 
 /// Adds the files under `dir`, whose path relative to the root is `at`, to
-/// `files`, leaving out hidden ones and not following symbolic links.
-fn walk(dir: &Path, at: &str, files: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+/// `files`, in name order, leaving out hidden ones and not following
+/// symbolic links, counting the entries visited in `entries` and stopping
+/// at `CAP` of them. Returns whether it saw the whole tree.
+fn walk(dir: &Path, at: &str, files: &mut Vec<String>, entries: &mut usize) -> bool {
+    let Ok(listing) = fs::read_dir(dir) else {
+        return true;
     };
-    for entry in entries.flatten() {
+    let mut listing: Vec<fs::DirEntry> = listing.flatten().collect();
+    listing.sort_by_key(fs::DirEntry::file_name);
+    for entry in listing {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -152,17 +199,26 @@ fn walk(dir: &Path, at: &str, files: &mut Vec<String>) {
         if name.starts_with('.') {
             continue;
         }
+        if *entries == CAP {
+            return false;
+        }
+        *entries += 1;
         let path = if at.is_empty() {
             name.to_string()
         } else {
             format!("{at}/{name}")
         };
         match entry.file_type() {
-            Ok(kind) if kind.is_dir() => walk(&entry.path(), &path, files),
+            Ok(kind) if kind.is_dir() => {
+                if !walk(&entry.path(), &path, files, entries) {
+                    return false;
+                }
+            }
             Ok(kind) if kind.is_file() => files.push(path),
             _ => {}
         }
     }
+    true
 }
 
 /// Whether the path `parts` matches the pattern `pattern`, both split at
@@ -204,9 +260,15 @@ mod tests {
 
     use super::*;
 
-    /// Runs the call in `arguments`, as the model sees the result.
+    /// Runs the call in `arguments` with `dir` as the working directory,
+    /// as the model sees the result.
+    fn run_in(dir: &Path, arguments: &Value) -> String {
+        crate::tools::Output::of(super::run(dir, arguments), false).text
+    }
+
+    /// Runs the call in `arguments` in the working directory.
     fn run(arguments: &Value) -> String {
-        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
+        run_in(Path::new("."), arguments)
     }
 
     /// A directory of its own with a small tree in it.
@@ -233,7 +295,7 @@ mod tests {
     fn lists_the_files_a_pattern_matches() {
         let dir = tree();
         let at = dir.to_str().unwrap();
-        let list = |pattern: &str| run(&json!({ "pattern": pattern, "path": at }));
+        let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern, "path": at }));
         assert_eq!(
             list("*.rs"),
             format!(
@@ -253,8 +315,70 @@ mod tests {
             format!("{at}/docs/x.md\n[1 file matching **/?.md in {at}]")
         );
         assert_eq!(list("*.go"), format!("[no files match *.go in {at}]"));
-        assert!(run(&json!({ "pattern": "*.rs", "path": "/nonexistent" })).starts_with("error: "));
-        assert!(run(&json!({ "path": at })).starts_with("error: glob needs"));
+        assert_eq!(
+            run_in(&dir, &json!({ "pattern": "*.rs", "path": "src" })),
+            "src/b.rs\nsrc/deep/c.rs\n[2 files matching *.rs in src]"
+        );
+        assert!(
+            run_in(&dir, &json!({ "pattern": "*.rs", "path": "/nonexistent" }))
+                .starts_with("error: ")
+        );
+        assert!(run_in(&dir, &json!({ "path": at })).starts_with("error: glob needs"));
+        // In the working directory itself: this package's.
+        assert!(run(&json!({ "pattern": "glob.rs" })).starts_with("tools/glob.rs\n"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_path_outside_the_working_directory() {
+        let dir = tree();
+        let at = dir.to_str().unwrap();
+        let refused = |path: &str| {
+            format!(
+                "error: glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
+            )
+        };
+        // Above the working directory, by its absolute path or a relative one.
+        let src = dir.join("src");
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": at })),
+            refused(at)
+        );
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": ".." })),
+            refused("..")
+        );
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": "/" })),
+            refused("/")
+        );
+        assert_eq!(
+            run(&json!({ "pattern": "README*", "path": "/" })),
+            refused("/")
+        );
+        // A symbolic link out of it leads outside too.
+        std::os::unix::fs::symlink(&dir, src.join("up")).unwrap();
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": "up" })),
+            refused("up")
+        );
+        // The working directory and the directories below it are fine.
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": "." })),
+            "b.rs\ndeep/c.rs\n[2 files matching *.rs]"
+        );
+        assert_eq!(
+            run_in(&src, &json!({ "pattern": "*.rs", "path": "deep" })),
+            "deep/c.rs\n[1 file matching *.rs in deep]"
+        );
+        assert_eq!(
+            run_in(&dir, &json!({ "pattern": "*.rs", "path": "src/deep" })),
+            "src/deep/c.rs\n[1 file matching *.rs in src/deep]"
+        );
+        assert_eq!(
+            run_in(&dir, &json!({ "pattern": "*.rs", "path": "src/" })),
+            "src/b.rs\nsrc/deep/c.rs\n[2 files matching *.rs in src/]"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -273,7 +397,7 @@ mod tests {
         fs::write(dir.join(".gitignore"), "ignored/\n").unwrap();
         fs::create_dir_all(dir.join("ignored")).unwrap();
         fs::write(dir.join("ignored/i.rs"), "").unwrap();
-        let list = |pattern: &str| run(&json!({ "pattern": pattern, "path": at }));
+        let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern, "path": at }));
         assert_eq!(
             list("*.rs"),
             format!(
@@ -292,6 +416,57 @@ mod tests {
             format!(
                 "[the first {MOST} of 151 files matching docs/*.md in {at}; narrow the pattern for the rest]"
             )
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn caps_the_walk_outside_git() {
+        let dir = tree();
+        assert!(
+            !Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "the temporary directory is in a git repository"
+        );
+        fs::create_dir(dir.join("many")).unwrap();
+        for i in 0..CAP + 1000 {
+            fs::write(dir.join(format!("many/{i:05}.txt")), "").unwrap();
+        }
+        let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern }));
+        // In name order, the walk visits a.rs, docs, docs/x.md and many,
+        // then as many files in many as the cap leaves, and never src.
+        let walked = CAP - 4;
+        let found = list("many/*.txt");
+        let lines: Vec<&str> = found.lines().collect();
+        assert_eq!(lines.len(), MOST + 1);
+        assert_eq!(lines[0], "many/00000.txt");
+        assert_eq!(
+            lines[MOST],
+            format!(
+                "[the first {MOST} of {walked} files matching many/*.txt among the first {CAP} entries walked; narrow the pattern or the path for the rest]"
+            )
+        );
+        assert_eq!(
+            list("*.md"),
+            format!(
+                "docs/x.md\n[1 file matching *.md among the first {CAP} entries walked; narrow the path for the rest]"
+            )
+        );
+        assert_eq!(
+            list("src/*.rs"),
+            format!(
+                "[no files match src/*.rs among the first {CAP} entries walked; narrow the path to search further]"
+            )
+        );
+        // Under the cap, the list is whole again.
+        assert_eq!(
+            run_in(&dir, &json!({ "pattern": "*.rs", "path": "src" })),
+            "src/b.rs\nsrc/deep/c.rs\n[2 files matching *.rs in src]"
         );
         fs::remove_dir_all(dir).unwrap();
     }
