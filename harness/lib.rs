@@ -36,6 +36,7 @@ mod log;
 
 use std::{
     error::Error,
+    fmt::Write,
     fs,
     ops::ControlFlow,
     path::{Path, PathBuf},
@@ -275,12 +276,13 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    prompt.push_str(&format!("{}\n\n{}", tools(), instructions()));
+    prompt.push_str(&tools());
+    prompt.push_str("\n\n");
+    prompt.push_str(&instructions());
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
-        prompt.push_str(&format!(
-            "\n\n# Project instructions\n\nFrom AGENTS.md:\n\n{instructions}"
-        ));
+        prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
+        prompt.push_str(&instructions);
     }
     prompt
 }
@@ -443,7 +445,6 @@ enum Outcome {
 /// A turn as the transcript keeps it: the turn, the tokens it takes read
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
-#[derive(Clone)]
 struct Entry {
     turn: Turn,
     tokens: usize,
@@ -699,7 +700,8 @@ impl<M: LanguageModel> Harness<M> {
     /// recent exchanges without their thoughts. Returns whether it did: not
     /// when there is nothing to compact yet, nor when `on_event` breaks
     /// while the note is written, which leaves the conversation as it was
-    /// but for the note.
+    /// but for the note. Fails as the model does, or if what is read back
+    /// does not fit.
     pub fn compact(
         &mut self,
         on_event: impl FnMut(Event) -> ControlFlow<()>,
@@ -1134,7 +1136,7 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
     if !messages.is_empty() {
         text.push_str("\n\nThe user's messages so far, oldest first:");
         for message in messages {
-            text.push_str(&format!("\n\n<message>\n{message}\n</message>"));
+            write!(text, "\n\n<message>\n{message}\n</message>").expect("a String takes any write");
         }
     }
     if exchanges {

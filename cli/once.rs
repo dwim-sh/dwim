@@ -98,13 +98,12 @@ impl Printer {
                     self.replied = true;
                 }
             }
-            Event::Token => {}
             Event::Call { name, detail } => {
                 self.end_thought();
                 eprintln!("{name}({detail})");
             }
             Event::Output(output) => eprintln!("{output}"),
-            Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
+            Event::Token | Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
         }
     }
 

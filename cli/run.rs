@@ -5,6 +5,7 @@
 use std::{
     env,
     error::Error,
+    fmt::Write,
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
@@ -543,7 +544,7 @@ impl App {
                 return;
             }
             Some(Err(what)) => {
-                self.say(notice(what));
+                self.say(&notice(what));
                 return;
             }
         };
@@ -805,12 +806,12 @@ impl App {
                 return;
             }
         };
-        self.say(lines);
+        self.say(&lines);
     }
 
     /// Prints `lines` above the live region, cut to the terminal's width,
     /// with a blank line after them.
-    fn say(&mut self, lines: Vec<Line>) {
+    fn say(&mut self, lines: &[Line]) {
         let (columns, _) = self.screen.size();
         self.lines
             .extend(lines.iter().map(|line| tui::truncate(line, columns)));
@@ -982,7 +983,7 @@ fn download_details(progress: Progress, elapsed: Duration) -> String {
     let speed = rate.map_or(String::new(), |rate| {
         format!("{}/s", model::bytes(rate as u64))
     });
-    details.push_str(&format!(" · {speed:>10}"));
+    write!(details, " · {speed:>10}").expect("a String takes any write");
     if let Some(total) = total {
         let left = match rate {
             Some(rate) if done < total => {
@@ -995,7 +996,7 @@ fn download_details(progress: Progress, elapsed: Duration) -> String {
             }
             _ => String::new(),
         };
-        details.push_str(&format!(" · {left:>7} left"));
+        write!(details, " · {left:>7} left").expect("a String takes any write");
     }
     details
 }

@@ -94,7 +94,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         format!(
             "[{} {} matching {what}]",
             found.len(),
-            plural(found.len() as u64, "file")
+            plural(found.len() as u64, "file", "files")
         )
     };
     Ok(format!("{}\n{note}", shown.join("\n")))

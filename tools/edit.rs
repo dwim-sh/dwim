@@ -112,42 +112,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         .map(|line| String::from_utf8_lossy(without_ending(line)))
         .collect();
     let (found, tier) = find(&texts, &wanted);
-    let at = match (found.as_slice(), start) {
-        ([], _) => {
-            let around = match start {
-                Some(start) if start >= 1 && start <= count => format!(
-                    ". The lines around {start} stand as:\n{}",
-                    numbered(
-                        &lines,
-                        start.saturating_sub(CONTEXT + 1),
-                        (start + wanted.len() + CONTEXT - 1).min(count)
-                    )
-                ),
-                _ => "; read the lines and copy them".to_string(),
-            };
-            return Err(format!(
-                "old_string not found in {path}; nothing changed{around}"
-            ));
-        }
-        ([at], _) => *at,
-        (many, Some(start)) => match many.iter().find(|&&at| at + 1 == start) {
-            Some(&at) => at,
-            None => {
-                return Err(format!(
-                    "old_string matches {} times in {path}, at lines {}, and none begins at line {start}; nothing changed",
-                    many.len(),
-                    list(many)
-                ));
-            }
-        },
-        (many, None) => {
-            return Err(format!(
-                "old_string matches {} times in {path}, at lines {}; give start, the line of the one you mean; nothing changed",
-                many.len(),
-                list(many)
-            ));
-        }
-    };
+    let at = place(&found, start, &lines, &wanted, path)?;
     let (first, last) = (at + 1, at + wanted.len());
     let new = fitted(&lines[at..last], &wanted, new, tier).map_err(|line| {
         format!(
@@ -170,7 +135,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         0 => format!("lines {first}–{last} removed"),
         added => format!(
             "lines {first}–{last} replaced by {added} {}",
-            plural(added as u64, "line")
+            plural(added as u64, "line", "lines")
         ),
     };
     let moved = if last < count && first + added != last + 1 {
@@ -194,8 +159,57 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     Ok(format!(
         "{shown}\n[{path}: {what}{moved}{elsewhere}; {} {} in all]{note}",
         now.len(),
-        plural(now.len() as u64, "line")
+        plural(now.len() as u64, "line", "lines")
     ))
+}
+
+/// Where the edit goes, as an index from zero: the one place `wanted`
+/// was `found` to begin in `lines`, or the one beginning at `start`; or
+/// the error the model is told for none, showing it the lines around
+/// `start` if it gave one, and for several that `start` does not pick.
+fn place(
+    found: &[usize],
+    start: Option<usize>,
+    lines: &[&[u8]],
+    wanted: &[&str],
+    path: &str,
+) -> Result<usize, String> {
+    let count = lines.len();
+    match (found, start) {
+        ([], _) => {
+            let around = match start {
+                Some(start) if start >= 1 && start <= count => format!(
+                    ". The lines around {start} stand as:\n{}",
+                    numbered(
+                        lines,
+                        start.saturating_sub(CONTEXT + 1),
+                        (start + wanted.len() + CONTEXT - 1).min(count)
+                    )
+                ),
+                _ => "; read the lines and copy them".to_string(),
+            };
+            Err(format!(
+                "old_string not found in {path}; nothing changed{around}"
+            ))
+        }
+        ([at], _) => Ok(*at),
+        (many, Some(start)) => many
+            .iter()
+            .find(|&&at| at + 1 == start)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "old_string matches {} times in {path}, at lines {}, and none begins at line {start}; nothing changed",
+                    many.len(),
+                    list(many)
+                )
+            }),
+        (many, None) => Err(format!(
+            "old_string matches {} times in {path}, at lines {}; give start, the line of the one you mean; nothing changed",
+            many.len(),
+            list(many)
+        )),
+    }
 }
 
 /// The lines of `text`, without their endings.

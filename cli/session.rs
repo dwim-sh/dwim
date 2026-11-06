@@ -153,23 +153,23 @@ impl Stderr {
         match loading {
             Loading::Downloading(progress) => self.stage(
                 format!("downloading {}", progress.file),
-                format!(
+                &format!(
                     "{}/{}",
                     model::bytes(progress.done),
                     model::bytes(progress.total.unwrap_or(progress.done))
                 ),
                 progress.total.is_some_and(|total| progress.done >= total),
             ),
-            Loading::Device(name) => self.device = name.clone(),
+            Loading::Device(name) => self.device.clone_from(name),
             Loading::Sized(size) => eprintln!("{}", model::describe(size)),
             Loading::Weights { done, total } => self.stage(
                 format!("loading the model on {}", self.device),
-                format!("{done}/{total}"),
+                &format!("{done}/{total}"),
                 done >= total,
             ),
             Loading::Prompting { read, total } => self.stage(
                 "reading the system prompt".to_string(),
-                format!("{read}/{total}"),
+                &format!("{read}/{total}"),
                 read >= total,
             ),
         }
@@ -177,7 +177,7 @@ impl Stderr {
 
     /// Tells how far along `stage` is, with `progress` as its measure, and
     /// whether it is `done`.
-    pub fn stage(&mut self, stage: String, progress: String, done: bool) {
+    pub fn stage(&mut self, stage: String, progress: &str, done: bool) {
         if self.stage != stage {
             self.stage = stage;
             if !self.terminal {

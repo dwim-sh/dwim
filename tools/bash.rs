@@ -485,7 +485,7 @@ impl Stream {
         let mut parts = vec![format!(
             "{} {}, {} bytes",
             self.lines(),
-            plural(self.lines(), "line"),
+            plural(self.lines(), "line", "lines"),
             self.total
         )];
         let path = self.path.display();

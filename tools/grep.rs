@@ -160,7 +160,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         format!(
             "[{} {} for {what}]",
             matches.len(),
-            plural(matches.len() as u64, "match"),
+            plural(matches.len() as u64, "match", "matches"),
         )
     };
     Ok(format!("{}\n{note}", matches.join("\n")))

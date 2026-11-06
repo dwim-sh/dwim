@@ -267,7 +267,8 @@ impl<M: LanguageModel> Chat<M> {
     /// Feeds `turns` to the model as the conversation so far, without a
     /// reply to them, as the template writes a conversation over: a reply
     /// already made with an empty thought before it, since the template
-    /// leaves earlier thoughts out.
+    /// leaves earlier thoughts out. Fails when the turns do not fit in the
+    /// context window.
     pub fn replay(&mut self, turns: &[Turn]) -> Result<()> {
         let mut tokens = Vec::new();
         for turn in turns {
@@ -283,7 +284,7 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Most tokens a plain answer to `message` takes with its framing, if
     /// it is limited to `limit` tokens: what [`Chat::answer`] needs room
-    /// for.
+    /// for. Fails only if the message cannot be encoded.
     pub fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
         Ok(self.user(message)?.len()
             + opening(&self.tokenizer, false)?.len()
@@ -539,11 +540,7 @@ impl<M: LanguageModel> Chat<M> {
         // What has followed a <tool_call> tag written in the thought, while
         // it is not yet known whether the tag opens a call.
         let mut held: Option<String> = None;
-        // The thought's tokens, how often each window of them has been
-        // written, and whether one has been written too often.
-        let mut recent: Vec<u32> = Vec::new();
-        let mut windows: HashMap<u64, u32> = HashMap::new();
-        let mut repeating = false;
+        let mut repeats = Repeats::default();
         let mut replied = false;
         // Whether the model tried to end the reply without doing either, and
         // must write out its answer before it may end.
@@ -560,7 +557,7 @@ impl<M: LanguageModel> Chat<M> {
             }
             if let Some(closing) = &self.closing
                 && thinking
-                && (self.thought_limit.is_some_and(|limit| thought >= limit) || repeating)
+                && (self.thought_limit.is_some_and(|limit| thought >= limit) || repeats.repeating)
             {
                 let closing = format!("\n\n{closing}\n");
                 let mut tokens = self.tokenizer.encode(&closing)?;
@@ -657,23 +654,14 @@ impl<M: LanguageModel> Chat<M> {
             }
             if thinking {
                 thought += 1;
-                recent.push(token);
-                if recent.len() >= REPEAT_WINDOW {
-                    let mut hasher = DefaultHasher::new();
-                    recent[recent.len() - REPEAT_WINDOW..].hash(&mut hasher);
-                    let count = windows.entry(hasher.finish()).or_insert(0);
-                    *count += 1;
-                    repeating |= *count >= REPEATS;
-                }
+                repeats.push(token);
             }
             let flow = if consumed {
                 ControlFlow::Continue(())
             } else if token == self.think {
                 thinking = true;
                 thought = 0;
-                recent.clear();
-                windows.clear();
-                repeating = false;
+                repeats = Repeats::default();
                 ControlFlow::Continue(())
             } else if token == self.think_end {
                 thinking = false;
@@ -745,6 +733,30 @@ impl<M: LanguageModel> Chat<M> {
         tally.seconds += start.elapsed().as_secs_f64();
         self.len += tokens.len();
         Ok(logits)
+    }
+}
+
+/// Whether a thought is going round in circles: its tokens so far, how
+/// often each window of [`REPEAT_WINDOW`] of them has been written, and
+/// whether one has been written [`REPEATS`] times.
+#[derive(Default)]
+struct Repeats {
+    recent: Vec<u32>,
+    windows: HashMap<u64, u32>,
+    repeating: bool,
+}
+
+impl Repeats {
+    /// Takes the thought's next token.
+    fn push(&mut self, token: u32) {
+        self.recent.push(token);
+        if self.recent.len() >= REPEAT_WINDOW {
+            let mut hasher = DefaultHasher::new();
+            self.recent[self.recent.len() - REPEAT_WINDOW..].hash(&mut hasher);
+            let count = self.windows.entry(hasher.finish()).or_insert(0);
+            *count += 1;
+            self.repeating |= *count >= REPEATS;
+        }
     }
 }
 

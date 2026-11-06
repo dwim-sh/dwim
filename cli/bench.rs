@@ -57,7 +57,7 @@ pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
             pos += n;
             stderr.stage(
                 format!("filling the context to {depth}"),
-                format!("{pos}/{depth}"),
+                &format!("{pos}/{depth}"),
                 pos >= depth,
             );
         }

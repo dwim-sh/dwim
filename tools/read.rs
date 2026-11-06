@@ -159,7 +159,7 @@ fn page(mut file: impl BufRead, path: &str, start: u64, most: usize) -> io::Resu
     } else if shown == 0 {
         format!(
             "[{path} has {lines} {}; nothing from line {start}]",
-            plural(lines, "line")
+            plural(lines, "line", "lines")
         )
     } else if end < lines {
         format!(
@@ -174,7 +174,7 @@ fn page(mut file: impl BufRead, path: &str, start: u64, most: usize) -> io::Resu
             note.len() - 1,
             &format!(
                 "; {cut} {} longer than {LINE} bytes cut",
-                plural(cut, "line")
+                plural(cut, "line", "lines")
             ),
         );
     }
