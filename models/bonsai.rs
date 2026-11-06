@@ -17,11 +17,25 @@
 //! output projection was rotated in the checkpoint's order and is left as
 //! it is.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
 use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
+
+/// The model as `dwim` names it.
+pub const NAME: &str = "bonsai-2-27b";
+
+/// The file holding the model: a GGUF file, which carries the tokenizer
+/// and the sampling settings too.
+pub const WEIGHTS: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+
+/// Where the model's files are kept: under the platform's cache directory
+/// (`~/.cache` on Linux, `~/Library/Caches` on macOS), since they can
+/// always be fetched again.
+pub fn cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(NAME))
+}
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -1232,9 +1246,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir()
-            .unwrap()
-            .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        let path = cache_dir().unwrap().join(WEIGHTS);
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;

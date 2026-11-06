@@ -313,7 +313,6 @@ dependencies = [
 name = "dwim-difftest"
 version = "0.0.8"
 dependencies = [
- "dirs",
  "dwim-gpu",
  "dwim-models",
 ]
