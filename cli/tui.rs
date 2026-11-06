@@ -204,7 +204,6 @@ fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
             if line_width + word_width <= width {
                 line_width += word_width;
             } else if word.starts_with(' ') {
-                // Break the line at the spaces, dropping them.
                 lines.push(start..pos);
                 start = pos + word.len();
                 line_width = 0;
@@ -214,7 +213,6 @@ fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
                     start = pos;
                     line_width = 0;
                 }
-                // A word too long for a line of its own is broken anywhere.
                 for (i, c) in word.char_indices() {
                     let char_width = c.width().unwrap_or(0);
                     if line_width + char_width > width && line_width > 0 {
@@ -228,7 +226,6 @@ fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
             pos += word.len();
         }
         lines.push(start..pos);
-        // Skip the newline.
         pos += 1;
     }
     for line in &mut lines {

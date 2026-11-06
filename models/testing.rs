@@ -4,19 +4,17 @@
 
 use std::collections::VecDeque;
 
-use crate::{LanguageModel, Tokenizer};
+use crate::{LanguageModel, Tokenizer, chat};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
 /// of its scripts, then ends the reply. Once its scripts run out, it ends
 /// every reply at once.
 pub struct Scripted {
-    /// Every token fed so far, in order.
     pub fed: Vec<u32>,
     scripts: VecDeque<Vec<u32>>,
     /// What it says when asked for a plain answer, if not the next script.
     answer: Option<Vec<u32>>,
-    /// What is left of the reply being said.
     saying: VecDeque<u32>,
     /// Whether the last batch ended with the template's opening of a
     /// reply, and with the thought closed, so the next sampled token
@@ -46,13 +44,9 @@ impl Scripted {
             saying: VecDeque::new(),
             pending: None,
             vocab: tokenizer.vocab_size(),
-            opening: tokenizer
-                .encode_with_special("<|im_start|>assistant\n<think>\n")
-                .unwrap(),
-            unthinking: tokenizer
-                .encode_with_special("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-                .unwrap(),
-            end: tokenizer.special("<|im_end|>").unwrap(),
+            opening: chat::opening(tokenizer, true).unwrap(),
+            unthinking: chat::opening(tokenizer, false).unwrap(),
+            end: tokenizer.special(chat::IM_END).unwrap(),
             max_len,
         }
     }

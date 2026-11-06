@@ -15,7 +15,7 @@ use ash::{
     vk,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host};
 
 /// Size of each of the two staging buffers host memory is copied to and
 /// from the device through: uploads alternate between them, so that one is
@@ -487,11 +487,6 @@ impl Vulkan {
         }
     }
 
-    /// Name of the GPU.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Creates a buffer of `bytes` in memory of the given kind.
     fn buffer(
         &self,
@@ -745,7 +740,6 @@ impl Vulkan {
             self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
         }
         self.barrier(cmd);
-        // Enough recorded for the GPU to get going on.
         let recorded = {
             let mut ring = self.ring.lock().unwrap();
             ring.recorded += 1;
@@ -942,6 +936,15 @@ impl Device for Vulkan {
     type Weight = Weight;
     type Cache = Cache;
 
+    fn name(&self) -> String {
+        // Drivers append their own name in parentheses; the GPU's is enough.
+        self.name
+            .split(" (")
+            .next()
+            .unwrap_or(&self.name)
+            .to_string()
+    }
+
     fn memory(&self) -> Option<u64> {
         // The heap of the first device-local memory type, which `buffer`
         // allocates from.
@@ -968,9 +971,9 @@ impl Device for Vulkan {
         // programs use too, unless the firmware set aside more memory for
         // the GPU than the host has for itself.
         if self.integrated
-            && let Some(total) = crate::meminfo("MemTotal")
+            && let Some(total) = host::total()
             && size <= total
-            && let Some(available) = crate::meminfo("MemAvailable")
+            && let Some(available) = host::available()
         {
             free = free.min(available);
         }
@@ -1090,7 +1093,6 @@ impl Device for Vulkan {
             offset: offset as u32,
             len: src.len as u32,
         };
-        // A thread for each word of scales the blocks have.
         let (first, blocks) = (offset / CACHE_BLOCK, src.len / CACHE_BLOCK);
         let words = (first + blocks).div_ceil(2) - first / 2;
         let groups = self.groups(words, 64);

@@ -10,17 +10,14 @@
 //!
 //! A [`Harness`] wraps a [`Chat`] and reports each turn's thoughts, text,
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
-//! them as they happen. The tools are `bash`, which runs a shell command,
-//! `read`, which reads a file a page at a time, `edit`, which replaces a
-//! string in a file and shows the lines as they now stand, `write`, which
-//! writes a file whole, and `grep` and `glob`, which search files for text
-//! and for names; they live in `dwim_tools`. The system prompt pushes the model to use them rather
-//! than answer from memory or ask the user for a command, and carries the
-//! project's own instructions. Where the model is, and what the project
-//! looks like, go ahead of the first message instead, since a model won't
-//! always go looking on its own: they change from one run to the next,
-//! and keeping them out of the system prompt keeps the state saved after
-//! it good across days, branches, and directories.
+//! them as they happen. The tools live in `dwim_tools`. The system prompt
+//! pushes the model to use them rather than answer from memory or ask the
+//! user for a command, and carries the project's own instructions. Where
+//! the model is, and what the project looks like, go ahead of the first
+//! message instead, since a model won't always go looking on its own: they
+//! change from one run to the next, and keeping them out of the system
+//! prompt keeps the state saved after it good across days, branches, and
+//! directories.
 //!
 //! The harness also keeps the conversation within the context window. It
 //! keeps a transcript of the turns since the system prompt, and when the
@@ -47,7 +44,7 @@ use std::{
 };
 
 use dwim_models::{Chat, Chunk, LanguageModel, Turn};
-use dwim_tools::{ToolCall, Tools};
+use dwim_tools::{ToolCall, Tools, bash, read};
 
 pub use crate::log::Log;
 
@@ -83,7 +80,7 @@ pub const THINKING_BUDGET: Option<usize> = Some(2048);
 /// takes.
 pub const MAX_CALLS: usize = 100;
 
-/// Tool calls in a row without a file changed by `edit` or `write`, after
+/// Tool calls in a row without one that changed a file, after
 /// which the model is reminded to make the change it has found: on
 /// SWE-bench's django-11797 the model showed the bug and read the code at
 /// fault, and then read and searched for the rest of an hour without
@@ -111,12 +108,6 @@ const GO_ON: &str = "Go on with the work: no one will read this until you are do
 
 /// How a reply says, in auto mode, that the work is done: its last line.
 const DONE: &str = "DONE";
-
-/// What the model gets back for a command that would take away changes it
-/// has made to the project's tracked files. On SWE-bench's django-11797 the
-/// model made the fix, then ran `git stash` to see its new test fail
-/// without it, and the run ended with nothing changed.
-const DISCARDS: &str = "error: not run: this would take away the changes you have made to the project's files (git stash, checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your change, undo it with edit, run what you want, and then make the change again with edit. git diff shows your changes.";
 
 /// What the model is asked with once it has made [`MAX_CALLS`] calls in a
 /// turn: a message it answers without tools, which ends the turn.
@@ -158,10 +149,6 @@ const MESSAGES: usize = 16;
 /// lines and the errors the model had spent the conversation finding.
 const NOTE_TOKENS: (usize, usize) = (256, 2048);
 
-/// Tokens kept for the framing around the note prompt and the note, over
-/// the two themselves.
-const FRAMING: usize = 32;
-
 /// Most tokens of the account of a turn that reached [`MAX_CALLS`], in a
 /// context with room for it. A small context allows a sixteenth of itself.
 const ACCOUNT_TOKENS: usize = 1024;
@@ -176,8 +163,11 @@ const NOTE_HEAD: &str = "The conversation so far was compacted to make room in t
 /// conversation compacted, so that it goes on.
 const CONTINUE: &str = "Your reply was stopped short because the context window was full, and the conversation has been compacted since. Go on from where you left off.";
 
-/// How the agent should behave: the start of the system prompt.
-const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, and grep and glob tools that search files for text and for names, and you may use them at any time without asking.
+/// How the agent should behave: the start of the system prompt, with the
+/// tools' own limits in it.
+fn instructions() -> String {
+    format!(
+        r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, and grep and glob tools that search files for text and for names, and you may use them at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
 - While you think, notice when you are recalling how code works rather than reading it: "I think", "I recall", "I believe", "probably". The code here is one version of the project, and may not be the one you remember. Stop the thought there, and read or run that code instead. The same goes for going back and forth: when you have written "wait" or "actually" about the same question twice, stop and find out with a tool. One read or one run settles what more thinking will not.
@@ -185,9 +175,9 @@ const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user
 - When a request could be a question or a task, treat it as a task and do it.
 - To change something, run the commands that change it instead of explaining how.
 - To find where something is, use grep for text and glob for file names, not find, grep or ls through bash: they leave out what git ignores and show line numbers to read from.
-- To read a file, use read, not cat: a page of up to 1000 numbered lines from the line you give, or from the first, that says where the next page starts. Prefer one larger read over many small slices: read the whole function or class you are working on, and the code around it, rather than a few lines at a time, and use grep to find specific content in a large file.
+- To read a file, use read, not cat: a page of up to {page} numbered lines from the line you give, or from the first, that says where the next page starts. Prefer one larger read over many small slices: read the whole function or class you are working on, and the code around it, rather than a few lines at a time, and use grep to find specific content in a large file.
 - To create a file, or replace one wholly, use write, not a heredoc. To change lines in a file, use edit, not sed or a script: give the lines that change as read shows them, with a line or two around them to find the place, and the lines to put in their place; a change in several places is several edits. Its result shows the lines as they now stand, so don't read the file back to check.
-- If a command fails, read the error and try another way. A command's result ends with its exit code, and what it printed to standard error comes after a `[stderr]` line. A command is killed after 300 seconds unless you give it a longer timeout; give a long build or test run one.
+- If a command fails, read the error and try another way. A command's result ends with its exit code, and what it printed to standard error comes after a `[stderr]` line. A command is killed after {timeout} seconds unless you give it a longer timeout; give a long build or test run one.
 - When a command prints more than fits, the result shows the start and the end of its output and names a file that holds all of it, with the line to read it from: use read on that file instead of running the command again.
 - Once a command or a read has given you what you needed, use it and take the next step: don't run the same command again, and don't read the same lines again.
 - To fix a problem, find the code responsible, make the smallest change that fixes it, then run the code or its tests to check the change, and iterate: if the check fails, read the error, change the code again, and check again.
@@ -197,7 +187,11 @@ const INSTRUCTIONS: &str = r#"You are `dwim`, a coding agent working in the user
 - A `<system-reminder>` block at the end of a tool's result is from the harness, not the tool: read it and follow it.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
-For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#;
+For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#,
+        page = read::PAGE,
+        timeout = bash::TIMEOUT,
+    )
+}
 
 /// How the tools are called, declared as Bonsai's chat template puts it,
 /// after their signatures.
@@ -281,7 +275,7 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    prompt.push_str(&format!("{}\n\n{INSTRUCTIONS}", tools()));
+    prompt.push_str(&format!("{}\n\n{}", tools(), instructions()));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str(&format!(
@@ -321,14 +315,11 @@ pub fn environment(dir: &Path) -> String {
         "linux" => "Linux",
         os => os,
     };
-    let days = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() / 86400);
     format!(
         "# Environment\n\nWorking directory: {}\nEvery command runs in the working directory, and every path is relative to it; do not cd there or spell it out.\nFiles: {}\nGit repository: {git}\nPlatform: {platform}\nDate: {}",
         dir.display(),
         files(dir),
-        date(days as i64),
+        now().0,
     )
 }
 
@@ -355,6 +346,18 @@ fn files(dir: &Path) -> String {
         names.push("…".to_string());
     }
     names.join(" ")
+}
+
+/// The date and the time of day now, in UTC.
+fn now() -> (String, String) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let day = secs % 86400;
+    (
+        date((secs / 86400) as i64),
+        format!("{:02}:{:02}:{:02}", day / 3600, day / 60 % 60, day % 60),
+    )
 }
 
 /// The date `days` after 1970-01-01, as year-month-day.
@@ -392,27 +395,28 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// What happens during a turn, as it happens.
-pub enum Event<'a> {
+#[derive(Debug, PartialEq)]
+pub enum Event {
     /// Part of the model's thought, before it replies.
-    Thought(&'a str),
+    Thought(String),
     /// Text of the reply.
-    Text(&'a str),
+    Text(String),
     /// A token sampled, as it may be hidden (a tool-call tag or body, a
     /// thought that closes) rather than shown as a thought or text piece.
     Token,
     /// A tool is about to run: its name and how it was called.
     Call {
-        name: &'a str,
-        detail: &'a str,
+        name: String,
+        detail: String,
     },
     /// What the tool returned, as the model sees it.
-    Output(&'a str),
+    Output(String),
     /// The reply was stopped short because the context window was full.
     Cut,
     /// The conversation is being compacted: the model is writing the note
     /// it will go on from, which follows in `Note` pieces.
     Compacting,
-    Note(&'a str),
+    Note(String),
     /// The conversation was compacted: how many tokens it took before, and
     /// how many it takes now.
     Compacted {
@@ -420,6 +424,9 @@ pub enum Event<'a> {
         after: usize,
     },
 }
+
+/// What a turn's events go to, which ends the turn early by breaking.
+type OnEvent<'a> = &'a mut dyn FnMut(Event) -> ControlFlow<()>;
 
 /// What opens the conversation over with the system prompt, once the chat
 /// is cleared: from a saved state, or by reading the prompt again.
@@ -431,6 +438,16 @@ type Restart<M> = Box<dyn FnMut(&mut Chat<M>) -> Result<(), Box<dyn Error>>>;
 enum Outcome {
     Done,
     Cut,
+}
+
+/// A turn as the transcript keeps it: the turn, the tokens it takes read
+/// back, and whether a user turn is the harness's own prompt to the model
+/// rather than the user's message.
+#[derive(Clone)]
+struct Entry {
+    turn: Turn,
+    tokens: usize,
+    prompt: bool,
 }
 
 /// The loop around a [`Chat`] that runs the tools the model calls and feeds
@@ -446,24 +463,19 @@ pub struct Harness<M: LanguageModel> {
     calls: usize,
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
-    /// compacted: each turn, and the tokens it takes read back.
-    transcript: Vec<(Turn, usize)>,
+    /// compacted.
+    transcript: Vec<Entry>,
     /// Opens the conversation over with the system prompt, once the chat
     /// is cleared.
     restart: Restart<M>,
     /// Most tokens of a note.
     note_tokens: usize,
-    /// Tokens kept free past every reply: room for the note prompt and
-    /// the note.
-    reserve: usize,
-    /// Most tokens of a thought, if they are limited.
-    thinking_budget: Option<usize>,
     /// Tool calls made in the turn so far, and the most there may be
     /// before the model is asked to reply.
     steps: usize,
     max_calls: usize,
-    /// Tool calls in a row without a file changed by `edit` or `write`, and
-    /// how many before the model is reminded to make its change.
+    /// Tool calls in a row without one that changed a file, and how many
+    /// before the model is reminded to make its change.
     unchanged: usize,
     nudge_after: usize,
     /// Auto mode: whether a reply with no call that doesn't say it is
@@ -555,12 +567,11 @@ impl<M: LanguageModel> Harness<M> {
         restart: impl FnMut(&mut Chat<M>) -> Result<(), Box<dyn Error>> + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let note_tokens = (chat.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
-        let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
+        let reserve = chat.answer_tokens(NOTE_PROMPT, note_tokens)?;
         chat.reserve(reserve);
-        chat.set_thinking(true);
         let mut harness = Self {
             chat,
-            tools: Tools::new(),
+            tools: Tools::new(dir),
             environment: Some(environment(dir)),
             dir: dir.to_path_buf(),
             calls: 0,
@@ -568,8 +579,6 @@ impl<M: LanguageModel> Harness<M> {
             transcript: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
-            reserve,
-            thinking_budget: THINKING_BUDGET,
             steps: 0,
             max_calls: MAX_CALLS,
             unchanged: 0,
@@ -578,7 +587,7 @@ impl<M: LanguageModel> Harness<M> {
             went_on: 0,
             log: Log::none(),
         };
-        harness.limit_thoughts();
+        harness.limit_thoughts(THINKING_BUDGET);
         Ok(harness)
     }
 
@@ -586,23 +595,21 @@ impl<M: LanguageModel> Harness<M> {
     /// runs to the budget is ended with a closing in the model's voice,
     /// and the model goes on to act on what it has thought so far.
     pub fn set_thinking_budget(&mut self, tokens: Option<usize>) {
-        self.thinking_budget = tokens;
-        self.limit_thoughts();
+        self.limit_thoughts(tokens);
         self.log.thinking_budget(tokens);
     }
 
-    /// Has the chat end a thought at the thinking budget with the closing
-    /// for where the turn is: to check with a tool before the model has
-    /// called one in the turn, when it is thinking from memory, and to
-    /// decide from the results once it has.
-    fn limit_thoughts(&mut self) {
+    /// Has the chat end a thought at `tokens`, the thinking budget, if
+    /// there is one, with the closing for where the turn is: to check with
+    /// a tool before the model has called one in the turn, when it is
+    /// thinking from memory, and to decide from the results once it has.
+    fn limit_thoughts(&mut self, tokens: Option<usize>) {
         let closing = if self.steps == 0 {
             RECALL_CLOSING
         } else {
             DECIDE_CLOSING
         };
-        self.chat
-            .limit_thoughts(self.thinking_budget.unwrap_or(usize::MAX), closing);
+        self.chat.limit_thoughts(tokens, closing);
     }
 
     /// Runs the model's shell commands through `shell`, as `shell -c
@@ -613,10 +620,11 @@ impl<M: LanguageModel> Harness<M> {
         self.tools.set_shell(shell);
     }
 
-    /// Sets how many tool calls in a row without a file changed by `edit`
-    /// or `write` the model may make before it is reminded to make its
-    /// change, [`NUDGE_AFTER`] unless set.
-    pub fn set_nudge_after(&mut self, calls: usize) {
+    /// Sets how many tool calls in a row without one that changed a file
+    /// the model may make before it is reminded to make its change,
+    /// [`NUDGE_AFTER`] unless set.
+    #[cfg(test)]
+    fn set_nudge_after(&mut self, calls: usize) {
         self.nudge_after = calls;
     }
 
@@ -631,13 +639,9 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Sets how many tool calls the model may make in one turn before it
     /// is asked to reply with what it has, [`MAX_CALLS`] unless set.
-    pub fn set_call_limit(&mut self, calls: usize) {
+    #[cfg(test)]
+    fn set_call_limit(&mut self, calls: usize) {
         self.max_calls = calls;
-    }
-
-    /// Most tokens of a thought, if they are limited.
-    pub fn thinking_budget(&self) -> Option<usize> {
-        self.thinking_budget
     }
 
     /// Keeps a transcript of the session in `log`, starting with what the
@@ -651,7 +655,7 @@ impl<M: LanguageModel> Harness<M> {
             &self.dir,
             self.chat.capacity(),
             self.chat.sampler(),
-            self.thinking_budget,
+            self.chat.thought_limit(),
             system,
         );
         self.log = log;
@@ -666,15 +670,11 @@ impl<M: LanguageModel> Harness<M> {
         }
     }
 
-    /// Number of tokens in the conversation so far.
-    pub fn tokens(&self) -> usize {
-        self.chat.tokens()
-    }
-
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
-    pub fn transcript(&self) -> impl Iterator<Item = &Turn> {
-        self.transcript.iter().map(|(turn, _)| turn)
+    #[cfg(test)]
+    fn transcript(&self) -> impl Iterator<Item = &Turn> {
+        self.transcript.iter().map(|entry| &entry.turn)
     }
 
     /// Sends a message from the user, with where the agent is ahead of the
@@ -685,10 +685,37 @@ impl<M: LanguageModel> Harness<M> {
     pub fn send(
         &mut self,
         message: &str,
-        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
+        on_event: impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<(), Box<dyn Error>> {
+        self.ended(on_event, |harness, on_event| {
+            harness.converse(message, on_event)
+        })
+    }
+
+    /// Compacts the conversation to make room in the context: has the
+    /// model write a note to go on from, reported as `Note` pieces, starts
+    /// the conversation over from the system prompt, and reads back where
+    /// the agent is, the note, the user's earlier messages, and the most
+    /// recent exchanges without their thoughts. Returns whether it did: not
+    /// when there is nothing to compact yet, nor when `on_event` breaks
+    /// while the note is written, which leaves the conversation as it was
+    /// but for the note.
+    pub fn compact(
+        &mut self,
+        on_event: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<bool, Box<dyn Error>> {
+        self.ended(on_event, |harness, on_event| harness.compaction(on_event))
+    }
+
+    /// Runs `work`, reporting to `on_event`, and records in the log how it
+    /// ended, if not on its own: with an error, or interrupted.
+    fn ended<T>(
+        &mut self,
+        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
+        work: impl FnOnce(&mut Self, OnEvent) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
         let mut interrupted = false;
-        let result = self.converse(message, &mut |event| {
+        let result = work(self, &mut |event| {
             let flow = on_event(event);
             interrupted |= flow.is_break();
             flow
@@ -699,22 +726,18 @@ impl<M: LanguageModel> Harness<M> {
     }
 
     /// Sends a message from the user, as [`Harness::send`] does.
-    fn converse(
-        &mut self,
-        message: &str,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn converse(&mut self, message: &str, on_event: OnEvent) -> Result<(), Box<dyn Error>> {
         let ahead = self.environment.take();
         self.steps = 0;
         self.unchanged = 0;
         self.went_on = 0;
-        let mut outcome = self.run(Turn::User(message.to_string()), ahead, on_event)?;
+        let mut outcome = self.run(Turn::User(message.to_string()), false, ahead, on_event)?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
                 return Ok(());
             }
             if self.compaction(on_event)? {
-                outcome = self.run(Turn::User(CONTINUE.to_string()), None, on_event)?;
+                outcome = self.run(Turn::User(CONTINUE.to_string()), true, None, on_event)?;
                 if outcome == Outcome::Cut {
                     let _ = on_event(Event::Cut);
                 }
@@ -728,14 +751,15 @@ impl<M: LanguageModel> Harness<M> {
     /// results back, until the model replies with text alone, is
     /// interrupted, or is stopped short for room; or until it has made
     /// [`MAX_CALLS`] calls in the turn, when it is asked to reply with
-    /// what it has.
+    /// what it has. A message that is the harness's own `prompt` rather
+    /// than the user's is kept as such.
     fn run(
         &mut self,
         mut input: Turn,
+        mut prompt: bool,
         mut ahead: Option<String>,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+        on_event: OnEvent,
     ) -> Result<Outcome, Box<dyn Error>> {
-        // The last call run, as its name and arguments.
         let mut last = None;
         loop {
             if let Turn::User(message) = &input {
@@ -760,19 +784,21 @@ impl<M: LanguageModel> Harness<M> {
                     return Err("the cap is reached by tool results".into());
                 };
                 self.chat.feed_results(outputs)?;
-                self.record(input)?;
+                self.record(input, prompt)?;
                 let outcome = self.account(on_event)?;
                 if outcome == Outcome::Cut || !self.go_on() {
                     return Ok(outcome);
                 }
                 self.steps = 0;
                 input = Turn::User(GO_ON.to_string());
+                prompt = true;
                 continue;
             }
-            self.limit_thoughts();
+            let budget = self.chat.thought_limit();
+            self.limit_thoughts(budget);
             let mut text = String::new();
             let before = self.chat.stats();
-            let calls = {
+            let reply = {
                 let collect = |chunk: Chunk| {
                     match chunk {
                         Chunk::Thought(piece) => self.log.stream("thought", piece),
@@ -790,58 +816,53 @@ impl<M: LanguageModel> Harness<M> {
                     Turn::Reply { .. } => return Err("a reply is the model's to make".into()),
                 }
             };
-            let cut = self.chat.cut();
             self.log.reply(
-                &calls,
-                self.chat.thought_ended(),
-                cut,
+                &reply.calls,
+                reply.thought_ended,
+                reply.cut,
                 self.chat.tokens(),
                 &before,
                 &self.chat.stats(),
             );
-            self.record(input)?;
-            self.record(Turn::Reply {
-                text,
-                calls: calls.clone(),
-            })?;
-            if cut {
+            self.record(input, prompt)?;
+            self.record(
+                Turn::Reply {
+                    text,
+                    calls: reply.calls.clone(),
+                },
+                false,
+            )?;
+            if reply.cut {
                 return Ok(Outcome::Cut);
             }
-            if calls.is_empty() {
+            if reply.calls.is_empty() {
                 if !self.go_on() {
                     return Ok(Outcome::Done);
                 }
                 input = Turn::User(GO_ON.to_string());
+                prompt = true;
                 continue;
             }
             let mut outputs = Vec::new();
-            for call in &calls {
+            for call in &reply.calls {
                 let mut seconds = None;
-                let mut changes = false;
+                let mut changed = false;
                 self.steps += 1;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = dwim_tools::describe(&call);
                         self.log.call(&call.name, &detail);
                         if on_event(Event::Call {
-                            name: &call.name,
-                            detail: &detail,
+                            name: call.name.clone(),
+                            detail: detail.clone(),
                         })
                         .is_break()
                         {
                             return Ok(Outcome::Done);
                         }
-                        changes = matches!(call.name.as_str(), "edit" | "write");
                         let this = Some((call.name.clone(), call.arguments.to_string()));
                         if this == last {
                             REPEATED.to_string()
-                        } else if call.name == "bash"
-                            && call.arguments["command"]
-                                .as_str()
-                                .is_some_and(|command| discards(command, &self.dir))
-                            && changed(&self.dir)
-                        {
-                            DISCARDS.to_string()
                         } else {
                             last = this;
                             let start = Instant::now();
@@ -850,16 +871,17 @@ impl<M: LanguageModel> Harness<M> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            output
+                            changed = output.changed;
+                            output.text
                         }
                     }
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
                 self.log.output(&output, seconds);
-                if on_event(Event::Output(&output)).is_break() {
+                if on_event(Event::Output(output.clone())).is_break() {
                     return Ok(Outcome::Done);
                 }
-                if changes && !output.starts_with("error:") {
+                if changed {
                     self.unchanged = 0;
                 } else {
                     self.unchanged += 1;
@@ -875,6 +897,7 @@ impl<M: LanguageModel> Harness<M> {
                 self.unchanged = 0;
             }
             input = Turn::Results(outputs);
+            prompt = false;
         }
     }
 
@@ -884,7 +907,7 @@ impl<M: LanguageModel> Harness<M> {
     fn go_on(&mut self) -> bool {
         let done = matches!(
             self.transcript.last(),
-            Some((Turn::Reply { text, .. }, _)) if said_done(text)
+            Some(Entry { turn: Turn::Reply { text, .. }, .. }) if said_done(text)
         );
         if !self.auto || done || self.went_on >= AUTO_ROUNDS {
             return false;
@@ -896,35 +919,36 @@ impl<M: LanguageModel> Harness<M> {
     /// Asks the model, once it has made [`MAX_CALLS`] calls in a turn, for
     /// an account of the turn, which it gives without tools, reported as
     /// `Text` pieces, and records the exchange. The turn ends with it.
-    fn account(
-        &mut self,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<Outcome, Box<dyn Error>> {
-        let prompt = STEPS_PROMPT;
-        self.log.user(prompt, None, self.chat.tokens());
+    fn account(&mut self, on_event: OnEvent) -> Result<Outcome, Box<dyn Error>> {
+        self.log.user(STEPS_PROMPT, None, self.chat.tokens());
         let before = self.chat.stats();
-        let text = self.chat.answer(prompt, self.account_limit(), |chunk| {
-            let Chunk::Text(text) = chunk else {
-                return ControlFlow::Continue(());
-            };
-            self.log.stream("text", text);
-            on_event(Event::Text(text))
-        })?;
-        let cut = self.chat.cut();
+        let answer = self
+            .chat
+            .answer(STEPS_PROMPT, self.account_limit(), |text| {
+                self.log.stream("text", text);
+                on_event(Event::Text(text.to_string()))
+            })?;
         self.log.reply(
             &[],
             false,
-            cut,
+            answer.cut,
             self.chat.tokens(),
             &before,
             &self.chat.stats(),
         );
-        self.record(Turn::User(prompt.to_string()))?;
-        self.record(Turn::Reply {
-            text,
-            calls: Vec::new(),
-        })?;
-        Ok(if cut { Outcome::Cut } else { Outcome::Done })
+        self.record(Turn::User(STEPS_PROMPT.to_string()), true)?;
+        self.record(
+            Turn::Reply {
+                text: answer.text,
+                calls: Vec::new(),
+            },
+            false,
+        )?;
+        Ok(if answer.cut {
+            Outcome::Cut
+        } else {
+            Outcome::Done
+        })
     }
 
     /// Most tokens of the account of a turn: [`ACCOUNT_TOKENS`], or a
@@ -935,15 +959,19 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Most tokens the account of a turn takes, with the prompt for it.
     fn account_tokens(&self) -> Result<usize, Box<dyn Error>> {
-        let prompt = Turn::User(STEPS_PROMPT.to_string());
-        Ok(self.chat.measure(&prompt)? + self.account_limit() + FRAMING)
+        self.chat.answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
-    /// Adds a turn to the transcript, and returns the tokens it takes.
-    fn record(&mut self, turn: Turn) -> Result<usize, Box<dyn Error>> {
+    /// Adds a turn to the transcript, a user turn as the harness's own
+    /// `prompt` or the user's message.
+    fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
         let tokens = self.chat.measure(&turn)?;
-        self.transcript.push((turn, tokens));
-        Ok(tokens)
+        self.transcript.push(Entry {
+            turn,
+            tokens,
+            prompt,
+        });
+        Ok(())
     }
 
     /// Makes room for `input`, and for `more` tokens after it, compacting
@@ -955,7 +983,7 @@ impl<M: LanguageModel> Harness<M> {
         &mut self,
         input: &Turn,
         more: usize,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
+        on_event: OnEvent,
     ) -> Result<bool, Box<dyn Error>> {
         let needed = self.chat.measure(input)? + more;
         let capacity = self.chat.capacity();
@@ -965,7 +993,7 @@ impl<M: LanguageModel> Harness<M> {
         {
             return Ok(false);
         }
-        if self.chat.tokens() + needed + self.reserve > capacity {
+        if needed > self.chat.free() {
             return Err(
                 format!("a message of {needed} tokens does not fit in the context window").into(),
             );
@@ -973,34 +1001,8 @@ impl<M: LanguageModel> Harness<M> {
         Ok(true)
     }
 
-    /// Compacts the conversation to make room in the context: has the
-    /// model write a note to go on from, reported as `Note` pieces, starts
-    /// the conversation over from the system prompt, and reads back where
-    /// the agent is, the note, the user's earlier messages, and the most
-    /// recent exchanges without their thoughts. Returns whether it did: not when there is
-    /// nothing to compact yet, nor when `on_event` breaks while the note
-    /// is written, which leaves the conversation as it was but for the
-    /// note.
-    pub fn compact(
-        &mut self,
-        mut on_event: impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<bool, Box<dyn Error>> {
-        let mut interrupted = false;
-        let result = self.compaction(&mut |event| {
-            let flow = on_event(event);
-            interrupted |= flow.is_break();
-            flow
-        });
-        self.log
-            .end(result.as_ref().err().map(|e| e as _), interrupted);
-        result
-    }
-
     /// Compacts the conversation, as [`Harness::compact`] does.
-    fn compaction(
-        &mut self,
-        on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
-    ) -> Result<bool, Box<dyn Error>> {
+    fn compaction(&mut self, on_event: OnEvent) -> Result<bool, Box<dyn Error>> {
         if self.transcript.is_empty() {
             return Ok(false);
         }
@@ -1010,15 +1012,15 @@ impl<M: LanguageModel> Harness<M> {
         }
         let before = self.chat.tokens();
         let mut interrupted = false;
-        let note = self.chat.answer(NOTE_PROMPT, self.note_tokens, |chunk| {
-            let Chunk::Text(text) = chunk else {
-                return ControlFlow::Continue(());
-            };
-            self.log.stream("note", text);
-            let flow = on_event(Event::Note(text));
-            interrupted |= flow.is_break();
-            flow
-        })?;
+        let note = self
+            .chat
+            .answer(NOTE_PROMPT, self.note_tokens, |text| {
+                self.log.stream("note", text);
+                let flow = on_event(Event::Note(text.to_string()));
+                interrupted |= flow.is_break();
+                flow
+            })?
+            .text;
         if interrupted {
             return Ok(false);
         }
@@ -1032,19 +1034,20 @@ impl<M: LanguageModel> Harness<M> {
             &messages,
             start < self.transcript.len(),
         );
-        let mut kept = vec![Turn::User(head.clone())];
+        let mut kept = vec![(Turn::User(head.clone()), true)];
         kept.extend(
             self.transcript[start..]
                 .iter()
-                .map(|(turn, _)| turn.clone()),
+                .map(|entry| (entry.turn.clone(), entry.prompt)),
         );
+        let turns: Vec<Turn> = kept.iter().map(|(turn, _)| turn.clone()).collect();
 
         self.chat.clear();
         (self.restart)(&mut self.chat)?;
-        self.chat.replay(&kept, |_, _| {})?;
+        self.chat.replay(&turns)?;
         self.transcript.clear();
-        for turn in kept {
-            self.record(turn)?;
+        for (turn, prompt) in kept {
+            self.record(turn, prompt)?;
         }
         let after = self.chat.tokens();
         self.log
@@ -1067,17 +1070,17 @@ impl<M: LanguageModel> Drop for Harness<M> {
 /// tokens, each starting at a reply, and always the last reply, which any
 /// pending tool results answer. The whole transcript's length if there is
 /// no reply yet.
-fn tail(transcript: &[(Turn, usize)], budget: usize) -> usize {
+fn tail(transcript: &[Entry], budget: usize) -> usize {
     let replies: Vec<usize> = (0..transcript.len())
-        .filter(|&i| matches!(transcript[i].0, Turn::Reply { .. }))
+        .filter(|&i| matches!(transcript[i].turn, Turn::Reply { .. }))
         .collect();
     let Some(&last) = replies.last() else {
         return transcript.len();
     };
     let mut start = last;
-    let mut total: usize = transcript[start..].iter().map(|(_, tokens)| tokens).sum();
+    let mut total: usize = transcript[start..].iter().map(|entry| entry.tokens).sum();
     for &i in replies.iter().rev().skip(1) {
-        let more: usize = transcript[i..start].iter().map(|(_, tokens)| tokens).sum();
+        let more: usize = transcript[i..start].iter().map(|entry| entry.tokens).sum();
         if total + more > budget {
             break;
         }
@@ -1096,81 +1099,23 @@ fn said_done(text: &str) -> bool {
         .is_some_and(|line| line.trim_matches(|c: char| !c.is_alphanumeric()) == DONE)
 }
 
-/// Whether a shell command would take away changes to the files of the git
-/// work tree at `dir`: `git stash` that saves them, `git checkout` of files,
-/// named with `--`, as `.`, or by a path that is there, or forced, `git
-/// restore` of files, `git reset --hard`, or `git clean` with force, in any
-/// of the commands it chains.
-fn discards(command: &str, dir: &Path) -> bool {
-    command.split(['\n', ';', '&', '|', '(', ')']).any(|part| {
-        let words: Vec<&str> = part.split_whitespace().collect();
-        let Some(at) = words.iter().position(|word| *word == "git") else {
-            return false;
-        };
-        // The subcommand, past git's own options and their values.
-        let mut rest = words[at + 1..].iter().copied();
-        let subcommand = loop {
-            match rest.next() {
-                Some("-C" | "-c" | "--git-dir" | "--work-tree") => {
-                    rest.next();
-                }
-                Some(word) if word.starts_with('-') => {}
-                other => break other,
-            }
-        };
-        let args: Vec<&str> = rest.collect();
-        match subcommand {
-            Some("stash") => args
-                .first()
-                .is_none_or(|first| ["push", "save"].contains(first) || first.starts_with('-')),
-            Some("checkout") => args.iter().any(|arg| {
-                ["--", ".", "-f", "--force"].contains(arg)
-                    || !arg.starts_with('-') && dir.join(arg).exists()
-            }),
-            Some("restore") => {
-                !args.contains(&"--staged")
-                    || args.iter().any(|arg| ["--worktree", "-W"].contains(arg))
-            }
-            Some("reset") => args.contains(&"--hard"),
-            Some("clean") => args.iter().any(|arg| {
-                arg.starts_with('-') && !arg.starts_with("--") && arg.contains('f')
-                    || *arg == "--force"
-            }),
-            _ => false,
-        }
-    })
-}
-
-/// Whether the git work tree at `dir` has changes to its tracked files; not
-/// if it is not one.
-fn changed(dir: &Path) -> bool {
-    Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .current_dir(dir)
-        .output()
-        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
-}
-
-/// The user's own messages among `turns`, oldest first, as many of the
-/// most recent as fit in `budget` tokens: not the notes of earlier
-/// compactions, nor the prompts to go on after a reply was cut, nor
-/// those for an account of a turn.
-fn messages(turns: &[(Turn, usize)], budget: usize) -> Vec<&str> {
+/// The user's own messages among `entries`, oldest first, as many of the
+/// most recent as fit in `budget` tokens: not the harness's prompts, such
+/// as the notes of earlier compactions.
+fn messages(entries: &[Entry], budget: usize) -> Vec<&str> {
     let mut kept = Vec::new();
     let mut total = 0;
-    for (turn, tokens) in turns.iter().rev() {
-        let Turn::User(message) = turn else {
+    for entry in entries.iter().rev() {
+        let Turn::User(message) = &entry.turn else {
             continue;
         };
-        if message.contains(NOTE_HEAD)
-            || [CONTINUE, STEPS_PROMPT, GO_ON].contains(&message.as_str())
-        {
+        if entry.prompt {
             continue;
         }
-        if total + tokens > budget {
+        if total + entry.tokens > budget {
             break;
         }
-        total += tokens;
+        total += entry.tokens;
         kept.push(message.as_str());
     }
     kept.reverse();
@@ -1198,11 +1143,27 @@ fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) 
     text
 }
 
+impl Event {
+    /// What the user is told of the event, for the ones that are told
+    /// rather than shown: the reply stopped short, and the compaction as
+    /// it starts and as it ends.
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Event::Cut => Some("Stopped short: the context window is full".to_string()),
+            Event::Compacting => Some("Compacting the conversation…".to_string()),
+            Event::Compacted { before, after } => {
+                Some(format!("Compacted from {before} to {after} tokens"))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The event for a piece of the model's reply.
 fn event(chunk: Chunk) -> Event {
     match chunk {
-        Chunk::Thought(text) => Event::Thought(text),
-        Chunk::Text(text) => Event::Text(text),
+        Chunk::Thought(text) => Event::Thought(text.to_string()),
+        Chunk::Text(text) => Event::Text(text.to_string()),
         Chunk::Token => Event::Token,
     }
 }
@@ -1262,9 +1223,6 @@ mod tests {
         let mut note = String::new();
         harness
             .send(message, |event| {
-                // The `Token` events only move the rate counter; they carry
-                // no text and are not interesting to the event-sequence
-                // assertions.
                 let name = match event {
                     Event::Thought(_) => "thought",
                     Event::Text(_) => "text",
@@ -1274,7 +1232,7 @@ mod tests {
                     Event::Cut => "cut",
                     Event::Compacting => "compacting",
                     Event::Note(text) => {
-                        note.push_str(text);
+                        note.push_str(&text);
                         "note"
                     }
                     Event::Compacted { .. } => "compacted",
@@ -1299,6 +1257,10 @@ mod tests {
             max_len,
             "Task: keep going.\nNext: more of the same.",
         );
+        let reserve = harness
+            .chat
+            .answer_tokens(NOTE_PROMPT, harness.note_tokens)
+            .unwrap();
         let mut messages = 0;
         let (events, note) = loop {
             messages += 1;
@@ -1311,7 +1273,7 @@ mod tests {
                 events,
                 ["thought", "text", "call", "output", "thought", "text"]
             );
-            assert!(harness.tokens() <= max_len - harness.reserve);
+            assert!(harness.chat.tokens() <= max_len - reserve);
         };
         assert!(messages > 1);
         // The compaction comes before the message or the tool results
@@ -1364,8 +1326,8 @@ mod tests {
         let fed = &harness.chat.model().fed;
         let expected = Tokenizer::tiny().encode_with_special(&format!("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{head}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")).unwrap();
         assert_eq!(&fed[..expected.len()], expected);
-        assert!(harness.tokens() < max_len / 2);
-        assert_eq!(harness.tokens(), fed.len());
+        assert!(harness.chat.tokens() < max_len / 2);
+        assert_eq!(harness.chat.tokens(), fed.len());
 
         // The conversation goes on, and the earlier note is not a message
         // of the user's the next time.
@@ -1405,6 +1367,10 @@ mod tests {
         let mut harness = harness(&scripts, max_len, "Task: go on.");
         // The replies are long thoughts: not the budget's business here.
         harness.set_thinking_budget(None);
+        let reserve = harness
+            .chat
+            .answer_tokens(NOTE_PROMPT, harness.note_tokens)
+            .unwrap();
         for i in 0..3 {
             let (events, _) = send(&mut harness, &format!("message {i}"));
             assert_eq!(events, ["thought", "text"], "{i}");
@@ -1434,7 +1400,7 @@ mod tests {
                 .iter()
                 .any(|turn| matches!(turn, Turn::User(message) if message == "message 3"))
         );
-        assert!(harness.tokens() <= max_len - harness.reserve);
+        assert!(harness.chat.tokens() <= max_len - reserve);
     }
 
     #[test]
@@ -1443,7 +1409,7 @@ mod tests {
         // with the closing, and the reply goes on to its call and its text.
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
-        assert_eq!(limited.thinking_budget(), THINKING_BUDGET);
+        assert_eq!(limited.chat.thought_limit(), THINKING_BUDGET);
         assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
         limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
@@ -1452,12 +1418,9 @@ mod tests {
         let mut events = Vec::new();
         limited
             .send("go", |event| {
-                // The `Token` events only move the rate counter; they carry
-                // no text and are not interesting to the event-sequence
-                // assertions.
                 let name = match event {
                     Event::Thought(text) => {
-                        thought.push_str(text);
+                        thought.push_str(&text);
                         "thought"
                     }
                     Event::Text(_) => "text",
@@ -1505,11 +1468,11 @@ mod tests {
         let scripts = [reply(1000, false)];
         let mut free = harness(&scripts, 8000, "");
         free.set_thinking_budget(None);
-        assert_eq!(free.thinking_budget(), None);
+        assert_eq!(free.chat.thought_limit(), None);
         let mut thought = String::new();
         free.send("go", |event| {
             if let Event::Thought(text) = event {
-                thought.push_str(text);
+                thought.push_str(&text);
             }
             ControlFlow::Continue(())
         })
@@ -1746,103 +1709,6 @@ mod tests {
     }
 
     #[test]
-    fn knows_the_commands_that_discard_changes() {
-        // A checkout of a path that is there discards it, as the model ran
-        // it on django-11797; one of a branch, which is not a path, doesn't.
-        let dir = scratch();
-        fs::create_dir_all(dir.join("django/db/models")).unwrap();
-        fs::write(dir.join("django/db/models/lookups.py"), "").unwrap();
-        for command in [
-            "git stash",
-            "cd /x && git stash && python3 tests/runtests.py lookup",
-            "git stash push -m wip",
-            "git stash -u",
-            "git -C /x stash",
-            "git checkout -- django/db/models/lookups.py",
-            "git checkout .",
-            "git checkout -f main",
-            "cp lookups.py /tmp/b && git checkout django/db/models/lookups.py && echo reverted",
-            "git checkout HEAD django/db/models/lookups.py",
-            "git restore lookups.py",
-            "git restore --staged --worktree lookups.py",
-            "git reset --hard",
-            "git reset --hard HEAD~1",
-            "git clean -fd",
-            "git clean --force",
-        ] {
-            assert!(discards(command, &dir), "{command}");
-        }
-        for command in [
-            "git status",
-            "git diff",
-            "git stash list",
-            "git stash show -p",
-            "git stash pop",
-            "git checkout -b fix",
-            "git checkout main",
-            "git restore --staged lookups.py",
-            "git reset HEAD lookups.py",
-            "git clean -n",
-            "git log --oneline -5 && git show HEAD",
-            "echo git stash is not run here > notes.txt",
-        ] {
-            assert!(!discards(command, &dir), "{command}");
-        }
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn refuses_to_discard_changes_to_the_project() {
-        // With a tracked file changed, git stash is refused and the change
-        // stays; with none changed, it runs.
-        let dir = scratch();
-        let git = |args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                    .args(args)
-                    .current_dir(&dir)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
-            );
-        };
-        git(&["init", "-q"]);
-        fs::write(dir.join("a.txt"), "old\n").unwrap();
-        git(&["add", "a.txt"]);
-        git(&["commit", "-qm", "a"]);
-        let scripts = [
-            reply_calling(10, "bash", "command", "cd DIR && git stash"),
-            reply(10, false),
-        ];
-        let path = dir.join("log.jsonl");
-        assert!(!changed(&dir));
-        fs::write(dir.join("a.txt"), "new\n").unwrap();
-        assert!(changed(&dir));
-        let mut harness = harness_in(&dir, &scripts, &path);
-        send(&mut harness, "go");
-        let turns: Vec<&Turn> = harness.transcript().collect();
-        assert!(
-            matches!(turns[2], Turn::Results(outputs) if outputs[0] == DISCARDS),
-            "{:?}",
-            turns[2]
-        );
-        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
-
-        fs::write(dir.join("a.txt"), "old\n").unwrap();
-        let mut harness = harness_in(&dir, &scripts, &path);
-        send(&mut harness, "go");
-        let turns: Vec<&Turn> = harness.transcript().collect();
-        assert!(
-            matches!(turns[2], Turn::Results(outputs) if outputs[0] != DISCARDS),
-            "{:?}",
-            turns[2]
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn asks_for_an_account_at_the_call_cap() {
         // Three calls under a cap of three: the results of the third are
         // fed, the model is asked for an account of the turn, which it
@@ -1970,9 +1836,19 @@ mod tests {
 
     #[test]
     fn keeps_the_most_recent_exchanges_from_a_reply() {
-        let user = |i: usize| (Turn::User(format!("message {i}")), 10);
+        let entry = |turn: Turn, tokens: usize| Entry {
+            turn,
+            tokens,
+            prompt: false,
+        };
+        let prompt = |text: &str| Entry {
+            turn: Turn::User(text.to_string()),
+            tokens: 10,
+            prompt: true,
+        };
+        let user = |i: usize| entry(Turn::User(format!("message {i}")), 10);
         let reply = |n: usize| {
-            (
+            entry(
                 Turn::Reply {
                     text: "Ok.".to_string(),
                     calls: Vec::new(),
@@ -1980,7 +1856,7 @@ mod tests {
                 n,
             )
         };
-        let results = |n: usize| (Turn::Results(vec!["ok".to_string()]), n);
+        let results = |n: usize| entry(Turn::Results(vec!["ok".to_string()]), n);
         let transcript = vec![
             user(1),
             reply(50),
@@ -2015,11 +1891,11 @@ mod tests {
         let turns = vec![
             user(1),
             reply(50),
-            (Turn::User(CONTINUE.to_string()), 10),
+            prompt(CONTINUE),
             reply(10),
-            (Turn::User(format!("# Environment\n\n{NOTE_HEAD} x")), 10),
+            prompt(&format!("# Environment\n\n{NOTE_HEAD} x")),
             user(2),
-            (Turn::User(STEPS_PROMPT.to_string()), 10),
+            prompt(STEPS_PROMPT),
             reply(10),
             user(3),
         ];
@@ -2106,7 +1982,10 @@ mod tests {
         );
         assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
-        assert!(prompt.contains(INSTRUCTIONS));
+        assert!(prompt.contains(&instructions()));
+        // The tools' limits as the tools have them.
+        assert!(prompt.contains(&format!("a page of up to {} numbered lines", read::PAGE)));
+        assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
         assert!(prompt.contains("From AGENTS.md:\n\n# `dwim`"));
         // What changes between runs is not in the prompt, so that the state
         // saved after it is good for the next run.

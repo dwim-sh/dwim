@@ -1,13 +1,16 @@
+//! Downloading the model's files into its directory, resuming what an
+//! interrupted run left.
+
 use std::{
     error::Error,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::Duration,
 };
 
-use crate::models::{MODELS, Model};
+use crate::model;
 
 /// How long a partial download can go without being written to before it is
 /// taken for the leftover of an interrupted run, to be resumed, rather than
@@ -15,7 +18,7 @@ use crate::models::{MODELS, Model};
 const STALE: Duration = Duration::from_secs(60);
 
 /// How far along the download of one of a model's files is.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Progress {
     pub file: &'static str,
     /// Bytes downloaded so far.
@@ -25,42 +28,16 @@ pub struct Progress {
     pub total: Option<u64>,
 }
 
-/// Looks up a model by name, and the directory its files are kept in.
-pub fn locate(name: &str) -> Result<(&'static Model, PathBuf), Box<dyn Error>> {
-    let model = Model::find(name).ok_or_else(|| {
-        let known: Vec<_> = MODELS.iter().map(|model| model.name).collect();
-        format!("unknown model '{name}' (known: {})", known.join(", "))
-    })?;
-    let dir = model.dir().ok_or("cannot determine the cache directory")?;
-    Ok((model, dir))
-}
-
-/// How much of a model is in `dir`: how many of its files, and their size in
-/// bytes.
-pub fn on_disk(model: &Model, dir: &Path) -> (usize, u64) {
-    model
-        .files
-        .iter()
-        .filter_map(|file| fs::metadata(dir.join(file)).ok())
-        .fold((0, 0), |(files, bytes), metadata| {
-            (files + 1, bytes + metadata.len())
-        })
-}
-
-/// Downloads a model's files into `dir`, skipping any that are already there,
-/// and reporting progress on each one as it comes in.
-pub fn fetch(
-    model: &'static Model,
-    dir: &Path,
-    mut progress: impl FnMut(Progress),
-) -> Result<(), Box<dyn Error>> {
+/// Downloads the model's files into `dir`, skipping any that are already
+/// there, and reporting progress on each one as it comes in.
+pub fn fetch(dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(dir)?;
-    for file in model.files {
+    for file in model::FILES {
         let path = dir.join(file);
         if path.exists() {
             continue;
         }
-        download(model, file, &path, &mut progress)?;
+        download(file, &path, &mut progress)?;
     }
     Ok(())
 }
@@ -72,8 +49,7 @@ pub fn fetch(
 /// A partial file another run is still writing is waited for; one nobody is
 /// writing is picked up where it left off, which matters for a model of
 /// several gigabytes on a slow link.
-pub fn download(
-    model: &Model,
+fn download(
     file: &'static str,
     path: &Path,
     progress: &mut impl FnMut(Progress),
@@ -101,7 +77,7 @@ pub fn download(
         done,
         total: None,
     });
-    let mut request = ureq::get(&model.url(file));
+    let mut request = ureq::get(&model::url(file));
     if done > 0 {
         request = request.header("Range", &format!("bytes={done}-"));
     }
@@ -153,7 +129,6 @@ fn save(
         }
         writer.write_all(&buf[..n])?;
         done += n as u64;
-        // The file's last report, once it is complete, is made below.
         if Some(done) != total {
             progress(Progress { file, done, total });
         }
@@ -169,19 +144,4 @@ fn save(
         total: Some(done),
     });
     Ok(())
-}
-
-/// Formats a byte count for humans, in decimal units.
-pub fn size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
-    if bytes < 1000 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1000.0;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }

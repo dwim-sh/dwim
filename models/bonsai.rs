@@ -17,11 +17,25 @@
 //! output projection was rotated in the checkpoint's order and is left as
 //! it is.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
 use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
+
+/// The model as `dwim` names it.
+pub const NAME: &str = "bonsai-2-27b";
+
+/// The file holding the model: a GGUF file, which carries the tokenizer
+/// and the sampling settings too.
+pub const WEIGHTS: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+
+/// Where the model's files are kept: under the platform's cache directory
+/// (`~/.cache` on Linux, `~/Library/Caches` on macOS), since they can
+/// always be fetched again.
+pub fn cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(NAME))
+}
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -168,8 +182,6 @@ impl Config {
         ]
     }
 
-    /// Width of the linear attention's queries and keys per token, and of
-    /// its values.
     /// Activations of a linear layer's convolution state: the tokens before
     /// the batch, a row of channels each.
     fn conv_width(&self) -> usize {
@@ -202,9 +214,9 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// The memory the model in `gguf` takes on a device.
-    pub fn of(gguf: &Gguf) -> Result<Self> {
-        let c = Config::load(gguf)?;
+    /// The memory the model in `gguf`, configured as `c`, takes on a
+    /// device.
+    pub fn of(c: &Config, gguf: &Gguf) -> Result<Self> {
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host.
         let mut weights = 0;
@@ -864,7 +876,6 @@ struct State<D: Device> {
 }
 
 impl<D: Device> State<D> {
-    /// Allocates state for sequences of up to `max_len` tokens.
     fn new(c: &Config, d: &D, max_len: usize, caches: usize, slots: usize) -> Self {
         let kv_dim = c.kv_heads * c.head_dim;
         let widths = c.widths();
@@ -909,7 +920,6 @@ impl<D: Device> State<D> {
         }
     }
 
-    /// Sizes the buffers for a batch of `n` tokens.
     fn batch(&mut self, device: &D, n: usize) {
         assert!(n <= BATCH, "a batch of {n} tokens is more than {BATCH}");
         let buffers = [
@@ -1167,8 +1177,6 @@ mod tests {
     fn run<D: Device>(path: &Path, device: D) -> [Vec<f32>; 3] {
         let gguf = Arc::new(Gguf::open(path).unwrap());
         let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
-        // A batch of several tokens, then one more, then a batch of many,
-        // each carrying the state.
         let first = model.forward(&[3, 17, 42, 7, 9], 0);
         let second = model.forward(&[11], 5);
         let many: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
@@ -1238,9 +1246,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir()
-            .unwrap()
-            .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        let path = cache_dir().unwrap().join(WEIGHTS);
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;

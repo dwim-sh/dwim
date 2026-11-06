@@ -12,8 +12,7 @@
 use std::{
     cell::{Cell, RefCell},
     error::Error,
-    ffi::{CStr, c_char, c_int, c_void},
-    ptr::{self, NonNull},
+    ptr::NonNull,
     slice,
 };
 
@@ -28,7 +27,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, host};
 
 /// Positions one threadgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -389,11 +388,6 @@ impl Metal {
         })
     }
 
-    /// Name of the GPU.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Creates a buffer of `bytes` in memory shared with the GPU, which Metal
     /// clears to zero.
     fn buffer(&self, bytes: usize) -> Object<dyn MTLBuffer> {
@@ -446,7 +440,6 @@ impl Metal {
         };
         encoder
             .dispatchThreadgroups_threadsPerThreadgroup(size(groups.0, groups.1), size(threads, 1));
-        // Enough encoded for the GPU to get going on while the rest is.
         current.dispatched += 1;
         if current.dispatched >= SUBMIT_EVERY {
             let Pending { cmd, encoder, .. } = pending.take().unwrap();
@@ -654,45 +647,14 @@ struct LenParams {
     len: u32,
 }
 
-unsafe extern "C" {
-    fn sysctlbyname(
-        name: *const c_char,
-        old: *mut c_void,
-        old_len: *mut usize,
-        new: *const c_void,
-        new_len: usize,
-    ) -> c_int;
-}
-
-/// The value of the sysctl `name`, an integer of type `T`.
-fn sysctl<T: Default>(name: &CStr) -> Option<T> {
-    let mut value = T::default();
-    let mut len = size_of::<T>();
-    let status = unsafe {
-        sysctlbyname(
-            name.as_ptr(),
-            (&raw mut value).cast(),
-            &mut len,
-            ptr::null(),
-            0,
-        )
-    };
-    (status == 0 && len == size_of::<T>()).then_some(value)
-}
-
-/// What the host can give without swapping: the share of its memory the
-/// kernel counts as available, as `memory_pressure` reports it, the
-/// counterpart of Linux's `MemAvailable`.
-fn available() -> Option<u64> {
-    let total: u64 = sysctl(c"hw.memsize")?;
-    let percent: u32 = sysctl(c"kern.memorystatus_level")?;
-    Some(total / 100 * u64::from(percent.min(100)))
-}
-
 impl Device for Metal {
     type Buffer = Buffer;
     type Weight = Weight;
     type Cache = Cache;
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
 
     fn memory(&self) -> Option<u64> {
         // Metal's estimate of the most the GPU can use without hurting
@@ -704,7 +666,7 @@ impl Device for Metal {
             .device
             .recommendedMaxWorkingSetSize()
             .saturating_sub(allocated);
-        if let Some(available) = available() {
+        if let Some(available) = host::available() {
             free = free.min(available);
         }
         Some(free)
@@ -938,7 +900,6 @@ impl Device for Metal {
             );
             return;
         }
-        // Each SIMD group takes one row of bf16 weights for eight tokens.
         self.dispatch_grid(
             &self.kernels.matmul_bf16,
             &[&out.buf, &w.buf, &x.buf],
@@ -1352,18 +1313,6 @@ mod tests {
 
     use crate::Device;
     check_against_cpu!(super::Metal::new());
-
-    /// Checks that the host's available memory is read, and is some of
-    /// its memory but no more than all of it.
-    #[test]
-    fn available_is_part_of_the_host() {
-        let total: u64 = super::sysctl(c"hw.memsize").unwrap();
-        let available = super::available().unwrap();
-        assert!(
-            available > 0 && available <= total,
-            "{available} of {total}"
-        );
-    }
 
     /// Checks the tile kernel a GPU without matrix accelerators takes, on
     /// one that has them too.

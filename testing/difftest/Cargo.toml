@@ -8,6 +8,5 @@ name = "difftest"
 path = "main.rs"
 
 [dependencies]
-dirs = "7.0.0"
 dwim-gpu.workspace = true
 dwim-models.workspace = true

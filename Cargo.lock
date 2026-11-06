@@ -305,7 +305,6 @@ dependencies = [
  "dwim-gpu",
  "dwim-harness",
  "dwim-models",
- "libc",
  "unicode-width",
  "ureq",
 ]
@@ -314,7 +313,6 @@ dependencies = [
 name = "dwim-difftest"
 version = "0.0.8"
 dependencies = [
- "dirs",
  "dwim-gpu",
  "dwim-models",
 ]

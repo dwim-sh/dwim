@@ -8,19 +8,50 @@
 
 use std::{
     io::{BufRead, BufReader},
+    path::Path,
     process::{Command, Stdio},
     sync::OnceLock,
 };
 
 use serde_json::Value;
 
-use crate::string;
+use crate::{
+    Parameter, Signature, Tool, cut, directory, plural, required, search, string, without_ending,
+};
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "grep", "description": "Search files for a regular expression and show the matching lines as file:line:text, up to 100 of them, leaving out files git ignores. To see the code around a match, read the file from its line.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "The regular expression to search for."}, "path": {"type": "string", "description": "The file or directory to search (default: the working directory)."}, "glob": {"type": "string", "description": "Only files whose name matches this pattern, such as *.rs. Optional."}}, "required": ["pattern"]}}}"#;
+const NAME: &str = "grep";
+
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: false,
+    describe: search,
+    run: |tools, arguments| run(&tools.dir, arguments),
+};
+
+fn signature() -> Signature {
+    Signature {
+        description: format!(
+            "Search files for a regular expression and show the matching lines as file:line:text, up to {MOST} of them, leaving out files git ignores. To see the code around a match, read the file from its line."
+        ),
+        parameters: vec![
+            Parameter::string("pattern", "The regular expression to search for."),
+            Parameter::string(
+                "path",
+                "The file or directory to search (default: the working directory).",
+            )
+            .optional(),
+            Parameter::string(
+                "glob",
+                "Only files whose name matches this pattern, such as *.rs. Optional.",
+            )
+            .optional(),
+        ],
+    }
+}
 
 /// Most matches shown.
-pub const MOST: usize = 100;
+const MOST: usize = 100;
 
 /// Most bytes of a match shown; a longer line is cut there, with a mark.
 const LINE: usize = 500;
@@ -38,17 +69,14 @@ fn ripgrep() -> bool {
     })
 }
 
-/// Searches as `arguments` ask, returning what the model should see.
-pub fn run(arguments: &Value) -> String {
-    let Some(pattern) = string(arguments, "pattern") else {
-        return "error: grep needs a 'pattern' string".to_string();
-    };
+/// Searches as `arguments` ask, in `dir` or a path taken from it,
+/// returning what the model should see.
+fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
+    let pattern = required(arguments, NAME, "pattern")?;
     if pattern.is_empty() {
-        return "error: the pattern is empty".to_string();
+        return Err("the pattern is empty".to_string());
     }
-    let path = string(arguments, "path")
-        .filter(|path| !path.is_empty())
-        .unwrap_or(".");
+    let path = directory(arguments).unwrap_or(".");
     let glob = string(arguments, "glob").filter(|glob| !glob.is_empty());
     let mut command = if ripgrep() {
         let mut command = Command::new("rg");
@@ -85,13 +113,13 @@ pub fn run(arguments: &Value) -> String {
     };
     command
         .args(["-e", pattern, "--", path])
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => return format!("error: could not search: {e}"),
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("could not search: {e}"))?;
     // The matches up to the most shown, after which the search is ended:
     // it would otherwise run on for nothing.
     let stdout = BufReader::new(child.stdout.take().unwrap());
@@ -118,9 +146,9 @@ pub fn run(arguments: &Value) -> String {
     if matches.is_empty() {
         return match output {
             // Both searchers exit with 1 for no match and 2 for an error.
-            Ok(output) if output.status.code() == Some(1) => format!("[no matches for {what}]"),
-            Ok(output) => format!("error: {}", String::from_utf8_lossy(&output.stderr).trim()),
-            Err(e) => format!("error: could not search: {e}"),
+            Ok(output) if output.status.code() == Some(1) => Ok(format!("[no matches for {what}]")),
+            Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            Err(e) => Err(format!("could not search: {e}")),
         };
     }
     matches.sort_by_key(|line| key(line));
@@ -132,29 +160,17 @@ pub fn run(arguments: &Value) -> String {
         format!(
             "[{} {} for {what}]",
             matches.len(),
-            if matches.len() == 1 {
-                "match"
-            } else {
-                "matches"
-            }
+            plural(matches.len() as u64, "match"),
         )
     };
-    format!("{}\n{note}", matches.join("\n"))
+    Ok(format!("{}\n{note}", matches.join("\n")))
 }
 
 /// A match as the model sees it: text, without a carriage return at its
 /// end, cut at [`LINE`] bytes with a mark.
 fn shown(line: &[u8]) -> String {
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let mut text = String::from_utf8_lossy(line).into_owned();
-    if text.len() > LINE {
-        let end = (0..=LINE)
-            .rev()
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        text.truncate(end);
-        text.push('…');
-    }
+    let mut text = String::from_utf8_lossy(without_ending(line)).into_owned();
+    cut(&mut text, LINE);
     text
 }
 
@@ -176,6 +192,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Runs the call in `arguments`, as the model sees the result.
+    fn run(arguments: &Value) -> String {
+        crate::Output::of(super::run(Path::new("."), arguments), false).text
+    }
 
     /// A directory of its own with a few files in it.
     fn project() -> PathBuf {

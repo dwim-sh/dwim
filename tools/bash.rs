@@ -14,6 +14,11 @@
 //! output short, and with the shell's own rule every one of them ended
 //! with `head`'s zero, so a failed build read as a success to the model
 //! and to the harness alike.
+//!
+//! A command that would take away changes the model has made to the
+//! project's tracked files is not run: on SWE-bench's django-11797 the
+//! model made the fix, then ran `git stash` to see its new test fail
+//! without it, and the run ended with nothing changed.
 
 use std::{
     collections::VecDeque,
@@ -36,15 +41,56 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{number, string};
+use crate::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "bash", "description": "Run a shell command in the working directory and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}, "timeout": {"type": "integer", "description": "Seconds the command may run (default 300; 0 for no limit). Give a long build or test run more."}, "workdir": {"type": "string", "description": "The directory to run it in (default: the working directory)."}}, "required": ["command"]}}}"#;
+const NAME: &str = "bash";
+
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: false,
+    describe,
+    run,
+};
+
+fn signature() -> Signature {
+    Signature {
+        description: "Run a shell command in the working directory and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed.".to_string(),
+        parameters: vec![
+            Parameter::string("command", "The command to run."),
+            Parameter::integer(
+                "timeout",
+                format!(
+                    "Seconds the command may run (default {TIMEOUT}; 0 for no limit). Give a long build or test run more."
+                ),
+            )
+            .optional(),
+            Parameter::string(
+                "workdir",
+                "The directory to run it in (default: the working directory).",
+            )
+            .optional(),
+        ],
+    }
+}
+
+/// How a call reads on screen: the command.
+fn describe(arguments: &Value) -> Option<String> {
+    string(arguments, "command").map(str::to_string)
+}
+
+fn run(tools: &mut Tools, arguments: &Value) -> Result<String, String> {
+    tools.bash.run(&tools.dir, arguments)
+}
 
 /// Seconds a command may run unless the call says otherwise: long enough
 /// for a build or a test run, short enough that a command that hangs, or
 /// a server that was never going to end, does not hold the session long.
-const TIMEOUT: u64 = 300;
+pub const TIMEOUT: u64 = 300;
+
+/// What the model is told for a command that would take away changes it
+/// has made to the project's tracked files.
+const DISCARDS: &str = "not run: this would take away the changes you have made to the project's files (git stash, checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your change, undo it with edit, run what you want, and then make the change again with edit. git diff shows your changes.";
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
@@ -75,7 +121,7 @@ pub struct Bash {
     /// The program commands run through, as `shell -c command`: `sh`,
     /// unless another is set.
     shell: PathBuf,
-    dir: PathBuf,
+    outputs: PathBuf,
     /// Commands run so far; the next one's files are named by the count.
     calls: usize,
     /// Most bytes of a stream kept in its file.
@@ -87,23 +133,19 @@ static OUTPUT_DIRS: AtomicUsize = AtomicUsize::new(0);
 
 impl Default for Bash {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Bash {
-    pub fn new() -> Self {
         let tmp = env::temp_dir();
         sweep(&tmp);
         let n = OUTPUT_DIRS.fetch_add(1, Ordering::Relaxed);
         Self {
             shell: PathBuf::from("sh"),
-            dir: tmp.join(format!("dwim-{}-{n}", process::id())),
+            outputs: tmp.join(format!("dwim-{}-{n}", process::id())),
             calls: 0,
             retain: RETAINED,
         }
     }
+}
 
+impl Bash {
     /// Runs commands through `shell`, as `shell -c command`, instead of
     /// `sh`: a script that runs them somewhere else, such as in a container
     /// that has what the project needs installed.
@@ -113,30 +155,31 @@ impl Bash {
 
     /// The file for the `stream` of the command being run.
     fn file(&self, stream: &str) -> PathBuf {
-        self.dir.join(format!("{}.{stream}", self.calls))
+        self.outputs.join(format!("{}.{stream}", self.calls))
     }
 
-    /// Runs the command in `arguments`, returning what the model should see.
-    pub fn run(&mut self, arguments: &Value) -> String {
-        let Some(command) = string(arguments, "command") else {
-            return "error: bash needs a 'command' string".to_string();
-        };
-        let timeout = match arguments.get("timeout") {
+    /// Runs the command in `arguments` in `dir`, or in the directory the
+    /// call names, returning what the model should see; not one that would
+    /// discard the model's changes to the project at `dir`.
+    fn run(&mut self, dir: &Path, arguments: &Value) -> Result<String, String> {
+        let command = required(arguments, NAME, "command")?;
+        let timeout = match optional_number(
+            arguments,
+            "timeout",
+            "a number of seconds, or 0 for no limit",
+        )? {
             None => Some(Duration::from_secs(TIMEOUT)),
-            Some(_) => match number(arguments, "timeout") {
-                Some(0) => None,
-                Some(seconds) => Some(Duration::from_secs(seconds)),
-                None => {
-                    return "error: 'timeout' is a number of seconds, or 0 for no limit"
-                        .to_string();
-                }
-            },
+            Some(0) => None,
+            Some(seconds) => Some(Duration::from_secs(seconds)),
         };
-        let workdir = string(arguments, "workdir").map(PathBuf::from);
+        let workdir = string(arguments, "workdir").map(|workdir| dir.join(workdir));
         if let Some(dir) = &workdir
             && !dir.is_dir()
         {
-            return format!("error: workdir {} is not a directory", dir.display());
+            return Err(format!("workdir {} is not a directory", dir.display()));
+        }
+        if discards(command, dir) && changed(dir) {
+            return Err(DISCARDS.to_string());
         }
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
@@ -150,14 +193,11 @@ impl Bash {
             .stderr(Stdio::piped())
             // In a process group of its own, so that the timeout ends what
             // the command started along with it.
-            .process_group(0);
-        if let Some(dir) = &workdir {
-            shell.current_dir(dir);
-        }
-        let mut child = match shell.spawn() {
-            Ok(child) => child,
-            Err(e) => return format!("[error: could not run {}: {e}]", self.shell.display()),
-        };
+            .process_group(0)
+            .current_dir(workdir.as_deref().unwrap_or(dir));
+        let mut child = shell
+            .spawn()
+            .map_err(|e| format!("could not run {}: {e}", self.shell.display()))?;
         let pid = child.id();
         let mut stdout = Stream::new("stdout", self);
         let mut stderr = Stream::new("stderr", self);
@@ -192,14 +232,69 @@ impl Bash {
             Ok(status) => ended(status),
             Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
-        report(&stdout, &stderr, &status)
+        Ok(report(&stdout, &stderr, &status))
     }
 }
 
 impl Drop for Bash {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        let _ = fs::remove_dir_all(&self.outputs);
     }
+}
+
+/// Whether a shell command would take away changes to the files of the git
+/// work tree at `dir`: `git stash` that saves them, `git checkout` of files,
+/// named with `--`, as `.`, or by a path that is there, or forced, `git
+/// restore` of files, `git reset --hard`, or `git clean` with force, in any
+/// of the commands it chains.
+fn discards(command: &str, dir: &Path) -> bool {
+    command.split(['\n', ';', '&', '|', '(', ')']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        let Some(at) = words.iter().position(|word| *word == "git") else {
+            return false;
+        };
+        // The subcommand, past git's own options and their values.
+        let mut rest = words[at + 1..].iter().copied();
+        let subcommand = loop {
+            match rest.next() {
+                Some("-C" | "-c" | "--git-dir" | "--work-tree") => {
+                    rest.next();
+                }
+                Some(word) if word.starts_with('-') => {}
+                other => break other,
+            }
+        };
+        let args: Vec<&str> = rest.collect();
+        match subcommand {
+            Some("stash") => args
+                .first()
+                .is_none_or(|first| ["push", "save"].contains(first) || first.starts_with('-')),
+            Some("checkout") => args.iter().any(|arg| {
+                ["--", ".", "-f", "--force"].contains(arg)
+                    || !arg.starts_with('-') && dir.join(arg).exists()
+            }),
+            Some("restore") => {
+                !args.contains(&"--staged")
+                    || args.iter().any(|arg| ["--worktree", "-W"].contains(arg))
+            }
+            Some("reset") => args.contains(&"--hard"),
+            Some("clean") => args.iter().any(|arg| {
+                arg.starts_with('-') && !arg.starts_with("--") && arg.contains('f')
+                    || *arg == "--force"
+            }),
+            _ => false,
+        }
+    })
+}
+
+/// Whether the git work tree at `dir` has changes to its tracked files; not
+/// if it is not one.
+fn changed(dir: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
 /// Removes the output directories in `tmp` of dwim processes that are no
@@ -264,7 +359,7 @@ impl Stream {
             newlines: 0,
             kept: 0,
             file: None,
-            dir: bash.dir.clone(),
+            dir: bash.outputs.clone(),
             path: bash.file(name),
             retain: bash.retain,
             error: None,
@@ -344,9 +439,6 @@ impl Stream {
         if self.total <= PREVIEW as u64 {
             return String::from_utf8_lossy(&self.head).trim_end().to_string();
         }
-        // Cut the start after a line end if one comes late enough to keep
-        // most of the half, and the end before one that comes early
-        // enough, and elsewhere at a character boundary.
         let head = &self.head[..HALF];
         let cut = match head.iter().rposition(|&b| b == b'\n') {
             Some(at) if at + 1 >= HALF / 2 => at + 1,
@@ -409,15 +501,6 @@ impl Stream {
         }
         parts.extend(self.error.clone());
         Some(format!("[{}: {}]", self.name, parts.join(", ")))
-    }
-}
-
-/// `word`, or its plural if `n` is not one.
-fn plural(n: u64, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
     }
 }
 
@@ -517,14 +600,20 @@ mod tests {
         ToolCall::parse(text).unwrap()
     }
 
+    /// Runs the call in `arguments` in the working directory, as the model
+    /// sees the result.
+    fn run(bash: &mut Bash, arguments: &Value) -> String {
+        crate::Output::of(bash.run(Path::new("."), arguments), false).text
+    }
+
     /// Runs `command` through the tool.
     fn sh(command: &str, bash: &mut Bash) -> String {
-        bash.run(&serde_json::json!({ "command": command }))
+        run(bash, &serde_json::json!({ "command": command }))
     }
 
     #[test]
     fn runs_bash() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         assert_eq!(
             sh("echo hi; echo err >&2", &mut bash),
             "hi\n[stderr]\nerr\n[exit code 0]"
@@ -540,7 +629,7 @@ mod tests {
             sh("kill -9 $$", &mut bash),
             "[killed by signal 9 (SIGKILL)]"
         );
-        assert!(!bash.dir.exists(), "nothing outgrew its preview");
+        assert!(!bash.outputs.exists(), "nothing outgrew its preview");
     }
 
     #[test]
@@ -548,13 +637,13 @@ mod tests {
         let script = env::temp_dir().join(format!("dwim-shell-{}", process::id()));
         fs::write(&script, "#!/bin/sh\necho via; exec sh \"$@\"\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         bash.set_shell(script.clone());
         assert_eq!(sh("echo hi", &mut bash), "via\nhi\n[exit code 0]");
         assert_eq!(sh("exit 3", &mut bash), "via\n[exit code 3]");
         fs::remove_file(script).unwrap();
         bash.set_shell(PathBuf::from("/nonexistent/shell"));
-        assert!(sh("true", &mut bash).starts_with("[error: could not run /nonexistent/shell: "));
+        assert!(sh("true", &mut bash).starts_with("error: could not run /nonexistent/shell: "));
     }
 
     #[test]
@@ -562,12 +651,15 @@ mod tests {
         // Timed loosely: on a loaded machine the shell may start late, so
         // what matters is that the command is killed, and long before it
         // would have ended by itself.
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let start = std::time::Instant::now();
-        let output = bash.run(&serde_json::json!({
-            "command": "echo start; sleep 60; echo end",
-            "timeout": 2
-        }));
+        let output = run(
+            &mut bash,
+            &serde_json::json!({
+                "command": "echo start; sleep 60; echo end",
+                "timeout": 2
+            }),
+        );
         assert!(start.elapsed() < Duration::from_secs(30));
         assert!(!output.contains("end"), "{output}");
         assert!(
@@ -578,39 +670,54 @@ mod tests {
         );
         // What the command started goes with it, so the pipes close.
         let start = std::time::Instant::now();
-        let output = bash.run(&serde_json::json!({
-            "command": "sleep 60 & sleep 60",
-            "timeout": "2"
-        }));
+        let output = run(
+            &mut bash,
+            &serde_json::json!({
+                "command": "sleep 60 & sleep 60",
+                "timeout": "2"
+            }),
+        );
         assert!(start.elapsed() < Duration::from_secs(30));
         assert!(output.ends_with(", or 0 for none]"), "{output}");
         assert_eq!(
-            bash.run(&serde_json::json!({ "command": "true", "timeout": 0 })),
+            run(
+                &mut bash,
+                &serde_json::json!({ "command": "true", "timeout": 0 })
+            ),
             "[exit code 0]"
         );
         assert!(
-            bash.run(&serde_json::json!({ "command": "true", "timeout": "soon" }))
-                .starts_with("error: 'timeout' is")
+            run(
+                &mut bash,
+                &serde_json::json!({ "command": "true", "timeout": "soon" })
+            )
+            .starts_with("error: 'timeout' is")
         );
     }
 
     #[test]
     fn runs_in_the_directory_given() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let dir = env::temp_dir().canonicalize().unwrap();
         assert_eq!(
-            bash.run(&serde_json::json!({ "command": "pwd", "workdir": dir })),
+            run(
+                &mut bash,
+                &serde_json::json!({ "command": "pwd", "workdir": dir })
+            ),
             format!("{}\n[exit code 0]", dir.display())
         );
         assert!(
-            bash.run(&serde_json::json!({ "command": "pwd", "workdir": "/nonexistent/dir" }))
-                .starts_with("error: workdir /nonexistent/dir is not a directory")
+            run(
+                &mut bash,
+                &serde_json::json!({ "command": "pwd", "workdir": "/nonexistent/dir" })
+            )
+            .starts_with("error: workdir /nonexistent/dir is not a directory")
         );
     }
 
     #[test]
     fn keeps_the_error_and_the_status_after_a_flood() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let output = sh("seq 1 50000; echo 'boom: it broke' >&2; exit 7", &mut bash);
         assert!(output.starts_with("1\n2\n3\n"), "{output}");
         assert!(output.contains("\n[… lines "), "{output}");
@@ -628,9 +735,9 @@ mod tests {
 
     #[test]
     fn keeps_long_output_for_reading_later() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let output = sh("seq 1 50000", &mut bash);
-        let path = bash.dir.join("1.stdout");
+        let path = bash.outputs.join("1.stdout");
         let note = output
             .lines()
             .find(|line| line.starts_with("[stdout: "))
@@ -694,9 +801,12 @@ mod tests {
         );
         // And the read tool, from the line the marker names, starts on the
         // first line left out.
-        let page = crate::read::run(
-            &serde_json::json!({ "path": path.to_str().unwrap(), "start": first }),
-        );
+        let page = Tools::new(Path::new("."))
+            .run(&ToolCall {
+                name: "read".to_string(),
+                arguments: serde_json::json!({ "path": path.to_str().unwrap(), "start": first }),
+            })
+            .text;
         assert!(page.starts_with(&format!("{first}\t{first}\n")), "{page}");
         assert_eq!(
             sh(&format!("sed -n '500,502p' {}", path.display()), &mut bash),
@@ -704,14 +814,14 @@ mod tests {
         );
 
         drop(bash);
-        assert!(!path.exists(), "the harness takes its files with it");
+        assert!(!path.exists(), "the tool takes its files with it");
     }
 
     #[test]
     fn drains_both_streams_at_once() {
         let (done, finished) = mpsc::channel();
         thread::spawn(move || {
-            let mut bash = Bash::new();
+            let mut bash = Bash::default();
             let output = sh(
                 "(head -c 300000 /dev/zero | tr '\\0' e >&2) & head -c 300000 /dev/zero | tr '\\0' o; wait",
                 &mut bash,
@@ -734,14 +844,14 @@ mod tests {
 
     #[test]
     fn cuts_between_characters() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let output = sh("yes ä | head -c 50000", &mut bash);
         assert!(!output.contains('\u{FFFD}'), "{output}");
         assert!(output.starts_with("ä\nä\n"));
         assert!(output.contains("\nä\n[… lines "), "{output}");
         assert!(output.contains(" …]\nä\nä\n"), "{output}");
         assert_eq!(
-            fs::metadata(bash.dir.join("1.stdout")).unwrap().len(),
+            fs::metadata(bash.outputs.join("1.stdout")).unwrap().len(),
             50000
         );
         let output = sh("printf 'x\\377\\376y'", &mut bash);
@@ -754,10 +864,10 @@ mod tests {
 
     #[test]
     fn discards_past_the_cap_and_says_so() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         bash.retain = 3000;
         let output = sh("seq 1 20000", &mut bash);
-        let path = bash.dir.join("1.stdout");
+        let path = bash.outputs.join("1.stdout");
         let note = output
             .lines()
             .find(|line| line.starts_with("[stdout: "))
@@ -777,8 +887,8 @@ mod tests {
 
     #[test]
     fn reports_a_file_it_could_not_keep() {
-        let mut bash = Bash::new();
-        bash.dir = PathBuf::from("/dev/null/nowhere");
+        let mut bash = Bash::default();
+        bash.outputs = PathBuf::from("/dev/null/nowhere");
         let output = sh("seq 1 20000", &mut bash);
         let note = output
             .lines()
@@ -810,21 +920,100 @@ mod tests {
 
     #[test]
     fn needs_a_command() {
-        assert!(
-            Bash::new()
-                .run(&serde_json::json!({}))
-                .starts_with("error: bash needs")
+        assert!(run(&mut Bash::default(), &serde_json::json!({})).starts_with("error: bash needs"));
+    }
+
+    #[test]
+    fn knows_the_commands_that_discard_changes() {
+        // A checkout of a path that is there discards it, as the model ran
+        // it on django-11797; one of a branch, which is not a path, doesn't.
+        let dir = env::temp_dir().join(format!("dwim-discards-{}", process::id()));
+        fs::create_dir_all(dir.join("django/db/models")).unwrap();
+        fs::write(dir.join("django/db/models/lookups.py"), "").unwrap();
+        for command in [
+            "git stash",
+            "cd /x && git stash && python3 tests/runtests.py lookup",
+            "git stash push -m wip",
+            "git stash -u",
+            "git -C /x stash",
+            "git checkout -- django/db/models/lookups.py",
+            "git checkout .",
+            "git checkout -f main",
+            "cp lookups.py /tmp/b && git checkout django/db/models/lookups.py && echo reverted",
+            "git checkout HEAD django/db/models/lookups.py",
+            "git restore lookups.py",
+            "git restore --staged --worktree lookups.py",
+            "git reset --hard",
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git clean --force",
+        ] {
+            assert!(discards(command, &dir), "{command}");
+        }
+        for command in [
+            "git status",
+            "git diff",
+            "git stash list",
+            "git stash show -p",
+            "git stash pop",
+            "git checkout -b fix",
+            "git checkout main",
+            "git restore --staged lookups.py",
+            "git reset HEAD lookups.py",
+            "git clean -n",
+            "git log --oneline -5 && git show HEAD",
+            "echo git stash is not run here > notes.txt",
+        ] {
+            assert!(!discards(command, &dir), "{command}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_discard_changes_to_the_project() {
+        // With a tracked file changed, git stash is refused and the change
+        // stays; with none changed, it runs.
+        let dir = env::temp_dir().join(format!("dwim-refuses-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        fs::write(dir.join("a.txt"), "old\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "a"]);
+        assert!(!changed(&dir));
+        fs::write(dir.join("a.txt"), "new\n").unwrap();
+        assert!(changed(&dir));
+        let mut bash = Bash::default();
+        let stash = serde_json::json!({ "command": "git stash" });
+        assert_eq!(bash.run(&dir, &stash), Err(DISCARDS.to_string()));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        fs::write(dir.join("a.txt"), "old\n").unwrap();
+        assert_eq!(
+            bash.run(&dir, &stash),
+            Ok("No local changes to save\n[exit code 0]".to_string())
         );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn parses_coder_calls() {
-        let mut bash = Bash::new();
+        let mut bash = Bash::default();
         let ls = call("<function=bash>\n<parameter=command>\nls -l\n</parameter>\n</function>");
         assert_eq!(ls.name, "bash");
         let echo =
             call("<function=bash>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>");
-        assert_eq!(bash.run(&echo.arguments), "a\nb\n[exit code 0]");
+        assert_eq!(run(&mut bash, &echo.arguments), "a\nb\n[exit code 0]");
         assert!(ToolCall::parse("<function=bash>\n<parameter=command>\nls").is_err());
     }
 }

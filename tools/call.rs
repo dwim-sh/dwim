@@ -146,7 +146,6 @@ fn step<'a>(
     steps: &[std::result::Result<Step<'a>, Fault<'a>>],
     from: usize,
 ) -> std::result::Result<Step<'a>, Fault<'a>> {
-    // Where a suffix of the block starts in it.
     let at = |rest: &str| text.len() - rest.len();
     let rest = text[from..].trim_start();
     if let Some(after) = rest.strip_prefix("</function>") {
@@ -174,7 +173,6 @@ fn step<'a>(
         let next = places
             .binary_search(&(at + CLOSE.len()))
             .expect("every </parameter> is a place");
-        // Whether the rest gives the value's parameter again.
         let mut later = Some(next);
         while let Some(i) = later {
             later = match steps[i] {
@@ -243,8 +241,6 @@ fn step<'a>(
             return Ok(step);
         }
     }
-    // Every end was tried; the error is from the likeliest of them, or
-    // else from the last, which is the last place.
     if let Some(fault) = likeliest {
         return Err(fault);
     }

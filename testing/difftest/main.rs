@@ -21,8 +21,11 @@ use std::{
     time::Instant,
 };
 
-use dwim_gpu::{Cpu, Gpu};
-use dwim_models::{Device, Gguf, LanguageModel, bonsai::Model};
+use dwim_gpu::{Cpu, Device, Gpu};
+use dwim_models::{
+    Gguf, LanguageModel,
+    bonsai::{self, Model},
+};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention
@@ -150,9 +153,9 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let model = dirs::cache_dir()
+    let model = bonsai::cache_dir()
         .ok_or("no cache directory")?
-        .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+        .join(bonsai::WEIGHTS);
     if !model.exists() {
         return Err(format!("no model at {}: run dwim once to fetch it", model.display()).into());
     }

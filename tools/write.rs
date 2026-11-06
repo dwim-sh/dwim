@@ -14,44 +14,60 @@ use std::{fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{plural, string};
+use crate::{Parameter, Signature, Tool, plural, required, string};
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "write", "description": "Write a file whole, creating it and the directories it goes in, or replacing what it held; the file ends with a newline. For a change within a file, use edit.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The file to write."}, "content": {"type": "string", "description": "What the file is to hold."}}, "required": ["path", "content"]}}}"#;
+const NAME: &str = "write";
 
-/// Writes the file in `arguments`, returning what the model should see.
-pub fn run(arguments: &Value) -> String {
-    let Some(path) = string(arguments, "path") else {
-        return "error: write needs a 'path' string".to_string();
-    };
-    let Some(content) = string(arguments, "content") else {
-        return "error: write needs a 'content' string, what the file is to hold".to_string();
-    };
-    let file = Path::new(path);
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: true,
+    describe,
+    run: |tools, arguments| run(&tools.dir, arguments),
+};
+
+fn signature() -> Signature {
+    Signature {
+        description: "Write a file whole, creating it and the directories it goes in, or replacing what it held; the file ends with a newline. For a change within a file, use edit.".to_string(),
+        parameters: vec![
+            Parameter::string("path", "The file to write."),
+            Parameter::string("content", "What the file is to hold."),
+        ],
+    }
+}
+
+/// How a call reads on screen: the file.
+fn describe(arguments: &Value) -> Option<String> {
+    string(arguments, "path").map(str::to_string)
+}
+
+/// Writes the file in `arguments`, a path taken from `dir`, returning what
+/// the model should see.
+fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
+    let path = required(arguments, NAME, "path")?;
+    let content = required(arguments, NAME, "content")?;
+    let file = dir.join(path);
     if file.is_dir() {
-        return format!("error: {path} is a directory");
+        return Err(format!("{path} is a directory"));
     }
     let existed = file.exists();
     if let Some(parent) = file.parent()
         && !parent.as_os_str().is_empty()
-        && let Err(e) = fs::create_dir_all(parent)
     {
-        return format!("error: cannot make {}: {e}", parent.display());
+        fs::create_dir_all(parent).map_err(|e| format!("cannot make {}: {e}", parent.display()))?;
     }
     let mut content = content.to_string();
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    if let Err(e) = fs::write(file, &content) {
-        return format!("error: cannot write {path}: {e}");
-    }
+    fs::write(&file, &content).map_err(|e| format!("cannot write {path}: {e}"))?;
     let lines = content.lines().count() as u64;
-    format!(
+    Ok(format!(
         "[{} {path}: {lines} {}, {} bytes]",
         if existed { "replaced" } else { "wrote" },
         plural(lines, "line"),
         content.len()
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -61,6 +77,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Runs the call in `arguments`, as the model sees the result.
+    fn run(arguments: &Value) -> String {
+        crate::Output::of(super::run(Path::new("."), arguments), false).text
+    }
 
     /// A directory of its own.
     fn dir() -> PathBuf {

@@ -71,7 +71,6 @@ kernel void attention(
     uint kv_dim = p.n_kv_heads * p.head_dim;
     float scale = rsqrt(float(p.head_dim));
     uint quads = p.head_dim / 4;
-    // The first query head of the group, for this token, in vectors.
     uint qbase = (t * p.n_heads + kvh * group) * quads;
 
     // Each lane of a SIMD group takes four elements of a key in each round

@@ -9,25 +9,48 @@ use std::{fs, path::Path, process::Command};
 
 use serde_json::Value;
 
-use crate::{plural, string};
+use crate::{Parameter, Signature, Tool, directory, plural, required, search};
 
-/// The tool as the system prompt declares it.
-pub const SIGNATURE: &str = r#"{"type": "function", "function": {"name": "glob", "description": "List the files whose paths match a pattern, up to 100, leaving out files git ignores: *.rs for every Rust file under the directory, src/*.rs for those directly in src, src/**/*_test.go for those anywhere below it. A pattern without a slash matches a file name anywhere.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "The pattern: * matches within a name, ** across directories, ? one character."}, "path": {"type": "string", "description": "The directory to search (default: the working directory)."}}, "required": ["pattern"]}}}"#;
+const NAME: &str = "glob";
+
+pub const TOOL: Tool = Tool {
+    name: NAME,
+    signature,
+    changes: false,
+    describe: search,
+    run: |tools, arguments| run(&tools.dir, arguments),
+};
+
+fn signature() -> Signature {
+    Signature {
+        description: format!(
+            "List the files whose paths match a pattern, up to {MOST}, leaving out files git ignores: *.rs for every Rust file under the directory, src/*.rs for those directly in src, src/**/*_test.go for those anywhere below it. A pattern without a slash matches a file name anywhere."
+        ),
+        parameters: vec![
+            Parameter::string(
+                "pattern",
+                "The pattern: * matches within a name, ** across directories, ? one character.",
+            ),
+            Parameter::string(
+                "path",
+                "The directory to search (default: the working directory).",
+            )
+            .optional(),
+        ],
+    }
+}
 
 /// Most files shown.
-pub const MOST: usize = 100;
+const MOST: usize = 100;
 
-/// Lists the files `arguments` ask for, returning what the model should
-/// see.
-pub fn run(arguments: &Value) -> String {
-    let Some(pattern) = string(arguments, "pattern") else {
-        return "error: glob needs a 'pattern' string".to_string();
-    };
-    let path = string(arguments, "path")
-        .filter(|path| !path.is_empty())
-        .unwrap_or(".");
-    if !Path::new(path).is_dir() {
-        return format!("error: {path} is not a directory");
+/// Lists the files `arguments` ask for, under `dir` or a path taken from
+/// it, returning what the model should see.
+fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
+    let pattern = required(arguments, NAME, "pattern")?;
+    let path = directory(arguments).unwrap_or(".");
+    let root = dir.join(path);
+    if !root.is_dir() {
+        return Err(format!("{path} is not a directory"));
     }
     let segments: Vec<&str> = pattern
         .trim_start_matches("./")
@@ -35,15 +58,14 @@ pub fn run(arguments: &Value) -> String {
         .filter(|segment| !segment.is_empty())
         .collect();
     if segments.is_empty() {
-        return "error: the pattern is empty".to_string();
+        return Err("the pattern is empty".to_string());
     }
-    // A name alone is a name anywhere.
     let segments = if segments.len() == 1 {
         vec!["**", segments[0]]
     } else {
         segments
     };
-    let files = files(Path::new(path));
+    let files = files(&root);
     let found: Vec<&String> = files
         .iter()
         .filter(|file| matches(&segments, &file.split('/').collect::<Vec<_>>()))
@@ -53,7 +75,7 @@ pub fn run(arguments: &Value) -> String {
         path => format!("{pattern} in {path}"),
     };
     if found.is_empty() {
-        return format!("[no files match {what}]");
+        return Ok(format!("[no files match {what}]"));
     }
     let shown: Vec<String> = found
         .iter()
@@ -75,7 +97,7 @@ pub fn run(arguments: &Value) -> String {
             plural(found.len() as u64, "file")
         )
     };
-    format!("{}\n{note}", shown.join("\n"))
+    Ok(format!("{}\n{note}", shown.join("\n")))
 }
 
 /// The files under `dir`, as paths relative to it with `/` between their
@@ -181,6 +203,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Runs the call in `arguments`, as the model sees the result.
+    fn run(arguments: &Value) -> String {
+        crate::Output::of(super::run(Path::new("."), arguments), false).text
+    }
 
     /// A directory of its own with a small tree in it.
     fn tree() -> PathBuf {

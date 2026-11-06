@@ -1,6 +1,6 @@
 //! Checks of a GPU device's operations against the CPU reference.
 
-use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, ternary};
+use crate::{CACHE_BLOCK, CONV_KERNEL, Cpu, Device, HADAMARD_BLOCK, Tensor, cache_bytes, ternary};
 
 /// Defines a test for each check, run on the device `$open` returns, and
 /// skipped if it returns an error.
@@ -358,11 +358,6 @@ pub fn ternary_matmul_speed<D: Device>(gpu: &D) {
 /// much of the arithmetic it does a second: a page is read at a depth
 /// three times slower than at the start, which the arithmetic of attention
 /// does not account for.
-/// Bytes a position of a cache `kv_dim` wide takes.
-fn cache_bytes_per(kv_dim: usize) -> usize {
-    kv_dim + kv_dim / CACHE_BLOCK * 2
-}
-
 pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
     let mut rng = Rng(29);
     let (heads, head_dim, kv_heads) = (24, 256, 4);
@@ -393,7 +388,7 @@ pub fn attention_speed<D: Device>(gpu: &D, n: usize) {
         let flops = (4 * positions * heads * head_dim) as f64;
         // The caches it reads: every position's keys and values, a byte an
         // element and a half float a block, once for the batch.
-        let bytes = 2 * (pos + n) * cache_bytes_per(kv_dim);
+        let bytes = 2 * (pos + n) * cache_bytes(kv_dim);
         eprintln!(
             "attention n={n} at {pos:<6} {:8.2} ms  {:6.3} ms/token  {:5.2} TFLOP/s  {:5.0} GB/s",
             each * 1e3,
@@ -816,7 +811,6 @@ pub fn hadamard_matches_cpu<D: Device>(gpu: &D) {
             gpu.hadamard(&mut buf, &signs, inverse);
             close(&gpu.read(&buf), &want, 1e-5);
         }
-        // The inverse undoes the rotation.
         let mut back = x.clone();
         Cpu.hadamard(&mut back, &signs, false);
         Cpu.hadamard(&mut back, &signs, true);

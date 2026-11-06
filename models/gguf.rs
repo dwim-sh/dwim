@@ -252,7 +252,6 @@ impl Gguf {
         self.meta.get(key)
     }
 
-    /// The metadata's keys.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.meta.keys().map(String::as_str)
     }
@@ -291,7 +290,6 @@ impl Gguf {
         }
     }
 
-    /// Names of every tensor.
     pub fn tensors(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }
@@ -302,7 +300,6 @@ impl Gguf {
             .ok_or_else(|| format!("missing tensor '{name}'").into())
     }
 
-    /// The raw bytes of a tensor.
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let info = self.info(name)?;
         let start = self.data_start + info.offset as usize;
@@ -313,7 +310,6 @@ impl Gguf {
         Ok(unsafe { slice::from_raw_parts(self.map.add(start), size) })
     }
 
-    /// Copies out an f32 tensor.
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>> {
         if self.info(name)?.dtype != F32 {
             return Err(format!("tensor '{name}' is not f32").into());
@@ -325,7 +321,6 @@ impl Gguf {
             .collect())
     }
 
-    /// Copies out a bf16 matrix.
     pub fn bf16(&self, name: &str) -> Result<Tensor> {
         let info = self.info(name)?;
         if info.dtype != BF16 || info.dims.len() != 2 {
@@ -341,7 +336,6 @@ impl Gguf {
         })
     }
 
-    /// Copies out a ternary matrix.
     pub fn ternary(&self, name: &str) -> Result<Tensor> {
         let info = self.info(name)?;
         if info.dtype != PTQ1_0 || info.dims.len() != 2 {

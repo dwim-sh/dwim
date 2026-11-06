@@ -6,191 +6,51 @@
 //! error.
 
 use std::{
-    env,
     error::Error,
-    io::{self, IsTerminal, Write},
+    io::{self, Write},
     ops::ControlFlow,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
+    path::Path,
+    time::Instant,
 };
 
-use dwim_gpu::{Cpu, Gpu};
-use dwim_harness::{self as harness, Harness, Log};
-use dwim_models::{Chat, Gguf, Tokenizer};
+use dwim_harness::{Event, Log};
 
-use crate::{fetch, models, opts::Device};
+use crate::session::{self, Settings, Stderr};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone, keeping a transcript of it in `log`;
-/// then reports where the time went, if
-/// `stats` asks for it.
-#[allow(clippy::too_many_arguments)]
+/// then reports where the time went, if `stats` asks for it.
 pub fn once(
-    name: &str,
-    device: Device,
-    context: Option<usize>,
-    thinking_budget: Option<usize>,
-    effort: harness::Effort,
-    temperature: Option<f32>,
-    shell: Option<PathBuf>,
+    settings: &Settings,
     prompt: &str,
     stats: bool,
     log: Log,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let (model, dir) = fetch::locate(name)?;
-    let mut progress = Progress::new();
-    fetch::fetch(model, &dir, |file| {
-        let total = file.total.unwrap_or(file.done);
-        progress.report(
-            format!("downloading {}", file.file),
-            megabytes(file.done),
-            megabytes(total),
-        );
+    let transcript = log.path().map(Path::to_path_buf);
+    let mut stderr = Stderr::new();
+    let mut loaded = session::load(settings, log, |loading| stderr.report(&loading))?;
+    if let Some(path) = transcript {
+        eprintln!("transcript in {}", path.display());
+    }
+    // No one is here to answer the model, so it goes on by itself.
+    loaded.harness.set_auto(true);
+    let mut printer = Printer::default();
+    loaded.harness.send(prompt, |event| {
+        printer.print(event);
+        ControlFlow::Continue(())
     })?;
-    let gguf = model.open(&dir)?;
-    let (report, loading) = match device {
-        Device::Cpu => answer(
-            gguf,
-            Cpu,
-            model,
-            "cpu",
-            context,
-            thinking_budget,
-            effort,
-            temperature,
-            shell,
-            prompt,
-            log,
-        )?,
-        Device::Gpu => {
-            let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let device = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
-            answer(
-                gguf,
-                gpu,
-                model,
-                &device,
-                context,
-                thinking_budget,
-                effort,
-                temperature,
-                shell,
-                prompt,
-                log,
-            )?
-        }
-    };
+    drop(printer);
     if stats {
-        for line in report.report(loading, started.elapsed()) {
+        for line in loaded
+            .harness
+            .stats()
+            .report(loaded.loading, started.elapsed())
+        {
             eprintln!("{line}");
         }
     }
     Ok(())
-}
-
-/// Loads `name` onto `device`, which is called `on`, with room for
-/// `context` tokens (or as many as fit), says how much memory that takes,
-/// and answers `prompt` with it, keeping a transcript in `log`; returns
-/// where the time went and how long the loading took.
-#[allow(clippy::too_many_arguments)]
-fn answer<D: dwim_gpu::Device + 'static>(
-    gguf: Arc<Gguf>,
-    device: D,
-    which: &'static models::Model,
-    on: &str,
-    context: Option<usize>,
-    thinking_budget: Option<usize>,
-    effort: harness::Effort,
-    temperature: Option<f32>,
-    shell: Option<PathBuf>,
-    prompt: &str,
-    log: Log,
-) -> Result<(harness::Stats, Duration), Box<dyn Error>> {
-    let name = which.name;
-    let mut progress = Progress::new();
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let sampler = models::sampler(&gguf, temperature);
-    let loading = Instant::now();
-    let size = models::size(&gguf, &device, context)?;
-    eprintln!("{}", models::describe(&size));
-    let model = models::load(gguf, device, size.context, |done, total| {
-        let on = if on == "cpu" { "the CPU" } else { on };
-        progress.report(format!("loading {name} on {on}"), done, total);
-    })?;
-    let loading = loading.elapsed();
-    let mut chat = Chat::new(model, tokenizer, sampler)?;
-    let cwd = env::current_dir()?;
-    let system = harness::system_prompt(&cwd, effort);
-    models::start(&mut chat, which, &system, |read, total| {
-        progress.report("reading the system prompt".to_string(), read, total);
-    })?;
-
-    let mut printer = Printer::default();
-    if let Some(path) = log.path() {
-        eprintln!("transcript in {}", path.display());
-    }
-    let mut harness = Harness::new(chat, &cwd, {
-        let system = system.clone();
-        move |chat| models::start(chat, which, &system, |_, _| {}).map(|_| ())
-    })?;
-    harness.set_thinking_budget(thinking_budget);
-    // No one is here to answer the model, so it goes on by itself.
-    harness.set_auto(true);
-    if let Some(shell) = shell {
-        harness.set_shell(shell);
-    }
-    harness.keep_log(log, name, on, &system);
-    harness.send(prompt, |event| {
-        printer.print(event);
-        ControlFlow::Continue(())
-    })?;
-    Ok((harness.stats(), loading))
-}
-
-/// Bytes as whole megabytes.
-pub fn megabytes(bytes: u64) -> usize {
-    (bytes / (1 << 20)) as usize
-}
-
-/// How far along getting ready is, on standard error: a line rewritten as it
-/// goes when standard error is a terminal, and one line for each stage when
-/// it is not.
-pub struct Progress {
-    terminal: bool,
-    stage: String,
-}
-
-impl Progress {
-    pub fn new() -> Self {
-        Self {
-            terminal: io::stderr().is_terminal(),
-            stage: String::new(),
-        }
-    }
-
-    pub fn report(&mut self, stage: String, done: usize, total: usize) {
-        if self.stage != stage {
-            self.stage = stage;
-            if !self.terminal {
-                eprintln!("{}…", self.stage);
-            }
-        }
-        if self.terminal {
-            eprint!("\r\x1b[K{}… {done}/{total}", self.stage);
-            if done >= total {
-                eprintln!();
-            }
-            let _ = io::stderr().flush();
-        }
-    }
 }
 
 /// Prints a turn as it happens: the reply to standard output, and the
@@ -206,11 +66,16 @@ struct Printer {
 }
 
 impl Printer {
-    fn print(&mut self, event: harness::Event) {
+    fn print(&mut self, event: Event) {
+        if let Some(notice) = event.notice() {
+            self.end_thought();
+            eprintln!("[{notice}]");
+            return;
+        }
         match event {
-            harness::Event::Thought(text) => {
+            Event::Thought(text) | Event::Note(text) => {
                 let text = if self.thinking {
-                    text
+                    text.as_str()
                 } else {
                     text.trim_start()
                 };
@@ -220,10 +85,10 @@ impl Printer {
                     self.thinking = true;
                 }
             }
-            harness::Event::Text(text) => {
+            Event::Text(text) => {
                 self.end_thought();
                 let text = if self.replied {
-                    text
+                    text.as_str()
                 } else {
                     text.trim_start()
                 };
@@ -233,28 +98,13 @@ impl Printer {
                     self.replied = true;
                 }
             }
-            harness::Event::Token => {}
-            harness::Event::Call { name, detail } => {
+            Event::Token => {}
+            Event::Call { name, detail } => {
                 self.end_thought();
-                match name {
-                    "bash" => eprintln!("$ {detail}"),
-                    name => eprintln!("{name}({detail})"),
-                }
+                eprintln!("{name}({detail})");
             }
-            harness::Event::Output(output) => eprintln!("{output}"),
-            harness::Event::Cut => {
-                self.end_thought();
-                eprintln!("[stopped short: the context window is full]");
-            }
-            harness::Event::Compacting => {
-                self.end_thought();
-                eprintln!("[compacting the conversation]");
-            }
-            harness::Event::Note(text) => self.print(harness::Event::Thought(text)),
-            harness::Event::Compacted { before, after } => {
-                self.end_thought();
-                eprintln!("[compacted from {before} to {after} tokens]");
-            }
+            Event::Output(output) => eprintln!("{output}"),
+            Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
         }
     }
 
