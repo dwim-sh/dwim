@@ -22,6 +22,10 @@ impl Device for Cpu {
     type Weight = Tensor;
     type Cache = Cache;
 
+    fn name(&self) -> String {
+        "cpu".to_string()
+    }
+
     fn memory(&self) -> Option<u64> {
         crate::host::available()
     }

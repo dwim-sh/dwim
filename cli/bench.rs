@@ -9,7 +9,7 @@
 
 use std::{error::Error, sync::Arc, time::Instant};
 
-use dwim_gpu::{Cpu, Gpu};
+use dwim_gpu::{Cpu, Device as _, Gpu};
 use dwim_models::{Gguf, LanguageModel, Tokenizer};
 
 use crate::{fetch, models, once::Progress, opts::Device};
@@ -51,13 +51,7 @@ pub fn bench(name: &str, device: Device, context: Option<usize>) -> Result<(), B
         Device::Cpu => run(gguf, Cpu, model, "the CPU", context),
         Device::Gpu => {
             let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let on = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
+            let on = gpu.name();
             run(gguf, gpu, model, &on, context)
         }
     }

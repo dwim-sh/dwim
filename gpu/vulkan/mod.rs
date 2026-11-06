@@ -487,11 +487,6 @@ impl Vulkan {
         }
     }
 
-    /// Name of the GPU.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Creates a buffer of `bytes` in memory of the given kind.
     fn buffer(
         &self,
@@ -940,6 +935,15 @@ impl Device for Vulkan {
     type Buffer = Buffer;
     type Weight = Weight;
     type Cache = Cache;
+
+    fn name(&self) -> String {
+        // Drivers append their own name in parentheses; the GPU's is enough.
+        self.name
+            .split(" (")
+            .next()
+            .unwrap_or(&self.name)
+            .to_string()
+    }
 
     fn memory(&self) -> Option<u64> {
         // The heap of the first device-local memory type, which `buffer`

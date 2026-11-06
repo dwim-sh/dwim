@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim_gpu::{Cpu, Gpu};
+use dwim_gpu::{Cpu, Device as _, Gpu};
 use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
@@ -66,13 +66,7 @@ pub fn once(
         )?,
         Device::Gpu => {
             let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let device = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
+            let device = gpu.name();
             answer(
                 gguf,
                 gpu,

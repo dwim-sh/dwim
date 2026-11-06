@@ -20,7 +20,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim_gpu::{BACKEND, Cpu, Gpu};
+use dwim_gpu::{BACKEND, Cpu, Device as _, Gpu};
 use dwim_harness::{self as harness, Harness, Log};
 use dwim_models::{Chat, Gguf, Tokenizer};
 
@@ -281,13 +281,7 @@ fn work(
         ),
         Device::Gpu => {
             let gpu = Gpu::new()?;
-            // Drivers append their own name in parentheses; the GPU's is enough.
-            let name = gpu
-                .name()
-                .split(" (")
-                .next()
-                .unwrap_or(gpu.name())
-                .to_string();
+            let name = gpu.name();
             let _ = replies.send(Reply::Device(name.clone()));
             serve(
                 gguf,

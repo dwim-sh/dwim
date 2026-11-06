@@ -389,11 +389,6 @@ impl Metal {
     }
 
     /// Creates a buffer of `bytes` in memory shared with the GPU, which Metal
-    /// Name of the GPU.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// clears to zero.
     fn buffer(&self, bytes: usize) -> Object<dyn MTLBuffer> {
         self.device
@@ -656,6 +651,10 @@ impl Device for Metal {
     type Buffer = Buffer;
     type Weight = Weight;
     type Cache = Cache;
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
 
     fn memory(&self) -> Option<u64> {
         // Metal's estimate of the most the GPU can use without hurting

@@ -75,6 +75,9 @@ pub trait Device {
     /// about half the memory of half-precision floats.
     type Cache;
 
+    /// What the device is called: the GPU's name, or `cpu`.
+    fn name(&self) -> String;
+
     /// Bytes of memory free on the device for a model, if it can tell:
     /// what it can allocate without taking memory others are using. On a
     /// GPU that shares the host's memory, that is the host's memory free.
