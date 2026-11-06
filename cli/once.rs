@@ -33,6 +33,7 @@ pub fn once(
     thinking_budget: Option<usize>,
     effort: harness::Effort,
     temperature: Option<f32>,
+    speculate: usize,
     shell: Option<PathBuf>,
     prompt: &str,
     stats: bool,
@@ -60,6 +61,7 @@ pub fn once(
             thinking_budget,
             effort,
             temperature,
+            speculate,
             shell,
             prompt,
             log,
@@ -82,6 +84,7 @@ pub fn once(
                 thinking_budget,
                 effort,
                 temperature,
+                speculate,
                 shell,
                 prompt,
                 log,
@@ -110,6 +113,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     thinking_budget: Option<usize>,
     effort: harness::Effort,
     temperature: Option<f32>,
+    speculate: usize,
     shell: Option<PathBuf>,
     prompt: &str,
     log: Log,
@@ -127,6 +131,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     })?;
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;
+    chat.set_drafts(speculate);
     let cwd = env::current_dir()?;
     let system = harness::system_prompt(&cwd, effort);
     models::start(&mut chat, which, &system, |read, total| {

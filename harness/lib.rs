@@ -509,7 +509,7 @@ impl Stats {
             + m.thought.seconds
             + m.answer.seconds
             + self.tool_seconds;
-        vec![
+        let mut lines = vec![
             row(
                 "loading",
                 String::new(),
@@ -538,10 +538,24 @@ impl Stats {
                 String::new(),
             ),
             row("total", String::new(), total.as_secs_f64(), String::new()),
-        ]
-        .into_iter()
-        .map(|line| line.trim_end().to_string())
-        .collect()
+        ];
+        // Drafting, after the tokens generated, where the model drafted.
+        if m.drafted > 0 {
+            lines.insert(
+                5,
+                format!(
+                    "{:<8}{:>13}{:>10}{:>11}",
+                    "drafts",
+                    format!("{} tokens", m.drafted),
+                    "",
+                    format!("{:.0}% kept", 100.0 * m.accepted as f64 / m.drafted as f64)
+                ),
+            );
+        }
+        lines
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
     }
 }
 
@@ -2055,6 +2069,8 @@ mod tests {
                     tokens: 300,
                     seconds: 10.0,
                 },
+                drafted: 0,
+                accepted: 0,
             },
             calls: 2,
             tool_seconds: 0.5,

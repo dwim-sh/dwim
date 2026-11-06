@@ -25,6 +25,51 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        let (kept, total) = self.candidates(logits);
+        let r = self.rng.next() * total;
+        let mut acc = 0.0;
+        for &(token, p) in &kept {
+            acc += p;
+            if r < acc {
+                return token;
+            }
+        }
+        kept[kept.len() - 1].0
+    }
+
+    /// Checks `draft`, a token proposed for `logits`, as speculative
+    /// sampling does: it is accepted with the probability `sample` would
+    /// pick it, and otherwise another token is picked from the rest in
+    /// proportion to their probabilities, so that the tokens come out
+    /// distributed as `sample`'s picks are. Returns the token, and whether
+    /// it is the draft.
+    pub fn verify(&mut self, logits: &[f32], draft: u32) -> (u32, bool) {
+        let (kept, total) = self.candidates(logits);
+        let p = kept
+            .iter()
+            .find(|&&(token, _)| token == draft)
+            .map_or(0.0, |&(_, p)| p);
+        if p >= total || self.rng.next() * total < p {
+            return (draft, true);
+        }
+        let r = self.rng.next() * (total - p);
+        let mut acc = 0.0;
+        let mut last = draft;
+        for &(token, p) in kept.iter().filter(|&&(token, _)| token != draft) {
+            acc += p;
+            if r < acc {
+                return (token, false);
+            }
+            last = token;
+        }
+        (last, false)
+    }
+
+    /// The tokens the sampler picks among for `logits`, most likely first,
+    /// each with its probability, and the total of those: the top k at the
+    /// temperature, cut to top_p and min_p. At a temperature of zero, the
+    /// most likely alone, certain.
+    fn candidates(&self, logits: &[f32]) -> (Vec<(u32, f32)>, f32) {
         // The top k in one pass over the logits, kept in order: a vocabulary
         // is a quarter of a million entries, and k is twenty.
         let k = self.top_k.clamp(1, logits.len());
@@ -38,7 +83,7 @@ impl Sampler {
             candidates.truncate(k);
         }
         if self.temperature == 0.0 {
-            return candidates[0].0;
+            return (vec![(candidates[0].0, 1.0)], 1.0);
         }
 
         let max = candidates[0].1;
@@ -63,15 +108,14 @@ impl Sampler {
             kept += probs[n];
             n += 1;
         }
-        let r = self.rng.next() * kept;
-        let mut acc = 0.0;
-        for i in 0..n {
-            acc += probs[i];
-            if r < acc {
-                return candidates[i].0;
-            }
-        }
-        candidates[n - 1].0
+        (
+            candidates[..n]
+                .iter()
+                .zip(&probs)
+                .map(|(&(token, _), &p)| (token, p))
+                .collect(),
+            kept,
+        )
     }
 }
 

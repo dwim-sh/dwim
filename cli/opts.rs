@@ -53,6 +53,11 @@ pub struct Opts {
     #[argh(option)]
     pub temperature: Option<f32>,
 
+    /// tokens the model drafts ahead and verifies in one pass, where its
+    /// file has a drafter, or 0 to decode a token at a time (default: 4)
+    #[argh(option, default = "dwim_models::DRAFTS")]
+    pub speculate: usize,
+
     /// program to run the model's shell commands through, as `shell -c
     /// command` (default: sh)
     #[argh(option)]

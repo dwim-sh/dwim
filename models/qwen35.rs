@@ -35,6 +35,10 @@ use crate::{Device, Gguf, LanguageModel, Result, Tensor, rope_table};
 /// hung if it runs for seconds, so batches are kept short.
 pub const BATCH: usize = 64;
 
+/// Most tokens the model drafts at once: a batch to be verified holds them
+/// and the token before.
+pub const MAX_DRAFTS: usize = 8;
+
 /// The architecture, read from the GGUF metadata.
 #[derive(Debug)]
 pub struct Config {
@@ -66,6 +70,9 @@ pub struct Config {
     /// them, rather than the tiled order llama.cpp's converter puts them
     /// in otherwise.
     pub out_grouped: bool,
+    /// Whether the file holds the layer that predicts the token after the
+    /// next, which the model drafts with.
+    pub drafter: bool,
 }
 
 /// The blockwise Hadamard rotation PrismML folds into Bonsai's weights:
@@ -86,8 +93,9 @@ impl Config {
             return Err(format!("the '{arch}' architecture is not supported").into());
         }
         let key = |name: &str| gguf.u32(&format!("{arch}.{name}"));
-        // The last blocks of a file may predict further tokens, which this
-        // model does not do: they are left out, as llama.cpp leaves them.
+        // The last blocks of a file may predict further tokens: the first
+        // of them is the drafter, where the file has its weights, and the
+        // rest are left out, as llama.cpp leaves them all.
         let nextn = gguf
             .get(&format!("{arch}.nextn_predict_layers"))
             .and_then(|v| v.as_i64())
@@ -96,10 +104,11 @@ impl Config {
         if nextn >= blocks {
             return Err("every layer of the model predicts further tokens".into());
         }
+        let layers = blocks - nextn;
         let config = Self {
             hidden: key("embedding_length")? as usize,
             intermediate: key("feed_forward_length")? as usize,
-            layers: blocks - nextn,
+            layers,
             heads: key("attention.head_count")? as usize,
             kv_heads: key("attention.head_count_kv")? as usize,
             head_dim: key("attention.key_length")? as usize,
@@ -117,6 +126,10 @@ impl Config {
                 .get("prism.hadamard.gdn_v_grouped")
                 .and_then(|v| v.as_bool())
                 == Some(true),
+            drafter: nextn >= 1
+                && gguf
+                    .info(&format!("blk.{layers}.nextn.eh_proj.weight"))
+                    .is_ok(),
         };
         if key("ssm.conv_kernel")? as usize != CONV_KERNEL {
             return Err("the convolution kernel is not four wide".into());
@@ -229,12 +242,24 @@ impl Memory {
         }
         let attention = (0..c.layers).filter(|&i| c.is_attention(i)).count();
         let linear = c.layers - attention;
-        let activations = BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab;
+        let mut activations =
+            BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab;
         let states = linear * (2 * c.conv_width() + c.ssm_width());
+        // The drafter has a key/value cache of its own, and verifying a
+        // batch keeps the linear layers' states run through it apart, their
+        // inputs for it, the hidden state after every token, and every
+        // token's logits.
+        let caches = attention + c.drafter as usize;
+        if c.drafter {
+            activations += linear
+                * (c.ssm_width() + BATCH * (2 * c.k_dim() + c.v_dim() + 2 * c.v_heads))
+                + (BATCH + 2) * c.hidden
+                + MAX_DRAFTS * c.vocab;
+        }
         let kv_dim = c.kv_heads * c.head_dim;
         Ok(Self {
             fixed: (weights + 4 * (activations + states)) as u64,
-            per_token: (2 * attention * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
+            per_token: (2 * caches * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
         })
     }
 }
@@ -330,10 +355,27 @@ pub struct Model<D: Device> {
     layers: Vec<Layer<D>>,
     norm: D::Buffer,
     lm_head: D::Weight,
+    /// The layer that predicts the token after the next, if the file has
+    /// it.
+    draft: Option<Draft<D>>,
     /// The signs of the rotation, by the width of the activations they
     /// apply to, if the weights are rotated.
     signs: Option<Vec<(usize, D::Buffer)>>,
     state: State<D>,
+}
+
+/// The layer that predicts the token after the next, to draft with: a full
+/// attention layer with a key/value cache of its own, fed the embedding of
+/// the token picked and the hidden state it was picked from, each
+/// normalized and taken through its half of one projection; its output,
+/// normalized, goes through the model's head.
+struct Draft<D: Device> {
+    embed_norm: D::Buffer,
+    hidden_norm: D::Buffer,
+    embed_proj: D::Weight,
+    hidden_proj: D::Weight,
+    layer: Layer<D>,
+    norm: D::Buffer,
 }
 
 struct Layer<D: Device> {
@@ -404,140 +446,53 @@ impl<D: Device> Model<D> {
             device: &device,
             gguf: &gguf,
             done: 0,
-            total: attention_layers * 11 + (c.layers - attention_layers) * 12 + 2,
+            total: attention_layers * 11
+                + (c.layers - attention_layers) * 12
+                + 2
+                + if c.drafter { 16 } else { 0 },
             on_progress,
             rotated: Vec::new(),
         };
         let g = &*gguf;
 
         let mut layers = Vec::with_capacity(c.layers);
-        let mut caches = 0;
-        let mut slots = 0;
+        let (mut caches, mut slots) = (0, 0);
         for i in 0..c.layers {
-            let p = format!("blk.{i}");
-            let attn_norm = l.buffer(g.f32s(&format!("{p}.attn_norm.weight"))?);
-            let mixer = if c.is_attention(i) {
-                // The query projection puts each head's gate after its
-                // query: the rows are split into two matrices.
-                let name = format!("{p}.attn_q.weight");
-                let both = g.matrix(&name)?;
-                if both.shape()[0] != 2 * c.heads * c.head_dim {
-                    return Err(format!("{name} does not hold a gate for each query").into());
-                }
-                let rows = |first: usize| -> Vec<usize> {
-                    (0..c.heads)
-                        .flat_map(|h| {
-                            (0..c.head_dim).map(move |i| (2 * h + first) * c.head_dim + i)
-                        })
-                        .collect()
-                };
-                let q = l.rotated(&name, both.select_rows(&rows(0)));
-                let gate = l.device.upload(both.select_rows(&rows(1)));
-                caches += 1;
-                Mixer::Attention {
-                    q,
-                    gate,
-                    k: l.weight(&format!("{p}.attn_k.weight"))?,
-                    v: l.weight(&format!("{p}.attn_v.weight"))?,
-                    o: l.weight(&format!("{p}.attn_output.weight"))?,
-                    q_norm: l.buffer(g.f32s(&format!("{p}.attn_q_norm.weight"))?),
-                    k_norm: l.buffer(g.f32s(&format!("{p}.attn_k_norm.weight"))?),
-                    cache: caches - 1,
-                }
-            } else {
-                // The value heads, and everything per value head, are put
-                // back into the checkpoint's order: the rows of the value
-                // heads' matrices, and of the value part of the combined
-                // projection after its queries and keys.
-                let heads = untiled(c.k_heads, c.v_heads, c.state_dim);
-                let name = format!("{p}.attn_qkv.weight");
-                let qkv = g.matrix(&name)?;
-                let rows: Vec<usize> = (0..2 * c.k_dim())
-                    .chain(heads.iter().map(|&r| 2 * c.k_dim() + r))
-                    .collect();
-                if qkv.shape()[0] != rows.len() {
-                    return Err(
-                        format!("{name} is not as tall as the queries, keys and values").into(),
-                    );
-                }
-                let qkv = l.rotated(&name, qkv.select_rows(&rows));
-                let name = format!("{p}.attn_gate.weight");
-                let z = l.rotated(&name, g.matrix(&name)?.select_rows(&heads));
-                // The decay and forget projections, a row per value head,
-                // as one bf16 matrix.
-                let heads = untiled(c.k_heads, c.v_heads, 1);
-                let ab = match (
-                    g.matrix(&format!("{p}.ssm_alpha.weight"))?
-                        .select_rows(&heads),
-                    g.matrix(&format!("{p}.ssm_beta.weight"))?
-                        .select_rows(&heads),
-                ) {
-                    (Tensor::Bf16 { shape, data: alpha }, Tensor::Bf16 { data: beta, .. }) => {
-                        let mut data = alpha;
-                        data.extend(beta);
-                        Tensor::Bf16 {
-                            shape: vec![2 * shape[0], shape[1]],
-                            data,
-                        }
-                    }
-                    _ => {
-                        return Err(format!(
-                            "{p}: the decay and forget projections are not f32 or bf16"
-                        )
-                        .into());
-                    }
-                };
-                let ab = l.device.upload(ab);
-                l.tick();
-                let mut conv = g.f32s(&format!("{p}.ssm_conv1d.weight"))?;
-                let v = 2 * c.k_dim() * CONV_KERNEL;
-                let grouped = untile(&conv[v..], c.k_heads, c.v_heads, c.state_dim * CONV_KERNEL);
-                conv[v..].copy_from_slice(&grouped);
-                let conv = l.buffer(conv);
-                let mut decay = untile(&g.f32s(&format!("{p}.ssm_a"))?, c.k_heads, c.v_heads, 1);
-                decay.extend(untile(
-                    &g.f32s(&format!("{p}.ssm_dt.bias"))?,
-                    c.k_heads,
-                    c.v_heads,
-                    1,
-                ));
-                let decay = l.buffer(decay);
-                let norm = l.buffer(g.f32s(&format!("{p}.ssm_norm.weight"))?);
-                // The output projection takes the value heads' outputs in
-                // the checkpoint's order, or in the tiled order, in which
-                // case its columns are put back into the checkpoint's too.
-                let name = format!("{p}.ssm_out.weight");
-                let out = g.matrix(&name)?;
-                let out = if c.out_grouped {
-                    out
-                } else {
-                    out.select_column_groups(c.state_dim, &untiled(c.k_heads, c.v_heads, 1))
-                };
-                let out = l.rotated(&name, out);
-                slots += 1;
-                Mixer::Linear {
-                    qkv,
-                    z,
-                    ab,
-                    conv,
-                    decay,
-                    norm,
-                    out,
-                    slot: slots - 1,
-                }
-            };
-            let mlp_norm = l.buffer(g.f32s(&format!("{p}.post_attention_norm.weight"))?);
-            layers.push(Layer {
-                attn_norm,
-                mixer,
-                mlp_norm,
-                gate: l.weight(&format!("{p}.ffn_gate.weight"))?,
-                up: l.weight(&format!("{p}.ffn_up.weight"))?,
-                down: l.weight(&format!("{p}.ffn_down.weight"))?,
-            });
+            layers.push(load_layer(
+                &mut l,
+                c,
+                i,
+                c.is_attention(i),
+                &mut caches,
+                &mut slots,
+            )?);
         }
         let norm = l.buffer(g.f32s("output_norm.weight")?);
         let lm_head = l.weight("output.weight")?;
+        let draft = if c.drafter {
+            if c.rotation.is_some() {
+                return Err("a drafter in rotated weights is not implemented".into());
+            }
+            let p = format!("blk.{}.nextn", c.layers);
+            // The projection takes the embedding first, then the hidden
+            // state: the two halves are kept apart, so that the two can be
+            // normalized and multiplied as they are and the results added.
+            let name = format!("{p}.eh_proj.weight");
+            let both = g.matrix(&name)?;
+            if both.shape() != [c.hidden, 2 * c.hidden] {
+                return Err(format!("{name} does not take an embedding and a hidden state").into());
+            }
+            Some(Draft {
+                embed_norm: l.buffer(g.f32s(&format!("{p}.enorm.weight"))?),
+                hidden_norm: l.buffer(g.f32s(&format!("{p}.hnorm.weight"))?),
+                embed_proj: l.upload(both.select_column_groups(c.hidden, &[0])),
+                hidden_proj: l.upload(both.select_column_groups(c.hidden, &[1])),
+                layer: load_layer(&mut l, c, c.layers, true, &mut caches, &mut slots)?,
+                norm: l.buffer(g.f32s(&format!("{p}.shared_head_norm.weight"))?),
+            })
+        } else {
+            None
+        };
 
         // A rotated file says which weights were rotated: they must be
         // exactly the ones the forward pass rotates activations for, and
@@ -578,178 +533,317 @@ impl<D: Device> Model<D> {
             layers,
             norm,
             lm_head,
+            draft,
             signs,
             state,
         })
     }
 
-    fn forward_batch(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-        let c = &self.config;
-        let d = &self.device;
+    /// Runs a batch of tokens, the first at position `pos`, and returns the
+    /// logits after the last; or, verifying, the logits after each, a row
+    /// per token, with the tokens not committed: the linear layers' states
+    /// are run forward apart from the real ones, and the drafter waits for
+    /// `rewind` to say which tokens were kept.
+    fn forward_batch(&mut self, tokens: &[u32], pos: usize, verify: bool) -> Vec<f32> {
+        let p = Pass {
+            c: &self.config,
+            d: &self.device,
+            signs: self.signs.as_deref(),
+            gguf: &self.gguf,
+        };
+        let (c, d) = (p.c, p.d);
         let s = &mut self.state;
         let n = tokens.len();
-        let eps = c.eps;
-        let kv_dim = c.kv_heads * c.head_dim;
         s.batch(d, n);
+        p.embed(&mut s.x, tokens);
+        for layer in &self.layers {
+            p.layer(s, layer, n, pos, verify);
+        }
+        if !verify {
+            s.parity = !s.parity;
+        }
+        let Some(draft) = &self.draft else {
+            // Only the last token's logits are wanted.
+            d.resize(&mut s.xb, c.hidden);
+            d.resize(&mut s.xh, c.hidden);
+            d.copy(&mut s.xb, 0, &s.x, (n - 1) * c.hidden, c.hidden);
+            p.normalize(&mut s.xh, &s.xb, &self.norm, 1);
+            d.matmul(&mut s.logits, &self.lm_head, &s.xh);
+            return d.read(&s.logits);
+        };
+        // The normalized hidden state after every token, for the drafter,
+        // in the rows after the one carried over.
+        p.normalize(&mut s.xh, &s.x, &self.norm, n);
+        d.copy(&mut s.hidden, c.hidden, &s.xh, 0, n * c.hidden);
+        if verify {
+            s.verified = tokens.to_vec();
+            s.verified_at = pos;
+            d.resize(&mut s.logits, n * c.vocab);
+            d.matmul(&mut s.logits, &self.lm_head, &s.xh);
+            return d.read(&s.logits);
+        }
+        d.resize(&mut s.xb, c.hidden);
+        d.copy(&mut s.xb, 0, &s.xh, (n - 1) * c.hidden, c.hidden);
+        d.resize(&mut s.logits, c.vocab);
+        d.matmul(&mut s.logits, &self.lm_head, &s.xb);
+        // The drafter catches up: it runs at every position whose next
+        // token is known, from the one carried over if there is one, and
+        // the hidden state after the batch is carried over for the next.
+        let first = if s.carry { 0 } else { 1 };
+        p.drafter(
+            s,
+            draft,
+            n - first,
+            pos + first - 1,
+            first,
+            false,
+            &tokens[first..],
+        );
+        s.carry_over(d, n);
+        d.read(&s.logits)
+    }
+}
 
-        // Embeddings are looked up on the CPU and, if the table is rotated,
-        // rotated back on the device.
-        let mut x = vec![0.0; n * c.hidden];
+/// What a pass through the model has at hand: the configuration, the
+/// device, the signs of the rotation if the weights are rotated, and the
+/// file for the embedding table.
+struct Pass<'a, D: Device> {
+    c: &'a Config,
+    d: &'a D,
+    signs: Option<&'a [(usize, D::Buffer)]>,
+    gguf: &'a Gguf,
+}
+
+impl<'a, D: Device> Pass<'a, D> {
+    /// The signs of the rotation for activations of `width`, if the
+    /// weights are rotated.
+    fn signs(&self, width: usize) -> Option<&'a D::Buffer> {
+        self.signs.map(|signs| {
+            &signs
+                .iter()
+                .find(|(w, _)| *w == width)
+                .expect("checked at load")
+                .1
+        })
+    }
+
+    /// `out = rmsnorm(x) * weight` for `rows` rows of `x`, as wide as
+    /// `weight`, rotated if the weights are: what a matrix multiplication's
+    /// input goes through.
+    fn normalize(&self, out: &mut D::Buffer, x: &D::Buffer, weight: &D::Buffer, rows: usize) {
+        let (c, d) = (self.c, self.d);
+        match self.signs(c.hidden) {
+            Some(signs) => d.rmsnorm_hadamard(out, x, weight, signs, c.eps),
+            None => {
+                d.copy(out, 0, x, 0, rows * c.hidden);
+                d.rmsnorm(out, weight, c.eps);
+            }
+        }
+    }
+
+    /// Rotates activations of `width` on their way out of a mixer or a
+    /// network, if the weights are.
+    fn rotate(&self, x: &mut D::Buffer, width: usize) {
+        if let Some(signs) = self.signs(width) {
+            self.d.hadamard(x, signs, false);
+        }
+    }
+
+    /// Writes the embeddings of `tokens` into `out`, which is their size:
+    /// looked up on the CPU and, if the table is rotated, rotated back on
+    /// the device.
+    fn embed(&self, out: &mut D::Buffer, tokens: &[u32]) {
+        let c = self.c;
+        let mut x = vec![0.0; tokens.len() * c.hidden];
         for (x, &token) in x.chunks_exact_mut(c.hidden).zip(tokens) {
             self.gguf
                 .row("token_embd.weight", token as usize, x)
                 .expect("checked at load");
         }
-        d.write(&mut s.x, &x);
-        // The signs of the rotation for activations of each width, if the
-        // weights are rotated.
-        let signs = |width: usize| {
-            self.signs.as_ref().map(|signs| {
-                &signs
-                    .iter()
-                    .find(|(w, _)| *w == width)
-                    .expect("checked at load")
-                    .1
-            })
-        };
-        if let Some(signs) = signs(c.hidden) {
-            d.hadamard(&mut s.x, signs, true);
+        self.d.write(out, &x);
+        if let Some(signs) = self.signs(c.hidden) {
+            self.d.hadamard(out, signs, true);
         }
-        // `out = rmsnorm(x) * weight` for `rows` rows of `x`, as wide as
-        // `weight`, rotated if the weights are: what a matrix
-        // multiplication's input goes through.
-        let normalize =
-            |out: &mut D::Buffer, x: &D::Buffer, weight: &D::Buffer, rows: usize| match signs(
-                c.hidden,
-            ) {
-                Some(signs) => d.rmsnorm_hadamard(out, x, weight, signs, eps),
-                None => {
-                    d.copy(out, 0, x, 0, rows * c.hidden);
-                    d.rmsnorm(out, weight, eps);
-                }
-            };
-        // Rotates activations of `width` on their way out of a mixer or a
-        // network, if the weights are.
-        let rotate = |x: &mut D::Buffer, width: usize| {
-            if let Some(signs) = signs(width) {
-                d.hadamard(x, signs, false);
-            }
-        };
-
-        for layer in &self.layers {
-            // The token mixer, with its result added back into the
-            // residual stream. It sees the normalized activations, rotated
-            // if the weights are, and the recurrent-state projections see
-            // them as they are.
-            normalize(&mut s.xh, &s.x, &layer.attn_norm, n);
-            match &layer.mixer {
-                Mixer::Attention {
-                    q,
-                    gate,
-                    k,
-                    v,
-                    o,
-                    q_norm,
-                    k_norm,
-                    cache,
-                } => {
-                    let q_dim = c.heads * c.head_dim;
-                    d.resize(&mut s.q, n * q_dim);
-                    d.resize(&mut s.gate, n * q_dim);
-                    d.resize(&mut s.k, n * kv_dim);
-                    d.resize(&mut s.v, n * kv_dim);
-                    d.resize(&mut s.att, n * q_dim);
-                    d.matmul(&mut s.q, q, &s.xh);
-                    d.matmul(&mut s.gate, gate, &s.xh);
-                    d.matmul(&mut s.k, k, &s.xh);
-                    d.matmul(&mut s.v, v, &s.xh);
-                    d.rmsnorm(&mut s.q, q_norm, eps);
-                    d.rmsnorm(&mut s.k, k_norm, eps);
-                    d.rope(&mut s.q, &s.rope, pos, c.heads, c.head_dim, c.rot_dim);
-                    d.rope(&mut s.k, &s.rope, pos, c.kv_heads, c.head_dim, c.rot_dim);
-                    d.store(&mut s.k_cache[*cache], pos * kv_dim, &s.k);
-                    d.store(&mut s.v_cache[*cache], pos * kv_dim, &s.v);
-                    d.attention(
-                        &mut s.att,
-                        &s.q,
-                        &s.k_cache[*cache],
-                        &s.v_cache[*cache],
-                        pos,
-                        c.heads,
-                        c.head_dim,
-                        c.kv_heads,
-                    );
-                    d.sigmoid_mul(&mut s.att, &s.gate);
-                    rotate(&mut s.att, q_dim);
-                    d.matmul(&mut s.xb, o, &s.att);
-                }
-                Mixer::Linear {
-                    qkv,
-                    z,
-                    ab,
-                    conv,
-                    decay,
-                    norm,
-                    out,
-                    slot,
-                } => {
-                    let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
-                    d.resize(&mut s.q, n * k_dim);
-                    d.resize(&mut s.k, n * k_dim);
-                    d.resize(&mut s.v, n * v_dim);
-                    d.resize(&mut s.att, n * v_dim);
-                    d.matmul(&mut s.qkv, qkv, &s.xh);
-                    d.matmul(&mut s.z, z, &s.xh);
-                    d.copy(&mut s.xb, 0, &s.x, 0, n * c.hidden);
-                    d.rmsnorm(&mut s.xb, &layer.attn_norm, eps);
-                    d.matmul(&mut s.ab, ab, &s.xb);
-                    // The convolution reads the tokens before the batch from
-                    // one state buffer and leaves the ones after it in the
-                    // other.
-                    let [a, b] = &mut s.conv_state[*slot];
-                    let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
-                    d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
-                    d.l2norm(&mut s.q, c.state_dim, eps);
-                    d.l2norm(&mut s.k, c.state_dim, eps);
-                    d.delta_net(
-                        &mut s.att,
-                        &s.q,
-                        &s.k,
-                        &s.v,
-                        &s.ab,
-                        decay,
-                        &mut s.ssm_state[*slot],
-                        c.k_heads,
-                        c.v_heads,
-                        c.state_dim,
-                    );
-                    d.rmsnorm(&mut s.att, norm, eps);
-                    d.silu_mul(&mut s.z, &s.att);
-                    rotate(&mut s.z, v_dim);
-                    d.matmul(&mut s.xb, out, &s.z);
-                }
-            }
-            d.add(&mut s.x, &s.xb);
-
-            // Feed-forward network, likewise added back.
-            normalize(&mut s.xh, &s.x, &layer.mlp_norm, n);
-            d.matmul(&mut s.up, &layer.gate, &s.xh);
-            d.matmul(&mut s.gate_ffn, &layer.up, &s.xh);
-            d.silu_mul(&mut s.up, &s.gate_ffn);
-            rotate(&mut s.up, c.intermediate);
-            d.matmul(&mut s.xb, &layer.down, &s.up);
-            d.add(&mut s.x, &s.xb);
-        }
-        s.parity = !s.parity;
-
-        // Only the last token's logits are wanted.
-        d.resize(&mut s.xb, c.hidden);
-        d.resize(&mut s.xh, c.hidden);
-        d.copy(&mut s.xb, 0, &s.x, (n - 1) * c.hidden, c.hidden);
-        normalize(&mut s.xh, &s.xb, &self.norm, 1);
-        d.matmul(&mut s.logits, &self.lm_head, &s.xh);
-        d.read(&s.logits)
     }
+
+    /// Runs `n` tokens, the first at position `pos`, through a layer: from
+    /// the residual stream in `s.x` and back into it. Verifying, a linear
+    /// layer runs its recurrent state forward apart from the real one and
+    /// keeps its inputs, for the tokens accepted to be committed from.
+    fn layer(&self, s: &mut State<D>, layer: &Layer<D>, n: usize, pos: usize, verify: bool) {
+        let (c, d) = (self.c, self.d);
+        let eps = c.eps;
+        let kv_dim = c.kv_heads * c.head_dim;
+        // The token mixer, with its result added back into the residual
+        // stream. It sees the normalized activations, rotated if the
+        // weights are, and the recurrent-state projections see them as
+        // they are.
+        self.normalize(&mut s.xh, &s.x, &layer.attn_norm, n);
+        match &layer.mixer {
+            Mixer::Attention {
+                q,
+                gate,
+                k,
+                v,
+                o,
+                q_norm,
+                k_norm,
+                cache,
+            } => {
+                let q_dim = c.heads * c.head_dim;
+                d.resize(&mut s.q, n * q_dim);
+                d.resize(&mut s.gate, n * q_dim);
+                d.resize(&mut s.k, n * kv_dim);
+                d.resize(&mut s.v, n * kv_dim);
+                d.resize(&mut s.att, n * q_dim);
+                d.matmul(&mut s.q, q, &s.xh);
+                d.matmul(&mut s.gate, gate, &s.xh);
+                d.matmul(&mut s.k, k, &s.xh);
+                d.matmul(&mut s.v, v, &s.xh);
+                d.rmsnorm(&mut s.q, q_norm, eps);
+                d.rmsnorm(&mut s.k, k_norm, eps);
+                d.rope(&mut s.q, &s.rope, pos, c.heads, c.head_dim, c.rot_dim);
+                d.rope(&mut s.k, &s.rope, pos, c.kv_heads, c.head_dim, c.rot_dim);
+                d.store(&mut s.k_cache[*cache], pos * kv_dim, &s.k);
+                d.store(&mut s.v_cache[*cache], pos * kv_dim, &s.v);
+                d.attention(
+                    &mut s.att,
+                    &s.q,
+                    &s.k_cache[*cache],
+                    &s.v_cache[*cache],
+                    pos,
+                    c.heads,
+                    c.head_dim,
+                    c.kv_heads,
+                );
+                d.sigmoid_mul(&mut s.att, &s.gate);
+                self.rotate(&mut s.att, q_dim);
+                d.matmul(&mut s.xb, o, &s.att);
+            }
+            Mixer::Linear {
+                qkv,
+                z,
+                ab,
+                conv,
+                decay,
+                norm,
+                out,
+                slot,
+            } => {
+                let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
+                d.resize(&mut s.q, n * k_dim);
+                d.resize(&mut s.k, n * k_dim);
+                d.resize(&mut s.v, n * v_dim);
+                d.resize(&mut s.att, n * v_dim);
+                d.matmul(&mut s.qkv, qkv, &s.xh);
+                d.matmul(&mut s.z, z, &s.xh);
+                d.copy(&mut s.xb, 0, &s.x, 0, n * c.hidden);
+                d.rmsnorm(&mut s.xb, &layer.attn_norm, eps);
+                d.matmul(&mut s.ab, ab, &s.xb);
+                if verify {
+                    let width = n * (2 * k_dim + v_dim);
+                    d.resize(&mut s.qkv_saved[*slot], width);
+                    d.copy(&mut s.qkv_saved[*slot], 0, &s.qkv, 0, width);
+                    d.resize(&mut s.ab_saved[*slot], n * 2 * c.v_heads);
+                    d.copy(&mut s.ab_saved[*slot], 0, &s.ab, 0, n * 2 * c.v_heads);
+                    d.copy(
+                        &mut s.ssm_scratch[*slot],
+                        0,
+                        &s.ssm_state[*slot],
+                        0,
+                        c.ssm_width(),
+                    );
+                }
+                // The convolution reads the tokens before the batch from
+                // one state buffer and leaves the ones after it in the
+                // other.
+                let [a, b] = &mut s.conv_state[*slot];
+                let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
+                d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
+                d.l2norm(&mut s.q, c.state_dim, eps);
+                d.l2norm(&mut s.k, c.state_dim, eps);
+                let ssm = if verify {
+                    &mut s.ssm_scratch[*slot]
+                } else {
+                    &mut s.ssm_state[*slot]
+                };
+                d.delta_net(
+                    &mut s.att,
+                    &s.q,
+                    &s.k,
+                    &s.v,
+                    &s.ab,
+                    decay,
+                    ssm,
+                    c.k_heads,
+                    c.v_heads,
+                    c.state_dim,
+                );
+                d.rmsnorm(&mut s.att, norm, eps);
+                d.silu_mul(&mut s.z, &s.att);
+                self.rotate(&mut s.z, v_dim);
+                d.matmul(&mut s.xb, out, &s.z);
+            }
+        }
+        d.add(&mut s.x, &s.xb);
+
+        // Feed-forward network, likewise added back.
+        self.normalize(&mut s.xh, &s.x, &layer.mlp_norm, n);
+        d.matmul(&mut s.up, &layer.gate, &s.xh);
+        d.matmul(&mut s.gate_ffn, &layer.up, &s.xh);
+        d.silu_mul(&mut s.up, &s.gate_ffn);
+        self.rotate(&mut s.up, c.intermediate);
+        d.matmul(&mut s.xb, &layer.down, &s.up);
+        d.add(&mut s.x, &s.xb);
+    }
+
+    /// Runs the drafter at `rows` positions from `pos`: each fed the
+    /// hidden state in a row of `s.hidden` from `first` on, or, chaining
+    /// drafts, the drafter's own last output, and the token that followed
+    /// the position. Leaves its output, normalized, in `s.xh`: what it
+    /// predicts the token after from, through the model's head.
+    #[allow(clippy::too_many_arguments)]
+    fn drafter(
+        &self,
+        s: &mut State<D>,
+        draft: &Draft<D>,
+        rows: usize,
+        pos: usize,
+        first: usize,
+        chain: bool,
+        tokens: &[u32],
+    ) {
+        let (c, d) = (self.c, self.d);
+        debug_assert_eq!(tokens.len(), rows);
+        if rows == 0 {
+            return;
+        }
+        s.batch(d, rows);
+        self.embed(&mut s.xb, tokens);
+        d.rmsnorm(&mut s.xb, &draft.embed_norm, c.eps);
+        if chain {
+            d.copy(&mut s.xh, 0, &s.drafted, 0, c.hidden);
+        } else {
+            d.copy(&mut s.xh, 0, &s.hidden, first * c.hidden, rows * c.hidden);
+        }
+        d.rmsnorm(&mut s.xh, &draft.hidden_norm, c.eps);
+        d.matmul(&mut s.x, &draft.embed_proj, &s.xb);
+        d.matmul(&mut s.xb, &draft.hidden_proj, &s.xh);
+        d.add(&mut s.x, &s.xb);
+        self.layer(s, &draft.layer, rows, pos, false);
+        self.normalize(&mut s.xh, &s.x, &draft.norm, rows);
+    }
+}
+
+/// The most likely token.
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &logit) in logits.iter().enumerate() {
+        if logit > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
 }
 
 /// Uploads the weights, counting them off.
@@ -785,12 +879,148 @@ impl<D: Device, F: FnMut(usize, usize)> Loader<'_, D, F> {
         w
     }
 
+    /// Uploads a matrix that takes activations as they are.
+    fn upload(&mut self, tensor: Tensor) -> D::Weight {
+        let w = self.device.upload(tensor);
+        self.tick();
+        w
+    }
+
     fn buffer(&mut self, values: Vec<f32>) -> D::Buffer {
         let mut buf = self.device.alloc(values.len());
         self.device.write(&mut buf, &values);
         self.tick();
         buf
     }
+}
+
+/// Loads layer `i`, full attention or linear, giving it the next key/value
+/// cache or recurrent state.
+fn load_layer<D: Device, F: FnMut(usize, usize)>(
+    l: &mut Loader<'_, D, F>,
+    c: &Config,
+    i: usize,
+    attention: bool,
+    caches: &mut usize,
+    slots: &mut usize,
+) -> Result<Layer<D>> {
+    let g = l.gguf;
+    let p = format!("blk.{i}");
+    let attn_norm = l.buffer(g.f32s(&format!("{p}.attn_norm.weight"))?);
+    let mixer = if attention {
+        // The query projection puts each head's gate after its
+        // query: the rows are split into two matrices.
+        let name = format!("{p}.attn_q.weight");
+        let both = g.matrix(&name)?;
+        if both.shape()[0] != 2 * c.heads * c.head_dim {
+            return Err(format!("{name} does not hold a gate for each query").into());
+        }
+        let rows = |first: usize| -> Vec<usize> {
+            (0..c.heads)
+                .flat_map(|h| (0..c.head_dim).map(move |i| (2 * h + first) * c.head_dim + i))
+                .collect()
+        };
+        let q = l.rotated(&name, both.select_rows(&rows(0)));
+        let gate = l.device.upload(both.select_rows(&rows(1)));
+        *caches += 1;
+        Mixer::Attention {
+            q,
+            gate,
+            k: l.weight(&format!("{p}.attn_k.weight"))?,
+            v: l.weight(&format!("{p}.attn_v.weight"))?,
+            o: l.weight(&format!("{p}.attn_output.weight"))?,
+            q_norm: l.buffer(g.f32s(&format!("{p}.attn_q_norm.weight"))?),
+            k_norm: l.buffer(g.f32s(&format!("{p}.attn_k_norm.weight"))?),
+            cache: *caches - 1,
+        }
+    } else {
+        // The value heads, and everything per value head, are put
+        // back into the checkpoint's order: the rows of the value
+        // heads' matrices, and of the value part of the combined
+        // projection after its queries and keys.
+        let heads = untiled(c.k_heads, c.v_heads, c.state_dim);
+        let name = format!("{p}.attn_qkv.weight");
+        let qkv = g.matrix(&name)?;
+        let rows: Vec<usize> = (0..2 * c.k_dim())
+            .chain(heads.iter().map(|&r| 2 * c.k_dim() + r))
+            .collect();
+        if qkv.shape()[0] != rows.len() {
+            return Err(format!("{name} is not as tall as the queries, keys and values").into());
+        }
+        let qkv = l.rotated(&name, qkv.select_rows(&rows));
+        let name = format!("{p}.attn_gate.weight");
+        let z = l.rotated(&name, g.matrix(&name)?.select_rows(&heads));
+        // The decay and forget projections, a row per value head,
+        // as one bf16 matrix.
+        let heads = untiled(c.k_heads, c.v_heads, 1);
+        let ab = match (
+            g.matrix(&format!("{p}.ssm_alpha.weight"))?
+                .select_rows(&heads),
+            g.matrix(&format!("{p}.ssm_beta.weight"))?
+                .select_rows(&heads),
+        ) {
+            (Tensor::Bf16 { shape, data: alpha }, Tensor::Bf16 { data: beta, .. }) => {
+                let mut data = alpha;
+                data.extend(beta);
+                Tensor::Bf16 {
+                    shape: vec![2 * shape[0], shape[1]],
+                    data,
+                }
+            }
+            _ => {
+                return Err(
+                    format!("{p}: the decay and forget projections are not f32 or bf16").into(),
+                );
+            }
+        };
+        let ab = l.device.upload(ab);
+        l.tick();
+        let mut conv = g.f32s(&format!("{p}.ssm_conv1d.weight"))?;
+        let v = 2 * c.k_dim() * CONV_KERNEL;
+        let grouped = untile(&conv[v..], c.k_heads, c.v_heads, c.state_dim * CONV_KERNEL);
+        conv[v..].copy_from_slice(&grouped);
+        let conv = l.buffer(conv);
+        let mut decay = untile(&g.f32s(&format!("{p}.ssm_a"))?, c.k_heads, c.v_heads, 1);
+        decay.extend(untile(
+            &g.f32s(&format!("{p}.ssm_dt.bias"))?,
+            c.k_heads,
+            c.v_heads,
+            1,
+        ));
+        let decay = l.buffer(decay);
+        let norm = l.buffer(g.f32s(&format!("{p}.ssm_norm.weight"))?);
+        // The output projection takes the value heads' outputs in
+        // the checkpoint's order, or in the tiled order, in which
+        // case its columns are put back into the checkpoint's too.
+        let name = format!("{p}.ssm_out.weight");
+        let out = g.matrix(&name)?;
+        let out = if c.out_grouped {
+            out
+        } else {
+            out.select_column_groups(c.state_dim, &untiled(c.k_heads, c.v_heads, 1))
+        };
+        let out = l.rotated(&name, out);
+        *slots += 1;
+        Mixer::Linear {
+            qkv,
+            z,
+            ab,
+            conv,
+            decay,
+            norm,
+            out,
+            slot: *slots - 1,
+        }
+    };
+    let mlp_norm = l.buffer(g.f32s(&format!("{p}.post_attention_norm.weight"))?);
+    Ok(Layer {
+        attn_norm,
+        mixer,
+        mlp_norm,
+        gate: l.weight(&format!("{p}.ffn_gate.weight"))?,
+        up: l.weight(&format!("{p}.ffn_up.weight"))?,
+        down: l.weight(&format!("{p}.ffn_down.weight"))?,
+    })
 }
 
 /// The elements of `n_v` heads of `per_head` elements each, in the
@@ -819,15 +1049,19 @@ fn untile<T: Clone>(data: &[T], n_k: usize, n_v: usize, per_head: usize) -> Vec<
 
 /// The first bytes of a saved state, and its layout's version.
 const STATE_MAGIC: &[u8; 8] = b"dwimstat";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 impl<D: Device> LanguageModel for Model<D> {
     /// The state after `len` positions: a header of the layout's version and
     /// the model's dimensions, then each attention layer's keys and values
-    /// for the positions as the caches hold them, then each linear layer's convolution state and
-    /// recurrent state.
+    /// for the positions as the caches hold them, the drafter's among
+    /// them, then each linear layer's convolution state and recurrent
+    /// state, then, for a drafter, the hidden state carried over for it.
     fn save(&self, len: usize) -> Option<Vec<u8>> {
         let (c, d, s) = (&self.config, &self.device, &self.state);
+        if !s.verified.is_empty() || (self.draft.is_some() && !s.carry) {
+            return None;
+        }
         let kv_dim = c.kv_heads * c.head_dim;
         let mut out = Vec::new();
         out.extend_from_slice(STATE_MAGIC);
@@ -839,6 +1073,7 @@ impl<D: Device> LanguageModel for Model<D> {
             kv_dim,
             c.conv_width(),
             c.ssm_width(),
+            if self.draft.is_some() { c.hidden } else { 0 },
         ] {
             out.extend_from_slice(&(value as u64).to_le_bytes());
         }
@@ -852,6 +1087,13 @@ impl<D: Device> LanguageModel for Model<D> {
             for buf in [conv, &s.ssm_state[slot]] {
                 out.extend(d.read(buf).iter().flat_map(|v| v.to_le_bytes()));
             }
+        }
+        if self.draft.is_some() {
+            out.extend(
+                d.read(&s.hidden)[..c.hidden]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()),
+            );
         }
         Some(out)
     }
@@ -873,7 +1115,7 @@ impl<D: Device> LanguageModel for Model<D> {
         if u32::from_le_bytes(take(4)?.try_into()?) != STATE_VERSION {
             return Err("a saved state of another version".into());
         }
-        let mut header = [0; 6];
+        let mut header = [0; 7];
         for value in &mut header {
             *value = u64::from_le_bytes(take(8)?.try_into()?) as usize;
         }
@@ -885,6 +1127,7 @@ impl<D: Device> LanguageModel for Model<D> {
                 kv_dim,
                 c.conv_width(),
                 c.ssm_width(),
+                if self.draft.is_some() { c.hidden } else { 0 },
             ]
         {
             return Err("a saved state of another model".into());
@@ -911,6 +1154,17 @@ impl<D: Device> LanguageModel for Model<D> {
             }
         }
         s.parity = true;
+        s.verified.clear();
+        if self.draft.is_some() {
+            let floats: Vec<f32> = take(c.hidden * 4)?
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            d.resize(&mut s.xb, c.hidden);
+            d.write(&mut s.xb, &floats);
+            d.copy(&mut s.hidden, 0, &s.xb, 0, c.hidden);
+            s.carry = true;
+        }
         Ok(len)
     }
 
@@ -922,16 +1176,143 @@ impl<D: Device> LanguageModel for Model<D> {
             pos + tokens.len() <= self.state.max_len,
             "tokens past the end of the cache"
         );
+        assert!(self.state.verified.is_empty(), "a batch is being verified");
         let mut logits = Vec::new();
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
-            logits = self.forward_batch(batch, pos + i * BATCH);
+            logits = self.forward_batch(batch, pos + i * BATCH, false);
         }
         logits
     }
 
-    /// Zeroes the linear layers' states, as they were before any token.
-    /// The attention layers' caches need no clearing: attention reads only
-    /// the positions before the token's.
+    /// The drafter runs at the position before `token`, fed the hidden
+    /// state the token was picked from, which the latest batch carried
+    /// over, and predicts the token after; then at each later position,
+    /// fed its own output and the token it drafted, until it has drafted
+    /// `k`, as many as the context has room to verify.
+    fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
+        let Some(draft) = &self.draft else {
+            return Vec::new();
+        };
+        let p = Pass {
+            c: &self.config,
+            d: &self.device,
+            signs: self.signs.as_deref(),
+            gguf: &self.gguf,
+        };
+        let (c, d) = (p.c, p.d);
+        let s = &mut self.state;
+        let k = k.min(MAX_DRAFTS).min(s.max_len.saturating_sub(pos + 1));
+        if !s.carry || !s.verified.is_empty() || pos == 0 || k == 0 {
+            return Vec::new();
+        }
+        let mut drafts = Vec::with_capacity(k);
+        let mut next = token;
+        for i in 0..k {
+            p.drafter(s, draft, 1, pos - 1 + i, 0, i > 0, &[next]);
+            d.copy(&mut s.drafted, 0, &s.xh, 0, c.hidden);
+            d.resize(&mut s.logits, c.vocab);
+            d.matmul(&mut s.logits, &self.lm_head, &s.xh);
+            next = argmax(&d.read(&s.logits));
+            drafts.push(next);
+        }
+        drafts
+    }
+
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        assert!(self.draft.is_some(), "the model does not draft");
+        assert!(
+            self.state.verified.is_empty() && self.state.carry,
+            "a batch is being verified, or none was run before"
+        );
+        assert!(
+            !tokens.is_empty() && tokens.len() <= MAX_DRAFTS + 1,
+            "a batch of {} tokens is not one to verify",
+            tokens.len()
+        );
+        assert!(
+            pos + tokens.len() <= self.state.max_len,
+            "tokens past the end of the cache"
+        );
+        self.forward_batch(tokens, pos, true)
+    }
+
+    /// The linear layers' states run through the whole batch become the
+    /// real ones if every token is kept; otherwise the real ones are run
+    /// through the tokens kept, from the inputs saved. The drafter then
+    /// catches up with the tokens kept, from the hidden states the model
+    /// computed for them, in place of what it ran while drafting, and the
+    /// hidden state after the last is carried over.
+    fn rewind(&mut self, keep: usize) {
+        let p = Pass {
+            c: &self.config,
+            d: &self.device,
+            signs: self.signs.as_deref(),
+            gguf: &self.gguf,
+        };
+        let (c, d) = (p.c, p.d);
+        let s = &mut self.state;
+        let n = s.verified.len();
+        assert!(
+            n > 0 && (1..=n).contains(&keep),
+            "keeping {keep} tokens of a batch of {n} being verified"
+        );
+        let tokens = std::mem::take(&mut s.verified);
+        if keep == n {
+            for slot in 0..s.ssm_state.len() {
+                std::mem::swap(&mut s.ssm_state[slot], &mut s.ssm_scratch[slot]);
+            }
+        } else {
+            s.batch(d, keep);
+            let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
+            for layer in &self.layers {
+                let Mixer::Linear {
+                    conv, decay, slot, ..
+                } = &layer.mixer
+                else {
+                    continue;
+                };
+                d.copy(
+                    &mut s.qkv,
+                    0,
+                    &s.qkv_saved[*slot],
+                    0,
+                    keep * (2 * k_dim + v_dim),
+                );
+                d.copy(&mut s.ab, 0, &s.ab_saved[*slot], 0, keep * 2 * c.v_heads);
+                d.resize(&mut s.q, keep * k_dim);
+                d.resize(&mut s.k, keep * k_dim);
+                d.resize(&mut s.v, keep * v_dim);
+                d.resize(&mut s.att, keep * v_dim);
+                let [a, b] = &mut s.conv_state[*slot];
+                let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
+                d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
+                d.l2norm(&mut s.q, c.state_dim, c.eps);
+                d.l2norm(&mut s.k, c.state_dim, c.eps);
+                d.delta_net(
+                    &mut s.att,
+                    &s.q,
+                    &s.k,
+                    &s.v,
+                    &s.ab,
+                    decay,
+                    &mut s.ssm_state[*slot],
+                    c.k_heads,
+                    c.v_heads,
+                    c.state_dim,
+                );
+            }
+        }
+        s.parity = !s.parity;
+        if let Some(draft) = &self.draft {
+            p.drafter(s, draft, keep, s.verified_at - 1, 0, false, &tokens[..keep]);
+            s.carry_over(d, keep);
+        }
+    }
+
+    /// Zeroes the linear layers' states, as they were before any token,
+    /// and forgets what was carried over for the drafter. The attention
+    /// layers' caches need no clearing: attention reads only the positions
+    /// before the token's.
     fn reset(&mut self) {
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
         for slot in 0..s.ssm_state.len() {
@@ -941,6 +1322,8 @@ impl<D: Device> LanguageModel for Model<D> {
             d.write(&mut s.ssm_state[slot], &vec![0.0; c.ssm_width()]);
         }
         s.parity = false;
+        s.carry = false;
+        s.verified.clear();
     }
 
     fn max_len(&self) -> usize {
@@ -981,6 +1364,23 @@ struct State<D: Device> {
     ssm_state: Vec<D::Buffer>,
     rope: D::Buffer,
     max_len: usize,
+    /// For the drafter, which runs a position behind the model: the
+    /// normalized hidden state after each token of the latest batch, in
+    /// the rows after the first, which holds the one after the token
+    /// before the batch, carried over; whether it holds one; and the
+    /// drafter's own output, from one drafted token to the next.
+    hidden: D::Buffer,
+    carry: bool,
+    drafted: D::Buffer,
+    /// A batch being verified: its tokens and the position of the first;
+    /// the linear layers' recurrent states run through it, kept apart from
+    /// the real ones until the accepted tokens are committed; and each
+    /// linear layer's convolution inputs and gates for it, to commit from.
+    verified: Vec<u32>,
+    verified_at: usize,
+    ssm_scratch: Vec<D::Buffer>,
+    qkv_saved: Vec<D::Buffer>,
+    ab_saved: Vec<D::Buffer>,
 }
 
 impl<D: Device> State<D> {
@@ -1010,7 +1410,7 @@ impl<D: Device> State<D> {
             up: d.alloc(BATCH * c.intermediate),
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
-            logits: d.alloc(c.vocab),
+            logits: d.alloc(if c.drafter { MAX_DRAFTS + 1 } else { 1 } * c.vocab),
             k_cache: (0..caches)
                 .map(|_| d.alloc_cache(max_len * kv_dim))
                 .collect(),
@@ -1026,7 +1426,31 @@ impl<D: Device> State<D> {
                 .collect(),
             rope,
             max_len,
+            hidden: d.alloc((BATCH + 1) * c.hidden),
+            carry: false,
+            drafted: d.alloc(c.hidden),
+            verified: Vec::new(),
+            verified_at: 0,
+            ssm_scratch: (0..if c.drafter { slots } else { 0 })
+                .map(|_| d.alloc(c.ssm_width()))
+                .collect(),
+            qkv_saved: (0..if c.drafter { slots } else { 0 })
+                .map(|_| d.alloc(BATCH * (2 * c.k_dim() + c.v_dim())))
+                .collect(),
+            ab_saved: (0..if c.drafter { slots } else { 0 })
+                .map(|_| d.alloc(BATCH * 2 * c.v_heads))
+                .collect(),
         }
+    }
+
+    /// Carries the hidden state after the last of `n` tokens over into
+    /// the first row, for the drafter, through `xb`.
+    fn carry_over(&mut self, d: &D, n: usize) {
+        let hidden = self.widths[0];
+        d.resize(&mut self.xb, hidden);
+        d.copy(&mut self.xb, 0, &self.hidden, n * hidden, hidden);
+        d.copy(&mut self.hidden, 0, &self.xb, 0, hidden);
+        self.carry = true;
     }
 
     /// Sizes the buffers for a batch of `n` tokens.
@@ -1143,9 +1567,21 @@ mod tests {
             tensors.push((name.to_string(), vec![cols, rows], dtype, data));
         };
         tern("output.weight", vocab, hidden, &mut names);
-        for i in 0..layers {
+        // A quantized file has a block after the layers that predicts the
+        // token after the next: a full attention layer, with the projection
+        // of an embedding and a hidden state into its input.
+        let blocks = if quantized { layers + 1 } else { layers };
+        for i in 0..blocks {
             let p = format!("blk.{i}");
-            if (i + 1) % 4 == 0 {
+            if i == layers {
+                tern(
+                    &format!("{p}.nextn.eh_proj.weight"),
+                    hidden,
+                    2 * hidden,
+                    &mut names,
+                );
+            }
+            if (i + 1) % 4 == 0 || i == layers {
                 tern(
                     &format!("{p}.attn_q.weight"),
                     heads * head_dim * 2,
@@ -1206,7 +1642,7 @@ mod tests {
             gguf::F32,
             rng.floats(hidden, 0.1, 1.0),
         ));
-        for i in 0..layers {
+        for i in 0..blocks {
             let p = format!("blk.{i}");
             tensors.push((
                 format!("{p}.attn_norm.weight"),
@@ -1220,7 +1656,17 @@ mod tests {
                 gguf::F32,
                 rng.floats(hidden, 0.1, 1.0),
             ));
-            if (i + 1) % 4 == 0 {
+            if i == layers {
+                for name in ["enorm", "hnorm", "shared_head_norm"] {
+                    tensors.push((
+                        format!("{p}.nextn.{name}.weight"),
+                        vec![hidden],
+                        gguf::F32,
+                        rng.floats(hidden, 0.1, 1.0),
+                    ));
+                }
+            }
+            if (i + 1) % 4 == 0 || i == layers {
                 tensors.push((
                     format!("{p}.attn_q_norm.weight"),
                     vec![head_dim],
@@ -1303,9 +1749,8 @@ mod tests {
             ("qwen35.full_attention_interval", n(4)),
         ];
         if quantized {
-            // The last block predicts the next token, and has no tensors
-            // here since none are read; the file also lists which layers
-            // are linear.
+            // The last block predicts the token after the next; the file
+            // also lists which layers are linear.
             meta.push(("qwen35.nextn_predict_layers", n(1)));
             let recurrent = (0..layers + 1).map(|i| Value::Bool((i + 1) % 4 != 0 && i < layers));
             meta.push((
@@ -1415,6 +1860,126 @@ mod tests {
         }
     }
 
+    /// Checks that every logit of `got` is within `tolerance` of `want`'s,
+    /// relative to its size.
+    fn close(got: &[f32], want: &[f32], tolerance: f32, what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        for (a, b) in got.iter().zip(want) {
+            assert!(
+                (a - b).abs() <= tolerance * (1.0 + b.abs()),
+                "{what}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Verifies a batch after a prefix, keeps `keep` tokens of it and runs
+    /// one more; and runs the same tokens plainly: the logits of the batch
+    /// must be those after each of its tokens, and the one more must come
+    /// out the same either way, the linear layers' states having been
+    /// committed through the tokens kept alone. Then the drafter must
+    /// draft the same after either.
+    fn verify_and_rewind<D: Device>(
+        path: &Path,
+        open: impl Fn() -> D,
+        keep: usize,
+        tolerance: f32,
+    ) {
+        let gguf = Arc::new(Gguf::open(path).unwrap());
+        let prefix = [3, 17, 42, 7, 9];
+        let batch = [11, 2, 30, 5];
+        let mut spec = Model::load(gguf.clone(), open(), 64, |_, _| {}).unwrap();
+        let mut plain = Model::load(gguf, open(), 64, |_, _| {}).unwrap();
+        spec.forward(&prefix, 0);
+        plain.forward(&prefix, 0);
+        let rows = spec.verify(&batch, 5);
+        let vocab = spec.config.vocab;
+        assert_eq!(rows.len(), batch.len() * vocab);
+        for (i, &token) in batch.iter().enumerate() {
+            let want = plain.forward(&[token], 5 + i);
+            close(
+                &rows[i * vocab..][..vocab],
+                &want,
+                tolerance,
+                &format!("row {i}"),
+            );
+            if i + 1 == keep {
+                break;
+            }
+        }
+        spec.rewind(keep);
+        let at = 5 + keep;
+        close(
+            &spec.forward(&[23], at),
+            &plain.forward(&[23], at),
+            tolerance,
+            "after the rewind",
+        );
+        assert_eq!(spec.draft(8, at + 1, 3), plain.draft(8, at + 1, 3));
+    }
+
+    #[test]
+    fn verifying_and_rewinding_runs_the_tokens_kept() {
+        let dir = std::env::temp_dir().join(format!("dwim-qwen35-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path, true);
+        for keep in 1..=4 {
+            verify_and_rewind(&path, || Cpu, keep, 1e-4);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verifying_and_rewinding_on_the_gpu_agrees_with_cpu() {
+        let dir =
+            std::env::temp_dir().join(format!("dwim-qwen35-verify-gpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path, true);
+        match Gpu::new() {
+            Ok(_) => {
+                // The batch may go through the tiled matmuls, which sum in
+                // half precision.
+                for keep in [1, 3, 4] {
+                    verify_and_rewind(&path, || Gpu::new().unwrap(), keep, 2e-2);
+                }
+            }
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drafts_are_the_drafters_most_likely_tokens_and_a_state_carries_them() {
+        let dir = std::env::temp_dir().join(format!("dwim-qwen35-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path, true);
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        let mut model = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
+        // Nothing to draft from before any token.
+        assert!(model.draft(3, 0, 4).is_empty());
+        model.forward(&[3, 17, 42, 7, 9], 0);
+        let drafts = model.draft(11, 5, 4);
+        assert_eq!(drafts.len(), 4);
+        assert!(drafts.iter().all(|&t| (t as usize) < model.config.vocab));
+        // Drafting is a function of the state: the same again.
+        assert_eq!(model.draft(11, 5, 4), drafts);
+        // Only as many as the context has room to verify.
+        assert_eq!(model.draft(11, 5, 100).len(), MAX_DRAFTS);
+        let mut small = Model::load(gguf.clone(), Cpu, 8, |_, _| {}).unwrap();
+        small.forward(&[3, 17, 42, 7, 9], 0);
+        assert_eq!(small.draft(11, 5, 4).len(), 2);
+        // A saved state carries what the drafter needs: the same drafts and
+        // the same logits after it is restored.
+        let state = model.save(5).unwrap();
+        let mut resumed = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        assert_eq!(resumed.restore(&state).unwrap(), 5);
+        assert_eq!(resumed.draft(11, 5, 4), drafts);
+        assert_eq!(resumed.forward(&[11], 5), model.forward(&[11], 5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Greedy completion of a prompt by each real model whose file is in
     /// the cache: run with `--ignored --nocapture` and compare with what
     /// llama.cpp says.
@@ -1443,6 +2008,7 @@ mod tests {
         let mut model = Model::load(gguf, device, 256, |_, _| {}).unwrap();
         eprintln!("loaded in {:.1}s", start.elapsed().as_secs_f32());
         let mut tokens = tokenizer.encode("The capital of France is").unwrap();
+        let prompt = tokens.clone();
         // The prompt first, then the tokens one at a time, each timed on
         // its own.
         let decode = 16;
@@ -1469,6 +2035,59 @@ mod tests {
         let text = String::from_utf8_lossy(&text);
         eprintln!("completion: {text:?}");
         assert!(text.starts_with(" Paris."), "{text:?}");
+        // The same completion with the drafter, where the model has one:
+        // greedy, so that it must come out token for token the same, and
+        // faster.
+        if model.config.drafter {
+            let plain = tokens[prompt.len()..].to_vec();
+            model.reset();
+            let mut toks = prompt.clone();
+            let mut logits = model.forward(&toks, 0);
+            let (mut out, mut drafted, mut accepted) = (Vec::new(), 0, 0);
+            let start = std::time::Instant::now();
+            while out.len() < decode {
+                let token = argmax(&logits);
+                out.push(token);
+                let pos = toks.len();
+                let drafts = model.draft(token, pos, 4);
+                if drafts.is_empty() {
+                    logits = model.forward(&[token], pos);
+                    toks.push(token);
+                    continue;
+                }
+                let mut batch = vec![token];
+                batch.extend(&drafts);
+                let rows = model.verify(&batch, pos);
+                let vocab = rows.len() / batch.len();
+                let mut keep = 1;
+                for (i, &draft) in drafts.iter().enumerate() {
+                    if argmax(&rows[i * vocab..][..vocab]) != draft || out.len() >= decode {
+                        break;
+                    }
+                    out.push(draft);
+                    keep += 1;
+                    accepted += 1;
+                }
+                drafted += drafts.len();
+                model.rewind(keep);
+                toks.extend(&batch[..keep]);
+                logits = rows[(keep - 1) * vocab..][..vocab].to_vec();
+            }
+            eprintln!(
+                "speculative decode: {:.1} tok/s over {} tokens, {accepted} of {drafted} drafts accepted",
+                out.len() as f32 / start.elapsed().as_secs_f32(),
+                out.len()
+            );
+            let got = String::from_utf8_lossy(
+                &out.iter()
+                    .flat_map(|&t| tokenizer.decode(t).to_vec())
+                    .collect::<Vec<u8>>(),
+            )
+            .to_string();
+            eprintln!("speculative completion: {got:?}");
+            assert_eq!(out, plain, "{got:?}");
+            tokens = toks;
+        }
         // A long prompt, carrying on from the completion, for the speed of
         // the batch kernels at their size.
         let passage =

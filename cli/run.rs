@@ -50,6 +50,7 @@ pub fn run(
     thinking_budget: Option<usize>,
     effort: harness::Effort,
     temperature: Option<f32>,
+    speculate: usize,
     shell: Option<PathBuf>,
     verbose: bool,
     log: Log,
@@ -74,6 +75,7 @@ pub fn run(
                 thinking_budget,
                 effort,
                 temperature,
+                speculate,
                 shell,
                 log,
                 requests_rx,
@@ -253,6 +255,7 @@ fn work(
     thinking_budget: Option<usize>,
     effort: harness::Effort,
     temperature: Option<f32>,
+    speculate: usize,
     shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
@@ -273,6 +276,7 @@ fn work(
             thinking_budget,
             effort,
             temperature,
+            speculate,
             shell,
             log,
             requests,
@@ -298,6 +302,7 @@ fn work(
                 thinking_budget,
                 effort,
                 temperature,
+                speculate,
                 shell,
                 log,
                 requests,
@@ -320,6 +325,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     thinking_budget: Option<usize>,
     effort: harness::Effort,
     temperature: Option<f32>,
+    speculate: usize,
     shell: Option<PathBuf>,
     log: Log,
     requests: Receiver<Request>,
@@ -334,6 +340,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
         let _ = replies.send(Reply::Loading { done, total });
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
+    chat.set_drafts(speculate);
     let cwd = env::current_dir()?;
     let system = harness::system_prompt(&cwd, effort);
     models::start(&mut chat, which, &system, |read, total| {

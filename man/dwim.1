@@ -144,6 +144,10 @@ Sample at temperature
 instead of the one the model file recommends; 0 always picks the
 likeliest token.
 .TP
+.BI \-\-speculate " n"
+Tokens the model drafts ahead and verifies in one pass, where its file has
+a drafter, as Qwen3.8-27B's does; 0 decodes a token at a time (default: 4).
+.TP
 .BI \-\-transcript " file"
 Write the session's transcript to
 .I file
