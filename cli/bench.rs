@@ -7,7 +7,7 @@
 //! tokens a second for both, so that the slope is a number a change can be
 //! measured against.
 
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{error::Error, path::Path, sync::Arc, time::Instant};
 
 use dwim_gpu::{Cpu, Gpu};
 use dwim_models::{Gguf, LanguageModel, Tokenizer};
@@ -35,20 +35,33 @@ const FILLER: &str = include_str!("bench.rs");
 
 /// Times the model at each depth of context and prints a table of tokens
 /// a second, reading and generating, on standard output.
-pub fn bench(name: &str, device: Device, context: Option<usize>) -> Result<(), Box<dyn Error>> {
+pub fn bench(
+    name: &str,
+    device: Device,
+    drafting: bool,
+    context: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
     let (model, dir) = fetch::locate(name)?;
     let mut progress = Progress::new();
-    fetch::fetch(model, &dir, |file| {
+    let mut downloading = |file: fetch::Progress| {
         let total = file.total.unwrap_or(file.done);
         progress.report(
             format!("downloading {}", file.file),
             crate::once::megabytes(file.done),
             crate::once::megabytes(total),
         );
-    })?;
-    let gguf = model.open(&dir)?;
+    };
+    fetch::fetch(model, &dir, &mut downloading)?;
+    let draft = if drafting {
+        let draft_dir = models::draft_dir()?;
+        fetch::fetch(models::DRAFT, &draft_dir, &mut downloading)?;
+        Some(models::draft_files(&draft_dir)?)
+    } else {
+        None
+    };
+    let gguf = models::open(model, &dir)?;
     match device {
-        Device::Cpu => run(gguf, Cpu, model, "the CPU", context),
+        Device::Cpu => run(gguf, Cpu, model, "the CPU", draft.as_deref(), context),
         Device::Gpu => {
             let gpu = Gpu::new()?;
             // Drivers append their own name in parentheses; the GPU's is enough.
@@ -58,7 +71,7 @@ pub fn bench(name: &str, device: Device, context: Option<usize>) -> Result<(), B
                 .next()
                 .unwrap_or(gpu.name())
                 .to_string();
-            run(gguf, gpu, model, &on, context)
+            run(gguf, gpu, model, &on, draft.as_deref(), context)
         }
     }
 }
@@ -70,14 +83,19 @@ fn run<D: dwim_gpu::Device + 'static>(
     device: D,
     which: &'static models::Model,
     on: &str,
+    draft: Option<&Path>,
     context: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let size = models::size(&gguf, &device, context)?;
+    let size = models::size(&gguf, &device, draft, context)?;
     eprintln!("{}", models::describe(&size));
     let mut progress = Progress::new();
-    let mut model = models::load(gguf, device, size.context, |done, total| {
-        progress.report(format!("loading {} on {on}", which.name), done, total);
+    let mut model = models::load(gguf, device, size.context, draft, |what, done, total| {
+        let what = match what {
+            models::Loading::Model => which.name,
+            models::Loading::Draft => "the draft",
+        };
+        progress.report(format!("loading {what} on {on}"), done, total);
     })?;
     let depths = depths(model.max_len());
     if depths.is_empty() {

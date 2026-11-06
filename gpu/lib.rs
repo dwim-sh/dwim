@@ -7,10 +7,12 @@
 #[macro_use]
 mod tests;
 
+pub mod affine4;
 pub mod cpu;
 #[cfg(target_vendor = "apple")]
 pub mod metal;
 pub mod ternary;
+pub mod twobit;
 pub mod vulkan;
 
 pub use cpu::Cpu;
@@ -42,17 +44,33 @@ pub const CONV_KERNEL: usize = 4;
 /// sharing an f16 scale, as [`quantize`] makes them.
 pub const CACHE_BLOCK: usize = 32;
 
-/// A weight matrix on the host, of shape `[rows, cols]`: either raw bf16
-/// bits, or rows of ternary blocks.
+/// A weight matrix on the host, of shape `[rows, cols]`: raw bf16 bits,
+/// rows of ternary blocks, or rows of 4-bit groups as [`affine4`] packs
+/// them.
 pub enum Tensor {
     Bf16 { shape: Vec<usize>, data: Vec<u16> },
     Ternary { shape: Vec<usize>, data: Vec<u8> },
+    Affine4 { shape: Vec<usize>, data: Vec<u8> },
 }
 
 impl Tensor {
     pub fn shape(&self) -> &[usize] {
         match self {
-            Tensor::Bf16 { shape, .. } | Tensor::Ternary { shape, .. } => shape,
+            Tensor::Bf16 { shape, .. }
+            | Tensor::Ternary { shape, .. }
+            | Tensor::Affine4 { shape, .. } => shape,
+        }
+    }
+
+    /// The matrix quantized four bits a weight, as [`affine4`] does it,
+    /// unless it is ternary already.
+    pub fn affine4(self) -> Tensor {
+        match self {
+            Tensor::Bf16 { shape, data } => Tensor::Affine4 {
+                data: affine4::quantize_bf16(&data, shape[0], shape[1]),
+                shape,
+            },
+            other => other,
         }
     }
 }
@@ -220,6 +238,67 @@ pub trait Device {
         x: &Self::Buffer,
         state: &Self::Buffer,
         weight: &Self::Buffer,
+    );
+
+    /// The draft's two-tap dynamic convolution over the rows of `x`, a
+    /// row of `hidden` channels per token: each channel of a row is
+    /// weighed by a base weight plus the dynamic weight of its group of
+    /// `group` channels, and added to the row before weighed the same way
+    /// by the second tap's weights, the row before the first being zero.
+    /// `base` holds the base weights as two stages of two taps of `hidden`
+    /// each, and `dynamic` holds every row's dynamic weights as two stages
+    /// of two taps of `hidden / group` each. The convolution of `stage` 0
+    /// prepares a sublayer's input; that of stage 1 finishes its output and
+    /// adds `residual` to it.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_conv(
+        &self,
+        out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        dynamic: &Self::Buffer,
+        base: &Self::Buffer,
+        residual: Option<&Self::Buffer>,
+        stage: usize,
+        group: usize,
+    );
+
+    /// Attention of the draft's block of rows, the first at position
+    /// `pos`, over the context before it and the block itself: each of a
+    /// row's `n_heads` heads, `head_dim` long, attends to the keys of the
+    /// `window - 1` positions before the row's and to the block's own
+    /// rows, all of them, and writes its result to `out`. `k_ring` and
+    /// `v_ring` hold the context's `n_kv_heads` heads of keys and values
+    /// as [`ring_store`](Self::ring_store) lays them out, in `window`
+    /// slots each, of which the positions before `pos` are read; `k_block`
+    /// and `v_block` hold the block's rows, `n_kv_heads * head_dim` each.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_attention(
+        &self,
+        out: &mut Self::Buffer,
+        q: &Self::Buffer,
+        k_ring: &Self::Buffer,
+        v_ring: &Self::Buffer,
+        k_block: &Self::Buffer,
+        v_block: &Self::Buffer,
+        pos: usize,
+        window: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+    );
+
+    /// Stores rows of keys or values, `n_kv_heads * head_dim` each, the
+    /// first at position `pos`, into a ring of `window` slots per head,
+    /// laid out head by head, slot by slot: a position goes in the slot
+    /// `pos % window` of each head.
+    fn ring_store(
+        &self,
+        ring: &mut Self::Buffer,
+        rows: &Self::Buffer,
+        pos: usize,
+        window: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
     );
 
     /// The gated delta rule of linear attention, one token after another.

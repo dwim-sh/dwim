@@ -25,12 +25,24 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        let distribution = self.distribution(logits, &[]);
+        self.draw(&distribution)
+    }
+
+    /// The distribution the sampler picks from, given the logits, with
+    /// `forbidden` tokens left out: the tokens that may be picked, each
+    /// with its probability, in descending order, the probabilities
+    /// summing to one. At a temperature of zero, the most likely token
+    /// alone.
+    pub fn distribution(&self, logits: &[f32], forbidden: &[u32]) -> Distribution {
         // The top k in one pass over the logits, kept in order: a vocabulary
         // is a quarter of a million entries, and k is twenty.
         let k = self.top_k.clamp(1, logits.len());
         let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
         for (token, &logit) in logits.iter().enumerate() {
-            if candidates.len() == k && logit <= candidates[k - 1].1 {
+            if (candidates.len() == k && logit <= candidates[k - 1].1)
+                || forbidden.contains(&(token as u32))
+            {
                 continue;
             }
             let at = candidates.partition_point(|&(_, l)| l >= logit);
@@ -38,7 +50,7 @@ impl Sampler {
             candidates.truncate(k);
         }
         if self.temperature == 0.0 {
-            return candidates[0].0;
+            return vec![(candidates[0].0, 1.0)];
         }
 
         let max = candidates[0].1;
@@ -63,15 +75,55 @@ impl Sampler {
             kept += probs[n];
             n += 1;
         }
-        let r = self.rng.next() * kept;
+        candidates[..n]
+            .iter()
+            .zip(&probs)
+            .map(|(&(token, _), &p)| (token, p / kept))
+            .collect()
+    }
+
+    /// Picks a token from a distribution.
+    pub fn draw(&mut self, distribution: &Distribution) -> u32 {
+        if distribution.len() == 1 {
+            return distribution[0].0;
+        }
+        let r = self.rng.next();
         let mut acc = 0.0;
-        for i in 0..n {
-            acc += probs[i];
+        for &(token, p) in distribution {
+            acc += p;
             if r < acc {
-                return candidates[i].0;
+                return token;
             }
         }
-        candidates[n - 1].0
+        distribution[distribution.len() - 1].0
+    }
+
+    /// A number uniform in [0, 1).
+    pub fn uniform(&mut self) -> f32 {
+        self.rng.next()
+    }
+}
+
+/// Tokens that may be picked, each with its probability, in descending
+/// order; the probabilities sum to one.
+pub type Distribution = Vec<(u32, f32)>;
+
+/// How the next token is picked: with a sampler, leaving out tokens that
+/// are forbidden at the point the conversation has reached.
+pub struct Policy<'a> {
+    pub sampler: &'a mut Sampler,
+    pub forbidden: &'a [u32],
+    /// The logits the last token was picked from, kept so that it can be
+    /// picked again under another policy.
+    pub logits: Option<Vec<f32>>,
+}
+
+impl Policy<'_> {
+    /// Picks a token from the logits.
+    pub fn pick(&mut self, logits: &[f32]) -> u32 {
+        let distribution = self.sampler.distribution(logits, self.forbidden);
+        self.logits = Some(logits.to_vec());
+        self.sampler.draw(&distribution)
     }
 }
 

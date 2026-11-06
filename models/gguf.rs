@@ -19,7 +19,7 @@ use std::{
     ptr, slice,
 };
 
-use crate::{Result, Tensor, ternary};
+use crate::{Result, Tensor, ternary, twobit};
 
 /// A metadata value.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,10 +78,18 @@ impl Value {
     }
 }
 
-/// The tensor types the model uses.
+/// The tensor types the model uses: the ternary matrices come packed
+/// either 1.75 bits a weight, as [`ternary`] holds them, or two bits, as
+/// [`twobit`] does.
 pub const F32: u32 = 0;
 pub const BF16: u32 = 30;
+pub const PQ2_0: u32 = 142;
 pub const PTQ1_0: u32 = 143;
+
+/// Whether a tensor type is a packing of ternary weights.
+pub fn is_ternary(dtype: u32) -> bool {
+    dtype == PTQ1_0 || dtype == PQ2_0
+}
 
 /// Where a tensor is and what it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +114,7 @@ impl Info {
             F32 => rows * cols * 4,
             BF16 => rows * cols * 2,
             PTQ1_0 => rows * ternary::row_bytes(*cols),
+            PQ2_0 => rows * twobit::row_bytes(*cols),
             other => return Err(format!("tensor type {other} is not supported").into()),
         })
     }
@@ -341,16 +350,45 @@ impl Gguf {
         })
     }
 
-    /// Copies out a ternary matrix.
+    /// Copies out a ternary matrix, from either packing, as [`ternary`]
+    /// holds it.
     pub fn ternary(&self, name: &str) -> Result<Tensor> {
         let info = self.info(name)?;
-        if info.dtype != PTQ1_0 || info.dims.len() != 2 {
+        if !is_ternary(info.dtype) || info.dims.len() != 2 {
             return Err(format!("tensor '{name}' is not a ternary matrix").into());
         }
-        Ok(Tensor::Ternary {
-            shape: info.shape(),
-            data: self.bytes(name)?.to_vec(),
-        })
+        let shape = info.shape();
+        let data = match info.dtype {
+            PTQ1_0 => self.bytes(name)?.to_vec(),
+            _ => twobit::to_ternary(self.bytes(name)?, shape[0], shape[1])
+                .map_err(|e| format!("tensor '{name}' is not ternary: {e}"))?,
+        };
+        Ok(Tensor::Ternary { shape, data })
+    }
+
+    /// Reconstructs row `row` of a ternary matrix into `out`, as wide as
+    /// the row, from whichever packing it is in.
+    pub fn dequantize_row(&self, name: &str, row: usize, out: &mut [f32]) -> Result<()> {
+        let info = self.info(name)?;
+        if !is_ternary(info.dtype) || info.dims.len() != 2 {
+            return Err(format!("tensor '{name}' is not a ternary matrix").into());
+        }
+        let cols = info.dims[0];
+        if row >= info.dims[1] || out.len() != cols {
+            return Err(format!("row {row} of {cols} is not in tensor '{name}'").into());
+        }
+        let bytes = self.bytes(name)?;
+        match info.dtype {
+            PTQ1_0 => {
+                let size = ternary::row_bytes(cols);
+                ternary::dequantize_row(&bytes[row * size..][..size], out);
+            }
+            _ => {
+                let size = twobit::row_bytes(cols);
+                twobit::dequantize_row(&bytes[row * size..][..size], out);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -467,11 +505,17 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         let bf16: Vec<u8> = (0..8u16).flat_map(|v| (v << 8).to_le_bytes()).collect();
-        let tern = vec![7u8; 2 * ternary::row_bytes(128)];
+        let mut tern = vec![0u8; 2 * ternary::row_bytes(128)];
+        for (i, row) in tern.chunks_exact_mut(ternary::row_bytes(128)).enumerate() {
+            let x: Vec<f32> = (0..128).map(|j| ((i + j) % 3) as f32 - 1.0).collect();
+            ternary::quantize_row(&x, row);
+        }
+        let two = twobit::from_ternary(&tern, 2, 128);
         let tensors = vec![
             ("norm".to_string(), vec![3], F32, f32s),
             ("w".to_string(), vec![4, 2], BF16, bf16),
             ("t".to_string(), vec![128, 2], PTQ1_0, tern.clone()),
+            ("t2".to_string(), vec![128, 2], PQ2_0, two.clone()),
         ];
         write(&path, &meta, &tensors).unwrap();
 
@@ -492,6 +536,21 @@ mod tests {
         assert_eq!(g.info("t").unwrap().shape(), [2, 128]);
         assert_eq!(g.bytes("t").unwrap(), tern);
         assert!(g.bf16("t").is_err());
+        // Either packing reads as the same ternary matrix.
+        assert_eq!(g.bytes("t2").unwrap(), two);
+        for name in ["t", "t2"] {
+            match g.ternary(name).unwrap() {
+                Tensor::Ternary { shape, data } => {
+                    assert_eq!(shape, [2, 128]);
+                    assert_eq!(data, tern);
+                }
+                _ => panic!("not ternary"),
+            }
+            let mut row = vec![0.0; 128];
+            g.dequantize_row(name, 1, &mut row).unwrap();
+            assert_eq!(&row[..4], [0.0, 1.0, -1.0, 0.0]);
+            assert!(g.dequantize_row(name, 2, &mut row).is_err());
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

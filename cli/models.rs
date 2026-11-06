@@ -7,7 +7,7 @@ use std::{
 };
 
 use dwim_gpu::{Cpu, Device, Gpu};
-use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai};
+use dwim_models::{Chat, Gguf, LanguageModel, Sampler, bonsai, draft, speculative::Speculator};
 
 use crate::{fetch, opts};
 
@@ -32,54 +32,47 @@ const MIN_CONTEXT: usize = 4096;
 const HEADROOM: u64 = 256 << 20;
 
 /// Models `dwim` knows how to fetch.
-pub const MODELS: &[Model] = &[Model {
-    name: "bonsai-2-27b",
-    repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
-    revision: "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
-    files: &["LICENSE", "NOTICE.txt", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
-    weights: "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-}];
+pub const MODELS: &[Model] = &[dwim_models::cache::BONSAI];
 
-/// A model hosted on Hugging Face.
-///
-/// The revision pins a commit, so the weights can't change underneath us and
-/// outputs stay reproducible.
-pub struct Model {
-    pub name: &'static str,
-    pub repo: &'static str,
-    pub revision: &'static str,
-    /// The files fetched.
-    pub files: &'static [&'static str],
-    /// The one among them holding the model: a GGUF file, which carries
-    /// the tokenizer and the sampling settings too.
-    pub weights: &'static str,
+/// The draft that proposes tokens for the model to check several at a
+/// time, which is fetched beside it.
+pub const DRAFT: &Model = &dwim_models::cache::DRAFT;
+
+/// The directory of the draft's files, and where they are kept, for
+/// `fetch::fetch`.
+pub fn draft_dir() -> Result<PathBuf, Box<dyn Error>> {
+    DRAFT
+        .dir()
+        .ok_or("cannot determine the cache directory".into())
 }
 
-impl Model {
-    /// Looks up a model by name.
-    pub fn find(name: &str) -> Option<&'static Model> {
-        MODELS.iter().find(|model| model.name == name)
-    }
+/// Where the draft's configuration and weights are: beside its weights,
+/// in its own directory or Hugging Face's cache.
+pub fn draft_files(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let weights = DRAFT
+        .weights(dir)
+        .ok_or_else(|| format!("no weights of the draft in {}", dir.display()))?;
+    Ok(weights
+        .parent()
+        .expect("a file has a directory")
+        .to_path_buf())
+}
 
-    /// URL to download one of the model's files from.
-    pub fn url(&self, file: &str) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            self.repo, self.revision, file
-        )
-    }
+/// A model hosted on Hugging Face, and where its files are kept.
+pub type Model = dwim_models::Source;
 
-    /// Local directory the model's files are stored in, under the platform's
-    /// cache directory (`~/.cache` on Linux, `~/Library/Caches` on macOS):
-    /// the files can always be fetched again.
-    pub fn dir(&self) -> Option<PathBuf> {
-        dirs::cache_dir().map(|dir| dir.join("dwim").join("models").join(self.name))
-    }
+/// Looks up a model by name.
+pub fn find(name: &str) -> Option<&'static Model> {
+    MODELS.iter().find(|model| model.name == name)
+}
 
-    /// Opens the model's weights in `dir`.
-    pub fn open(&self, dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
-        Ok(Arc::new(Gguf::open(&dir.join(self.weights))?))
-    }
+/// Opens the model's weights: in `dir`, its own directory, or in Hugging
+/// Face's cache.
+pub fn open(model: &Model, dir: &Path) -> Result<Arc<Gguf>, Box<dyn Error>> {
+    let path = model
+        .weights(dir)
+        .ok_or_else(|| format!("no weights of {} in {}", model.name, dir.display()))?;
+    Ok(Arc::new(Gguf::open(&path)?))
 }
 
 /// Tokens of conversation the model has room for, and the device memory
@@ -95,11 +88,17 @@ pub struct Size {
 pub fn size<D: Device>(
     gguf: &Gguf,
     device: &D,
+    draft: Option<&Path>,
     context: Option<usize>,
 ) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
     let trained = bonsai::Config::load(gguf)?.context_length;
-    let memory = bonsai::Memory::of(gguf)?;
+    let mut memory = bonsai::Memory::of(gguf)?;
+    if let Some(dir) = draft {
+        let draft = draft::Memory::of(&draft::Config::load(dir)?);
+        memory.fixed += draft.fixed;
+        memory.per_token += draft.per_token;
+    }
     let context = match context {
         Some(context) => context,
         None => fit(&memory, device, trained),
@@ -123,14 +122,26 @@ pub fn load<D: Device + 'static>(
     gguf: Arc<Gguf>,
     device: D,
     context: usize,
-    on_progress: impl FnMut(usize, usize),
+    draft: Option<&Path>,
+    mut on_progress: impl FnMut(Loading, usize, usize),
 ) -> Result<Box<dyn LanguageModel>, Box<dyn Error>> {
-    Ok(Box::new(bonsai::Model::load(
-        gguf,
-        device,
-        context,
-        on_progress,
-    )?))
+    let target = bonsai::Model::load(gguf, device, context, |done, total| {
+        on_progress(Loading::Model, done, total)
+    })?;
+    let Some(dir) = draft else {
+        return Ok(Box::new(target));
+    };
+    let draft = draft::Draft::load(dir, &target.device, context, |done, total| {
+        on_progress(Loading::Draft, done, total)
+    })?;
+    Ok(Box::new(Speculator::new(target, draft)?))
+}
+
+/// Which weights are loading: the model's, then the draft's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loading {
+    Model,
+    Draft,
 }
 
 /// Tokens of conversation that fit in the memory `device` has free,
@@ -149,13 +160,11 @@ fn fit<D: Device>(memory: &bonsai::Memory, device: &D, trained: usize) -> usize 
 /// default, if the model is downloaded and the device opens.
 pub fn default_size(device: opts::Device) -> Option<Size> {
     let (model, dir) = fetch::locate(DEFAULT).ok()?;
-    if !dir.join(model.weights).exists() {
-        return None;
-    }
-    let gguf = model.open(&dir).ok()?;
+    let gguf = open(model, &dir).ok()?;
+    let draft = draft_dir().ok().and_then(|dir| draft_files(&dir).ok());
     match device {
-        opts::Device::Cpu => size(&gguf, &Cpu, None).ok(),
-        opts::Device::Gpu => size(&gguf, &Gpu::new().ok()?, None).ok(),
+        opts::Device::Cpu => size(&gguf, &Cpu, draft.as_deref(), None).ok(),
+        opts::Device::Gpu => size(&gguf, &Gpu::new().ok()?, draft.as_deref(), None).ok(),
     }
 }
 

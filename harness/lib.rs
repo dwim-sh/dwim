@@ -490,7 +490,7 @@ impl Stats {
             + m.thought.seconds
             + m.answer.seconds
             + self.tool_seconds;
-        vec![
+        let mut lines = vec![
             row(
                 "loading",
                 String::new(),
@@ -519,10 +519,24 @@ impl Stats {
                 String::new(),
             ),
             row("total", String::new(), total.as_secs_f64(), String::new()),
-        ]
-        .into_iter()
-        .map(|line| line.trim_end().to_string())
-        .collect()
+        ];
+        if let Some(d) = &m.drafting
+            && d.cycles > 0
+        {
+            lines.push(format!(
+                "drafted {} of {} proposals in {} cycles, {:.2} tokens a cycle, {:.1} s drafting, {:.1} s checking",
+                d.accepted,
+                d.proposed,
+                d.cycles,
+                (d.accepted + d.cycles) as f64 / d.cycles as f64,
+                d.draft_seconds,
+                d.target_seconds
+            ));
+        }
+        lines
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
     }
 }
 
@@ -1856,6 +1870,7 @@ mod tests {
                     tokens: 300,
                     seconds: 10.0,
                 },
+                drafting: None,
             },
             calls: 2,
             tool_seconds: 0.5,

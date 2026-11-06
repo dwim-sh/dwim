@@ -3,8 +3,10 @@
 //! stays responsive while it downloads, loads, and generates.
 
 use std::{
+    collections::VecDeque,
     env,
     error::Error,
+    fs,
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
@@ -27,6 +29,7 @@ use dwim_models::{Chat, Gguf, Tokenizer};
 use crate::{
     fetch::{self, Progress},
     models,
+    models::Loading,
     opts::Device,
     tui::{self, Input, Line, Screen, span},
 };
@@ -39,6 +42,9 @@ const TICK: Duration = Duration::from_millis(80);
 /// the turn in progress and end the transcript.
 const FINISH: Duration = Duration::from_secs(2);
 
+/// How far back the status line's rate of tokens looks.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+
 /// Runs the shell until the user quits, showing the model's thinking if
 /// `thinking` is set, or once ctrl+o is pressed, and keeping a transcript
 /// of the session in `log`.
@@ -46,6 +52,7 @@ const FINISH: Duration = Duration::from_secs(2);
 pub fn run(
     name: &str,
     device: Device,
+    drafting: bool,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     effort: harness::Effort,
@@ -70,6 +77,7 @@ pub fn run(
                 model,
                 &dir,
                 device,
+                drafting,
                 context,
                 thinking_budget,
                 effort,
@@ -97,10 +105,12 @@ pub fn run(
         history: Vec::new(),
         recalled: None,
         status: Status::Loading {
+            what: Loading::Model,
             since: Instant::now(),
             done: 0,
             total: 0,
         },
+        recent: VecDeque::new(),
         started: Instant::now(),
         loading: Duration::ZERO,
         stats: harness::Stats::default(),
@@ -196,6 +206,7 @@ enum Reply {
     Transcript(PathBuf),
     /// How many of the model's tensors are loaded, out of how many.
     Loading {
+        what: Loading,
         done: usize,
         total: usize,
     },
@@ -248,6 +259,7 @@ fn work(
     model: &'static models::Model,
     dir: &Path,
     device: Device,
+    drafting: bool,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     effort: harness::Effort,
@@ -258,16 +270,25 @@ fn work(
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    fetch::fetch(model, dir, |progress| {
+    let mut downloading = |progress: Progress| {
         let _ = replies.send(Reply::Downloading(progress));
-    })?;
-    let gguf = model.open(dir)?;
+    };
+    fetch::fetch(model, dir, &mut downloading)?;
+    let draft = if drafting {
+        let draft_dir = models::draft_dir()?;
+        fetch::fetch(models::DRAFT, &draft_dir, &mut downloading)?;
+        Some(models::draft_files(&draft_dir)?)
+    } else {
+        None
+    };
+    let gguf = models::open(model, dir)?;
     match device {
         Device::Cpu => serve(
             gguf,
             Cpu,
             "cpu",
             model,
+            draft.as_deref(),
             context,
             thinking_budget,
             effort,
@@ -293,6 +314,7 @@ fn work(
                 gpu,
                 &name,
                 model,
+                draft.as_deref(),
                 context,
                 thinking_budget,
                 effort,
@@ -315,6 +337,7 @@ fn serve<D: dwim_gpu::Device + 'static>(
     device: D,
     on: &str,
     which: &'static models::Model,
+    draft: Option<&Path>,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     effort: harness::Effort,
@@ -327,10 +350,10 @@ fn serve<D: dwim_gpu::Device + 'static>(
 ) -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf, temperature);
-    let size = models::size(&gguf, &device, context)?;
+    let size = models::size(&gguf, &device, draft, context)?;
     let _ = replies.send(Reply::Size(size));
-    let model = models::load(gguf, device, size.context, |done, total| {
-        let _ = replies.send(Reply::Loading { done, total });
+    let model = models::load(gguf, device, size.context, draft, |what, done, total| {
+        let _ = replies.send(Reply::Loading { what, done, total });
     })?;
     let mut chat = Chat::new(model, tokenizer, sampler)?;
     let cwd = env::current_dir()?;
@@ -412,9 +435,10 @@ enum Status {
         since: Instant,
         progress: Progress,
     },
-    /// Loading the weights, since when: how many tensors so far, out of how
-    /// many.
+    /// Loading the weights, the model's or the draft's, since when: how
+    /// many tensors so far, out of how many.
     Loading {
+        what: Loading,
         since: Instant,
         done: usize,
         total: usize,
@@ -463,6 +487,10 @@ struct App {
     history: Vec<String>,
     recalled: Option<usize>,
     status: Status,
+    /// When each token of the last few seconds arrived, for the rate the
+    /// status line shows: a draft hands over several tokens at once, so
+    /// the rate over a moment would jump about.
+    recent: VecDeque<Instant>,
     /// When the shell started, how long loading the model took, and where
     /// the conversation's time has gone, as of the last reply.
     started: Instant,
@@ -691,12 +719,17 @@ impl App {
             Reply::Device(name) => self.gpu = Some(name),
             Reply::Size(size) => self.size = Some(size),
             Reply::Transcript(path) => self.transcript = Some(path),
-            Reply::Loading { done, total } => {
+            Reply::Loading { what, done, total } => {
                 let since = match self.status {
                     Status::Loading { since, .. } => since,
                     _ => Instant::now(),
                 };
-                self.status = Status::Loading { since, done, total };
+                self.status = Status::Loading {
+                    what,
+                    since,
+                    done,
+                    total,
+                };
             }
             Reply::Prompting { read, total } => {
                 let since = match self.status {
@@ -728,11 +761,15 @@ impl App {
                         start,
                         tokens: tokens + 1,
                     },
-                    _ => Status::Generating {
-                        start: Instant::now(),
-                        tokens: 1,
-                    },
+                    _ => {
+                        self.recent.clear();
+                        Status::Generating {
+                            start: Instant::now(),
+                            tokens: 1,
+                        }
+                    }
                 };
+                self.recent.push_back(Instant::now());
             }
             Reply::Call { name, detail } => {
                 // The text so far is finished; the tool's output and the
@@ -827,6 +864,7 @@ impl App {
         // The tokens are counted by the `Token` events as they are sampled;
         // a text or thought chunk only moves the clock, never the count.
         if !matches!(self.status, Status::Generating { .. }) {
+            self.recent.clear();
             self.status = Status::Generating {
                 start: Instant::now(),
                 tokens: 0,
@@ -988,6 +1026,24 @@ impl App {
         Ok(())
     }
 
+    /// The model's name as people say it.
+    fn title(&self) -> &str {
+        models::find(&self.model).map_or(self.model.as_str(), |model| model.title)
+    }
+
+    /// Tokens a second over the last [`RATE_WINDOW`], or since `start`
+    /// when that is less.
+    fn rate(&self, start: Instant) -> f32 {
+        let now = Instant::now();
+        let window = RATE_WINDOW.min(now.duration_since(start));
+        let count = self
+            .recent
+            .iter()
+            .filter(|&&at| now.duration_since(at) <= window)
+            .count();
+        count as f32 / window.as_secs_f32().max(1e-3)
+    }
+
     /// What the model is doing, with a spinner, while it's busy. Every
     /// number is padded to a fixed width, so the line does not shift as the
     /// numbers change.
@@ -1001,40 +1057,55 @@ impl App {
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
             Status::Downloading { since, progress } => (
-                "Downloading model…",
+                "Downloading model…".to_string(),
                 since,
                 download_details(progress, since.elapsed()),
             ),
-            Status::Loading { since, done, total } => (
-                match self.device {
-                    Device::Cpu => "Loading model…",
-                    Device::Gpu => "Loading model to GPU…",
+            Status::Loading {
+                what,
+                since,
+                done,
+                total,
+            } => (
+                match (what, self.device) {
+                    (Loading::Model, Device::Cpu) => format!("Loading {}…", self.title()),
+                    (Loading::Model, Device::Gpu) => {
+                        format!("Loading {} to GPU…", self.title())
+                    }
+                    (Loading::Draft, Device::Cpu) => {
+                        format!("Loading {}…", models::DRAFT.title)
+                    }
+                    (Loading::Draft, Device::Gpu) => {
+                        format!("Loading {} to GPU…", models::DRAFT.title)
+                    }
                 },
                 since,
                 format!("{} · {}", percent(done, total), seconds(since)),
             ),
             Status::Prompting { since, read, total } => (
-                "Reading system prompt…",
+                "Reading system prompt…".to_string(),
                 since,
                 format!("{} · {}", percent(read, total), seconds(since)),
             ),
             Status::Reading(since) => (
-                "Reading…",
+                "Reading…".to_string(),
                 since,
                 format!("{} · esc to interrupt", seconds(since)),
             ),
-            Status::Generating { start, tokens } => (
+            Status::Generating { start, .. } => (
                 match self.segment {
                     Segment::Thought => "Thinking…",
                     Segment::Text => "Generating…",
                     Segment::Note => "Compacting…",
-                },
+                }
+                .to_string(),
                 start,
                 format!(
                     "{:>5} tok/s · {}esc to interrupt",
-                    // Too early to tell the speed.
+                    // The rate over the last few seconds, once there is a
+                    // second of them to tell it from.
                     if start.elapsed() >= Duration::from_secs(1) {
-                        format!("{:.1}", tokens as f32 / start.elapsed().as_secs_f32())
+                        format!("{:.1}", self.rate(start))
                     } else {
                         String::new()
                     },
@@ -1123,21 +1194,27 @@ fn models_listing(
         let bullet = if i == 0 { "● " } else { "  " };
         let header = vec![span(bullet), span(model.name).bold()];
         let weights = match model.dir() {
-            Some(dir) => {
-                let (files, bytes) = fetch::on_disk(model, &dir);
-                match files {
-                    0 => "not fetched".to_string(),
-                    n if n == model.files.len() => {
+            Some(dir) => match model.weights(&dir) {
+                Some(path) if !path.starts_with(&dir) => format!(
+                    "{} at {}",
+                    fetch::size(fs::metadata(&path).map_or(0, |meta| meta.len())),
+                    tilde(&path)
+                ),
+                Some(_) => {
+                    let (files, bytes) = fetch::on_disk(model, &dir);
+                    if files == model.files.len() {
                         format!("{} in {}", fetch::size(bytes), tilde(&dir))
+                    } else {
+                        format!(
+                            "{files}/{} files, {} in {}",
+                            model.files.len(),
+                            fetch::size(bytes),
+                            tilde(&dir)
+                        )
                     }
-                    n => format!(
-                        "{n}/{} files, {} in {}",
-                        model.files.len(),
-                        fetch::size(bytes),
-                        tilde(&dir)
-                    ),
                 }
-            }
+                None => "not fetched".to_string(),
+            },
             None => "no cache directory".to_string(),
         };
         let mut rows = vec![("source", model.repo.to_string()), ("weights", weights)];

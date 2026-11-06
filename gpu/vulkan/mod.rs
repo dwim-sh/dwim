@@ -83,11 +83,20 @@ pub struct Cache {
 pub struct Weight {
     buf: vk::Buffer,
     shape: Vec<usize>,
-    ternary: bool,
+    format: Format,
+}
+
+/// How a weight matrix is packed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Bf16,
+    Ternary,
+    Affine4,
 }
 
 struct Kernels {
     matmul_bf16: vk::Pipeline,
+    matmul_affine4: vk::Pipeline,
     matmul_ternary: vk::Pipeline,
     matmul_ternary_batch: vk::Pipeline,
     matmul_ternary_tile: vk::Pipeline,
@@ -107,6 +116,9 @@ struct Kernels {
     rmsnorm_hadamard: vk::Pipeline,
     conv: vk::Pipeline,
     delta_net: vk::Pipeline,
+    draft_conv: vk::Pipeline,
+    draft_attention: vk::Pipeline,
+    ring_store: vk::Pipeline,
 }
 
 impl Kernels {
@@ -134,6 +146,7 @@ impl Kernels {
     fn matmul(&self, pipeline: vk::Pipeline) -> bool {
         [
             self.matmul_bf16,
+            self.matmul_affine4,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
@@ -143,9 +156,13 @@ impl Kernels {
         .contains(&pipeline)
     }
 
-    fn all(&self) -> [vk::Pipeline; 20] {
+    fn all(&self) -> [vk::Pipeline; 24] {
         [
+            self.draft_conv,
+            self.draft_attention,
+            self.ring_store,
             self.matmul_bf16,
+            self.matmul_affine4,
             self.matmul_ternary,
             self.matmul_ternary_batch,
             self.matmul_ternary_tile,
@@ -413,6 +430,7 @@ impl Vulkan {
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let kernels = Kernels {
                 matmul_bf16: spv!("matmul_bf16"),
+                matmul_affine4: spv!("matmul_affine4"),
                 matmul_ternary: spv!("matmul_ternary"),
                 matmul_ternary_batch: spv!("matmul_ternary_batch"),
                 matmul_ternary_tile: spv!("matmul_ternary_tile"),
@@ -432,6 +450,9 @@ impl Vulkan {
                 rmsnorm_hadamard: spv!("rmsnorm_hadamard"),
                 conv: spv!("conv"),
                 delta_net: spv!("delta_net"),
+                draft_conv: spv!("draft_conv"),
+                draft_attention: spv!("draft_attention"),
+                ring_store: spv!("ring_store"),
             };
 
             let mut gpu = Self {
@@ -896,6 +917,37 @@ struct ConvParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct DraftConvParams {
+    rows: u32,
+    hidden: u32,
+    group: u32,
+    stage: u32,
+    residual: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DraftAttentionParams {
+    rows: u32,
+    pos: u32,
+    window: u32,
+    n_heads: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RingParams {
+    rows: u32,
+    pos: u32,
+    window: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct DeltaNetParams {
     n: u32,
     n_k_heads: u32,
@@ -994,7 +1046,7 @@ impl Device for Vulkan {
                 Weight {
                     buf,
                     shape,
-                    ternary: false,
+                    format: Format::Bf16,
                 }
             }
             Tensor::Ternary { shape, data } => {
@@ -1005,7 +1057,21 @@ impl Device for Vulkan {
                 Weight {
                     buf,
                     shape,
-                    ternary: true,
+                    format: Format::Ternary,
+                }
+            }
+            Tensor::Affine4 { shape, data } => {
+                assert_eq!(data.len(), shape[0] * crate::affine4::row_bytes(shape[1]));
+                assert!(
+                    shape[1].is_multiple_of(128),
+                    "the kernel reads 4-bit rows in whole chunks of 128"
+                );
+                let buf = self.device_buffer(data.len());
+                self.upload_bytes(buf, 0, &data);
+                Weight {
+                    buf,
+                    shape,
+                    format: Format::Affine4,
                 }
             }
         }
@@ -1149,7 +1215,7 @@ impl Device for Vulkan {
                 groups,
             );
         };
-        if w.ternary && n >= TERNARY_TILE_TOKENS / 2 {
+        if (w.format == Format::Ternary) && n >= TERNARY_TILE_TOKENS / 2 {
             pack(pairs);
             let count = rows.div_ceil(TERNARY_TILE_ROWS);
             let width = count.min(self.max_groups as usize);
@@ -1199,7 +1265,7 @@ impl Device for Vulkan {
         // tables of its activations' sums, a workgroup per 1024 rows, with
         // the blocks of a matrix of few rows split among workgroups whose
         // partial sums are added up after.
-        if w.ternary && n == 1 && rows >= SUMS_MIN_ROWS {
+        if (w.format == Format::Ternary) && n == 1 && rows >= SUMS_MIN_ROWS {
             let blocks = cols / 128;
             let tiles = rows.div_ceil(SUMS_ROWS);
             let splits = (SUMS_WORKGROUPS / tiles).clamp(1, blocks);
@@ -1239,7 +1305,7 @@ impl Device for Vulkan {
         // few tokens through ternary weights are worth unpacking the
         // weights once for eight, and go as half floats packed a group of
         // eight tokens together.
-        let batch = w.ternary && n > 1;
+        let batch = (w.format == Format::Ternary) && n > 1;
         if batch {
             pack(TERNARY_TOKENS / 2);
         }
@@ -1250,8 +1316,10 @@ impl Device for Vulkan {
                 TERNARY_TOKENS,
                 self.packed,
             )
-        } else if w.ternary {
+        } else if w.format == Format::Ternary {
             (self.kernels.matmul_ternary, TERNARY_ROWS, 1, x.buf)
+        } else if w.format == Format::Affine4 {
+            (self.kernels.matmul_affine4, 1, BF16_TOKENS, x.buf)
         } else {
             (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf)
         };
@@ -1479,6 +1547,114 @@ impl Device for Vulkan {
         self.dispatch(self.kernels.conv, &buffers, &params, groups);
     }
 
+    fn draft_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        dynamic: &Buffer,
+        base: &Buffer,
+        residual: Option<&Buffer>,
+        stage: usize,
+        group: usize,
+    ) {
+        let hidden = base.len / 4;
+        let rows = x.len / hidden;
+        assert!(x.len == rows * hidden && out.len == x.len);
+        assert_eq!(dynamic.len, rows * 4 * (hidden / group));
+        assert!(stage < 2 && hidden.is_multiple_of(group));
+        let params = DraftConvParams {
+            rows: rows as u32,
+            hidden: hidden as u32,
+            group: group as u32,
+            stage: stage as u32,
+            residual: residual.is_some() as u32,
+        };
+        // Without a residual, the output stands in for it, unread.
+        let residual = residual.map_or(out.buf, |r| r.buf);
+        let groups = self.groups(rows * hidden, 256);
+        self.dispatch(
+            self.kernels.draft_conv,
+            &[out.buf, x.buf, dynamic.buf, base.buf, residual],
+            &params,
+            groups,
+        );
+    }
+
+    fn draft_attention(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_ring: &Buffer,
+        v_ring: &Buffer,
+        k_block: &Buffer,
+        v_block: &Buffer,
+        pos: usize,
+        window: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+    ) {
+        let kv_dim = n_kv_heads * head_dim;
+        let rows = q.len / (n_heads * head_dim);
+        assert!(k_block.len == rows * kv_dim && v_block.len == rows * kv_dim);
+        assert!(k_ring.len == n_kv_heads * window * head_dim && v_ring.len == k_ring.len);
+        assert_eq!(out.len, q.len);
+        assert!(
+            window + rows <= 2064 && 256usize.is_multiple_of(head_dim),
+            "the kernel takes a window of 2064 keys at most and heads that divide 256"
+        );
+        let params = DraftAttentionParams {
+            rows: rows as u32,
+            pos: pos as u32,
+            window: window as u32,
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            n_kv_heads: n_kv_heads as u32,
+        };
+        let groups = self.groups(rows * n_heads, 1);
+        self.dispatch(
+            self.kernels.draft_attention,
+            &[
+                out.buf,
+                q.buf,
+                k_ring.buf,
+                v_ring.buf,
+                k_block.buf,
+                v_block.buf,
+            ],
+            &params,
+            groups,
+        );
+    }
+
+    fn ring_store(
+        &self,
+        ring: &mut Buffer,
+        rows: &Buffer,
+        pos: usize,
+        window: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        let kv_dim = n_kv_heads * head_dim;
+        let n = rows.len / kv_dim;
+        assert!(rows.len == n * kv_dim && ring.len == n_kv_heads * window * head_dim);
+        let params = RingParams {
+            rows: n as u32,
+            pos: pos as u32,
+            window: window as u32,
+            n_kv_heads: n_kv_heads as u32,
+            head_dim: head_dim as u32,
+        };
+        let groups = self.groups(n * kv_dim, 256);
+        self.dispatch(
+            self.kernels.ring_store,
+            &[ring.buf, rows.buf],
+            &params,
+            groups,
+        );
+    }
+
     fn delta_net(
         &self,
         out: &mut Buffer,
@@ -1532,6 +1708,17 @@ mod tests {
     fn ternary_matmul_speed() {
         match super::Vulkan::new() {
             Ok(gpu) => crate::tests::ternary_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the bf16 matmul on the draft's shapes; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn bf16_matmul_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::tests::bf16_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }

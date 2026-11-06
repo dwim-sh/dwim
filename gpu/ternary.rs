@@ -51,21 +51,32 @@ pub fn quantize_row(x: &[f32], out: &mut [u8]) {
     for (block, out) in x.chunks_exact(BLOCK).zip(out.chunks_exact_mut(BLOCK_BYTES)) {
         let d = block.iter().fold(0.0f32, |d, v| d.max(v.abs()));
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-        for (m, byte) in out[..26].iter_mut().enumerate() {
-            let mut q: u32 = 0;
-            for n in 0..trits_in(m) {
-                // -1, 0, 1 as 0, 1, 2.
-                q = q * 3 + ((block[element(m, n)] * id).round() as i32 + 1) as u32;
-            }
-            if trits_in(m) == 4 {
-                // Shift the first trit up to where five-trit bytes keep it.
-                q *= 3;
-            }
-            // Scaled to fill the byte: 243 is 3 to the fifth.
-            *byte = ((q * 256).div_ceil(243)) as u8;
+        let mut trits = [0i8; BLOCK];
+        for (t, &v) in trits.iter_mut().zip(block) {
+            *t = (v * id).round() as i8;
         }
-        out[26..].copy_from_slice(&crate::to_f16(d).to_le_bytes());
+        pack(&trits, crate::to_f16(d), out);
     }
+}
+
+/// Packs a block of trits, each -1, 0, or 1, and the bits of its f16 scale
+/// into `out`, which holds `BLOCK_BYTES`.
+pub fn pack(trits: &[i8; BLOCK], scale: u16, out: &mut [u8]) {
+    assert_eq!(out.len(), BLOCK_BYTES);
+    for (m, byte) in out[..26].iter_mut().enumerate() {
+        let mut q: u32 = 0;
+        for n in 0..trits_in(m) {
+            // -1, 0, 1 as 0, 1, 2.
+            q = q * 3 + (trits[element(m, n)] + 1) as u32;
+        }
+        if trits_in(m) == 4 {
+            // Shift the first trit up to where five-trit bytes keep it.
+            q *= 3;
+        }
+        // Scaled to fill the byte: 243 is 3 to the fifth.
+        *byte = ((q * 256).div_ceil(243)) as u8;
+    }
+    out[26..].copy_from_slice(&scale.to_le_bytes());
 }
 
 /// Unpacks a block into its trits and its scale.

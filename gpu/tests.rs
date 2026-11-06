@@ -11,6 +11,7 @@ macro_rules! check_against_cpu {
             write_and_read_round_trip,
             alloc_is_zeroed_and_copy_moves_ranges,
             matmul_matches_cpu,
+            affine4_matmul_matches_cpu,
             ternary_matmul_matches_cpu,
             ternary_matmul_follows_writes,
             rmsnorm_matches_cpu,
@@ -24,6 +25,9 @@ macro_rules! check_against_cpu {
             rmsnorm_hadamard_matches_cpu,
             conv_matches_cpu,
             delta_net_matches_cpu,
+            draft_conv_matches_cpu,
+            draft_attention_matches_cpu,
+            ring_store_matches_cpu,
             resize_keeps_capacity
         );
     };
@@ -89,6 +93,10 @@ fn clone(t: &Tensor) -> Tensor {
             shape: shape.clone(),
             data: data.clone(),
         },
+        Tensor::Affine4 { shape, data } => Tensor::Affine4 {
+            shape: shape.clone(),
+            data: data.clone(),
+        },
     }
 }
 
@@ -140,7 +148,18 @@ pub fn alloc_is_zeroed_and_copy_moves_ranges<D: Device>(gpu: &D) {
 
 pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(4);
-    for (rows, cols, n) in [(1, 8, 1), (200, 192, 1), (77, 1032, 3), (70_000, 8, 2)] {
+    // Odd shapes, and a few tokens through whole blocks of 128 columns,
+    // which a device may stage as half floats for its matrix units.
+    for (rows, cols, n) in [
+        (1, 8, 1),
+        (200, 192, 1),
+        (77, 1032, 3),
+        (70_000, 8, 2),
+        (70, 128, 2),
+        (200, 5120, 8),
+        (300, 256, 16),
+        (1280, 5120, 5),
+    ] {
         let w = rng.bf16(&[rows, cols]);
         let x = rng.floats(n * cols);
         let mut want = vec![0.0; n * rows];
@@ -149,7 +168,67 @@ pub fn matmul_matches_cpu<D: Device>(gpu: &D) {
         let x = buffer(gpu, &x);
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &x);
-        close(&gpu.read(&out), &want, 1e-4);
+        let got = gpu.read(&out);
+        if n >= 2 && cols.is_multiple_of(128) {
+            let typical =
+                (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+            let (mut worst, mut sum) = (0.0f64, 0.0f64);
+            for (g, w) in got.iter().zip(&want) {
+                let e = (g - w).abs() as f64;
+                worst = worst.max(e);
+                sum += e * e;
+            }
+            let rms = (sum / got.len() as f64).sqrt();
+            assert!(
+                rms <= 1e-3 * typical && worst <= 1e-2 * typical,
+                "{rows}x{cols} n={n}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
+            );
+        } else {
+            close(&got, &want, 1e-4);
+        }
+    }
+}
+
+/// Single tokens, a few, and batches through 4-bit weights: the kernel for
+/// any batch, and the staged kernel a device may have for a few tokens.
+pub fn affine4_matmul_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(5);
+    for (rows, cols, n) in [
+        (1, 128, 1),
+        (200, 5120, 1),
+        (70, 128, 2),
+        (200, 5120, 8),
+        (300, 256, 16),
+        (1280, 5120, 5),
+        (77, 1024, 33),
+        (100, 384, 64),
+    ] {
+        let w = rng.bf16(&[rows, cols]).affine4();
+        let x = rng.floats(n * cols);
+        let mut want = vec![0.0; n * rows];
+        Cpu.matmul(&mut want, &clone(&w), &x);
+        let weight = gpu.upload(w);
+        let x = buffer(gpu, &x);
+        let mut out = gpu.alloc(n * rows);
+        gpu.matmul(&mut out, &weight, &x);
+        let got = gpu.read(&out);
+        if n >= 2 {
+            let typical =
+                (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+            let (mut worst, mut sum) = (0.0f64, 0.0f64);
+            for (g, w) in got.iter().zip(&want) {
+                let e = (g - w).abs() as f64;
+                worst = worst.max(e);
+                sum += e * e;
+            }
+            let rms = (sum / got.len() as f64).sqrt();
+            assert!(
+                rms <= 1e-3 * typical && worst <= 1e-2 * typical,
+                "{rows}x{cols} n={n}: rms {rms:.2e}, worst {worst:.2e}, typical {typical:.2e}"
+            );
+        } else {
+            close(&got, &want, 1e-4);
+        }
     }
 }
 
@@ -293,6 +372,35 @@ pub fn tile_error<D: Device>(gpu: &D) {
                 (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
             eprintln!(
                 "{rows}x{cols} n={n} vs {name}: worst {worst:.2e} rms {rms:.2e} typical {typical:.2e}"
+            );
+        }
+    }
+}
+
+/// Times the bf16 matmul on the draft's shapes for batches of tokens, and
+/// prints each batch's rate of reading the weights.
+pub fn bf16_matmul_speed<D: Device>(gpu: &D) {
+    let mut rng = Rng(22);
+    for (rows, cols) in [(17408, 5120), (5120, 17408), (4096, 5120), (1280, 5120)] {
+        let weight = gpu.upload(rng.bf16(&[rows, cols]));
+        for n in [1, 8, 16] {
+            let x = buffer(gpu, &rng.floats(n * cols));
+            let mut out = gpu.alloc(n * rows);
+            for _ in 0..40 {
+                gpu.matmul(&mut out, &weight, &x);
+            }
+            gpu.read(&out);
+            let runs = 100;
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                gpu.matmul(&mut out, &weight, &x);
+            }
+            gpu.read(&out);
+            let each = start.elapsed().as_secs_f64() / runs as f64;
+            eprintln!(
+                "bf16 {rows}x{cols} n={n:<3} {:8.3} ms  {:6.0} GB/s",
+                each * 1e3,
+                (rows * cols * 2) as f64 / each / 1e9
             );
         }
     }
@@ -889,6 +997,95 @@ pub fn conv_matches_cpu<D: Device>(gpu: &D) {
         close(&gpu.read(&v), &want_v, 1e-5);
         close(&gpu.read(&state_out), &want_state, 1e-6);
     }
+}
+
+pub fn draft_conv_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(31);
+    let (hidden, group) = (64, 16);
+    for (rows, stage, with_residual) in [(1, 0, false), (8, 0, false), (8, 1, true), (5, 1, false)]
+    {
+        let x = rng.floats(rows * hidden);
+        let dynamic = rng.floats(rows * 4 * (hidden / group));
+        let base = rng.floats(4 * hidden);
+        let residual = rng.floats(rows * hidden);
+        let mut want = vec![0.0; rows * hidden];
+        Cpu.draft_conv(
+            &mut want,
+            &x,
+            &dynamic,
+            &base,
+            with_residual.then_some(&residual),
+            stage,
+            group,
+        );
+        let mut out = gpu.alloc(rows * hidden);
+        let residual = buffer(gpu, &residual);
+        gpu.draft_conv(
+            &mut out,
+            &buffer(gpu, &x),
+            &buffer(gpu, &dynamic),
+            &buffer(gpu, &base),
+            with_residual.then_some(&residual),
+            stage,
+            group,
+        );
+        close(&gpu.read(&out), &want, 1e-5);
+    }
+}
+
+pub fn draft_attention_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(32);
+    let (n_heads, n_kv_heads, head_dim, window) = (4, 2, 128, 64);
+    let kv_dim = n_kv_heads * head_dim;
+    // Before the ring is full, over a full ring, and with no context.
+    for (pos, rows) in [(10, 8), (200, 8), (0, 3), (63, 1)] {
+        let q = rng.floats(rows * n_heads * head_dim);
+        let k_ring = rng.floats(n_kv_heads * window * head_dim);
+        let v_ring = rng.floats(n_kv_heads * window * head_dim);
+        let k_block = rng.floats(rows * kv_dim);
+        let v_block = rng.floats(rows * kv_dim);
+        let mut want = vec![0.0; q.len()];
+        Cpu.draft_attention(
+            &mut want, &q, &k_ring, &v_ring, &k_block, &v_block, pos, window, n_heads, head_dim,
+            n_kv_heads,
+        );
+        let mut out = gpu.alloc(q.len());
+        gpu.draft_attention(
+            &mut out,
+            &buffer(gpu, &q),
+            &buffer(gpu, &k_ring),
+            &buffer(gpu, &v_ring),
+            &buffer(gpu, &k_block),
+            &buffer(gpu, &v_block),
+            pos,
+            window,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+        );
+        close(&gpu.read(&out), &want, 1e-4);
+    }
+}
+
+pub fn ring_store_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(33);
+    let (n_kv_heads, head_dim, window) = (2, 32, 16);
+    let mut want = vec![0.0; n_kv_heads * window * head_dim];
+    let mut ring = gpu.alloc(want.len());
+    // Rows stored in turn, wrapping around the ring.
+    for (pos, rows) in [(0, 5), (5, 8), (13, 7)] {
+        let data = rng.floats(rows * n_kv_heads * head_dim);
+        Cpu.ring_store(&mut want, &data, pos, window, n_kv_heads, head_dim);
+        gpu.ring_store(
+            &mut ring,
+            &buffer(gpu, &data),
+            pos,
+            window,
+            n_kv_heads,
+            head_dim,
+        );
+    }
+    assert_eq!(gpu.read(&ring), want);
 }
 
 pub fn delta_net_matches_cpu<D: Device>(gpu: &D) {

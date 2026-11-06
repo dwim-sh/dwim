@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use dwim_gpu::{CACHE_BLOCK, CONV_KERNEL, HADAMARD_BLOCK, cache_bytes};
 
-use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_table, ternary};
+use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf, rope_table, ternary};
 
 /// Most tokens a forward pass runs through the model at once. Running a
 /// batch of tokens together reads each weight once for the whole batch,
@@ -29,6 +29,10 @@ use crate::{Device, Gguf, LanguageModel, Result, Tensor, gguf::PTQ1_0, rope_tabl
 /// A batch is one submission to the device, which a driver may abandon as
 /// hung if it runs for seconds, so batches are kept short.
 pub const BATCH: usize = 64;
+
+/// Most rows a verify pass runs at once, the logits of all of which are
+/// wanted: a draft's block.
+pub const VERIFY_ROWS: usize = 8;
 
 /// The architecture, read from the GGUF metadata.
 #[derive(Debug)]
@@ -108,7 +112,7 @@ impl Config {
         {
             return Err("the model has parts that are not implemented".into());
         }
-        if gguf.info("token_embd.weight")?.dtype != PTQ1_0 {
+        if !gguf::is_ternary(gguf.info("token_embd.weight")?.dtype) {
             return Err("the embedding table is not ternary".into());
         }
         for (key, want) in [
@@ -206,10 +210,16 @@ impl Memory {
     pub fn of(gguf: &Gguf) -> Result<Self> {
         let c = Config::load(gguf)?;
         // Every tensor goes to the device but the embedding table, which
-        // stays in the file on the host.
+        // stays in the file on the host; the ternary ones packed 1.75 bits
+        // a weight, whichever packing the file has them in.
         let mut weights = 0;
         for name in gguf.tensors().filter(|&name| name != "token_embd.weight") {
-            weights += gguf.info(name)?.size()?;
+            let info = gguf.info(name)?;
+            weights += if gguf::is_ternary(info.dtype) && info.dims.len() == 2 {
+                info.dims[1] * ternary::row_bytes(info.dims[0])
+            } else {
+                info.size()?
+            };
         }
         let attention = (0..c.layers).filter(|&i| c.is_attention(i)).count();
         let linear = c.layers - attention;
@@ -238,6 +248,28 @@ pub struct Model<D: Device> {
     /// apply to.
     signs: Vec<(usize, D::Buffer)>,
     state: State<D>,
+    /// The layers whose outputs are captured for a draft, and the rows
+    /// captured: a layer's rows after another's, [`BATCH`] rows a layer.
+    captures: Option<(Vec<usize>, D::Buffer)>,
+    /// What the last verify pass keeps for rewinding.
+    rewind: Option<Rewind<D>>,
+}
+
+/// What a verify pass keeps so that the model can forget some of its rows:
+/// the linear layers' states before it, and their inputs during it, from
+/// which the states after any number of its rows are computed again.
+struct Rewind<D: Device> {
+    /// The position of the pass's first row, and its rows.
+    pos: usize,
+    rows: usize,
+    /// Each linear layer's recurrent state and convolution state before
+    /// the pass, and the parity the convolution read its state at.
+    ssm: Vec<D::Buffer>,
+    conv: Vec<D::Buffer>,
+    parity: bool,
+    /// Each linear layer's convolution input and gates for the pass's rows.
+    qkv: Vec<D::Buffer>,
+    ab: Vec<D::Buffer>,
 }
 
 struct Layer<D: Device> {
@@ -489,6 +521,8 @@ impl<D: Device> Model<D> {
         let state = State::new(&config, &device, max_len, caches, slots);
         Ok(Self {
             config,
+            captures: None,
+            rewind: None,
             device,
             gguf,
             layers,
@@ -499,23 +533,204 @@ impl<D: Device> Model<D> {
         })
     }
 
-    fn forward_batch(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+    /// Writes the embeddings of `tokens`, a row each, into `into`, which
+    /// is resized to them: looked up on the CPU, and rotated back on the
+    /// device, into the basis the layers' residual stream is in.
+    pub fn embed(&self, tokens: &[u32], into: &mut D::Buffer) {
+        let c = &self.config;
+        let d = &self.device;
+        let mut x = vec![0.0; tokens.len() * c.hidden];
+        for (x, &token) in x.chunks_exact_mut(c.hidden).zip(tokens) {
+            self.gguf
+                .dequantize_row("token_embd.weight", token as usize, x)
+                .expect("checked at load");
+        }
+        d.resize(into, x.len());
+        d.write(into, &x);
+        d.hadamard(into, self.signs(c.hidden), true);
+    }
+
+    /// The signs of the rotation for activations of `width`.
+    pub fn signs(&self, width: usize) -> &D::Buffer {
+        &self
+            .signs
+            .iter()
+            .find(|(w, _)| *w == width)
+            .expect("checked at load")
+            .1
+    }
+
+    /// The head, which takes rows normalized and rotated by the signs for
+    /// the hidden width.
+    pub fn head(&self) -> &D::Weight {
+        &self.lm_head
+    }
+
+    /// Has the outputs of `layers`, ascending, captured for a draft at
+    /// every forward pass from now on: [`captures`](Self::captures) gives
+    /// them.
+    pub fn capture(&mut self, layers: &[usize]) {
+        assert!(
+            layers.windows(2).all(|w| w[0] < w[1])
+                && layers.iter().all(|&l| l < self.config.layers),
+            "layers to capture must be ascending ones of the model"
+        );
+        let buf = self.device.alloc(layers.len() * BATCH * self.config.hidden);
+        self.captures = Some((layers.to_vec(), buf));
+    }
+
+    /// The outputs of the layers captured at the last forward pass, a
+    /// layer's rows after another's at a stride of [`BATCH`] rows, as
+    /// many rows as the pass ran.
+    pub fn captures(&self) -> Option<&D::Buffer> {
+        self.captures.as_ref().map(|(_, buf)| buf)
+    }
+
+    /// Runs `tokens`, at most [`VERIFY_ROWS`] of them, the first at
+    /// position `pos`, through the model, and returns the logits after
+    /// each, a row of them per token, keeping what
+    /// [`rewind_to`](Self::rewind_to) needs to forget any of them.
+    pub fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        assert!(!tokens.is_empty() && tokens.len() <= VERIFY_ROWS);
+        assert!(pos + tokens.len() <= self.state.max_len);
+        self.snapshot(pos, tokens.len());
+        self.forward_batch(tokens, pos, tokens.len())
+    }
+
+    /// Keeps the linear layers' states, for a verify pass of `rows` rows
+    /// from `pos` to be rewound.
+    fn snapshot(&mut self, pos: usize, rows: usize) {
+        let (c, d, s) = (&self.config, &self.device, &self.state);
+        let copy = |src: &D::Buffer, len: usize| {
+            let mut dst = d.alloc(len);
+            d.copy(&mut dst, 0, src, 0, len);
+            dst
+        };
+        let rewind = match self.rewind.take() {
+            Some(mut r) if r.ssm.len() == s.ssm_state.len() => {
+                for (dst, src) in r.ssm.iter_mut().zip(&s.ssm_state) {
+                    d.copy(dst, 0, src, 0, c.ssm_width());
+                }
+                for (slot, dst) in r.conv.iter_mut().enumerate() {
+                    let src = &s.conv_state[slot][if s.parity { 0 } else { 1 }];
+                    d.copy(dst, 0, src, 0, c.conv_width());
+                }
+                r.pos = pos;
+                r.rows = rows;
+                r.parity = s.parity;
+                r
+            }
+            _ => Rewind {
+                pos,
+                rows,
+                ssm: s.ssm_state.iter().map(|b| copy(b, c.ssm_width())).collect(),
+                conv: (0..s.ssm_state.len())
+                    .map(|slot| {
+                        copy(
+                            &s.conv_state[slot][if s.parity { 0 } else { 1 }],
+                            c.conv_width(),
+                        )
+                    })
+                    .collect(),
+                parity: s.parity,
+                qkv: (0..s.ssm_state.len())
+                    .map(|_| d.alloc(VERIFY_ROWS * (2 * c.k_dim() + c.v_dim())))
+                    .collect(),
+                ab: (0..s.ssm_state.len())
+                    .map(|_| d.alloc(VERIFY_ROWS * 2 * c.v_heads))
+                    .collect(),
+            },
+        };
+        self.rewind = Some(rewind);
+    }
+
+    /// Forgets the rows of the last verify pass from position `len` on,
+    /// which must be at or after the pass's first row: the linear layers'
+    /// states are put back as they were before the pass and run over the
+    /// rows kept again. The attention caches need no forgetting: attention
+    /// reads only the positions before a token's.
+    pub fn rewind_to(&mut self, len: usize) -> Result<()> {
+        let Some(r) = &self.rewind else {
+            return Err("there is no verify pass to rewind".into());
+        };
+        if len < r.pos || len > r.pos + r.rows {
+            return Err(format!(
+                "cannot rewind to {len}: the last verify pass ran positions {} to {}",
+                r.pos,
+                r.pos + r.rows
+            )
+            .into());
+        }
+        let keep = len - r.pos;
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        let eps = c.eps;
+        let (k_dim, v_dim) = (c.k_dim(), c.v_dim());
+        s.parity = r.parity;
+        for (slot, ssm) in r.ssm.iter().enumerate() {
+            d.copy(&mut s.ssm_state[slot], 0, ssm, 0, c.ssm_width());
+            let input = if s.parity { 0 } else { 1 };
+            d.copy(
+                &mut s.conv_state[slot][input],
+                0,
+                &r.conv[slot],
+                0,
+                c.conv_width(),
+            );
+        }
+        if keep == 0 {
+            return Ok(());
+        }
+        s.batch(d, keep);
+        d.resize(&mut s.q, keep * k_dim);
+        d.resize(&mut s.k, keep * k_dim);
+        d.resize(&mut s.v, keep * v_dim);
+        d.resize(&mut s.att, keep * v_dim);
+        for layer in &self.layers {
+            let Mixer::Linear {
+                conv, decay, slot, ..
+            } = &layer.mixer
+            else {
+                continue;
+            };
+            d.copy(&mut s.qkv, 0, &r.qkv[*slot], 0, keep * (2 * k_dim + v_dim));
+            d.copy(&mut s.ab, 0, &r.ab[*slot], 0, keep * 2 * c.v_heads);
+            let [a, b] = &mut s.conv_state[*slot];
+            let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
+            d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
+            d.l2norm(&mut s.q, c.state_dim, eps);
+            d.l2norm(&mut s.k, c.state_dim, eps);
+            d.delta_net(
+                &mut s.att,
+                &s.q,
+                &s.k,
+                &s.v,
+                &s.ab,
+                decay,
+                &mut s.ssm_state[*slot],
+                c.k_heads,
+                c.v_heads,
+                c.state_dim,
+            );
+        }
+        s.parity = !s.parity;
+        Ok(())
+    }
+
+    /// Runs a batch, returning the logits after each of its last `rows`
+    /// tokens.
+    fn forward_batch(&mut self, tokens: &[u32], pos: usize, rows: usize) -> Vec<f32> {
+        let n = tokens.len();
+        assert!(rows >= 1 && rows <= n && rows <= VERIFY_ROWS);
+        let mut x = self.device.alloc(0);
+        std::mem::swap(&mut x, &mut self.state.x);
+        self.embed(tokens, &mut x);
+        std::mem::swap(&mut x, &mut self.state.x);
         let c = &self.config;
         let d = &self.device;
         let s = &mut self.state;
-        let n = tokens.len();
         let eps = c.eps;
         let kv_dim = c.kv_heads * c.head_dim;
         s.batch(d, n);
-
-        // Embeddings are looked up on the CPU and rotated back on the device.
-        let table = self.gguf.bytes("token_embd.weight").expect("embeddings");
-        let row = ternary::row_bytes(c.hidden);
-        let mut x = vec![0.0; n * c.hidden];
-        for (x, &token) in x.chunks_exact_mut(c.hidden).zip(tokens) {
-            ternary::dequantize_row(&table[token as usize * row..][..row], x);
-        }
-        d.write(&mut s.x, &x);
         // The signs of the rotation for activations of each width.
         let signs = |width: usize| {
             &self
@@ -525,9 +740,12 @@ impl<D: Device> Model<D> {
                 .expect("checked at load")
                 .1
         };
-        d.hadamard(&mut s.x, signs(c.hidden), true);
+        let keeping = self
+            .rewind
+            .as_ref()
+            .is_some_and(|r| r.pos == pos && r.rows == n);
 
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             // The token mixer, with its result added back into the
             // residual stream. It sees the normalized activations rotated,
             // and the recurrent-state projections see them as they are.
@@ -593,6 +811,10 @@ impl<D: Device> Model<D> {
                     d.copy(&mut s.xb, 0, &s.x, 0, n * c.hidden);
                     d.rmsnorm(&mut s.xb, &layer.attn_norm, eps);
                     d.matmul(&mut s.ab, ab, &s.xb);
+                    if keeping && let Some(r) = &mut self.rewind {
+                        d.copy(&mut r.qkv[*slot], 0, &s.qkv, 0, n * (2 * k_dim + v_dim));
+                        d.copy(&mut r.ab[*slot], 0, &s.ab, 0, n * 2 * c.v_heads);
+                    }
                     // The convolution reads the tokens before the batch from
                     // one state buffer and leaves the ones after it in the
                     // other.
@@ -629,13 +851,19 @@ impl<D: Device> Model<D> {
             d.hadamard(&mut s.up, signs(c.intermediate), false);
             d.matmul(&mut s.xb, &layer.down, &s.up);
             d.add(&mut s.x, &s.xb);
+            if let Some((layers, buf)) = &mut self.captures
+                && let Some(j) = layers.iter().position(|&l| l == i)
+            {
+                d.copy(buf, j * BATCH * c.hidden, &s.x, 0, n * c.hidden);
+            }
         }
         s.parity = !s.parity;
 
-        // Only the last token's logits are wanted.
-        d.resize(&mut s.xb, c.hidden);
-        d.resize(&mut s.xh, c.hidden);
-        d.copy(&mut s.xb, 0, &s.x, (n - 1) * c.hidden, c.hidden);
+        // The last tokens' logits, as many as are wanted.
+        d.resize(&mut s.xb, rows * c.hidden);
+        d.resize(&mut s.xh, rows * c.hidden);
+        d.resize(&mut s.logits, rows * c.vocab);
+        d.copy(&mut s.xb, 0, &s.x, (n - rows) * c.hidden, rows * c.hidden);
         d.rmsnorm_hadamard(&mut s.xh, &s.xb, &self.norm, signs(c.hidden), eps);
         d.matmul(&mut s.logits, &self.lm_head, &s.xh);
         d.read(&s.logits)
@@ -804,7 +1032,7 @@ impl<D: Device> LanguageModel for Model<D> {
         );
         let mut logits = Vec::new();
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
-            logits = self.forward_batch(batch, pos + i * BATCH);
+            logits = self.forward_batch(batch, pos + i * BATCH, 1);
         }
         logits
     }
@@ -813,6 +1041,7 @@ impl<D: Device> LanguageModel for Model<D> {
     /// The attention layers' caches need no clearing: attention reads only
     /// the positions before the token's.
     fn reset(&mut self) {
+        self.rewind = None;
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
         for slot in 0..s.ssm_state.len() {
             for conv in &mut s.conv_state[slot] {
@@ -890,7 +1119,7 @@ impl<D: Device> State<D> {
             up: d.alloc(BATCH * c.intermediate),
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
-            logits: d.alloc(c.vocab),
+            logits: d.alloc(VERIFY_ROWS * c.vocab),
             k_cache: (0..caches)
                 .map(|_| d.alloc_cache(max_len * kv_dim))
                 .collect(),
@@ -934,7 +1163,7 @@ impl<D: Device> State<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::gguf::{self, Value};
     use dwim_gpu::{Cpu, Gpu};
@@ -963,19 +1192,25 @@ mod tests {
                 .collect()
         }
 
-        fn ternary(&mut self, rows: usize, cols: usize, scale: f32) -> Vec<u8> {
+        /// A ternary matrix in the packing of tensor type `dtype`.
+        fn ternary(&mut self, rows: usize, cols: usize, scale: f32, dtype: u32) -> Vec<u8> {
             let mut data = vec![0; rows * ternary::row_bytes(cols)];
             for row in data.chunks_exact_mut(ternary::row_bytes(cols)) {
                 let values: Vec<f32> = (0..cols).map(|_| self.next() * scale).collect();
                 ternary::quantize_row(&values, row);
             }
-            data
+            if dtype == gguf::PQ2_0 {
+                crate::twobit::from_ternary(&data, rows, cols)
+            } else {
+                data
+            }
         }
     }
 
     /// Writes a tiny random model in the file format, four layers of which
-    /// the last is full attention.
-    fn synthetic(path: &Path) {
+    /// the last is full attention, with its ternary matrices in the packing
+    /// of tensor type `dtype`: a hidden width of 1024, a vocabulary of 64.
+    pub fn synthetic(path: &Path, dtype: u32) {
         let (hidden, inter, layers, heads, kv_heads, head_dim, rot_dim) =
             (1024, 1024, 4, 4, 2, 256, 64);
         let (k_heads, v_heads, state_dim, vocab) = (2, 8, 128, 64);
@@ -995,8 +1230,8 @@ mod tests {
             tensors.push((
                 name.to_string(),
                 vec![cols, rows],
-                gguf::PTQ1_0,
-                rng.ternary(rows, cols, scale),
+                dtype,
+                rng.ternary(rows, cols, scale, dtype),
             ));
         };
         tern("output.weight", vocab, hidden, &mut names);
@@ -1045,8 +1280,8 @@ mod tests {
         tensors.push((
             "token_embd.weight".into(),
             vec![hidden, vocab],
-            gguf::PTQ1_0,
-            rng.ternary(vocab, hidden, 0.5),
+            dtype,
+            rng.ternary(vocab, hidden, 0.5, dtype),
         ));
         tensors.push((
             "output_norm.weight".into(),
@@ -1181,7 +1416,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dwim-bonsai-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.gguf");
-        synthetic(&path);
+        synthetic(&path, gguf::PTQ1_0);
         let gguf = Arc::new(Gguf::open(&path).unwrap());
         // A conversation of two batches, and one that takes up from the
         // first's saved state: the same logits, since the state holds the
@@ -1212,7 +1447,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dwim-bonsai-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.gguf");
-        synthetic(&path);
+        synthetic(&path, gguf::PTQ1_0);
         let cpu = run(&path, Cpu);
         assert!(cpu[0].iter().all(|v| v.is_finite()));
         assert!(cpu[0].iter().any(|&v| v != 0.0));
@@ -1232,19 +1467,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The model packed two bits a weight is the same model: the same
+    /// logits, to the bit, as packed 1.75 bits a weight.
+    #[test]
+    fn two_bit_file_is_the_same_model() {
+        let dir = std::env::temp_dir().join(format!("dwim-bonsai-2bit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("ptq1_0.gguf");
+        let two = dir.join("pq2_0.gguf");
+        synthetic(&one, gguf::PTQ1_0);
+        synthetic(&two, gguf::PQ2_0);
+        assert!(std::fs::metadata(&two).unwrap().len() > std::fs::metadata(&one).unwrap().len());
+        assert_eq!(run(&one, Cpu), run(&two, Cpu));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Greedy completion of a prompt by the real model, if its file is in
     /// the cache: run with `--ignored --nocapture` and compare with what
     /// PrismML's llama.cpp says.
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dirs::cache_dir()
-            .unwrap()
-            .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
-        if !path.exists() {
-            eprintln!("skipping: no model at {}", path.display());
+        let model = crate::cache::BONSAI;
+        let Some(path) = model.dir().and_then(|dir| model.weights(&dir)) else {
+            eprintln!("skipping: the model is not in the cache");
             return;
-        }
+        };
+        eprintln!("model: {}", path.display());
         let gguf = Arc::new(Gguf::open(&path).unwrap());
         let tokenizer = crate::Tokenizer::from_gguf(&gguf).unwrap();
         let device = Gpu::new().unwrap();
@@ -1278,6 +1527,62 @@ mod tests {
         let text = String::from_utf8_lossy(&text);
         eprintln!("completion: {text:?}");
         assert!(text.starts_with(" Paris."), "{text:?}");
+        // With the draft, if it is in the cache: the same tokens, faster.
+        let draft = crate::cache::DRAFT;
+        if let Some(dir) = draft
+            .dir()
+            .and_then(|dir| draft.weights(&dir))
+            .and_then(|weights| weights.parent().map(|p| p.to_path_buf()))
+        {
+            let gguf = Arc::new(Gguf::open(&path).unwrap());
+            let device = Gpu::new().unwrap();
+            let start = std::time::Instant::now();
+            let target = Model::load(gguf, device, 512, |_, _| {}).unwrap();
+            let draft = crate::draft::Draft::load(&dir, &target.device, 512, |_, _| {}).unwrap();
+            let mut spec = crate::speculative::Speculator::new(target, draft).unwrap();
+            eprintln!("draft loaded in {:.1}s", start.elapsed().as_secs_f32());
+            let mut sampler = crate::Sampler::new(0.0, 1, 1.0, 0.0, 1);
+            let prompt = tokenizer.encode("The capital of France is").unwrap();
+            let logits = spec.forward(&prompt, 0);
+            let mut policy = crate::Policy {
+                sampler: &mut sampler,
+                forbidden: &[],
+                logits: None,
+            };
+            let mut out = vec![policy.pick(&logits)];
+            let mut pos = prompt.len();
+            let start = std::time::Instant::now();
+            while out.len() < 64 {
+                let anchor = *out.last().unwrap();
+                let picked = spec.next_tokens(anchor, pos, &mut policy);
+                pos += picked.len();
+                out.extend(picked);
+            }
+            let seconds = start.elapsed().as_secs_f32();
+            let stats = spec.drafting().unwrap();
+            eprintln!(
+                "drafted decode: {:.1} tok/s over {} tokens, {} cycles, accepted {} of {} proposals, {:.2} s drafting, {:.2} s checking",
+                out.len() as f32 / seconds,
+                out.len(),
+                stats.cycles,
+                stats.accepted,
+                stats.proposed,
+                stats.draft_seconds,
+                stats.target_seconds
+            );
+            let text: Vec<u8> = out
+                .iter()
+                .flat_map(|&t| tokenizer.decode(t).to_vec())
+                .collect();
+            let text = String::from_utf8_lossy(&text);
+            eprintln!("drafted completion: {text:?}");
+            assert!(
+                text.starts_with(" Paris.\nThe capital of Germany is Berlin."),
+                "{text:?}"
+            );
+        } else {
+            eprintln!("no draft in the cache");
+        }
         // A long prompt, carrying on from the completion, for the speed of
         // the batch kernels at their size.
         let passage =

@@ -20,6 +20,11 @@ pub struct Opts {
     #[argh(option)]
     pub context: Option<usize>,
 
+    /// run the model alone, without the draft that proposes tokens for it
+    /// to check several at a time
+    #[argh(switch)]
+    pub no_draft: bool,
+
     /// print the version and exit
     #[argh(switch)]
     pub version: bool,

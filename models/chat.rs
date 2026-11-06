@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
+    collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
     ops::ControlFlow,
     time::Instant,
 };
 
-use crate::{LanguageModel, Result, Sampler, Tokenizer};
+use crate::{LanguageModel, Policy, Result, Sampler, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -105,6 +106,8 @@ pub struct Stats {
     pub prompt: Tally,
     pub thought: Tally,
     pub answer: Tally,
+    /// How the model's drafting ahead has gone, if it drafts.
+    pub drafting: Option<crate::Drafting>,
 }
 
 /// Tokens of one kind, and the seconds the model took over them.
@@ -338,7 +341,10 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Where the conversation's time has gone so far.
     pub fn stats(&self) -> Stats {
-        self.stats
+        Stats {
+            drafting: self.model.drafting(),
+            ..self.stats
+        }
     }
 
     /// Sends a message from the user, streaming the reply to `on_chunk` as
@@ -374,7 +380,7 @@ impl<M: LanguageModel> Chat<M> {
         prompt.extend(self.tokenizer.encode("\n\n")?);
         prompt.push(self.think_end);
         prompt.extend(self.tokenizer.encode("\n\n")?);
-        let mut logits = self.feed(&prompt, Kind::Prompt)?;
+        let logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut answer = String::new();
@@ -382,26 +388,28 @@ impl<M: LanguageModel> Chat<M> {
         end.extend(self.tokenizer.encode("\n")?);
         // The answer is what the reserve is for, so it may use it.
         self.cut = false;
+        let forbidden = [self.think, self.think_end, self.tool_call];
+        let mut ahead = Ahead::default();
+        let mut token = self.policy(&forbidden).pick(&logits);
+        ahead.last = Some(logits);
+        ahead.from = prompt.last().copied();
         for _ in 0..limit {
             if !self.room(end.len(), 0) {
                 self.cut = true;
                 break;
             }
-            for token in [self.think, self.think_end, self.tool_call] {
-                logits[token as usize] = f32::NEG_INFINITY;
-            }
-            let token = self.sampler.sample(&logits);
             if token == self.im_end || token == self.end_of_text {
                 break;
             }
             let chunk = text.push(self.tokenizer.decode(token));
             answer.push_str(&chunk);
             let flow = on_chunk(Chunk::Text(&chunk));
-            logits = self.feed(&[token], Kind::Answer)?;
+            token = self.advance(token, Kind::Answer, &forbidden, &mut ahead)?;
             if flow.is_break() {
                 break;
             }
         }
+        self.forget_ahead(&mut ahead)?;
         self.feed(&end, Kind::Prompt)?;
         Ok(answer)
     }
@@ -485,7 +493,7 @@ impl<M: LanguageModel> Chat<M> {
             prompt.push(self.think_end);
             prompt.extend(self.tokenizer.encode("\n\n")?);
         }
-        let mut logits = self.feed(&prompt, Kind::Prompt)?;
+        let logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut calls = Vec::new();
@@ -511,6 +519,14 @@ impl<M: LanguageModel> Chat<M> {
         let mut interrupted = false;
         self.cut = false;
         self.thought_ended = false;
+        // The tokens picked ahead of the one being looked at, and the one
+        // being looked at, which is at position `len`, not yet run through
+        // the model, picked under the policy the tokens ahead were.
+        let mut ahead = Ahead::default();
+        let mut token = self.policy(&[]).pick(&logits);
+        ahead.last = Some(logits);
+        ahead.from = prompt.last().copied();
+        let mut forbidden: Vec<u32> = Vec::new();
         loop {
             if !self.room(self.ending, self.reserve) {
                 // The reply is stopped short, as if interrupted: what it
@@ -540,7 +556,11 @@ impl<M: LanguageModel> Chat<M> {
                     break;
                 }
                 let flow = on_chunk(Chunk::Thought(&closing));
-                logits = self.feed(&tokens, Kind::Thought)?;
+                self.forget_ahead(&mut ahead)?;
+                let logits = self.feed(&tokens, Kind::Thought)?;
+                token = self.policy(&forbidden).pick(&logits);
+                ahead.last = Some(logits);
+                ahead.from = Some(*tokens.last().unwrap());
                 thinking = false;
                 self.thought_ended = true;
                 if flow.is_break() {
@@ -549,12 +569,23 @@ impl<M: LanguageModel> Chat<M> {
                 }
                 continue;
             }
-            if answering && !replied {
-                for token in [self.im_end, self.end_of_text, self.tool_call] {
-                    logits[token as usize] = f32::NEG_INFINITY;
-                }
+            // While the model must write its answer out, it may not end
+            // the reply or call a tool: a token picked ahead under another
+            // policy is picked again under this one.
+            let wanted: Vec<u32> = if answering && !replied {
+                vec![self.im_end, self.end_of_text, self.tool_call]
+            } else {
+                Vec::new()
+            };
+            let kind = if thinking {
+                Kind::Thought
+            } else {
+                Kind::Answer
+            };
+            if wanted != forbidden {
+                forbidden = wanted;
+                token = self.repick(kind, &forbidden, &mut ahead)?;
             }
-            let mut token = self.sampler.sample(&logits);
             let kind = if thinking {
                 Kind::Thought
             } else {
@@ -672,7 +703,7 @@ impl<M: LanguageModel> Chat<M> {
             };
             // Feed the token even if the reply ends here, so that the model
             // remembers the reply exactly as far as it was shown.
-            logits = self.feed(&[token], kind)?;
+            token = self.advance(token, kind, &forbidden, &mut ahead)?;
             if flow.is_break() {
                 interrupted = true;
                 break;
@@ -689,6 +720,7 @@ impl<M: LanguageModel> Chat<M> {
 
         // End the reply the way the chat format expects, ready for the next
         // message, even if it was cut short.
+        self.forget_ahead(&mut ahead)?;
         let mut end = Vec::new();
         if thinking {
             end.extend(self.tokenizer.encode("\n")?);
@@ -709,16 +741,101 @@ impl<M: LanguageModel> Chat<M> {
         }
         let start = Instant::now();
         let logits = self.model.forward(tokens, self.len);
+        self.tally(kind, tokens.len(), start);
+        self.len += tokens.len();
+        Ok(logits)
+    }
+
+    /// Counts `tokens` taken since `start` as `kind`.
+    fn tally(&mut self, kind: Kind, tokens: usize, start: Instant) {
         let tally = match kind {
             Kind::Prompt => &mut self.stats.prompt,
             Kind::Thought => &mut self.stats.thought,
             Kind::Answer => &mut self.stats.answer,
         };
-        tally.tokens += tokens.len();
+        tally.tokens += tokens;
         tally.seconds += start.elapsed().as_secs_f64();
-        self.len += tokens.len();
-        Ok(logits)
     }
+
+    /// The policy tokens are picked with: the sampler, with `forbidden`
+    /// left out.
+    fn policy<'a>(&'a mut self, forbidden: &'a [u32]) -> Policy<'a> {
+        Policy {
+            sampler: &mut self.sampler,
+            forbidden,
+            logits: None,
+        }
+    }
+
+    /// Runs `token`, at position `len`, through the model, and returns the
+    /// token picked after it: one picked ahead, if there is one, or else
+    /// the model picks it under `forbidden`, and perhaps more ahead of it,
+    /// which are kept. The conversation grows by the token.
+    fn advance(
+        &mut self,
+        token: u32,
+        kind: Kind,
+        forbidden: &[u32],
+        ahead: &mut Ahead,
+    ) -> Result<u32> {
+        if self.len + 1 > self.model.max_len() {
+            return Err("the conversation no longer fits in the context window".into());
+        }
+        if ahead.tokens.is_empty() {
+            let start = Instant::now();
+            let mut policy = Policy {
+                sampler: &mut self.sampler,
+                forbidden,
+                logits: None,
+            };
+            let picked = self.model.next_tokens(token, self.len, &mut policy);
+            ahead.last = policy.logits.take();
+            self.tally(kind, picked.len(), start);
+            ahead.tokens.extend(picked);
+        }
+        ahead.from = Some(token);
+        self.len += 1;
+        Ok(ahead.tokens.pop_front().expect("a token is picked"))
+    }
+
+    /// Forgets the tokens picked ahead: the model's state is put back at
+    /// the conversation's length.
+    fn forget_ahead(&mut self, ahead: &mut Ahead) -> Result<()> {
+        if !ahead.tokens.is_empty() {
+            ahead.tokens.clear();
+            self.model.rewind(self.len)?;
+        }
+        Ok(())
+    }
+
+    /// Picks the token at position `len` again under `forbidden`, in place
+    /// of one picked under another policy: from the logits it was picked
+    /// from, if they are at hand, and otherwise by having the model forget
+    /// the token before it and run it again, picking afresh.
+    fn repick(&mut self, kind: Kind, forbidden: &[u32], ahead: &mut Ahead) -> Result<u32> {
+        if ahead.tokens.is_empty()
+            && let Some(logits) = &ahead.last
+        {
+            return Ok(self.policy(forbidden).pick(logits));
+        }
+        self.forget_ahead(ahead)?;
+        let from = ahead.from.ok_or("no token to pick again from")?;
+        self.len -= 1;
+        self.model.rewind(self.len)?;
+        self.advance(from, kind, forbidden, ahead)
+    }
+}
+
+/// Tokens the model has picked ahead of the one the chat is looking at,
+/// at the positions after it, which it has run through except the last;
+/// the logits the last of them was picked from, or, when there are none
+/// ahead, the one looked at; and the token before the one looked at, from
+/// which it can be picked again.
+#[derive(Default)]
+struct Ahead {
+    tokens: VecDeque<u32>,
+    last: Option<Vec<f32>>,
+    from: Option<u32>,
 }
 
 /// A tag of the chat format as tokens: its special token if the vocabulary

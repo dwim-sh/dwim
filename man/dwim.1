@@ -63,6 +63,17 @@ earlier messages, and the most recent exchanges without their thoughts.
 A reply that runs out of room is stopped short and goes on after a
 compaction.
 .TP
+.B \-\-no\-draft
+Run the model alone, generating a token at a time. By default a draft
+runs ahead of it: a small model trained to guess what the model says next,
+which proposes seven tokens at a time from the model's own hidden states;
+the model checks them all in one pass, which costs it little more than
+one token, and keeps those it would have picked itself. What comes out is
+what the model alone would say: the likeliest token at every step at a
+temperature of zero, and otherwise tokens drawn from the model's own
+distribution. The draft's weights are quantized to four bits as they
+load, and take 1.2 GB of memory beside the model's 6.
+.TP
 .B \-\-bench
 Instead of a session, time the model at several depths of context and
 print a table of tokens a second: at each of 1k, 8k, 32k, 64k and 128k
@@ -91,7 +102,8 @@ editing of files, stay here.
 When answering a prompt given on the command line, print where the time
 went once the reply ends: the time loading the model; the tokens read as
 prompts, generated while thinking, and generated as the reply, with the
-time and rate of each; and the tools run.
+time and rate of each; the tools run; and how the draft fared, as the
+proposals the model accepted, the cycles run, and the tokens a cycle gave.
 .TP
 .B \-\-thinking
 Show the model's thinking in the shell from the start, as
@@ -215,6 +227,20 @@ on a line with text clears it.
 .B AGENTS.md
 If present in the working directory, its contents are given to the agent as
 project instructions.
+.TP
+.I ~/.cache/dwim/models/
+The model's files and the draft's, downloaded on first use; on macOS the
+directory is
+.I ~/Library/Caches/dwim/models/
+instead. Nothing is downloaded where the model is in Hugging Face's cache
+already, left by another program that fetched it:
+.IR ~/.cache/huggingface/hub/ ,
+or where
+.BR HF_HUB_CACHE ,
+.B HF_HOME
+or
+.B XDG_CACHE_HOME
+puts it. Either of the model's packings will do there.
 .TP
 .I ~/.cache/dwim/states/
 The model's state after the system prompt, saved when a prompt is first

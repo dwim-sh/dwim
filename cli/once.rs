@@ -10,7 +10,7 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Write},
     ops::ControlFlow,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -29,6 +29,7 @@ use crate::{fetch, models, opts::Device};
 pub fn once(
     name: &str,
     device: Device,
+    drafting: bool,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     effort: harness::Effort,
@@ -41,21 +42,30 @@ pub fn once(
     let started = Instant::now();
     let (model, dir) = fetch::locate(name)?;
     let mut progress = Progress::new();
-    fetch::fetch(model, &dir, |file| {
+    let mut downloading = |file: fetch::Progress| {
         let total = file.total.unwrap_or(file.done);
         progress.report(
             format!("downloading {}", file.file),
             megabytes(file.done),
             megabytes(total),
         );
-    })?;
-    let gguf = model.open(&dir)?;
+    };
+    fetch::fetch(model, &dir, &mut downloading)?;
+    let draft = if drafting {
+        let draft_dir = models::draft_dir()?;
+        fetch::fetch(models::DRAFT, &draft_dir, &mut downloading)?;
+        Some(models::draft_files(&draft_dir)?)
+    } else {
+        None
+    };
+    let gguf = models::open(model, &dir)?;
     let (report, loading) = match device {
         Device::Cpu => answer(
             gguf,
             Cpu,
             model,
             "cpu",
+            draft.as_deref(),
             context,
             thinking_budget,
             effort,
@@ -78,6 +88,7 @@ pub fn once(
                 gpu,
                 model,
                 &device,
+                draft.as_deref(),
                 context,
                 thinking_budget,
                 effort,
@@ -106,6 +117,7 @@ fn answer<D: dwim_gpu::Device + 'static>(
     device: D,
     which: &'static models::Model,
     on: &str,
+    draft: Option<&Path>,
     context: Option<usize>,
     thinking_budget: Option<usize>,
     effort: harness::Effort,
@@ -119,11 +131,15 @@ fn answer<D: dwim_gpu::Device + 'static>(
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let sampler = models::sampler(&gguf, temperature);
     let loading = Instant::now();
-    let size = models::size(&gguf, &device, context)?;
+    let size = models::size(&gguf, &device, draft, context)?;
     eprintln!("{}", models::describe(&size));
-    let model = models::load(gguf, device, size.context, |done, total| {
+    let model = models::load(gguf, device, size.context, draft, |what, done, total| {
         let on = if on == "cpu" { "the CPU" } else { on };
-        progress.report(format!("loading {name} on {on}"), done, total);
+        let what = match what {
+            models::Loading::Model => name,
+            models::Loading::Draft => "the draft",
+        };
+        progress.report(format!("loading {what} on {on}"), done, total);
     })?;
     let loading = loading.elapsed();
     let mut chat = Chat::new(model, tokenizer, sampler)?;

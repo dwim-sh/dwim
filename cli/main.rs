@@ -37,8 +37,8 @@ fn main() {
     }
 
     if opts.bench {
-        if let Err(e) =
-            check_memory().and_then(|()| bench::bench(&opts.model, opts.device, opts.context))
+        if let Err(e) = check_memory()
+            .and_then(|()| bench::bench(&opts.model, opts.device, !opts.no_draft, opts.context))
         {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -57,6 +57,7 @@ fn main() {
             "" => run::run(
                 &opts.model,
                 opts.device,
+                !opts.no_draft,
                 opts.context,
                 thinking_budget,
                 opts.reasoning_effort,
@@ -68,6 +69,7 @@ fn main() {
             prompt => once::once(
                 &opts.model,
                 opts.device,
+                !opts.no_draft,
                 opts.context,
                 thinking_budget,
                 opts.reasoning_effort,

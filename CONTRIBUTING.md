@@ -20,7 +20,13 @@ driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
 
 The weights are downloaded on first use into `~/Library/Caches/dwim/models`
 on macOS, and `~/.cache/dwim/models` elsewhere. Bonsai 2 27B, the one model,
-is a 6 GB file; an interrupted download resumes on the next run.
+is a 6 GB file; an interrupted download resumes on the next run. Nothing is
+downloaded when the model is already in Hugging Face's cache
+(`~/.cache/huggingface/hub`, or where `HF_HUB_CACHE` or `HF_HOME` points),
+in either of its packings: the 1.75-bit `PTQ1_0` that `dwim` fetches, or the
+2-bit `PQ2_0` of the same weights that Splash fetches. The draft,
+`incoai/Qwen3.8-27B-DFlash2`, is fetched beside it, 4 GB of bf16 weights
+that load quantized to four bits, unless `--no-draft` runs the model alone.
 
 ## Running
 

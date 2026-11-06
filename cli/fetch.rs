@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::models::{MODELS, Model};
+use crate::models::{self, MODELS, Model};
 
 /// How long a partial download can go without being written to before it is
 /// taken for the leftover of an interrupted run, to be resumed, rather than
@@ -27,7 +27,7 @@ pub struct Progress {
 
 /// Looks up a model by name, and the directory its files are kept in.
 pub fn locate(name: &str) -> Result<(&'static Model, PathBuf), Box<dyn Error>> {
-    let model = Model::find(name).ok_or_else(|| {
+    let model = models::find(name).ok_or_else(|| {
         let known: Vec<_> = MODELS.iter().map(|model| model.name).collect();
         format!("unknown model '{name}' (known: {})", known.join(", "))
     })?;
@@ -48,12 +48,17 @@ pub fn on_disk(model: &Model, dir: &Path) -> (usize, u64) {
 }
 
 /// Downloads a model's files into `dir`, skipping any that are already there,
-/// and reporting progress on each one as it comes in.
+/// and reporting progress on each one as it comes in. Nothing is fetched
+/// when the weights are to be had already, in `dir` or in Hugging Face's
+/// cache.
 pub fn fetch(
     model: &'static Model,
     dir: &Path,
     mut progress: impl FnMut(Progress),
 ) -> Result<(), Box<dyn Error>> {
+    if model.weights(dir).is_some() {
+        return Ok(());
+    }
     fs::create_dir_all(dir)?;
     for file in model.files {
         let path = dir.join(file);

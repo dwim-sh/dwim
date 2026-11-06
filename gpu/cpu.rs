@@ -4,8 +4,8 @@
 use rayon::prelude::*;
 
 use crate::{
-    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, bf16, from_f16, quantize, sigmoid,
-    softplus, ternary,
+    CACHE_BLOCK, CONV_KERNEL, Device, HADAMARD_BLOCK, Tensor, affine4, bf16, from_f16, quantize,
+    sigmoid, softplus, ternary,
 };
 
 pub struct Cpu;
@@ -126,6 +126,10 @@ impl Device for Cpu {
                 .par_chunks_exact_mut(n)
                 .zip(data.par_chunks_exact(ternary::row_bytes(cols)))
                 .for_each(|(results, row)| row_dot(results, &|x| ternary::dot(row, x))),
+            Tensor::Affine4 { data, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(data.par_chunks_exact(affine4::row_bytes(cols)))
+                .for_each(|(results, row)| row_dot(results, &|x| affine4::dot(row, x))),
         }
         for (r, results) in by_row.chunks_exact(n).enumerate() {
             for (t, &result) in results.iter().enumerate() {
@@ -315,6 +319,119 @@ impl Device for Cpu {
             for c in 0..channels {
                 state_out[s * channels + c] =
                     input(n as isize + s as isize + 1 - CONV_KERNEL as isize, c);
+            }
+        }
+    }
+
+    fn draft_conv(
+        &self,
+        out: &mut Vec<f32>,
+        x: &Vec<f32>,
+        dynamic: &Vec<f32>,
+        base: &Vec<f32>,
+        residual: Option<&Vec<f32>>,
+        stage: usize,
+        group: usize,
+    ) {
+        let hidden = base.len() / 4;
+        let rows = x.len() / hidden;
+        let groups = hidden / group;
+        assert!(x.len() == rows * hidden && out.len() == x.len());
+        assert_eq!(dynamic.len(), rows * 4 * groups);
+        assert!(stage < 2 && hidden.is_multiple_of(group));
+        for t in 0..rows {
+            for c in 0..hidden {
+                let g = c / group;
+                let tap = |tap: usize| {
+                    base[(2 * stage + tap) * hidden + c]
+                        + dynamic[t * 4 * groups + (2 * stage + tap) * groups + g]
+                };
+                let mut value = x[t * hidden + c] * tap(0);
+                if t > 0 {
+                    value += x[(t - 1) * hidden + c] * tap(1);
+                }
+                if let Some(residual) = residual {
+                    value += residual[t * hidden + c];
+                }
+                out[t * hidden + c] = value;
+            }
+        }
+    }
+
+    fn draft_attention(
+        &self,
+        out: &mut Vec<f32>,
+        q: &Vec<f32>,
+        k_ring: &Vec<f32>,
+        v_ring: &Vec<f32>,
+        k_block: &Vec<f32>,
+        v_block: &Vec<f32>,
+        pos: usize,
+        window: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+    ) {
+        let group = n_heads / n_kv_heads;
+        let kv_dim = n_kv_heads * head_dim;
+        let rows = q.len() / (n_heads * head_dim);
+        assert!(k_block.len() == rows * kv_dim && v_block.len() == rows * kv_dim);
+        assert!(k_ring.len() == n_kv_heads * window * head_dim && v_ring.len() == k_ring.len());
+        assert_eq!(out.len(), q.len());
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        out.par_chunks_exact_mut(head_dim)
+            .zip(q.par_chunks_exact(head_dim))
+            .enumerate()
+            .for_each(|(i, (out, q))| {
+                let (row, head) = (i / n_heads, i % n_heads);
+                let kvh = head / group;
+                // The context positions the row sees, then the block.
+                let start = (pos + row + 1).saturating_sub(window);
+                let key = |t: usize| -> &[f32] {
+                    if t < pos {
+                        &k_ring[(kvh * window + t % window) * head_dim..][..head_dim]
+                    } else {
+                        &k_block[(t - pos) * kv_dim + kvh * head_dim..][..head_dim]
+                    }
+                };
+                let value = |t: usize| -> &[f32] {
+                    if t < pos {
+                        &v_ring[(kvh * window + t % window) * head_dim..][..head_dim]
+                    } else {
+                        &v_block[(t - pos) * kv_dim + kvh * head_dim..][..head_dim]
+                    }
+                };
+                let positions: Vec<usize> = (start..pos).chain(pos..pos + rows).collect();
+                let mut scores: Vec<f32> = positions
+                    .iter()
+                    .map(|&t| scale * q.iter().zip(key(t)).map(|(a, b)| a * b).sum::<f32>())
+                    .collect();
+                softmax(&mut scores);
+                out.fill(0.0);
+                for (&t, &score) in positions.iter().zip(&scores) {
+                    for (o, &v) in out.iter_mut().zip(value(t)) {
+                        *o += score * v;
+                    }
+                }
+            });
+    }
+
+    fn ring_store(
+        &self,
+        ring: &mut Vec<f32>,
+        rows: &Vec<f32>,
+        pos: usize,
+        window: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        let kv_dim = n_kv_heads * head_dim;
+        let n = rows.len() / kv_dim;
+        assert!(rows.len() == n * kv_dim && ring.len() == n_kv_heads * window * head_dim);
+        for (i, row) in rows.chunks_exact(kv_dim).enumerate() {
+            let slot = (pos + i) % window;
+            for (h, head) in row.chunks_exact(head_dim).enumerate() {
+                ring[(h * window + slot) * head_dim..][..head_dim].copy_from_slice(head);
             }
         }
     }

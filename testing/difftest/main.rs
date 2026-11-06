@@ -150,12 +150,11 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let model = dirs::cache_dir()
-        .ok_or("no cache directory")?
-        .join("dwim/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
-    if !model.exists() {
-        return Err(format!("no model at {}: run dwim once to fetch it", model.display()).into());
-    }
+    let source = dwim_models::cache::BONSAI;
+    let dir = source.dir().ok_or("no cache directory")?;
+    let model = source
+        .weights(&dir)
+        .ok_or_else(|| format!("no model in {}: run dwim once to fetch it", dir.display()))?;
     let gguf = Arc::new(Gguf::open(&model)?);
     let dir = root
         .join("target/difftest")

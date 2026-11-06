@@ -40,7 +40,8 @@ make install                     # in ~/.local
 make install PREFIX=/usr/local   # system-wide, which may need sudo
 ```
 
-Either way, the model (about 6 GB) is downloaded on first use.
+Either way, the model (about 6 GB) and its draft (about 4 GB) are downloaded
+on first use, unless they are in Hugging Face's cache already.
 
 ## Features
 
@@ -48,6 +49,8 @@ Either way, the model (about 6 GB) is downloaded on first use.
   going.
 - **Bonsai 2 27B model.** Qwen3.8-27B compressed to 6 GB with ternary
   weights.
+- **Speculative decoding.** A DFlash2 draft proposes seven tokens at a time
+  for the model to check in one pass, for the model's own output, faster.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.
