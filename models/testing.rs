@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{LanguageModel, Tokenizer};
+use crate::{LanguageModel, Tokenizer, chat};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
@@ -44,13 +44,9 @@ impl Scripted {
             saying: VecDeque::new(),
             pending: None,
             vocab: tokenizer.vocab_size(),
-            opening: tokenizer
-                .encode_with_special("<|im_start|>assistant\n<think>\n")
-                .unwrap(),
-            unthinking: tokenizer
-                .encode_with_special("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-                .unwrap(),
-            end: tokenizer.special("<|im_end|>").unwrap(),
+            opening: chat::opening(tokenizer, true).unwrap(),
+            unthinking: chat::opening(tokenizer, false).unwrap(),
+            end: tokenizer.special(chat::IM_END).unwrap(),
             max_len,
         }
     }

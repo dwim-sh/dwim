@@ -180,17 +180,7 @@ impl Tokenizer {
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
-        for special in [
-            "<|endoftext|>",
-            "<|im_start|>",
-            "<|im_end|>",
-            "<tool_call>",
-            "</tool_call>",
-            "<tool_response>",
-            "</tool_response>",
-            "<think>",
-            "</think>",
-        ] {
+        for special in crate::chat::SPECIAL_TOKENS {
             tokens.push(Value::Str(special.to_string()));
             types.push(Value::I32(if special.starts_with("<|") {
                 CONTROL as i32

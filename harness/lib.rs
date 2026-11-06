@@ -1040,7 +1040,7 @@ impl<M: LanguageModel> Harness<M> {
 
         self.chat.clear();
         (self.restart)(&mut self.chat)?;
-        self.chat.replay(&kept, |_, _| {})?;
+        self.chat.replay(&kept)?;
         self.transcript.clear();
         for turn in kept {
             self.record(turn)?;

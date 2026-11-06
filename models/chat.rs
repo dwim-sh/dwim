@@ -24,6 +24,33 @@ const CALL_OPENING: &str = "\n<function=";
 const REPEAT_WINDOW: usize = 32;
 const REPEATS: u32 = 3;
 
+/// The tags of the chat format, which are special tokens of the model's
+/// vocabulary.
+const IM_START: &str = "<|im_start|>";
+pub const IM_END: &str = "<|im_end|>";
+const END_OF_TEXT: &str = "<|endoftext|>";
+const THINK: &str = "<think>";
+const THINK_END: &str = "</think>";
+const TOOL_CALL: &str = "<tool_call>";
+const TOOL_CALL_END: &str = "</tool_call>";
+const TOOL_RESPONSE: &str = "<tool_response>";
+const TOOL_RESPONSE_END: &str = "</tool_response>";
+
+/// The chat format's tags, as a vocabulary for it has them: the ones
+/// starting with `<|` are control tokens, the rest user-defined.
+#[cfg(any(test, feature = "testing"))]
+pub const SPECIAL_TOKENS: [&str; 9] = [
+    END_OF_TEXT,
+    IM_START,
+    IM_END,
+    TOOL_CALL,
+    TOOL_CALL_END,
+    TOOL_RESPONSE,
+    TOOL_RESPONSE_END,
+    THINK,
+    THINK_END,
+];
+
 /// A conversation with an instruction-tuned model, in the ChatML format that
 /// Qwen models are trained on:
 ///
@@ -156,22 +183,45 @@ pub enum Chunk<'a> {
     Token,
 }
 
+/// The template's opening of a reply, for the model to go on from: with
+/// the thought open, for it to think, or with an empty thought closed at
+/// once, as the template opens a reply made without thinking.
+pub fn opening(tokenizer: &Tokenizer, thinking: bool) -> Result<Vec<u32>> {
+    let mut tokens = vec![tokenizer.special(IM_START)?];
+    tokens.extend(tokenizer.encode("assistant\n")?);
+    if thinking {
+        tokens.push(tokenizer.special(THINK)?);
+        tokens.extend(tokenizer.encode("\n")?);
+    } else {
+        tokens.extend(closed_thought(tokenizer)?);
+        tokens.extend(tokenizer.encode("\n\n")?);
+    }
+    Ok(tokens)
+}
+
+/// An empty thought, opened and closed, as the template writes one before
+/// a reply made without thinking, and before a reply written over.
+fn closed_thought(tokenizer: &Tokenizer) -> Result<Vec<u32>> {
+    let mut tokens = vec![tokenizer.special(THINK)?];
+    tokens.extend(tokenizer.encode("\n\n")?);
+    tokens.push(tokenizer.special(THINK_END)?);
+    Ok(tokens)
+}
+
 impl<M: LanguageModel> Chat<M> {
     pub fn new(model: M, tokenizer: Tokenizer, sampler: Sampler) -> Result<Self> {
-        Ok(Self {
+        let mut chat = Self {
             model,
-            im_start: tokenizer.special("<|im_start|>")?,
-            im_end: tokenizer.special("<|im_end|>")?,
-            end_of_text: tokenizer.special("<|endoftext|>")?,
-            think: tokenizer.special("<think>")?,
-            think_end: tokenizer.special("</think>")?,
-            tool_call: tokenizer.special("<tool_call>")?,
-            tool_call_end: tokenizer.special("</tool_call>")?,
-            tool_response: tag(&tokenizer, "<tool_response>")?,
-            tool_response_end: tag(&tokenizer, "</tool_response>")?,
-            // A newline, the end of the thought, two newlines, the end of
-            // the turn, and a newline.
-            ending: tokenizer.encode("\n")?.len() * 2 + tokenizer.encode("\n\n")?.len() + 2,
+            im_start: tokenizer.special(IM_START)?,
+            im_end: tokenizer.special(IM_END)?,
+            end_of_text: tokenizer.special(END_OF_TEXT)?,
+            think: tokenizer.special(THINK)?,
+            think_end: tokenizer.special(THINK_END)?,
+            tool_call: tokenizer.special(TOOL_CALL)?,
+            tool_call_end: tokenizer.special(TOOL_CALL_END)?,
+            tool_response: tag(&tokenizer, TOOL_RESPONSE)?,
+            tool_response_end: tag(&tokenizer, TOOL_RESPONSE_END)?,
+            ending: 0,
             tokenizer,
             sampler,
             len: 0,
@@ -181,7 +231,9 @@ impl<M: LanguageModel> Chat<M> {
             thought_limit: None,
             thinking: true,
             stats: Stats::default(),
-        })
+        };
+        chat.ending = chat.end_of_reply(true)?.len();
+        Ok(chat)
     }
 
     /// Opens the conversation with a system prompt, reporting how many of
@@ -204,31 +256,30 @@ impl<M: LanguageModel> Chat<M> {
         self.len = 0;
     }
 
-    /// Feeds `turns` to the model as the conversation so far, reporting
-    /// progress as `system` does, without a reply to them. A reply is
-    /// written as the chat template writes a reply already made, with an
-    /// empty thought before it, as the template leaves earlier thoughts
-    /// out when it writes a conversation over.
-    pub fn replay(&mut self, turns: &[Turn], on_progress: impl FnMut(usize, usize)) -> Result<()> {
+    /// Feeds `turns` to the model as the conversation so far, without a
+    /// reply to them, as the template writes a conversation over: a reply
+    /// already made with an empty thought before it, since the template
+    /// leaves earlier thoughts out.
+    pub fn replay(&mut self, turns: &[Turn]) -> Result<()> {
         let mut tokens = Vec::new();
         for turn in turns {
-            tokens.extend(match turn {
-                Turn::User(message) => self.user(message)?,
-                Turn::Reply { text, calls } => self.reply(text, calls)?,
-                Turn::Results(outputs) => self.results(outputs)?,
-            });
+            tokens.extend(self.encode(turn)?);
         }
-        self.read(&tokens, on_progress)
+        self.read(&tokens, |_, _| {})
     }
 
     /// Number of tokens `turn` takes when fed, as `replay` writes it.
     pub fn measure(&self, turn: &Turn) -> Result<usize> {
-        Ok(match turn {
-            Turn::User(message) => self.user(message)?,
-            Turn::Reply { text, calls } => self.reply(text, calls)?,
-            Turn::Results(outputs) => self.results(outputs)?,
+        Ok(self.encode(turn)?.len())
+    }
+
+    /// `turn` as tokens, as `replay` writes it.
+    fn encode(&self, turn: &Turn) -> Result<Vec<u32>> {
+        match turn {
+            Turn::User(message) => self.user(message),
+            Turn::Reply { text, calls } => self.reply(text, calls),
+            Turn::Results(outputs) => self.results(outputs),
         }
-        .len())
     }
 
     /// Feeds `tokens` a batch at a time, reporting how many so far, out of
@@ -365,20 +416,12 @@ impl<M: LanguageModel> Chat<M> {
     ) -> Result<String> {
         let turn = self.user(message)?;
         self.feed(&turn, Kind::Prompt)?;
-        // The template's opening of a reply, with the thought closed at
-        // once, as it writes a reply made without thinking.
-        let mut prompt = vec![self.im_start];
-        prompt.extend(self.tokenizer.encode("assistant\n")?);
-        prompt.push(self.think);
-        prompt.extend(self.tokenizer.encode("\n\n")?);
-        prompt.push(self.think_end);
-        prompt.extend(self.tokenizer.encode("\n\n")?);
+        let prompt = opening(&self.tokenizer, false)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut answer = String::new();
-        let mut end = vec![self.im_end];
-        end.extend(self.tokenizer.encode("\n")?);
+        let end = self.end_of_reply(false)?;
         // The answer is what the reserve is for, so it may use it.
         self.cut = false;
         for _ in 0..limit {
@@ -442,9 +485,7 @@ impl<M: LanguageModel> Chat<M> {
     /// A reply already made as a turn: an empty thought, its text, and its
     /// tool calls as written, each in a `<tool_call>` block.
     fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>> {
-        let mut content = vec![self.think];
-        content.extend(self.tokenizer.encode("\n\n")?);
-        content.push(self.think_end);
+        let mut content = closed_thought(&self.tokenizer)?;
         content.extend(self.tokenizer.encode(&format!("\n\n{text}"))?);
         for (i, call) in calls.iter().enumerate() {
             if i > 0 {
@@ -467,23 +508,26 @@ impl<M: LanguageModel> Chat<M> {
         Ok(turn)
     }
 
+    /// What ends a reply the way the chat format expects, ready for the
+    /// next message: the thought closed first if it is still open.
+    fn end_of_reply(&self, thinking: bool) -> Result<Vec<u32>> {
+        let mut end = Vec::new();
+        if thinking {
+            end.extend(self.tokenizer.encode("\n")?);
+            end.push(self.think_end);
+            end.extend(self.tokenizer.encode("\n\n")?);
+        }
+        end.push(self.im_end);
+        end.extend(self.tokenizer.encode("\n")?);
+        Ok(end)
+    }
+
     /// Generates the assistant's reply to the conversation so far.
     fn generate(
         &mut self,
         mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Vec<String>> {
-        // The template opens the thought for the model, or opens and
-        // closes it when the reply is to be made without thinking.
-        let mut prompt = vec![self.im_start];
-        prompt.extend(self.tokenizer.encode("assistant\n")?);
-        prompt.push(self.think);
-        if self.thinking {
-            prompt.extend(self.tokenizer.encode("\n")?);
-        } else {
-            prompt.extend(self.tokenizer.encode("\n\n")?);
-            prompt.push(self.think_end);
-            prompt.extend(self.tokenizer.encode("\n\n")?);
-        }
+        let prompt = opening(&self.tokenizer, self.thinking)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
@@ -679,16 +723,7 @@ impl<M: LanguageModel> Chat<M> {
             }
         }
 
-        // End the reply the way the chat format expects, ready for the next
-        // message, even if it was cut short.
-        let mut end = Vec::new();
-        if thinking {
-            end.extend(self.tokenizer.encode("\n")?);
-            end.push(self.think_end);
-            end.extend(self.tokenizer.encode("\n\n")?);
-        }
-        end.push(self.im_end);
-        end.extend(self.tokenizer.encode("\n")?);
+        let end = self.end_of_reply(thinking)?;
         self.feed(&end, Kind::Prompt)?;
         Ok(if interrupted { Vec::new() } else { calls })
     }
@@ -902,9 +937,7 @@ mod tests {
                 calls: Vec::new(),
             },
         ];
-        let mut progress = Vec::new();
-        chat.replay(&turns, |read, total| progress.push((read, total)))
-            .unwrap();
+        chat.replay(&turns).unwrap();
         let expected = chat
             .tokenizer
             .encode_with_special(&format!(
@@ -922,11 +955,6 @@ mod tests {
             .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
             .unwrap()
             .len();
-        assert_eq!(progress.first().unwrap().0, 0);
-        assert_eq!(
-            progress.last().unwrap(),
-            &(expected.len() - system, progress.last().unwrap().1)
-        );
         assert_eq!(
             turns
                 .iter()
