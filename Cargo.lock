@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "dwim"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "argh",
  "ash",
