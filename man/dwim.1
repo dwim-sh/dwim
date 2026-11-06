@@ -105,8 +105,9 @@ for no limit (default: 2048).
 The model thinks before every reply, and tends to think at length; a
 thought that repeats itself is ended whatever the budget. A thought that runs to
 the budget is ended with a sentence in the model's own voice, as the
-model's makers end one, and the model goes on to run a command or reply
-from what it has thought so far.
+model's makers end one: before the model has called a tool in the turn, that
+it will check what it recalls with one; after, that it will go with what it
+has worked out from the results rather than go over it again.
 A turn ends when the model replies with text alone, or, after a hundred
 tool calls without a reply, when it is asked to say what it has done and
 what remains.

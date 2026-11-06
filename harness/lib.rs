@@ -122,13 +122,23 @@ const DISCARDS: &str = "error: not run: this would take away the changes you hav
 /// turn: a message it answers without tools, which ends the turn.
 const STEPS_PROMPT: &str = "You have made many tool calls in this turn without replying, and the tools are off until the user's next message. Reply now with what you have done, what you found, and what remains, in a few sentences.";
 
-/// What ends a thought that runs to the thinking budget, in the model's
-/// voice, as Qwen3's own thinking budget ends one, but to check rather
-/// than to answer: Qwen3's "give the solution based on the thinking
-/// directly now" has the model answer from a thought that, on SWE-bench's
-/// django-11797, was most often recalling how the code works, when a read
-/// or a run would have told it.
-const BUDGET_CLOSING: &str = "I am not certain of this from memory, so I will check it in the code now with a tool, and decide from what it shows.";
+/// What ends a thought that runs to the thinking budget before the model
+/// has called a tool in the turn, in the model's voice, as Qwen3's own
+/// thinking budget ends one, but to check rather than to answer: Qwen3's
+/// "give the solution based on the thinking directly now" has the model
+/// answer from a thought that, on SWE-bench's django-11797, was most often
+/// recalling how the code works, when a read or a run would have told it.
+const RECALL_CLOSING: &str = "I am not certain of this from memory, so I will check it in the code now with a tool, and decide from what it shows.";
+
+/// What ends a thought that runs to the budget once the model has called
+/// a tool in the turn: what it is thinking about is then in the results,
+/// not recalled, and the thought is to be decided from, not checked over
+/// again. Ended with [`RECALL_CLOSING`], a thought that had found a
+/// spacing bug in a status line, from the function it had just read,
+/// re-read the function, thought the same two thousand tokens over again,
+/// and was sent by the second closing to the git history, three calls
+/// that bore nothing on the fix.
+const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need is in the output above. I will go with what I have worked out rather than go over it again: if there is a change to make, I make it now with edit, and otherwise I reply with it.";
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -548,8 +558,7 @@ impl<M: LanguageModel> Harness<M> {
         let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
         chat.reserve(reserve);
         chat.set_thinking(true);
-        chat.limit_thoughts(THINKING_BUDGET.unwrap_or(usize::MAX), BUDGET_CLOSING);
-        Ok(Self {
+        let mut harness = Self {
             chat,
             tools: Tools::new(),
             environment: Some(environment(dir)),
@@ -568,17 +577,32 @@ impl<M: LanguageModel> Harness<M> {
             auto: false,
             went_on: 0,
             log: Log::none(),
-        })
+        };
+        harness.limit_thoughts();
+        Ok(harness)
     }
 
     /// Limits a thought to `tokens`, or lifts the limit: a thought that
     /// runs to the budget is ended with a closing in the model's voice,
     /// and the model goes on to act on what it has thought so far.
     pub fn set_thinking_budget(&mut self, tokens: Option<usize>) {
-        self.chat
-            .limit_thoughts(tokens.unwrap_or(usize::MAX), BUDGET_CLOSING);
         self.thinking_budget = tokens;
+        self.limit_thoughts();
         self.log.thinking_budget(tokens);
+    }
+
+    /// Has the chat end a thought at the thinking budget with the closing
+    /// for where the turn is: to check with a tool before the model has
+    /// called one in the turn, when it is thinking from memory, and to
+    /// decide from the results once it has.
+    fn limit_thoughts(&mut self) {
+        let closing = if self.steps == 0 {
+            RECALL_CLOSING
+        } else {
+            DECIDE_CLOSING
+        };
+        self.chat
+            .limit_thoughts(self.thinking_budget.unwrap_or(usize::MAX), closing);
     }
 
     /// Runs the model's shell commands through `shell`, as `shell -c
@@ -745,6 +769,7 @@ impl<M: LanguageModel> Harness<M> {
                 input = Turn::User(GO_ON.to_string());
                 continue;
             }
+            self.limit_thoughts();
             let mut text = String::new();
             let before = self.chat.stats();
             let calls = {
@@ -1450,7 +1475,12 @@ mod tests {
             events,
             ["thought", "text", "call", "output", "thought", "text"]
         );
-        assert!(thought.contains(BUDGET_CLOSING), "{thought}");
+        // The first thought, before any call in the turn, is ended to
+        // check; the second, after the call, to decide.
+        let recall = thought.find(RECALL_CLOSING).expect(&thought);
+        let decide = thought.find(DECIDE_CLOSING).expect(&thought);
+        assert!(recall < decide, "{thought}");
+        assert_eq!(thought.matches(RECALL_CLOSING).count(), 1, "{thought}");
         assert!(thought.len() < 1000, "{}", thought.len());
         let turns: Vec<&Turn> = limited.transcript().collect();
         assert!(
@@ -1484,7 +1514,8 @@ mod tests {
             ControlFlow::Continue(())
         })
         .unwrap();
-        assert!(!thought.contains(BUDGET_CLOSING));
+        assert!(!thought.contains(RECALL_CLOSING));
+        assert!(!thought.contains(DECIDE_CLOSING));
         assert!(thought.len() >= 1000);
     }
 
