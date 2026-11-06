@@ -158,10 +158,6 @@ const MESSAGES: usize = 16;
 /// lines and the errors the model had spent the conversation finding.
 const NOTE_TOKENS: (usize, usize) = (256, 2048);
 
-/// Tokens kept for the framing around the note prompt and the note, over
-/// the two themselves.
-const FRAMING: usize = 32;
-
 /// Most tokens of the account of a turn that reached [`MAX_CALLS`], in a
 /// context with room for it. A small context allows a sixteenth of itself.
 const ACCOUNT_TOKENS: usize = 1024;
@@ -453,11 +449,6 @@ pub struct Harness<M: LanguageModel> {
     restart: Restart<M>,
     /// Most tokens of a note.
     note_tokens: usize,
-    /// Tokens kept free past every reply: room for the note prompt and
-    /// the note.
-    reserve: usize,
-    /// Most tokens of a thought, if they are limited.
-    thinking_budget: Option<usize>,
     /// Tool calls made in the turn so far, and the most there may be
     /// before the model is asked to reply.
     steps: usize,
@@ -555,9 +546,8 @@ impl<M: LanguageModel> Harness<M> {
         restart: impl FnMut(&mut Chat<M>) -> Result<(), Box<dyn Error>> + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let note_tokens = (chat.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
-        let reserve = chat.measure(&Turn::User(NOTE_PROMPT.to_string()))? + note_tokens + FRAMING;
+        let reserve = chat.answer_tokens(NOTE_PROMPT, note_tokens)?;
         chat.reserve(reserve);
-        chat.set_thinking(true);
         let mut harness = Self {
             chat,
             tools: Tools::new(),
@@ -568,8 +558,6 @@ impl<M: LanguageModel> Harness<M> {
             transcript: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
-            reserve,
-            thinking_budget: THINKING_BUDGET,
             steps: 0,
             max_calls: MAX_CALLS,
             unchanged: 0,
@@ -578,7 +566,7 @@ impl<M: LanguageModel> Harness<M> {
             went_on: 0,
             log: Log::none(),
         };
-        harness.limit_thoughts();
+        harness.limit_thoughts(THINKING_BUDGET);
         Ok(harness)
     }
 
@@ -586,23 +574,21 @@ impl<M: LanguageModel> Harness<M> {
     /// runs to the budget is ended with a closing in the model's voice,
     /// and the model goes on to act on what it has thought so far.
     pub fn set_thinking_budget(&mut self, tokens: Option<usize>) {
-        self.thinking_budget = tokens;
-        self.limit_thoughts();
+        self.limit_thoughts(tokens);
         self.log.thinking_budget(tokens);
     }
 
-    /// Has the chat end a thought at the thinking budget with the closing
-    /// for where the turn is: to check with a tool before the model has
-    /// called one in the turn, when it is thinking from memory, and to
-    /// decide from the results once it has.
-    fn limit_thoughts(&mut self) {
+    /// Has the chat end a thought at `tokens`, the thinking budget, if
+    /// there is one, with the closing for where the turn is: to check with
+    /// a tool before the model has called one in the turn, when it is
+    /// thinking from memory, and to decide from the results once it has.
+    fn limit_thoughts(&mut self, tokens: Option<usize>) {
         let closing = if self.steps == 0 {
             RECALL_CLOSING
         } else {
             DECIDE_CLOSING
         };
-        self.chat
-            .limit_thoughts(self.thinking_budget.unwrap_or(usize::MAX), closing);
+        self.chat.limit_thoughts(tokens, closing);
     }
 
     /// Runs the model's shell commands through `shell`, as `shell -c
@@ -635,11 +621,6 @@ impl<M: LanguageModel> Harness<M> {
         self.max_calls = calls;
     }
 
-    /// Most tokens of a thought, if they are limited.
-    pub fn thinking_budget(&self) -> Option<usize> {
-        self.thinking_budget
-    }
-
     /// Keeps a transcript of the session in `log`, starting with what the
     /// model was given before the first message: `model`, the `device` it
     /// runs on, where it is, the room it has, how it samples, its thinking
@@ -651,7 +632,7 @@ impl<M: LanguageModel> Harness<M> {
             &self.dir,
             self.chat.capacity(),
             self.chat.sampler(),
-            self.thinking_budget,
+            self.chat.thought_limit(),
             system,
         );
         self.log = log;
@@ -768,10 +749,11 @@ impl<M: LanguageModel> Harness<M> {
                 input = Turn::User(GO_ON.to_string());
                 continue;
             }
-            self.limit_thoughts();
+            let budget = self.chat.thought_limit();
+            self.limit_thoughts(budget);
             let mut text = String::new();
             let before = self.chat.stats();
-            let calls = {
+            let reply = {
                 let collect = |chunk: Chunk| {
                     match chunk {
                         Chunk::Thought(piece) => self.log.stream("thought", piece),
@@ -789,11 +771,10 @@ impl<M: LanguageModel> Harness<M> {
                     Turn::Reply { .. } => return Err("a reply is the model's to make".into()),
                 }
             };
-            let cut = self.chat.cut();
             self.log.reply(
-                &calls,
-                self.chat.thought_ended(),
-                cut,
+                &reply.calls,
+                reply.thought_ended,
+                reply.cut,
                 self.chat.tokens(),
                 &before,
                 &self.chat.stats(),
@@ -801,12 +782,12 @@ impl<M: LanguageModel> Harness<M> {
             self.record(input)?;
             self.record(Turn::Reply {
                 text,
-                calls: calls.clone(),
+                calls: reply.calls.clone(),
             })?;
-            if cut {
+            if reply.cut {
                 return Ok(Outcome::Cut);
             }
-            if calls.is_empty() {
+            if reply.calls.is_empty() {
                 if !self.go_on() {
                     return Ok(Outcome::Done);
                 }
@@ -814,7 +795,7 @@ impl<M: LanguageModel> Harness<M> {
                 continue;
             }
             let mut outputs = Vec::new();
-            for call in &calls {
+            for call in &reply.calls {
                 let mut seconds = None;
                 let mut changes = false;
                 self.steps += 1;
@@ -902,28 +883,28 @@ impl<M: LanguageModel> Harness<M> {
         let prompt = STEPS_PROMPT;
         self.log.user(prompt, None, self.chat.tokens());
         let before = self.chat.stats();
-        let text = self.chat.answer(prompt, self.account_limit(), |chunk| {
-            let Chunk::Text(text) = chunk else {
-                return ControlFlow::Continue(());
-            };
+        let answer = self.chat.answer(prompt, self.account_limit(), |text| {
             self.log.stream("text", text);
             on_event(Event::Text(text))
         })?;
-        let cut = self.chat.cut();
         self.log.reply(
             &[],
             false,
-            cut,
+            answer.cut,
             self.chat.tokens(),
             &before,
             &self.chat.stats(),
         );
         self.record(Turn::User(prompt.to_string()))?;
         self.record(Turn::Reply {
-            text,
+            text: answer.text,
             calls: Vec::new(),
         })?;
-        Ok(if cut { Outcome::Cut } else { Outcome::Done })
+        Ok(if answer.cut {
+            Outcome::Cut
+        } else {
+            Outcome::Done
+        })
     }
 
     /// Most tokens of the account of a turn: [`ACCOUNT_TOKENS`], or a
@@ -934,8 +915,7 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Most tokens the account of a turn takes, with the prompt for it.
     fn account_tokens(&self) -> Result<usize, Box<dyn Error>> {
-        let prompt = Turn::User(STEPS_PROMPT.to_string());
-        Ok(self.chat.measure(&prompt)? + self.account_limit() + FRAMING)
+        self.chat.answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
     /// Adds a turn to the transcript, and returns the tokens it takes.
@@ -964,7 +944,7 @@ impl<M: LanguageModel> Harness<M> {
         {
             return Ok(false);
         }
-        if self.chat.tokens() + needed + self.reserve > capacity {
+        if needed > self.chat.free() {
             return Err(
                 format!("a message of {needed} tokens does not fit in the context window").into(),
             );
@@ -1009,15 +989,15 @@ impl<M: LanguageModel> Harness<M> {
         }
         let before = self.chat.tokens();
         let mut interrupted = false;
-        let note = self.chat.answer(NOTE_PROMPT, self.note_tokens, |chunk| {
-            let Chunk::Text(text) = chunk else {
-                return ControlFlow::Continue(());
-            };
-            self.log.stream("note", text);
-            let flow = on_event(Event::Note(text));
-            interrupted |= flow.is_break();
-            flow
-        })?;
+        let note = self
+            .chat
+            .answer(NOTE_PROMPT, self.note_tokens, |text| {
+                self.log.stream("note", text);
+                let flow = on_event(Event::Note(text));
+                interrupted |= flow.is_break();
+                flow
+            })?
+            .text;
         if interrupted {
             return Ok(false);
         }
@@ -1295,6 +1275,10 @@ mod tests {
             max_len,
             "Task: keep going.\nNext: more of the same.",
         );
+        let reserve = harness
+            .chat
+            .answer_tokens(NOTE_PROMPT, harness.note_tokens)
+            .unwrap();
         let mut messages = 0;
         let (events, note) = loop {
             messages += 1;
@@ -1307,7 +1291,7 @@ mod tests {
                 events,
                 ["thought", "text", "call", "output", "thought", "text"]
             );
-            assert!(harness.tokens() <= max_len - harness.reserve);
+            assert!(harness.tokens() <= max_len - reserve);
         };
         assert!(messages > 1);
         // The compaction comes before the message or the tool results
@@ -1401,6 +1385,10 @@ mod tests {
         let mut harness = harness(&scripts, max_len, "Task: go on.");
         // The replies are long thoughts: not the budget's business here.
         harness.set_thinking_budget(None);
+        let reserve = harness
+            .chat
+            .answer_tokens(NOTE_PROMPT, harness.note_tokens)
+            .unwrap();
         for i in 0..3 {
             let (events, _) = send(&mut harness, &format!("message {i}"));
             assert_eq!(events, ["thought", "text"], "{i}");
@@ -1430,7 +1418,7 @@ mod tests {
                 .iter()
                 .any(|turn| matches!(turn, Turn::User(message) if message == "message 3"))
         );
-        assert!(harness.tokens() <= max_len - harness.reserve);
+        assert!(harness.tokens() <= max_len - reserve);
     }
 
     #[test]
@@ -1439,7 +1427,7 @@ mod tests {
         // with the closing, and the reply goes on to its call and its text.
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
-        assert_eq!(limited.thinking_budget(), THINKING_BUDGET);
+        assert_eq!(limited.chat.thought_limit(), THINKING_BUDGET);
         assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
         limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
@@ -1498,7 +1486,7 @@ mod tests {
         let scripts = [reply(1000, false)];
         let mut free = harness(&scripts, 8000, "");
         free.set_thinking_budget(None);
-        assert_eq!(free.thinking_budget(), None);
+        assert_eq!(free.chat.thought_limit(), None);
         let mut thought = String::new();
         free.send("go", |event| {
             if let Event::Thought(text) = event {
