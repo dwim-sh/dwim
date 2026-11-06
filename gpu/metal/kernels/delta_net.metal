@@ -53,7 +53,6 @@ kernel void delta_net(
         float softplus = z > 20.0f ? z : log(1.0f + exp(z));
         float g = exp(a * softplus);
         float beta = 1.0f / (1.0f + exp(-beta_raw));
-        // The state decays, and what it holds for the key is read out.
         uint kbase = ((t * p.n_k_heads + kh) * DIM + half_ * HALF) / 4;
         float mem = 0.0f;
         for (uint i = 0; i < 16; i++) {
@@ -63,7 +62,6 @@ kernel void delta_net(
         kv[lid] = mem;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float delta = (v[(t * p.n_v_heads + h) * DIM + j] - kv[j] - kv[DIM + j]) * beta;
-        // The value takes its place, and the query reads the state out.
         uint qbase = ((t * p.n_k_heads + kh) * DIM + half_ * HALF) / 4;
         float o = 0.0f;
         for (uint i = 0; i < 16; i++) {

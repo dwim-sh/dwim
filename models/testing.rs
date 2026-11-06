@@ -11,12 +11,10 @@ use crate::{LanguageModel, Tokenizer};
 /// of its scripts, then ends the reply. Once its scripts run out, it ends
 /// every reply at once.
 pub struct Scripted {
-    /// Every token fed so far, in order.
     pub fed: Vec<u32>,
     scripts: VecDeque<Vec<u32>>,
     /// What it says when asked for a plain answer, if not the next script.
     answer: Option<Vec<u32>>,
-    /// What is left of the reply being said.
     saying: VecDeque<u32>,
     /// Whether the last batch ended with the template's opening of a
     /// reply, and with the thought closed, so the next sampled token

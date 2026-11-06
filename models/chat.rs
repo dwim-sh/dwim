@@ -157,7 +157,6 @@ pub enum Chunk<'a> {
 }
 
 impl<M: LanguageModel> Chat<M> {
-    /// Starts a conversation.
     pub fn new(model: M, tokenizer: Tokenizer, sampler: Sampler) -> Result<Self> {
         Ok(Self {
             model,
@@ -493,7 +492,6 @@ impl<M: LanguageModel> Chat<M> {
         // the thought so far.
         let mut thinking = self.thinking;
         let mut thought = 0;
-        // The body of the tool call being written, if the model is in one.
         let mut call: Option<String> = None;
         // What has followed a <tool_call> tag written in the thought, while
         // it is not yet known whether the tag opens a call.
@@ -503,7 +501,6 @@ impl<M: LanguageModel> Chat<M> {
         let mut recent: Vec<u32> = Vec::new();
         let mut windows: HashMap<u64, u32> = HashMap::new();
         let mut repeating = false;
-        // Whether the reply has shown any text, or called a tool.
         let mut replied = false;
         // Whether the model tried to end the reply without doing either, and
         // must write out its answer before it may end.
@@ -644,8 +641,6 @@ impl<M: LanguageModel> Chat<M> {
                 held = Some(String::new());
                 ControlFlow::Continue(())
             } else if token == self.tool_call_end && thinking {
-                // A closing tag in the thought is part of it, shown as
-                // written.
                 let chunk = text.push(self.tokenizer.decode(token));
                 on_chunk(Chunk::Thought(&chunk))
             } else if token == self.tool_call {
@@ -677,9 +672,6 @@ impl<M: LanguageModel> Chat<M> {
                 interrupted = true;
                 break;
             }
-            // Count each token as sampled, even hidden ones (tool-call tags
-            // and bodies, closing tags) that produce no thought or text
-            // chunk.
             let flow = on_chunk(Chunk::Token);
             if flow.is_break() {
                 interrupted = true;
@@ -1219,7 +1211,6 @@ mod tests {
         let tokenizer = &chat.tokenizer;
         let mut turn = vec![chat.im_start];
         turn.extend(tokenizer.encode("user\n").unwrap());
-        // Plain results encode as the template would write them.
         turn.extend(
             tokenizer
                 .encode_with_special("<tool_response>\nout\n</tool_response>\n<tool_response>\n(exit 1)\n</tool_response>")

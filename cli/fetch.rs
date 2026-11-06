@@ -153,7 +153,6 @@ fn save(
         }
         writer.write_all(&buf[..n])?;
         done += n as u64;
-        // The file's last report, once it is complete, is made below.
         if Some(done) != total {
             progress(Progress { file, done, total });
         }

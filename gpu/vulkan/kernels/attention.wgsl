@@ -100,7 +100,6 @@ fn main(
     let kv = kvh * p.head_dim;
     let kv_dim = p.n_kv_heads * p.head_dim;
     let scale = inverseSqrt(f32(p.head_dim));
-    // The first query head of the group, for this token.
     let qbase = (t * p.n_heads + kvh * group) * p.head_dim;
 
     // Each lane of a subgroup takes four elements of a key, the lanes side

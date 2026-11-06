@@ -344,9 +344,6 @@ impl Stream {
         if self.total <= PREVIEW as u64 {
             return String::from_utf8_lossy(&self.head).trim_end().to_string();
         }
-        // Cut the start after a line end if one comes late enough to keep
-        // most of the half, and the end before one that comes early
-        // enough, and elsewhere at a character boundary.
         let head = &self.head[..HALF];
         let cut = match head.iter().rposition(|&b| b == b'\n') {
             Some(at) if at + 1 >= HALF / 2 => at + 1,

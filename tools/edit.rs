@@ -68,8 +68,6 @@ pub fn run(arguments: &Value) -> String {
         return "error: old_string and new_string are the same; nothing changed".to_string();
     }
     let wanted = split(old);
-    // Lines copied twice, in the old string and the new, which the note at
-    // the end of the result counts when there are many.
     let copied = kept(&wanted, &split(new));
     let start = match arguments.get("start") {
         None => None,
@@ -255,7 +253,6 @@ fn find(lines: &[Cow<str>], wanted: &[&str]) -> (Vec<usize>, Tier) {
 /// file without its ending, at `tier`; or its start, if `want` is a line
 /// `read` cut.
 fn matches(want: &str, line: &str, tier: Tier) -> bool {
-    // Whether read cut the line, as it stands, before any trimming.
     let long = line.len() > read::LINE;
     tier.trim(want) == tier.trim(line)
         || want

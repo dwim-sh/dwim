@@ -193,7 +193,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let r0 = ((tile / token_tiles) * p.stride + wg.x) * ROWS;
     let t0 = (tile % token_tiles) * TOKENS;
     let blocks = p.cols / BLOCK;
-    // The split's share of the blocks.
     let per_split = (blocks + p.splits - 1u) / p.splits;
     let b0 = split * per_split;
     let b1 = min(blocks, b0 + per_split);

@@ -168,8 +168,6 @@ impl Config {
         ]
     }
 
-    /// Width of the linear attention's queries and keys per token, and of
-    /// its values.
     /// Activations of a linear layer's convolution state: the tokens before
     /// the batch, a row of channels each.
     fn conv_width(&self) -> usize {
@@ -864,7 +862,6 @@ struct State<D: Device> {
 }
 
 impl<D: Device> State<D> {
-    /// Allocates state for sequences of up to `max_len` tokens.
     fn new(c: &Config, d: &D, max_len: usize, caches: usize, slots: usize) -> Self {
         let kv_dim = c.kv_heads * c.head_dim;
         let widths = c.widths();
@@ -909,7 +906,6 @@ impl<D: Device> State<D> {
         }
     }
 
-    /// Sizes the buffers for a batch of `n` tokens.
     fn batch(&mut self, device: &D, n: usize) {
         assert!(n <= BATCH, "a batch of {n} tokens is more than {BATCH}");
         let buffers = [
@@ -1167,8 +1163,6 @@ mod tests {
     fn run<D: Device>(path: &Path, device: D) -> [Vec<f32>; 3] {
         let gguf = Arc::new(Gguf::open(path).unwrap());
         let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
-        // A batch of several tokens, then one more, then a batch of many,
-        // each carrying the state.
         let first = model.forward(&[3, 17, 42, 7, 9], 0);
         let second = model.forward(&[11], 5);
         let many: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();

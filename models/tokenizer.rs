@@ -122,8 +122,6 @@ impl Tokenizer {
         let mut out = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
-            // The earliest special token in the text, and the longest one
-            // if several start there.
             let next = self
                 .special
                 .iter()

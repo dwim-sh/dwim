@@ -52,7 +52,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         let softplus = select(log(1.0 + exp(z)), z, z > 20.0);
         let g = exp(a * softplus);
         let beta = 1.0 / (1.0 + exp(-beta_raw));
-        // The state decays, and what it holds for the key is read out.
         let kbase = ((t * p.n_k_heads + kh) * DIM + half * HALF) / 4u;
         var mem = 0.0;
         for (var i = 0u; i < 16u; i++) {
@@ -62,7 +61,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         kv[lid] = mem;
         workgroupBarrier();
         let delta = (v[(t * p.n_v_heads + h) * DIM + j] - kv[j] - kv[DIM + j]) * beta;
-        // The value takes its place, and the query reads the state out.
         let qbase = ((t * p.n_k_heads + kh) * DIM + half * HALF) / 4u;
         var o = 0.0;
         for (var i = 0u; i < 16u; i++) {

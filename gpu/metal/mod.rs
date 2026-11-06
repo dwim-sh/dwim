@@ -446,7 +446,6 @@ impl Metal {
         };
         encoder
             .dispatchThreadgroups_threadsPerThreadgroup(size(groups.0, groups.1), size(threads, 1));
-        // Enough encoded for the GPU to get going on while the rest is.
         current.dispatched += 1;
         if current.dispatched >= SUBMIT_EVERY {
             let Pending { cmd, encoder, .. } = pending.take().unwrap();
@@ -938,7 +937,6 @@ impl Device for Metal {
             );
             return;
         }
-        // Each SIMD group takes one row of bf16 weights for eight tokens.
         self.dispatch_grid(
             &self.kernels.matmul_bf16,
             &[&out.buf, &w.buf, &x.buf],

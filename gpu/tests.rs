@@ -816,7 +816,6 @@ pub fn hadamard_matches_cpu<D: Device>(gpu: &D) {
             gpu.hadamard(&mut buf, &signs, inverse);
             close(&gpu.read(&buf), &want, 1e-5);
         }
-        // The inverse undoes the rotation.
         let mut back = x.clone();
         Cpu.hadamard(&mut back, &signs, false);
         Cpu.hadamard(&mut back, &signs, true);

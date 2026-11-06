@@ -37,7 +37,6 @@ pub fn run(arguments: &Value) -> String {
     if segments.is_empty() {
         return "error: the pattern is empty".to_string();
     }
-    // A name alone is a name anywhere.
     let segments = if segments.len() == 1 {
         vec!["**", segments[0]]
     } else {

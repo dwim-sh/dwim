@@ -66,7 +66,6 @@ kernel void matmul_ternary_tile(
     uint r0 = group.x * ROWS;
     uint t0 = group.y * TOKENS;
     uint blocks = p.cols / BLOCK;
-    // The SIMD group's rows and tokens of the tile.
     uint sr = (sg % 2) * 32;
     uint st = (sg / 2) * (TOKENS / 2);
     // The row the thread unpacks, clamped into the matrix; a row past the

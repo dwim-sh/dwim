@@ -735,7 +735,6 @@ impl<M: LanguageModel> Harness<M> {
         mut ahead: Option<String>,
         on_event: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> Result<Outcome, Box<dyn Error>> {
-        // The last call run, as its name and arguments.
         let mut last = None;
         loop {
             if let Turn::User(message) = &input {
@@ -1262,9 +1261,6 @@ mod tests {
         let mut note = String::new();
         harness
             .send(message, |event| {
-                // The `Token` events only move the rate counter; they carry
-                // no text and are not interesting to the event-sequence
-                // assertions.
                 let name = match event {
                     Event::Thought(_) => "thought",
                     Event::Text(_) => "text",
@@ -1452,9 +1448,6 @@ mod tests {
         let mut events = Vec::new();
         limited
             .send("go", |event| {
-                // The `Token` events only move the rate counter; they carry
-                // no text and are not interesting to the event-sequence
-                // assertions.
                 let name = match event {
                     Event::Thought(text) => {
                         thought.push_str(text);

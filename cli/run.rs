@@ -837,8 +837,6 @@ impl App {
             &text
         };
         self.reply.push_str(text);
-        // The tokens are counted by the `Token` events as they are sampled;
-        // a text or thought chunk only moves the clock, never the count.
         if !matches!(self.status, Status::Generating { .. }) {
             self.status = Status::Generating {
                 start: Instant::now(),
@@ -955,8 +953,6 @@ impl App {
         if !live.is_empty() || !blank {
             live.push(Line::new());
         }
-        // What the model is doing, while it is busy, just above the input
-        // box.
         if let Some(status) = self.status() {
             live.push(status);
         }

@@ -118,7 +118,6 @@ pub fn shown_line(line: &[u8]) -> (String, bool) {
 fn page(mut file: impl BufRead, path: &str, start: u64, most: usize) -> io::Result<String> {
     let mut text = String::new();
     let mut line = Vec::new();
-    // Lines read so far, shown in the page, and cut for length.
     let (mut lines, mut shown, mut cut) = (0, 0, 0);
     loop {
         line.clear();
@@ -132,7 +131,6 @@ fn page(mut file: impl BufRead, path: &str, start: u64, most: usize) -> io::Resu
         let (content, long) = shown_line(&line);
         let entry = format!("{lines}\t{content}\n");
         if shown == most || (shown > 0 && text.len() + entry.len() > BYTES) {
-            // The file goes on past the page: count the rest.
             lines += count(&mut file)?;
             break;
         }

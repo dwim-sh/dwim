@@ -286,7 +286,6 @@ impl Device for Cpu {
         assert!(state.len() == (CONV_KERNEL - 1) * channels && state_out.len() == state.len());
         let (q_dim, k_dim, v_dim) = (q.len() / n, k.len() / n, v.len() / n);
         assert_eq!(q_dim + k_dim + v_dim, channels);
-        // The rows before the batch, then the batch.
         let input = |t: isize, c: usize| {
             if t < 0 {
                 state[(t + CONV_KERNEL as isize - 1) as usize * channels + c]

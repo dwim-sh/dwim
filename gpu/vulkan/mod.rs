@@ -745,7 +745,6 @@ impl Vulkan {
             self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
         }
         self.barrier(cmd);
-        // Enough recorded for the GPU to get going on.
         let recorded = {
             let mut ring = self.ring.lock().unwrap();
             ring.recorded += 1;
@@ -1090,7 +1089,6 @@ impl Device for Vulkan {
             offset: offset as u32,
             len: src.len as u32,
         };
-        // A thread for each word of scales the blocks have.
         let (first, blocks) = (offset / CACHE_BLOCK, src.len / CACHE_BLOCK);
         let words = (first + blocks).div_ceil(2) - first / 2;
         let groups = self.groups(words, 64);
