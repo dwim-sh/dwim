@@ -623,7 +623,8 @@ impl<M: LanguageModel> Harness<M> {
     /// Sets how many tool calls in a row without a file changed by `edit`
     /// or `write` the model may make before it is reminded to make its
     /// change, [`NUDGE_AFTER`] unless set.
-    pub fn set_nudge_after(&mut self, calls: usize) {
+    #[cfg(test)]
+    fn set_nudge_after(&mut self, calls: usize) {
         self.nudge_after = calls;
     }
 
@@ -638,7 +639,8 @@ impl<M: LanguageModel> Harness<M> {
 
     /// Sets how many tool calls the model may make in one turn before it
     /// is asked to reply with what it has, [`MAX_CALLS`] unless set.
-    pub fn set_call_limit(&mut self, calls: usize) {
+    #[cfg(test)]
+    fn set_call_limit(&mut self, calls: usize) {
         self.max_calls = calls;
     }
 
@@ -668,14 +670,10 @@ impl<M: LanguageModel> Harness<M> {
         }
     }
 
-    /// Number of tokens in the conversation so far.
-    pub fn tokens(&self) -> usize {
-        self.chat.tokens()
-    }
-
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
-    pub fn transcript(&self) -> impl Iterator<Item = &Turn> {
+    #[cfg(test)]
+    fn transcript(&self) -> impl Iterator<Item = &Turn> {
         self.transcript.iter().map(|entry| &entry.turn)
     }
 
@@ -1275,7 +1273,7 @@ mod tests {
                 events,
                 ["thought", "text", "call", "output", "thought", "text"]
             );
-            assert!(harness.tokens() <= max_len - reserve);
+            assert!(harness.chat.tokens() <= max_len - reserve);
         };
         assert!(messages > 1);
         // The compaction comes before the message or the tool results
@@ -1328,8 +1326,8 @@ mod tests {
         let fed = &harness.chat.model().fed;
         let expected = Tokenizer::tiny().encode_with_special(&format!("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{head}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")).unwrap();
         assert_eq!(&fed[..expected.len()], expected);
-        assert!(harness.tokens() < max_len / 2);
-        assert_eq!(harness.tokens(), fed.len());
+        assert!(harness.chat.tokens() < max_len / 2);
+        assert_eq!(harness.chat.tokens(), fed.len());
 
         // The conversation goes on, and the earlier note is not a message
         // of the user's the next time.
@@ -1402,7 +1400,7 @@ mod tests {
                 .iter()
                 .any(|turn| matches!(turn, Turn::User(message) if message == "message 3"))
         );
-        assert!(harness.tokens() <= max_len - reserve);
+        assert!(harness.chat.tokens() <= max_len - reserve);
     }
 
     #[test]
