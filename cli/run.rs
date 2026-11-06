@@ -543,7 +543,7 @@ impl App {
                 return;
             }
             Some(Err(what)) => {
-                self.say(notice(what));
+                self.say(&notice(what));
                 return;
             }
         };
@@ -805,12 +805,12 @@ impl App {
                 return;
             }
         };
-        self.say(lines);
+        self.say(&lines);
     }
 
     /// Prints `lines` above the live region, cut to the terminal's width,
     /// with a blank line after them.
-    fn say(&mut self, lines: Vec<Line>) {
+    fn say(&mut self, lines: &[Line]) {
         let (columns, _) = self.screen.size();
         self.lines
             .extend(lines.iter().map(|line| tui::truncate(line, columns)));
