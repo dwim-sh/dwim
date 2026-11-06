@@ -443,7 +443,6 @@ enum Outcome {
 /// A turn as the transcript keeps it: the turn, the tokens it takes read
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
-#[derive(Clone)]
 struct Entry {
     turn: Turn,
     tokens: usize,
