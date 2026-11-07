@@ -917,7 +917,7 @@ impl<M: LanguageModel> Harness<M> {
         let before = self.chat.stats();
         let answer = self
             .chat
-            .answer(STEPS_PROMPT, self.account_limit(), |text| {
+            .answer(STEPS_PROMPT, &[], self.account_limit(), |text| {
                 self.log.stream("text", text);
                 on_event(Event::Text(text.to_string()))
             })?;
@@ -1433,7 +1433,7 @@ mod tests {
         // stopped short and goes on after a compaction.
         let mut scripts = vec![reply(100, true), reply(100, false)];
         scripts.extend((0..8).map(|_| reply(1800, false)));
-        let mut harness = harness(&scripts, 8000, "Task: go on.");
+        let mut harness = harness(&scripts, 8000, " go on.");
         // The long thoughts are to be stopped short for room, not ended
         // at the budget.
         harness.set_thinking_budget(None);
@@ -1499,7 +1499,10 @@ mod tests {
                 "reply"
             ]
         );
-        assert_eq!(records[cut + 2]["text"], "Task: go on.");
+        assert_eq!(
+            records[cut + 2]["text"],
+            "Task: go on.\n\nFindings:\n\nDone:\n\nNext:"
+        );
         assert!(records[cut + 3]["after"].as_u64() < records[cut + 3]["before"].as_u64());
         let head = records[cut + 3]["head"].as_str().unwrap();
         assert!(head.starts_with("# Environment"), "{head}");
