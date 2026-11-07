@@ -116,11 +116,14 @@ impl Opened {
 }
 
 /// Tokens of conversation the model has room for, and the device memory
-/// it takes with them.
+/// it takes: `model` bytes for the weights, activations, and recurrent
+/// states, whatever the context, and `conversation` bytes more for the
+/// tokens of context.
 #[derive(Clone, Copy, Debug)]
 pub struct Size {
     pub context: usize,
-    pub bytes: u64,
+    pub model: u64,
+    pub conversation: u64,
 }
 
 /// The size of the model on `device`, with room for `context` tokens of
@@ -142,7 +145,8 @@ pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size
     }
     Ok(Size {
         context,
-        bytes: memory.fixed + memory.per_token * context as u64,
+        model: memory.fixed,
+        conversation: memory.per_token * context as u64,
     })
 }
 
@@ -169,12 +173,14 @@ pub fn default_size(device: opts::Device) -> Option<Size> {
     size(&gguf, &Opened::open(device).ok()?, None).ok()
 }
 
-/// `size` as words: the tokens of context and the memory they take.
+/// `size` as words: the memory the model takes, and the tokens of context
+/// and the memory they take.
 pub fn describe(size: &Size) -> String {
     format!(
-        "{} tokens of context, {} of memory",
+        "model: {} · context: {} tokens ({})",
+        bytes(size.model),
         size.context,
-        bytes(size.bytes)
+        bytes(size.conversation)
     )
 }
 

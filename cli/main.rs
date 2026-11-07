@@ -165,9 +165,10 @@ fn layout(output: &str, size: Option<model::Size>) -> String {
     if let (Some(size), Some((_, description))) = (size, options.get_mut("--context")) {
         *description = format!(
             "tokens of conversation the model has room for (default: {} on this machine, \
-             taking {} of memory)",
+             taking {} beside the model's {})",
             size.context,
-            model::bytes(size.bytes)
+            model::bytes(size.conversation),
+            model::bytes(size.model)
         );
     }
     let mut text = format!("{USAGE}\n\n");
@@ -327,7 +328,8 @@ mod tests {
     fn help_fits_the_width() {
         let size = model::Size {
             context: 65536,
-            bytes: 20_000_000_000,
+            model: 17_000_000_000,
+            conversation: 3_000_000_000,
         };
         let text = layout(&output(), Some(size));
         for line in text.lines() {

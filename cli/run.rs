@@ -1013,8 +1013,9 @@ fn tilde(path: &Path) -> String {
 }
 
 /// The model, for the `/model` command: its source and its weights on
-/// disk, the device it runs on and how much conversation it has room for,
-/// as a table of labels and values.
+/// disk, the device it runs on and the memory the model takes there, and
+/// how much conversation it has room for and the memory that takes, as a
+/// table of labels and values.
 fn model_listing(
     name: &str,
     device: Device,
@@ -1041,11 +1042,14 @@ fn model_listing(
         }
         Err(e) => e.to_string(),
     };
-    let on = match (device, device_name) {
+    let mut on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
         (Device::Gpu, None) => "GPU".to_string(),
         (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
     };
+    if let Some(size) = size {
+        on.push_str(&format!(" · {}", model::bytes(size.model)));
+    }
     let mut rows = vec![
         (
             "source",
@@ -1058,9 +1062,9 @@ fn model_listing(
         rows.push((
             "context",
             format!(
-                "{} tokens in {} of memory",
+                "{} tokens ({})",
                 size.context,
-                model::bytes(size.bytes)
+                model::bytes(size.conversation)
             ),
         ));
     }
