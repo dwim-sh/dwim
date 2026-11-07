@@ -9,7 +9,8 @@ use crate::models::{LanguageModel, Result, Tokenizer, chat};
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
 /// of its scripts, then ends the reply. Once its scripts run out, it ends
-/// every reply at once.
+/// every reply at once. Its state is the tokens fed, which it saves and
+/// restores.
 pub struct Scripted {
     pub fed: Vec<u32>,
     scripts: VecDeque<Vec<u32>>,
@@ -136,6 +137,25 @@ impl LanguageModel for Scripted {
         let mut logits = vec![0.0; self.vocab];
         logits[next as usize] = 1.0;
         logits
+    }
+
+    /// The tokens fed so far, as bytes.
+    fn save(&self, len: usize) -> Option<Vec<u8>> {
+        Some(
+            self.fed[..len]
+                .iter()
+                .flat_map(|token| token.to_le_bytes())
+                .collect(),
+        )
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<usize> {
+        self.reset();
+        self.fed = state
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        Ok(self.fed.len())
     }
 
     fn mark(&mut self) -> bool {

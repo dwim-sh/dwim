@@ -1,6 +1,5 @@
 //! The one model, Qwen3.8-27B: finding its files, the device it runs on,
-//! how much conversation it has room for there, the state saved after the
-//! system prompt, and how it samples.
+//! how much conversation it has room for there, and how it samples.
 
 use std::{
     error::Error,
@@ -11,13 +10,11 @@ use std::{
 };
 
 use dwim::gpu::{Cpu, Device as _, Gpu};
-use dwim::models::{Chat, Gguf, LanguageModel, Sampler, qwen35};
+use dwim::models::{Gguf, LanguageModel, Sampler, qwen35};
+
+pub use dwim::server::protocol::Size;
 
 use crate::opts;
-
-/// Saved states kept, newest first: a state is a few hundred megabytes,
-/// and the system prompt changes with the project's `AGENTS.md`.
-const STATES_KEPT: usize = 4;
 
 /// Tokens of conversation the model has room for when the device cannot
 /// tell how much memory it has free, and the command line does not say.
@@ -115,17 +112,6 @@ impl Opened {
     }
 }
 
-/// Tokens of conversation the model has room for, and the device memory
-/// it takes: `model` bytes for the weights, activations, and recurrent
-/// states, whatever the context, and `conversation` bytes more for the
-/// tokens of context.
-#[derive(Clone, Copy, Debug)]
-pub struct Size {
-    pub context: usize,
-    pub model: u64,
-    pub conversation: u64,
-}
-
 /// The size of the model on `device`, with room for `context` tokens of
 /// conversation, or as many as fit in the memory it has free.
 pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size, Box<dyn Error>> {
@@ -197,68 +183,6 @@ pub fn bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
-}
-
-/// Opens the conversation with the system prompt: from the state saved by
-/// an earlier run with the same prompt, if there is one and it fits, and
-/// otherwise by reading the prompt, reporting progress as `Chat::system`
-/// does, and saving the state for the next run. Returns whether the state
-/// was restored.
-pub fn start<M: LanguageModel>(
-    chat: &mut Chat<M>,
-    prompt: &str,
-    on_progress: impl FnMut(usize, usize),
-) -> Result<bool, Box<dyn Error>> {
-    let path = state_path(prompt);
-    if let Some(path) = &path
-        && let Ok(state) = fs::read(path)
-        && chat.restore(&state).is_ok()
-    {
-        return Ok(true);
-    }
-    chat.system(prompt, on_progress)?;
-    if let Some(path) = path
-        && let Some(state) = chat.save()
-        && let Some(dir) = path.parent()
-        && fs::create_dir_all(dir).is_ok()
-        && fs::write(&path, state).is_ok()
-    {
-        prune(dir);
-    }
-    Ok(false)
-}
-
-/// Where the state after `prompt` is kept: named by a hash of the model's
-/// name and the prompt, in the cache directory.
-fn state_path(prompt: &str) -> Option<PathBuf> {
-    // FNV-1a, so that the name is the same from one build to the next.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in NAME.bytes().chain([0]).chain(prompt.bytes()) {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    Some(
-        dirs::cache_dir()?
-            .join("dwim")
-            .join("states")
-            .join(format!("{hash:016x}.bin")),
-    )
-}
-
-/// Removes all but the newest saved states.
-fn prune(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut states: Vec<_> = entries
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
-        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-        .collect();
-    states.sort();
-    for (_, path) in states.iter().rev().skip(STATES_KEPT) {
-        let _ = fs::remove_file(path);
-    }
 }
 
 /// The sampler for the model, with the settings its file recommends where

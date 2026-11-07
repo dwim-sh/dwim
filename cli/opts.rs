@@ -38,6 +38,11 @@ pub struct Opts {
     #[argh(switch)]
     pub bench: bool,
 
+    /// run the server that has the model, which sessions connect to, in the
+    /// foreground; a session starts one itself when none is running
+    #[argh(switch)]
+    pub serve: bool,
+
     /// show the model's thinking and the files it reads in the shell,
     /// which ctrl+o toggles
     #[argh(switch)]
