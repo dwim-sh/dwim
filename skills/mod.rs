@@ -16,6 +16,9 @@ use std::{
 /// The file a skill is.
 pub const FILE: &str = "SKILL.md";
 
+/// Most files of a skill's directory the loaded skill lists.
+pub const MAX_FILES: usize = 20;
+
 /// A skill: its name, what it is for, and the directory its SKILL.md is in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Skill {
@@ -215,6 +218,56 @@ pub fn find(dir: &Path) -> Found {
     scan(&roots(dir))
 }
 
+/// The skill's instructions as the model gets them: its `SKILL.md`'s body
+/// after the frontmatter, whole when there is no frontmatter, named with
+/// the directory it is in, with the files of that directory beside it.
+pub fn load(skill: &Skill) -> Result<String, String> {
+    let path = skill.dir.join(FILE);
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let body = split(&text)
+        .map(|(_, body)| body)
+        .unwrap_or(&text)
+        .trim()
+        .to_string();
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(&skill.dir) {
+        let mut entries = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != FILE && !name.starts_with('.'))
+            .collect::<Vec<_>>();
+        entries.sort();
+        for name in entries {
+            files.push(if skill.dir.join(&name).is_dir() {
+                format!("{name}/")
+            } else {
+                name
+            });
+        }
+    }
+    let files = if files.len() > MAX_FILES {
+        let mut shown = files[..MAX_FILES].join(", ");
+        shown.push_str(&format!(" and {} more", files.len() - MAX_FILES));
+        shown
+    } else {
+        files.join(", ")
+    };
+    let tail = if files.is_empty() {
+        String::from("No other files are there.")
+    } else {
+        format!(
+            "Paths in these instructions are relative to {}. Files there besides {FILE}: {files}",
+            skill.dir.display()
+        )
+    };
+    Ok(format!(
+        "<skill name=\"{}\" directory=\"{}\">\n{body}\n</skill>\n\n{tail}",
+        skill.name,
+        skill.dir.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -222,7 +275,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{Skill, parse, roots, scan};
+    use super::{FILE, Skill, load, parse, roots, scan};
 
     #[test]
     fn parses_the_frontmatter() {
@@ -356,6 +409,65 @@ mod tests {
             found.skipped,
             vec![(dir.join("b/bad/SKILL.md"), "no description".to_string())]
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn loads_the_instructions() {
+        let dir = std::env::temp_dir().join(format!("dwim-skill-load-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let one = dir.join("one");
+        let two = dir.join("two");
+        fs::create_dir_all(one.join("scripts")).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        fs::write(
+            one.join("SKILL.md"),
+            "---\nname: one\ndescription: One.\n---\nDo one.\n",
+        )
+        .unwrap();
+        fs::write(one.join("scripts/run.sh"), "").unwrap();
+        fs::write(one.join("a.txt"), "").unwrap();
+        fs::write(one.join(".hidden"), "").unwrap();
+        fs::write(
+            two.join("SKILL.md"),
+            "No frontmatter here.\nJust the body.\n",
+        )
+        .unwrap();
+        let one = Skill {
+            name: "one".into(),
+            description: "One.".into(),
+            dir: one,
+        };
+        let text = load(&one).unwrap();
+        assert!(text.starts_with("<skill name=\"one\" directory="), "{text}");
+        assert!(text.contains("Do one.\n</skill>"), "{text}");
+        assert!(
+            text.ends_with(
+                &format!(
+                    "Paths in these instructions are relative to {}. Files there besides {FILE}: a.txt, scripts/",
+                    one.dir.display()
+                )
+            ),
+            "{text}"
+        );
+        let two = Skill {
+            name: "two".into(),
+            description: "Two.".into(),
+            dir: two,
+        };
+        let text = load(&two).unwrap();
+        assert!(
+            text.contains("No frontmatter here.\nJust the body.\n</skill>"),
+            "{text}"
+        );
+        assert!(text.ends_with("No other files are there."), "{text}");
+        let missing = Skill {
+            name: "gone".into(),
+            description: "Gone.".into(),
+            dir: dir.join("gone"),
+        };
+        let err = load(&missing).unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

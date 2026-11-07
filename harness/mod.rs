@@ -248,7 +248,7 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    prompt.push_str(&tools());
+    prompt.push_str(&tools(!crate::skills::find(dir).skills.is_empty()));
     prompt.push_str("\n\n");
     prompt.push_str(&instructions());
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
@@ -260,11 +260,13 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
 }
 
 /// The tools, declared as the model's chat template puts them: the start of
-/// the system prompt, before what the user's system prompt says.
-fn tools() -> String {
+/// the system prompt, before what the user's system prompt says. The
+/// `skill` tool is declared when `skill` is true, when there are skills to
+/// load.
+fn tools(skill: bool) -> String {
     format!(
         "# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}\n</tools>\n\n{CALLING}",
-        crate::tools::signatures()
+        crate::tools::signatures(skill)
     )
 }
 

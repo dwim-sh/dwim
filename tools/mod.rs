@@ -1,11 +1,12 @@
 //! The tools the model can call: `bash`, which runs a shell command,
 //! `read`, which gives it a file a page at a time, `edit`, which replaces
 //! a string in a file with another, `write`, which writes a file whole,
-//! `grep`, which searches files for a pattern, and `glob`, which lists
-//! the files whose paths match one. Each is a [`Tool`]: the signature the
-//! system prompt declares it with, whether it changes a file, how a call
-//! reads on screen, and what it does. The tools work in the directory the
-//! agent does: a path a call gives is taken from there.
+//! `grep`, which searches files for a pattern, `glob`, which lists the
+//! files whose paths match one, and `skill`, which loads a skill's
+//! instructions by name. Each is a [`Tool`]: the signature the system
+//! prompt declares it with, whether it changes a file, how a call reads on
+//! screen, and what it does. The tools work in the directory the agent
+//! does: a path a call gives is taken from there.
 
 pub mod bash;
 mod call;
@@ -13,6 +14,7 @@ mod edit;
 mod glob;
 mod grep;
 pub mod read;
+mod skill;
 mod write;
 
 use std::{
@@ -22,6 +24,7 @@ use std::{
 
 use serde_json::Value;
 
+use crate::skills::Skill;
 use crate::tools::bash::Bash;
 pub use crate::tools::call::ToolCall;
 
@@ -40,13 +43,14 @@ pub struct Tool {
 }
 
 /// The tools, in the order the system prompt lists them.
-static TOOLS: [Tool; 6] = [
+static TOOLS: [Tool; 7] = [
     bash::TOOL,
     read::TOOL,
     edit::TOOL,
     write::TOOL,
     grep::TOOL,
     glob::TOOL,
+    skill::TOOL,
 ];
 
 /// The tool called `name`.
@@ -55,9 +59,12 @@ fn tool(name: &str) -> Option<&'static Tool> {
 }
 
 /// The tools' signatures, one per line, as the system prompt lists them.
-pub fn signatures() -> String {
+/// The tool named `skill` is left out when `skill` is false: it is
+/// declared only when there are skills to load.
+pub fn signatures(skill: bool) -> String {
     TOOLS
         .iter()
+        .filter(|tool| skill || tool.name != skill::TOOL.name)
         .map(|tool| (tool.signature)().json(tool.name))
         .collect::<Vec<_>>()
         .join("\n")
@@ -145,15 +152,19 @@ impl Signature {
 pub struct Tools {
     dir: PathBuf,
     bash: Bash,
+    /// The skills the `skill` tool can load.
+    skills: Vec<Skill>,
 }
 
 impl Tools {
     /// The tools working in `dir`: a path a call gives is taken from
-    /// there, and `bash` runs there.
+    /// there, `bash` runs there, and `skill` loads the skills of the
+    /// project there and of the user.
     pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
             bash: Bash::default(),
+            skills: crate::skills::find(dir).skills,
         }
     }
 
@@ -454,13 +465,19 @@ mod tests {
 
     #[test]
     fn lists_the_tools() {
-        let signatures = signatures();
-        assert_eq!(signatures.lines().count(), TOOLS.len());
-        for (line, tool) in signatures.lines().zip(&TOOLS) {
+        let all = signatures(true);
+        assert_eq!(all.lines().count(), TOOLS.len());
+        for (line, tool) in all.lines().zip(&TOOLS) {
             let signature: Value = serde_json::from_str(line).unwrap();
             assert_eq!(signature["type"], "function");
             assert_eq!(signature["function"]["name"], tool.name);
             assert!(signature["function"]["parameters"]["required"].is_array());
+        }
+        let without = signatures(false);
+        assert_eq!(without.lines().count(), TOOLS.len() - 1);
+        for line in without.lines() {
+            let signature: Value = serde_json::from_str(line).unwrap();
+            assert_ne!(signature["function"]["name"], "skill");
         }
         // As Python's json.dumps writes it, which the template's tojson
         // does, with the constants the tools work by in the prose.
