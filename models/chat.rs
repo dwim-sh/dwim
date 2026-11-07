@@ -445,9 +445,20 @@ impl<M: LanguageModel> Chat<M> {
     /// without thinking, without tool calls, and in at most `limit` tokens,
     /// streaming the answer to `on_text` as it is generated. The answer is
     /// what the reserve is for, so it may use it.
+    ///
+    /// The answer is written under `heads` in turn: each head is written
+    /// into the reply as the model's own, and the model goes on from it
+    /// until it ends the reply or uses the head's share of what is left of
+    /// `limit`, when the next head is written and the model goes on from
+    /// that. So an answer the model ends early still has every head, and
+    /// the last head has room of its own. With no heads, the model writes
+    /// the whole answer. An answer cut for room in the context has every
+    /// head all the same, unless there is no room for even them. The
+    /// answer returned has the heads in it.
     pub fn answer(
         &mut self,
         message: &str,
+        heads: &[&str],
         limit: usize,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer> {
@@ -459,25 +470,66 @@ impl<M: LanguageModel> Chat<M> {
         let mut text = Utf8Stream::default();
         let mut answer = String::new();
         let end = self.end_of_reply(false)?;
+        let heads: Vec<(&str, Vec<u32>)> = heads
+            .iter()
+            .map(|head| Ok((*head, self.tokenizer.encode(head)?)))
+            .collect::<Result<_>>()?;
+        // Tokens of the heads yet to be written. Each section leaves room
+        // for them, so that an answer cut for room still has every head:
+        // only the sections are cut short.
+        let mut ahead: usize = heads.iter().map(|(_, tokens)| tokens.len()).sum();
         let mut cut = false;
-        for _ in 0..limit {
-            if !self.room(end.len(), 0) {
-                cut = true;
-                break;
+        // A section for each head, or one for the whole answer.
+        let sections = heads.len().max(1);
+        let mut left = limit;
+        'sections: for i in 0..sections {
+            if let Some((head, tokens)) = heads.get(i) {
+                ahead -= tokens.len();
+                // Only the first head can want for room, with the heads
+                // after it and the end: each section leaves room for the
+                // heads after it.
+                if self.len + tokens.len() + ahead + end.len() > self.model.max_len() {
+                    cut = true;
+                    break;
+                }
+                left = left.saturating_sub(tokens.len());
+                // The head goes through the stream like the tokens: a
+                // character the last section was cut in the middle of is
+                // shown as the stray bytes it is, before the head, rather
+                // than glued to what the model says after it.
+                let chunk = text.push(head.as_bytes());
+                answer.push_str(&chunk);
+                let flow = on_text(&chunk);
+                logits = self.feed(tokens, Kind::Answer)?;
+                if flow.is_break() {
+                    break;
+                }
             }
-            for token in [self.think, self.think_end, self.tool_call] {
-                logits[token as usize] = f32::NEG_INFINITY;
-            }
-            let token = self.pick(&logits);
-            if token == self.im_end || token == self.end_of_text {
-                break;
-            }
-            let chunk = text.push(self.tokenizer.decode(token));
-            answer.push_str(&chunk);
-            let flow = on_text(&chunk);
-            logits = self.step(token, Kind::Answer)?;
-            if flow.is_break() {
-                break;
+            // The section's share of what is left: an even share with the
+            // sections to come, so that the last has whatever is left.
+            let share = left / (sections - i);
+            for _ in 0..share {
+                if !self.room(ahead + end.len(), 0) {
+                    // The section ends here, and so does each to come,
+                    // after its head.
+                    cut = true;
+                    break;
+                }
+                for token in [self.think, self.think_end, self.tool_call] {
+                    logits[token as usize] = f32::NEG_INFINITY;
+                }
+                let token = self.pick(&logits);
+                if token == self.im_end || token == self.end_of_text {
+                    break;
+                }
+                let chunk = text.push(self.tokenizer.decode(token));
+                answer.push_str(&chunk);
+                let flow = on_text(&chunk);
+                logits = self.step(token, Kind::Answer)?;
+                left -= 1;
+                if flow.is_break() {
+                    break 'sections;
+                }
             }
         }
         self.feed(&end, Kind::Prompt)?;
@@ -1129,16 +1181,42 @@ mod tests {
 
         // The reserve is room for a plain answer, which may use it.
         let answer = chat
-            .answer("x", 100, |_| ControlFlow::Continue(()))
+            .answer("x", &[], 100, |_| ControlFlow::Continue(()))
             .unwrap();
         assert_eq!(answer.text, "Short.");
         assert!(!answer.cut);
         assert!(chat.tokens() <= max_len);
         // A message with no room left for even its framing is refused.
         assert!(
-            chat.answer("y", 100, |_| ControlFlow::Continue(()))
+            chat.answer("y", &[], 100, |_| ControlFlow::Continue(()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn replays_past_an_opening_at_the_end_of_a_batch() {
+        // A batch of the replay ends with the opening of a reply that the
+        // next batch goes on past: the model takes up no script for it,
+        // and says the script when a reply is opened for it.
+        let mut chat = chat(&["First.\n</think>\n\nOne."]);
+        let opening = opening(&chat.tokenizer, false).unwrap().len();
+        // The replay is read in batches from its own first token.
+        let mut message = String::new();
+        while !(chat.measure(&Turn::User(message.clone())).unwrap() + opening).is_multiple_of(BATCH)
+        {
+            message.push('x');
+        }
+        let turns = [
+            Turn::User(message),
+            Turn::Reply {
+                text: "Checking in.".to_string(),
+                calls: Vec::new(),
+            },
+        ];
+        chat.replay(&turns).unwrap();
+        let mut streamed = String::new();
+        chat.send("go", text(&mut streamed)).unwrap();
+        assert_eq!(streamed.trim(), "One.");
     }
 
     #[test]
@@ -1150,7 +1228,7 @@ mod tests {
         ]);
         let mut streamed = String::new();
         let answer = chat
-            .answer("sum up", 100, |piece| {
+            .answer("sum up", &[], 100, |piece| {
                 streamed.push_str(piece);
                 ControlFlow::Continue(())
             })
@@ -1179,10 +1257,116 @@ mod tests {
 
         // An answer is cut at the limit.
         let answer = chat
-            .answer("again", 3, |_| ControlFlow::Continue(()))
+            .answer("again", &[], 3, |_| ControlFlow::Continue(()))
             .unwrap();
         assert_eq!(chat.tokenizer.encode(&answer.text).unwrap().len(), 3);
         assert_eq!(answer.text, "One");
+    }
+
+    #[test]
+    fn answers_under_heads() {
+        // The model ends its answer early, twice: each head pulls it on,
+        // and the answer has every head.
+        let mut chat = chat(&[" fix it.<|im_end|> none yet.<|im_end|>"]);
+        let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
+        let mut streamed = String::new();
+        let answer = chat
+            .answer("note", &heads, 100, |piece| {
+                streamed.push_str(piece);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(
+            answer.text,
+            "Task: fix it.\n\nFindings: none yet.\n\nDone:\n\nNext:"
+        );
+        assert_eq!(answer.text, streamed);
+        assert!(!answer.cut);
+        let expected = chat
+            .tokenizer
+            .encode_with_special("<|im_start|>assistant\n<think>\n\n</think>\n\nTask: fix it.\n\nFindings: none yet.\n\nDone:\n\nNext:<|im_end|>\n")
+            .unwrap();
+        assert!(chat.model.fed.ends_with(&expected));
+
+        // Each head has an even share of what is left of the limit, heads
+        // included, so the last has whatever is left.
+        let mut shared = self::chat(&["abcdefghij"]);
+        let answer = shared
+            .answer("note", &["A:", "B:"], 8, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(answer.text, "A:abcB:d");
+        assert_eq!(shared.tokenizer.encode(&answer.text).unwrap().len(), 8);
+
+        // A head of one token is written, not said: the model goes on
+        // from it.
+        let mut chat = self::chat(&[" one.<|im_end|> two."]);
+        let answer = chat
+            .answer("note", &["A", "\nB"], 100, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(answer.text, "A one.\nB two.");
+    }
+
+    #[test]
+    fn a_head_after_a_section_cut_mid_character_stays_whole() {
+        // The first section's share ends after the first byte of a
+        // two-byte character: the byte is shown for what it is, before
+        // the head, and the head is not glued to the byte that follows.
+        let mut chat = chat(&[" \u{e9}"]);
+        let mut streamed = String::new();
+        let answer = chat
+            .answer("note", &["A:", "B:"], 7, |piece| {
+                streamed.push_str(piece);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(answer.text, "A: \u{fffd}B:\u{fffd}");
+        assert_eq!(answer.text, streamed);
+    }
+
+    #[test]
+    fn an_answer_cut_for_room_has_every_head() {
+        // The context has room for the note's framing, its heads, and
+        // three tokens more: the first section is cut there, and the
+        // heads to come are written all the same, each with nothing
+        // under it.
+        let tokenizer = Tokenizer::tiny();
+        let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
+        let measure = Chat::new(
+            Scripted::new(&tokenizer, &[], 1 << 16),
+            Tokenizer::tiny(),
+            Sampler::new(0.0, 1, 1.0, 0.0, 1),
+        )
+        .unwrap();
+        let framing = measure.measure(&Turn::User("note".to_string())).unwrap()
+            + measure
+                .measure(&Turn::Reply {
+                    text: String::new(),
+                    calls: Vec::new(),
+                })
+                .unwrap();
+        let heads_len: usize = heads
+            .iter()
+            .map(|head| tokenizer.encode(head).unwrap().len())
+            .sum();
+        let system = tokenizer
+            .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
+            .unwrap()
+            .len();
+        let max_len = system + framing + heads_len + 3;
+        let model = Scripted::new(&tokenizer, &[], max_len).answers(&tokenizer, " fix it.");
+        let mut chat = Chat::new(model, tokenizer, Sampler::new(0.0, 1, 1.0, 0.0, 1)).unwrap();
+        chat.system("Be brief.", |_, _| {}).unwrap();
+        let mut streamed = String::new();
+        let answer = chat
+            .answer("note", &heads, 100, |piece| {
+                streamed.push_str(piece);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(answer.text, "Task: fi\n\nFindings:\n\nDone:\n\nNext:");
+        assert_eq!(answer.text, streamed);
+        assert!(answer.cut);
+        assert_eq!(chat.tokens(), max_len);
     }
 
     #[test]

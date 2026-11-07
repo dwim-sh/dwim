@@ -52,9 +52,11 @@ impl Scripted {
     }
 
     /// Has the model say `text` whenever it is asked for a plain answer,
-    /// rather than its next script.
+    /// rather than its next script. The text may have the chat format's
+    /// tags in it: an `<|im_end|>` in the middle ends the answer there, and
+    /// what follows is said if the answer is pulled on with a head.
     pub fn answers(mut self, tokenizer: &Tokenizer, text: &str) -> Self {
-        self.answer = Some(tokenizer.encode(text).unwrap());
+        self.answer = Some(tokenizer.encode_with_special(text).unwrap());
         self
     }
 
@@ -92,28 +94,41 @@ impl LanguageModel for Scripted {
         // A reply's prompt ends with the template's opening of one, and
         // the reply is then sampled a token at a time. The script is taken
         // up only once the sampling starts: a prompt read in batches may
-        // end a batch at an opening it goes on past.
+        // end a batch at an opening it goes on past, and the chat may
+        // write tokens into a reply it has just opened, such as a head,
+        // for the script to be said from. Either way, a batch that does
+        // not end at an opening leaves the reply as it was: opened and
+        // yet to be said, or under way.
         if tokens.len() > 1 {
-            self.pending = if self.fed.ends_with(&self.unthinking) {
-                Some(true)
+            if self.fed.ends_with(&self.unthinking) {
+                self.pending = Some(true);
+                self.saying.clear();
             } else if self.fed.ends_with(&self.opening) {
-                Some(false)
-            } else {
-                None
-            };
-            // Tokens the chat writes into a reply, rather than a prompt,
-            // leave the rest of the reply to be said.
-            if self.pending.is_some() {
+                self.pending = Some(false);
                 self.saying.clear();
             }
-        } else if let Some(unthinking) = self.pending.take() {
-            self.saying = self.script(unthinking).into();
-            // The batch's logits already said the first token.
-            self.saying.pop_front();
+        } else {
+            if let Some(unthinking) = self.pending.take() {
+                self.saying = self.script(unthinking).into();
+            }
+            // The token the logits said is said once it is fed. A token
+            // written in instead, such as a head of one token, leaves it
+            // to be said after.
+            if self.saying.front() == Some(&tokens[0]) {
+                self.saying.pop_front();
+            }
         }
         let next = match self.pending {
             Some(unthinking) => self.peek(unthinking).unwrap_or(self.end),
-            None => self.saying.pop_front().unwrap_or(self.end),
+            None => {
+                let next = self.saying.front().copied().unwrap_or(self.end);
+                // The chat ends a reply, or a section of an answer, at
+                // `<|im_end|>` without feeding it: it is said now.
+                if next == self.end {
+                    self.saying.pop_front();
+                }
+                next
+            }
         };
         let mut logits = vec![0.0; self.vocab];
         logits[next as usize] = 1.0;
