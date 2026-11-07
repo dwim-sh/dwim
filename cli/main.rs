@@ -8,6 +8,7 @@ mod session;
 mod tui;
 
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
     path::{Path, PathBuf},
@@ -28,7 +29,7 @@ fn main() {
         Ok(opts) => opts,
         Err(EarlyExit { output, status }) => {
             match status {
-                Ok(()) => print!("{}", help(output, &rest)),
+                Ok(()) => print!("{}", help(&output, &rest)),
                 Err(()) => eprint!("{output}"),
             }
             std::process::exit(status.map_or(1, |()| 0));
@@ -101,49 +102,143 @@ fn project(dir: &Path) -> String {
         .collect()
 }
 
-/// The help text, with the default context worked out for the device the
+/// The headings `--help` lists the options under, each with its options by
+/// name. Every option has to be under one of them, which a test checks.
+const GROUPS: &[(&str, &[&str])] = &[
+    ("The model:", &["--context", "--device", "--model"]),
+    (
+        "Thinking and sampling:",
+        &[
+            "--reasoning-effort",
+            "--speculate",
+            "--temperature",
+            "--thinking-budget",
+        ],
+    ),
+    (
+        "The session:",
+        &["--shell", "--stats", "--thinking", "--transcript"],
+    ),
+    (
+        "Instead of a session:",
+        &["--bench", "--download", "--help", "--version"],
+    ),
+];
+
+/// The first line of the help text, in place of the one argh writes, which
+/// spells out every option.
+const USAGE: &str = "Usage: dwim [options] [prompt...]";
+
+/// What dwim is, under the usage line.
+const ABOUT: &str = "A coding agent at the command line. With no prompt, it starts an \
+    interactive session in the current directory; given one, it answers it without the \
+    shell and exits.";
+
+/// The column an option's description starts in, when the option's name
+/// ends two or more columns before it; a longer name has its description
+/// under it instead.
+const COLUMN: usize = 24;
+
+/// The width the help text wraps at.
+const WIDTH: usize = 80;
+
+/// The column argh starts an option's description in.
+const ARGH_COLUMN: usize = 20;
+
+/// The help text: the options argh describes in `output`, sorted under
+/// headings, with the default context worked out for the device the
 /// arguments name, if the model is downloaded and the device opens.
-fn help(output: String, args: &[&str]) -> String {
+fn help(output: &str, args: &[&str]) -> String {
     let device = args
         .iter()
         .position(|&arg| arg == "--device")
         .and_then(|i| args.get(i + 1))
         .and_then(|value| Device::from_arg_value(value).ok())
         .unwrap_or(Device::Gpu);
-    let Some(size) = model::default_size(device) else {
-        return output;
-    };
-    let default = format!(
-        "(default: {} on this machine, taking {} of memory)",
-        size.context,
-        model::bytes(size.bytes)
-    );
-    // Put it in place of the description argh wrapped, wrapped the same way.
-    let mut lines = Vec::new();
-    let mut rest = output.lines().peekable();
-    while let Some(line) = rest.next() {
-        if !line.starts_with("  --context ") {
-            lines.push(line.to_string());
-            continue;
-        }
-        while rest.peek().is_some_and(|line| line.starts_with("    ")) {
-            rest.next();
-        }
-        let indent = line.find("tokens").unwrap_or(20);
-        let text = format!("tokens of conversation the model has room for {default}");
-        let mut current = format!("{:indent$}", "  --context");
-        for word in text.split(' ') {
-            if current.len() > indent && current.len() + 1 + word.len() > 80 {
-                lines.push(current);
-                current = " ".repeat(indent);
-            } else if current.len() > indent {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-        lines.push(current);
+    layout(output, model::default_size(device))
+}
+
+/// The help text laid out from argh's `output`, saying the default context
+/// is `size` if that is known.
+fn layout(output: &str, size: Option<model::Size>) -> String {
+    let mut options = options(output);
+    if let (Some(size), Some((_, description))) = (size, options.get_mut("--context")) {
+        *description = format!(
+            "tokens of conversation the model has room for (default: {} on this machine, \
+             taking {} of memory)",
+            size.context,
+            model::bytes(size.bytes)
+        );
     }
-    lines.join("\n") + "\n"
+    let mut text = format!("{USAGE}\n\n");
+    for line in tui::wrap(ABOUT, WIDTH) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    for (heading, names) in GROUPS {
+        text.push('\n');
+        text.push_str(heading);
+        text.push('\n');
+        for name in names.iter() {
+            let Some((usage, description)) = options.get(name) else {
+                continue;
+            };
+            let label = format!("  {usage}");
+            let mut lines = tui::wrap(description, WIDTH - COLUMN).into_iter();
+            if label.len() + 2 <= COLUMN {
+                let first = lines.next().unwrap_or("");
+                text.push_str(&format!("{label:<COLUMN$}{first}\n"));
+            } else {
+                text.push_str(&label);
+                text.push('\n');
+            }
+            for line in lines {
+                text.push_str(&format!("{:COLUMN$}{line}\n", ""));
+            }
+        }
+    }
+    text
+}
+
+/// The options argh's help `output` describes, by name: how each is given,
+/// as the usage line has it, such as `--context <tokens>`, and what it does.
+fn options(output: &str) -> BTreeMap<&str, (String, String)> {
+    let mut lines = output.lines();
+    let usages: BTreeMap<&str, &str> = lines
+        .next()
+        .unwrap_or("")
+        .split('[')
+        .filter_map(|part| part.split(']').next())
+        .filter(|part| part.starts_with("--"))
+        .map(|usage| (usage.split(' ').next().unwrap_or(usage), usage))
+        .collect();
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    for line in lines.skip_while(|line| *line != "Options:").skip(1) {
+        if let Some(rest) = line
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' '))
+        {
+            let name = rest.split([',', ' ']).next().unwrap_or(rest);
+            let description = line.get(ARGH_COLUMN..).unwrap_or("").trim();
+            entries.push((name, description.to_string()));
+        } else if let Some((_, description)) =
+            entries.last_mut().filter(|_| line.starts_with("    "))
+        {
+            if !description.is_empty() {
+                description.push(' ');
+            }
+            description.push_str(line.trim());
+        } else {
+            break;
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(name, description)| {
+            let usage = usages.get(name).copied().unwrap_or(name).to_string();
+            (name, (usage, description))
+        })
+        .collect()
 }
 
 /// Memory a Mac needs to run the model: its CPU and GPU share it, and the
@@ -170,4 +265,76 @@ fn check_memory() -> Result<(), Box<dyn Error>> {
 #[cfg(not(target_vendor = "apple"))]
 fn check_memory() -> Result<(), Box<dyn Error>> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The help text argh writes for the options.
+    fn output() -> String {
+        match Opts::from_args(&["dwim"], &["--help"]) {
+            Err(EarlyExit {
+                output,
+                status: Ok(()),
+            }) => output,
+            _ => panic!("--help did not print the help"),
+        }
+    }
+
+    #[test]
+    fn help_lists_every_option_once() {
+        let listed: Vec<&str> = GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), listed.len(), "an option is listed twice");
+        let output = output();
+        let parsed: Vec<&str> = options(&output).into_keys().collect();
+        assert_eq!(sorted, parsed, "the groups and the options differ");
+    }
+
+    #[test]
+    fn help_sorts_each_group_by_name() {
+        for (heading, names) in GROUPS {
+            assert!(
+                names.windows(2).all(|pair| pair[0] < pair[1]),
+                "{heading} is out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn help_keeps_the_descriptions() {
+        let output = output();
+        let options = options(&output);
+        let (usage, description) = &options["--thinking-budget"];
+        assert_eq!(usage, "--thinking-budget <tokens>");
+        assert_eq!(
+            description,
+            "most tokens the model may think at a time before it is made to act, \
+             or 0 for no limit (default: 2048)"
+        );
+        let (usage, description) = &options["--help"];
+        assert_eq!(usage, "--help");
+        assert_eq!(description, "display usage information");
+    }
+
+    #[test]
+    fn help_fits_the_width() {
+        let size = model::Size {
+            context: 65536,
+            bytes: 20_000_000_000,
+        };
+        let text = layout(&output(), Some(size));
+        for line in text.lines() {
+            assert!(line.len() <= WIDTH, "too long: {line:?}");
+        }
+        assert!(text.starts_with(USAGE));
+        assert!(text.contains("65536 on this machine"));
+        assert!(text.contains("\nThe model:\n  --context <tokens>"));
+    }
 }

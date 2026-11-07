@@ -17,7 +17,7 @@ pub struct Opts {
 
     /// tokens of conversation the model has room for (default: as many
     /// as fit in the device's free memory)
-    #[argh(option)]
+    #[argh(option, arg_name = "tokens")]
     pub context: Option<usize>,
 
     /// download the model if it is not yet, print the path of its weights,
@@ -45,32 +45,36 @@ pub struct Opts {
 
     /// most tokens the model may think at a time before it is made to act,
     /// or 0 for no limit (default: 2048)
-    #[argh(option, default = "dwim::harness::THINKING_BUDGET.unwrap_or(0)")]
+    #[argh(
+        option,
+        arg_name = "tokens",
+        default = "dwim::harness::THINKING_BUDGET.unwrap_or(0)"
+    )]
     pub thinking_budget: usize,
 
     /// how much the model reasons before it replies, as its chat template
     /// asks it to: xhigh, medium or low (default: medium)
-    #[argh(option, default = "dwim::harness::Effort::Medium")]
+    #[argh(option, arg_name = "effort", default = "dwim::harness::Effort::Medium")]
     pub reasoning_effort: dwim::harness::Effort,
 
     /// sampling temperature (default: what the model file recommends; 0
     /// always picks the likeliest token)
-    #[argh(option)]
+    #[argh(option, arg_name = "t")]
     pub temperature: Option<f32>,
 
     /// tokens the model drafts ahead and verifies in one pass, or 0 to
     /// decode a token at a time (default: 4)
-    #[argh(option, default = "dwim::models::DRAFTS")]
+    #[argh(option, arg_name = "n", default = "dwim::models::DRAFTS")]
     pub speculate: usize,
 
     /// program to run the model's shell commands through, as `shell -c
     /// command` (default: sh)
-    #[argh(option)]
+    #[argh(option, arg_name = "program")]
     pub shell: Option<PathBuf>,
 
     /// file to write the session's transcript to, as JSON Lines (default:
     /// a new file under ~/.local/state/dwim/projects/)
-    #[argh(option)]
+    #[argh(option, arg_name = "file")]
     pub transcript: Option<PathBuf>,
 
     /// prompt to answer without the shell, as the words after the options
