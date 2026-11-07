@@ -84,10 +84,8 @@ man dwim
 
 ## Using dwim from Claude Code or Codex
 
-dwim does well on one clear, bounded task with everything it needs in the
-prompt, and badly on anything vague or spread over several steps: its
-context is small and it cannot ask you anything. So let a frontier model
-do the planning, and dwim the typing. The
+dwim works well alongside a frontier model: let the frontier model do
+the planning, and dwim the work. The
 [dwim skills](https://github.com/dwim-sh/skills) teach an agent such as
 Claude Code or Codex to split the work that way:
 
