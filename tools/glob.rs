@@ -485,18 +485,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_the_walk_outside_git() {
+    fn walks_the_tree_itself_without_git() {
         let dir = tree();
-        assert!(
-            !Command::new("git")
-                .args(["rev-parse", "--is-inside-work-tree"])
-                .current_dir(&dir)
-                .output()
-                .unwrap()
-                .status
-                .success(),
-            "the temporary directory is in a git repository"
-        );
+        // A .git that is no repository keeps git from listing the tree,
+        // wherever the temporary directory is, so the walk is used.
+        fs::write(dir.join(".git"), "not a repository\n").unwrap();
         let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern }));
         // A directory that cannot be read is named, and the rest listed.
         let private = dir.join("private");
