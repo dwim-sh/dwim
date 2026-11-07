@@ -62,11 +62,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     if !root.is_dir() {
         return Err(format!("{path} is not a directory"));
     }
-    if !within(&root, dir) {
-        return Err(format!(
-            "glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
-        ));
-    }
+    within(dir, path)?;
     let segments: Vec<&str> = pattern
         .trim_start_matches("./")
         .split('/')
@@ -132,12 +128,23 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     Ok(format!("{}\n{note}", shown.join("\n")))
 }
 
-/// Whether the directory `dir` is `root` or below it, symbolic links
-/// resolved.
-fn within(dir: &Path, root: &Path) -> bool {
-    match (fs::canonicalize(dir), fs::canonicalize(root)) {
-        (Ok(dir), Ok(root)) => dir.starts_with(root),
-        _ => false,
+/// Checks that `path`, taken from `dir`, is `dir` or below it, symbolic
+/// links resolved, or says why the tool will not search it: it is
+/// outside, or it or `dir` cannot be resolved.
+fn within(dir: &Path, path: &str) -> Result<(), String> {
+    let (target, root) = match (fs::canonicalize(dir.join(path)), fs::canonicalize(dir)) {
+        (Ok(target), Ok(root)) => (target, root),
+        (Err(error), _) => return Err(format!("{path} cannot be resolved: {error}")),
+        (_, Err(error)) => {
+            return Err(format!("the working directory cannot be resolved: {error}"));
+        }
+    };
+    if target.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
+        ))
     }
 }
 
@@ -408,6 +415,17 @@ mod tests {
         assert_eq!(
             run_in(&src, &json!({ "pattern": "*.rs", "path": "up" })),
             refused("up")
+        );
+        // A path that cannot be resolved is not called outside.
+        assert!(
+            within(&src, "gone")
+                .unwrap_err()
+                .starts_with("gone cannot be resolved: ")
+        );
+        assert!(
+            within(&dir.join("gone"), "deep")
+                .unwrap_err()
+                .starts_with("deep cannot be resolved: ")
         );
         // The working directory and the directories below it are fine.
         assert_eq!(
