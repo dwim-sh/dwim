@@ -84,10 +84,9 @@ man dwim
 
 ## Using dwim as a sub-agent
 
-dwim works well alongside a frontier model: let the frontier model do
-the planning, and dwim the work. The
-[dwim skills](https://github.com/dwim-sh/skills) teach an agent such as
-Claude Code or Codex to split the work that way:
+dwim makes a good sub-agent: your main agent plans the change, and
+dwim writes the code. The [dwim skills](https://github.com/dwim-sh/skills)
+teach an agent such as Claude Code or Codex to delegate to it:
 
 ```console
 npx skills add dwim-sh/skills
@@ -105,7 +104,7 @@ Then, in the agent, ask for the change "with dwim":
    it with `Generated-by: dwim`, and ticks the step off. `/dwim-do all`
    goes on until a step fails review or none remain.
 
-The frontier model spends its tokens on the decisions and the review, and
+The main agent spends its tokens on the decisions and the review, and
 dwim, on your own GPU, on the code.
 
 ## License
