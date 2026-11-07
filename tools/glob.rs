@@ -206,16 +206,24 @@ fn walk(
     let Ok(listing) = fs::read_dir(dir) else {
         return true;
     };
-    let mut listing: Vec<fs::DirEntry> = listing.flatten().collect();
-    listing.sort_by_key(fs::DirEntry::file_name);
-    for entry in listing {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
+    let mut listing: Vec<(String, fs::DirEntry)> = listing
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (!name.starts_with('.')).then_some((name, entry))
+        })
+        .collect();
+    // The first names up to the room the cap leaves, and one over it so
+    // that the cap is seen hit: a huge directory is not sorted whole.
+    let room = CAP - *entries + 1;
+    let cut = listing.len() > room;
+    if cut {
+        listing.select_nth_unstable_by(room, |a, b| a.0.cmp(&b.0));
+        listing.truncate(room);
+    }
+    listing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (name, entry) in listing {
+        let name = name.as_str();
         let path = if at.is_empty() {
             name.to_string()
         } else {
@@ -245,7 +253,7 @@ fn walk(
             files.push(path);
         }
     }
-    true
+    !cut
 }
 
 /// Whether a file in the directory `parts`, or in one below it, could
