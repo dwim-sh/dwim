@@ -61,8 +61,13 @@ compaction.
 .BI \-\-device " device"
 Device to run the model on:
 .B gpu
-(default), or
-.BR cpu .
+(default), through whichever API opens it, CUDA before Vulkan;
+.BR cpu ;
+or the GPU through one API:
+.BR cuda ,
+.BR vulkan ,
+or
+.BR metal .
 .TP
 .BI \-\-model " model"
 Model to run (default:

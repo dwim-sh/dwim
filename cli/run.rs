@@ -21,7 +21,6 @@ use crossterm::{
     event::{self, Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim::gpu::BACKEND;
 use dwim::harness::{self, Event, Log};
 use dwim::models::qwen35;
 
@@ -912,7 +911,7 @@ impl App {
             Status::Loading { since, done, total } => (
                 match self.device {
                     Device::Cpu => "Loading model…",
-                    Device::Gpu => "Loading model to GPU…",
+                    Device::Gpu(_) => "Loading model to GPU…",
                 },
                 since,
                 format!("{} · {}", percent(done, total), seconds(since)),
@@ -1042,8 +1041,8 @@ fn model_listing(
     };
     let on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
-        (Device::Gpu, None) => "GPU".to_string(),
-        (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
+        (Device::Gpu(_), None) => "GPU".to_string(),
+        (Device::Gpu(_), Some(gpu)) => format!("GPU · {gpu}"),
     };
     let mut rows = vec![
         (

@@ -154,7 +154,7 @@ fn help(output: &str, args: &[&str]) -> String {
         .position(|&arg| arg == "--device")
         .and_then(|i| args.get(i + 1))
         .and_then(|value| Device::from_arg_value(value).ok())
-        .unwrap_or(Device::Gpu);
+        .unwrap_or(Device::Gpu(None));
     layout(output, model::default_size(device))
 }
 

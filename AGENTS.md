@@ -23,10 +23,13 @@ compiles the Vulkan kernels.
 * `tools/`: the tools, one file each, and `call`, which parses a call as the
   model writes it.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,
-  `vulkan` (WGSL kernels compiled to SPIR-V at build time), and `metal`
-  (MSL kernels compiled when the device opens). `quant` is the 4- and 8-bit
-  block weight formats.
-* `scripts/`: `swebench.py` runs SWE-bench Lite; `release` cuts a release.
+  `cuda` (CUDA C kernels compiled by NVRTC when the device opens), `vulkan`
+  (WGSL kernels compiled to SPIR-V at build time), and `metal` (MSL kernels
+  compiled when the device opens). `platform` is `Gpu`, whichever of them
+  opens: CUDA before Vulkan. `quant` is the 4- and 8-bit block weight
+  formats.
+* `scripts/`: `swebench.py` runs SWE-bench Lite; `modal-gpu.py` runs the GPU
+  checks on an NVIDIA GPU in Modal; `release` cuts a release.
 * `testing/`: `difftest`, differential testing of the GPU against the CPU
   with the real weights.
 * `man/`: `dwim.1`, the manual page.
@@ -47,8 +50,9 @@ ones the sampler accepts.
 
 ## Building
 
-`cargo build` needs nothing beyond Rust. The GPU needs Metal on macOS or a
-Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights (16 GB)
+`cargo build` needs nothing beyond Rust. The GPU needs Metal on macOS, and
+elsewhere an NVIDIA driver with the CUDA toolkit's NVRTC, or a Vulkan 1.1
+driver with `VK_KHR_push_descriptor`. The weights (16 GB)
 are fetched into the user's Hugging Face cache on first use, or by
 `dwim --download`.
 
