@@ -4,6 +4,7 @@ mod model;
 mod once;
 mod opts;
 mod run;
+mod serve;
 mod session;
 mod tui;
 
@@ -50,6 +51,9 @@ fn main() {
         }
         if opts.bench {
             return bench::bench(&settings);
+        }
+        if opts.serve {
+            return serve::serve(&settings);
         }
         let log = log(opts.transcript)?;
         match prompt.trim() {
@@ -121,7 +125,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Instead of a session:",
-        &["--bench", "--download", "--help", "--version"],
+        &["--bench", "--download", "--help", "--serve", "--version"],
     ),
 ];
 

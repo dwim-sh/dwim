@@ -26,10 +26,9 @@ use dwim::harness::{self, Event, Log};
 use dwim::models::qwen35;
 
 use crate::{
-    fetch::Progress,
     model::{self, Size},
     opts::{self, Device},
-    session::{self, Loading, Settings},
+    session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
 
@@ -231,8 +230,8 @@ enum Request {
 
 /// What the model thread reports back.
 enum Reply {
-    /// How far along loading the model is.
-    Loading(Loading),
+    /// What the server is doing while the session waits on it.
+    Status(session::Status),
     /// The model is ready for a message, and how long loading it took.
     Ready(Duration),
     /// Something that happened in the turn.
@@ -260,8 +259,11 @@ fn work(
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(settings, log, |loading| {
-        let _ = replies.send(Reply::Loading(loading));
+    let loaded = session::load(settings, log, {
+        let replies = replies.clone();
+        move |status| {
+            let _ = replies.send(Reply::Status(status));
+        }
     })?;
     let mut harness = loaded.harness;
     let _ = replies.send(Reply::Ready(loaded.loading));
@@ -303,10 +305,13 @@ fn work(
 
 /// What the model is doing.
 enum Status {
-    /// Downloading one of the model's files, since when.
+    /// Downloading one of the model's files, since when: how many bytes so
+    /// far, out of how many if that is known.
     Downloading {
         since: Instant,
-        progress: Progress,
+        file: String,
+        done: u64,
+        total: Option<u64>,
     },
     /// Loading the weights, since when: how many tensors so far, out of how
     /// many.
@@ -325,6 +330,8 @@ enum Status {
     Idle,
     /// Reading the prompt, before the first token of the reply.
     Reading(Instant),
+    /// Waiting for the model, which another session has, since when.
+    Waiting(Instant),
     Generating {
         start: Instant,
         tokens: usize,
@@ -430,7 +437,10 @@ impl App {
         let busy = !matches!(self.status, Status::Idle);
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                if matches!(self.status, Status::Reading(_) | Status::Generating { .. }) {
+                if matches!(
+                    self.status,
+                    Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+                ) {
                     self.interrupt();
                 } else if !self.input.is_empty() {
                     self.input.take();
@@ -483,7 +493,10 @@ impl App {
 
     /// Stops the reply being generated, if any.
     fn interrupt(&mut self) {
-        if matches!(self.status, Status::Reading(_) | Status::Generating { .. }) {
+        if matches!(
+            self.status,
+            Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+        ) {
             self.stop.store(true, Ordering::Relaxed);
             self.interrupted = true;
         }
@@ -562,7 +575,7 @@ impl App {
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
         match reply {
-            Reply::Loading(loading) => self.loading(loading),
+            Reply::Status(status) => self.status_update(status),
             Reply::Ready(loading) => {
                 self.loading = loading;
                 self.status = Status::Idle;
@@ -607,35 +620,46 @@ impl App {
         Ok(())
     }
 
-    /// Shows how far along loading the model is.
-    fn loading(&mut self, loading: Loading) {
-        match loading {
-            Loading::Downloading(progress) => {
+    /// Shows what the server is doing while the session waits on it.
+    fn status_update(&mut self, status: session::Status) {
+        match status {
+            session::Status::Downloading { file, done, total } => {
                 // Time each file on its own, so the speed is of this one.
-                let since = match self.status {
+                let since = match &self.status {
                     Status::Downloading {
-                        since,
-                        progress: last,
-                    } if last.file == progress.file => since,
+                        since, file: last, ..
+                    } if *last == file => *since,
                     _ => Instant::now(),
                 };
-                self.status = Status::Downloading { since, progress };
+                self.status = Status::Downloading {
+                    since,
+                    file,
+                    done,
+                    total,
+                };
             }
-            Loading::Device(name) => self.device_name = Some(name),
-            Loading::Sized(size) => self.size = Some(size),
-            Loading::Weights { done, total } => {
+            session::Status::Device(name) => self.device_name = Some(name),
+            session::Status::Sized(size) => self.size = Some(size),
+            session::Status::Weights { done, total } => {
                 let since = match self.status {
                     Status::Loading { since, .. } => since,
                     _ => Instant::now(),
                 };
                 self.status = Status::Loading { since, done, total };
             }
-            Loading::Prompting { read, total } => {
+            session::Status::Prompting { read, total } => {
                 let since = match self.status {
                     Status::Prompting { since, .. } => since,
                     _ => Instant::now(),
                 };
                 self.status = Status::Prompting { since, read, total };
+            }
+            session::Status::Busy => {
+                let since = match self.status {
+                    Status::Reading(since) | Status::Waiting(since) => since,
+                    _ => Instant::now(),
+                };
+                self.status = Status::Waiting(since);
             }
         }
     }
@@ -902,10 +926,12 @@ impl App {
         };
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
-            Status::Downloading { since, progress } => (
+            Status::Downloading {
+                since, done, total, ..
+            } => (
                 "Downloading model…",
                 since,
-                download_details(progress, since.elapsed()),
+                download_details(done, total, since.elapsed()),
             ),
             Status::Loading { since, done, total } => (
                 match self.device {
@@ -924,6 +950,14 @@ impl App {
                 "Reading…",
                 since,
                 format!("{} · esc to interrupt", seconds(since)),
+            ),
+            Status::Waiting(since) => (
+                "Waiting for the model…",
+                since,
+                format!(
+                    "another session has it · {} · esc to interrupt",
+                    seconds(since)
+                ),
             ),
             Status::Generating { start, tokens } => (
                 match self.segment {
@@ -971,8 +1005,7 @@ fn rate(done: f64, elapsed: Duration) -> Option<f64> {
 /// How a download is going: how much of the file has arrived, out of how
 /// much, at what speed, and the time left once the file's size is known.
 /// The fields are padded to fixed widths, as the status line's are.
-fn download_details(progress: Progress, elapsed: Duration) -> String {
-    let Progress { done, total, .. } = progress;
+fn download_details(done: u64, total: Option<u64>, elapsed: Duration) -> String {
     let mut details = format!("{:>8}", model::bytes(done));
     if let Some(total) = total {
         details.push_str(&format!(

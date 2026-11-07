@@ -3,4 +3,5 @@
 pub mod gpu;
 pub mod harness;
 pub mod models;
+pub mod server;
 pub mod tools;

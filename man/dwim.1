@@ -169,6 +169,22 @@ the weights for another program.
 .B \-\-help
 Display usage information.
 .TP
+.B \-\-serve
+Run the server that has the model, in the foreground, until it has gone
+ten minutes without a session. The model takes most of the memory a
+machine has, so one process loads it, and every session is a client of
+that process over a Unix socket: a session starts the server itself when
+none is listening, detached, with its standard error in a log, so this is
+for running it by hand or under a service manager.
+.BR \-\-model ,
+.B \-\-device
+and
+.B \-\-context
+are the server's: a session that asks for others than the server has gets
+the server replaced if it has no sessions, and an error if it has.
+Sessions take turns with the model, a reply at a time, each with its own
+conversation; a session whose turn it is not waits, and says so.
+.TP
 .B \-\-version
 Print the version and exit.
 .SH INTERACTIVE SHELL
@@ -311,6 +327,18 @@ streams, at least once a second, so a session that is killed leaves its
 transcript up to then. Transcripts are not removed. On macOS the
 directory is
 .I ~/Library/Application Support/dwim/projects/
+instead.
+.TP
+.I $XDG_RUNTIME_DIR/dwim-<uid>.sock
+The socket the server listens on, in the temporary directory where there
+is no runtime directory, as on macOS. A session connects to it, and starts
+a server when nothing answers.
+.TP
+.I ~/.local/state/dwim/server.log
+Where a server that a session started writes what it reports: how
+loading went, each session opened and closed, and why it exited. On macOS
+the file is
+.I ~/Library/Application Support/dwim/server.log
 instead.
 .TP
 .I $TMPDIR/dwim-<pid>-<n>/
