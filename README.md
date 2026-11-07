@@ -54,7 +54,7 @@ ahead of time.
 - **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
   or more, decoding several tokens at a time with the drafter its file
   ships.
-- **Fast local inference.** Metal on macOS, Vulkan on Linux.
+- **Fast local inference.** Metal on macOS, CUDA or Vulkan on Linux.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.
   Commands run without confirmation and without a time limit, until they

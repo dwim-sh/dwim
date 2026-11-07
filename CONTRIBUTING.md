@@ -3,8 +3,9 @@
 ## Building
 
 `cargo build` needs nothing beyond Rust. The Vulkan kernels are compiled from
-WGSL to SPIR-V by `naga` in `build.rs`, and Metal compiles its own kernels
-from source when the device opens.
+WGSL to SPIR-V by `naga` in `build.rs`; CUDA and Metal compile their own
+kernels from source when the device opens, CUDA's with NVRTC, which it loads
+then along with the driver.
 
 ```
 cargo build              # debug, with the model and the devices optimized
@@ -15,8 +16,11 @@ make install             # a release build and the manual page, in ~/.local
 `make install PREFIX=/usr/local` installs system-wide, which may need `sudo`;
 `make uninstall` removes what `make install` put there.
 
-Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
-driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
+Running the model on a GPU needs Metal on macOS, and elsewhere an NVIDIA
+driver with the CUDA toolkit's NVRTC library, or a Vulkan 1.1 driver with
+`VK_KHR_push_descriptor`. CUDA is tried first where there is a driver, and
+`--device cuda` or `--device vulkan` insists on one. `--device cpu` runs
+anywhere, slowly.
 
 The weights are downloaded on first use into the Hugging Face cache,
 `~/.cache/huggingface/hub`, in the layout the `huggingface_hub` library
@@ -64,6 +68,11 @@ recorded into `target/difftest/` on the first run, which takes minutes, and
 again only when the CPU's or the model's code changes; after that a run
 takes seconds. `--repeat <n>` runs the GPU's side again, for mistakes it
 makes only now and then.
+
+Without an NVIDIA GPU at hand, `modal run scripts/modal-gpu.py` runs the
+CUDA kernels' checks on one in [Modal](https://modal.com), and `--what
+speed`, `--what model`, and `--what difftest` the kernels' timings, the
+real model, and the difftest; the script's comment says more.
 
 Run the agent before calling a change done. The model is easy to break in
 ways tests don't catch, such as replies that end with nothing to show, so

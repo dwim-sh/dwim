@@ -1,37 +1,30 @@
 //! Devices a model runs on: the operations a transformer's forward pass is
 //! built from, and their implementations. [`Cpu`] is the reference; the
-//! `metal` and [`vulkan`] devices run the same operations on a GPU with
-//! hand-written compute kernels.
+//! `cuda`, `metal`, and [`vulkan`] devices run the same operations on a GPU
+//! with hand-written compute kernels, and [`Gpu`] is whichever of them
+//! opens.
 
 #[cfg(test)]
 #[macro_use]
 mod tests;
 
 pub mod cpu;
+#[cfg(not(target_vendor = "apple"))]
+pub mod cuda;
 pub mod host;
 #[cfg(target_vendor = "apple")]
 pub mod metal;
+pub mod platform;
 pub mod quant;
 pub mod vulkan;
 
 pub use cpu::Cpu;
+#[cfg(not(target_vendor = "apple"))]
+pub use cuda::Cuda;
 #[cfg(target_vendor = "apple")]
 pub use metal::Metal;
+pub use platform::{Api, Gpu};
 pub use vulkan::Vulkan;
-
-/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-#[cfg(target_vendor = "apple")]
-pub type Gpu = Metal;
-/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-#[cfg(not(target_vendor = "apple"))]
-pub type Gpu = Vulkan;
-
-/// The name of the API [`Gpu`] drives the GPU through.
-#[cfg(target_vendor = "apple")]
-pub const BACKEND: &str = "Metal";
-/// The name of the API [`Gpu`] drives the GPU through.
-#[cfg(not(target_vendor = "apple"))]
-pub const BACKEND: &str = "Vulkan";
 
 /// Taps of the causal convolution in linear attention.
 pub const CONV_KERNEL: usize = 4;

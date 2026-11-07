@@ -75,15 +75,16 @@ impl Opened {
     pub fn open(device: opts::Device) -> Result<Self, Box<dyn Error>> {
         Ok(match device {
             opts::Device::Cpu => Opened::Cpu(Cpu),
-            opts::Device::Gpu => Opened::Gpu(Box::new(Gpu::new()?)),
+            opts::Device::Gpu(api) => Opened::Gpu(Box::new(Gpu::open(api)?)),
         })
     }
 
-    /// What the device is called.
+    /// What the device is called: a GPU's name, and the API it is driven
+    /// through.
     pub fn name(&self) -> String {
         match self {
             Opened::Cpu(device) => device.name(),
-            Opened::Gpu(device) => device.name(),
+            Opened::Gpu(device) => format!("{} via {}", device.name(), device.api()),
         }
     }
 

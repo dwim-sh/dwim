@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use argh::FromArgs;
+use dwim::gpu::Api;
 
 use crate::{model, session::Settings};
 
@@ -11,8 +12,9 @@ pub struct Opts {
     #[argh(option, default = "model::NAME.to_string()")]
     pub model: String,
 
-    /// device to run the model on: gpu (default), or cpu
-    #[argh(option, default = "Device::Gpu")]
+    /// device to run the model on: gpu (default), cpu, or the GPU through
+    /// one API: cuda, vulkan, or metal
+    #[argh(option, default = "Device::Gpu(None)")]
     pub device: Device,
 
     /// tokens of conversation the model has room for (default: as many
@@ -104,19 +106,25 @@ pub fn budget(tokens: usize) -> Option<usize> {
     (tokens > 0).then_some(tokens)
 }
 
-/// Where to run the model.
+/// Where to run the model: the CPU, or the GPU through an API of one's
+/// choosing or whichever opens.
 #[derive(Clone, Copy)]
 pub enum Device {
     Cpu,
-    Gpu,
+    Gpu(Option<Api>),
 }
 
 impl argh::FromArgValue for Device {
     fn from_arg_value(value: &str) -> Result<Self, String> {
         match value {
             "cpu" => Ok(Device::Cpu),
-            "gpu" => Ok(Device::Gpu),
-            _ => Err(format!("unknown device '{value}' (expected gpu or cpu)")),
+            "gpu" => Ok(Device::Gpu(None)),
+            _ => value
+                .parse()
+                .map(|api| Device::Gpu(Some(api)))
+                .map_err(|_| {
+                    format!("unknown device '{value}' (expected gpu, cpu, cuda, vulkan, or metal)")
+                }),
         }
     }
 }
