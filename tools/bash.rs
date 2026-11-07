@@ -15,6 +15,15 @@
 //! with `head`'s zero, so a failed build read as a success to the model
 //! and to the harness alike.
 //!
+//! A command runs with no terminal: in a session of its own, with the
+//! variables set that tell git and the programs it runs to do without an
+//! editor, a pager, or a prompt. Without them, `git commit --amend` with a
+//! trailer and no `--no-edit` opened `vi` on the terminal the user was
+//! looking at dwim in, and the session sat at "Reading…" until the user
+//! went looking for why, as a program that asks on the terminal, such as
+//! `less`, `sudo`, or `ssh` at a new host, would too. With no terminal to
+//! ask on, they fail, and the model sees the error.
+//!
 //! A command that would take away changes the model has made to the
 //! project's tracked files is not run: on SWE-bench's django-11797 the
 //! model made the fix, then ran `git stash` to see its new test fail
@@ -44,6 +53,21 @@ use serde_json::Value;
 use crate::tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
 
 const NAME: &str = "bash";
+
+/// The environment every command runs with, over the user's: no editor,
+/// since there is no one to type into one, so that `git commit --amend`,
+/// `git rebase` and the like take the message they are given; no pager,
+/// so that `git log` and `git diff` print and end; and no prompt for a
+/// password or a passphrase, which could only hang.
+const ENVIRONMENT: &[(&str, &str)] = &[
+    ("GIT_EDITOR", "true"),
+    ("EDITOR", "true"),
+    ("VISUAL", "true"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_SEQUENCE_EDITOR", "true"),
+];
 
 pub const TOOL: Tool = Tool {
     name: NAME,
@@ -188,13 +212,23 @@ impl Bash {
         let mut shell = Command::new(&self.shell);
         shell
             .args(["-c", &command])
+            .envs(ENVIRONMENT.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // In a process group of its own, so that the timeout ends what
-            // the command started along with it.
-            .process_group(0)
             .current_dir(workdir.as_deref().unwrap_or(dir));
+        // In a session of its own, which is a process group of its own
+        // with the command's ID, so that the timeout ends what the
+        // command started along with it, and with no controlling
+        // terminal, so that nothing it runs can open the user's.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let mut child = shell
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.shell.display()))?;
@@ -693,6 +727,45 @@ mod tests {
             )
             .starts_with("error: 'timeout' is")
         );
+    }
+
+    #[test]
+    fn runs_with_no_terminal() {
+        let mut bash = Bash::default();
+        // The variables that keep git and its programs from asking.
+        assert_eq!(
+            sh(
+                "echo $GIT_EDITOR $EDITOR $GIT_PAGER $GIT_TERMINAL_PROMPT",
+                &mut bash
+            ),
+            "true true cat 0\n[exit code 0]"
+        );
+        // No controlling terminal to ask on, even in a dwim run from one.
+        assert_eq!(
+            sh(
+                "(exec < /dev/tty) 2>/dev/null && echo tty || echo none",
+                &mut bash
+            ),
+            "none\n[exit code 0]"
+        );
+        // An amend with a trailer and no `--no-edit` opens the editor, which
+        // takes the message as it is instead of hanging.
+        let dir = env::temp_dir().join(format!("dwim-amend-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let git = "git -c user.name=t -c user.email=t@t -c commit.gpgsign=false";
+        let out = run(
+            &mut bash,
+            &serde_json::json!({
+                "command": format!(
+                    "git init -q . && {git} commit -q --allow-empty -m first && \
+                     {git} commit -q --allow-empty --amend --trailer=Generated-by:dwim && \
+                     git log -1 --format=%B"
+                ),
+                "workdir": dir,
+            }),
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(out, "first\n\nGenerated-by: dwim\n[exit code 0]");
     }
 
     #[test]
