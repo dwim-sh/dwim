@@ -84,7 +84,7 @@ man dwim
 
 ## Using dwim as a sub-agent
 
-dwim makes a good sub-agent: your main agent plans the change, and
+dwim also makes a good sub-agent: your main agent plans the change, and
 dwim writes the code. The [dwim skills](https://github.com/dwim-sh/skills)
 teach an agent such as Claude Code or Codex to delegate to it:
 
