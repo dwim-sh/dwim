@@ -3,6 +3,8 @@
 
 # dwim
 
+*Do what I mean.*
+
 **A coding agent that runs on your own GPU.**
 
 The agent, the model, and the engine that runs it, in one Rust program:
