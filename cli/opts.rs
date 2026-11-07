@@ -23,8 +23,9 @@ pub struct Opts {
     #[argh(option)]
     pub provider: Option<Kind>,
 
-    /// device to run the model on: gpu (default), or cpu
-    #[argh(option, default = "Device::Gpu", from_str_fn(device))]
+    /// device to run the model on: gpu (default), cpu, or the GPU through
+    /// one API: cuda, vulkan, or metal
+    #[argh(option, default = "Device::Gpu(None)", from_str_fn(device))]
     pub device: Device,
 
     /// tokens of conversation each session has room for (default: as
@@ -150,8 +151,13 @@ pub fn budget(tokens: usize) -> Option<usize> {
 fn device(value: &str) -> Result<Device, String> {
     match value {
         "cpu" => Ok(Device::Cpu),
-        "gpu" => Ok(Device::Gpu),
-        _ => Err(format!("unknown device '{value}' (expected gpu or cpu)")),
+        "gpu" => Ok(Device::Gpu(None)),
+        _ => value
+            .parse()
+            .map(|api| Device::Gpu(Some(api)))
+            .map_err(|_| {
+                format!("unknown device '{value}' (expected gpu, cpu, cuda, vulkan, or metal)")
+            }),
     }
 }
 
@@ -233,7 +239,7 @@ pub fn help(output: &str, args: &[&str]) -> String {
         .position(|&arg| arg == "--device")
         .and_then(|i| args.get(i + 1))
         .and_then(|value| device(value).ok())
-        .unwrap_or(Device::Gpu);
+        .unwrap_or(Device::Gpu(None));
     layout(output, Model::default_size(device))
 }
 

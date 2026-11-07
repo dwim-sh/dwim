@@ -60,7 +60,7 @@ ahead of time.
 - **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
   or more, decoding several tokens at a time with the drafter its file
   ships.
-- **Fast local inference.** Metal on macOS, Vulkan on Linux.
+- **Fast local inference.** Metal on macOS, CUDA or Vulkan on Linux.
 - **Built-in local inference server.** The model is loaded once, in a
   `dwim` server that every `dwim` you run connects to. The first one starts
   it in the background, and it exits when idle. Sessions share the weights,

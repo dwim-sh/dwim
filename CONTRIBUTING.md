@@ -3,8 +3,9 @@
 ## Building
 
 `cargo build` needs nothing beyond Rust. The Vulkan kernels are compiled from
-WGSL to SPIR-V by `naga` in `build.rs`, and Metal compiles its own kernels
-from source when the device opens.
+WGSL to SPIR-V by `naga` in `build.rs`; CUDA and Metal compile their own
+kernels from source when the device opens, CUDA's with NVRTC, which it loads
+then along with the driver.
 
 ```
 cargo build              # debug, with the model and the devices optimized
@@ -15,8 +16,11 @@ make install             # a release build and the manual page, in ~/.local
 `make install PREFIX=/usr/local` installs system-wide, which may need `sudo`;
 `make uninstall` removes what `make install` put there.
 
-Running the model on a GPU needs Metal on macOS, and elsewhere a Vulkan 1.1
-driver with `VK_KHR_push_descriptor`. `--device cpu` runs anywhere, slowly.
+Running the model on a GPU needs Metal on macOS, and elsewhere an NVIDIA
+driver with the CUDA toolkit's NVRTC library, or a Vulkan 1.1 driver with
+`VK_KHR_push_descriptor`. CUDA is tried first where there is a driver, and
+`--device cuda` or `--device vulkan` insists on one. `--device cpu` runs
+anywhere, slowly.
 
 The weights are downloaded on first use into the Hugging Face cache,
 `~/.cache/huggingface/hub`, in the layout the `huggingface_hub` library
