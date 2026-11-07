@@ -82,7 +82,7 @@ it reads:
 man dwim
 ```
 
-## Using dwim with Claude Code or Codex
+## Using dwim with a frontier model
 
 dwim works well alongside a frontier model: let the frontier model do
 the planning, and dwim the work. The
