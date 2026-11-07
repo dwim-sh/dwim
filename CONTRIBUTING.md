@@ -69,7 +69,7 @@ Run the agent before calling a change done. The model is easy to break in
 ways tests don't catch, such as replies that end with nothing to show, so
 ask it something in the shell, and check a one-off prompt too.
 
-The coding style is in `CLAUDE.md`. Commit messages say what changed and why,
+The coding style is in `AGENTS.md`. Commit messages say what changed and why,
 in the imperative, with the reasoning in the body. A commit whose change
 `dwim` made ends with the line `Generated-by: dwim`. The person who commits
 it has read the change and stands behind it, and the message is theirs.
