@@ -77,8 +77,9 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     } else {
         segments
     };
-    let (files, complete) = files(&root, &segments);
-    let found: Vec<&String> = files
+    let listing = files(&root, &segments);
+    let found: Vec<&String> = listing
+        .files
         .iter()
         .filter(|file| matches(&segments, &file.split('/').collect::<Vec<_>>()))
         .collect();
@@ -93,12 +94,12 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         n if n > MOST => format!("the first {MOST} of {n} files matching"),
         n => format!("{n} {} matching", plural(n as u64, "file", "files")),
     };
-    let among = if complete {
+    let among = if listing.complete {
         String::new()
     } else {
         format!(" among the first {CAP} entries walked")
     };
-    let narrow = match (found.len() > MOST, complete) {
+    let narrow = match (found.len() > MOST, listing.complete) {
         (true, false) => Some("the pattern or the path"),
         (true, true) => Some("the pattern"),
         (false, false) => Some("the path"),
@@ -117,7 +118,16 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
             path => format!("{}/{file}", path.trim_end_matches('/')),
         })
         .collect();
-    lines.push(format!("[{count} {what}{among}{advice}]"));
+    let unread = match listing.unread.as_slice() {
+        [] => String::new(),
+        [one] => format!("; {one} could not be read"),
+        [one, more @ ..] => format!(
+            "; {one} and {} more {} could not be read",
+            more.len(),
+            plural(more.len() as u64, "directory", "directories")
+        ),
+    };
+    lines.push(format!("[{count} {what}{among}{advice}{unread}]"));
     Ok(lines.join("\n"))
 }
 
@@ -145,14 +155,22 @@ fn within(dir: &Path, path: &str) -> Result<(), String> {
 /// there is no git to ignore them, they hold more files than the project.
 const BUILT: [&str; 2] = ["node_modules", "target"];
 
-/// The files under `dir` the pattern `pattern` could match, as paths
-/// relative to `dir` with `/` between their parts, in order, hidden files
+/// What is listed under a directory: the files, as paths relative to it
+/// with `/` between their parts, in order; whether the list is complete,
+/// which it is not when the walk hit the cap; and the directories the
+/// walk could not read, by the same paths.
+struct Listing {
+    files: Vec<String>,
+    complete: bool,
+    unread: Vec<String>,
+}
+
+/// The files under `dir` the pattern `pattern` could match, hidden files
 /// and directories left out: what git lists where `dir` is in a
 /// repository, which leaves out what it ignores too, and otherwise what
 /// a walk of the directories the pattern reaches finds, up to `CAP`
-/// entries. The flag says whether the list is complete, which it is not
-/// when the walk hit the cap.
-fn files(dir: &Path, pattern: &[&str]) -> (Vec<String>, bool) {
+/// entries.
+fn files(dir: &Path, pattern: &[&str]) -> Listing {
     let listed = Command::new("git")
         .args([
             "ls-files",
@@ -165,9 +183,9 @@ fn files(dir: &Path, pattern: &[&str]) -> (Vec<String>, bool) {
         .output()
         .ok()
         .filter(|output| output.status.success());
-    let (mut files, complete) = match listed {
-        Some(output) => (
-            output
+    let mut listing = match listed {
+        Some(output) => Listing {
+            files: output
                 .stdout
                 .split(|&byte| byte == 0)
                 .filter(|file| !file.is_empty())
@@ -176,37 +194,45 @@ fn files(dir: &Path, pattern: &[&str]) -> (Vec<String>, bool) {
                 // A file deleted but not yet committed is still listed.
                 .filter(|file| dir.join(file).is_file())
                 .collect(),
-            true,
-        ),
+            complete: true,
+            unread: Vec::new(),
+        },
         None => {
-            let mut files = Vec::new();
+            let mut listing = Listing {
+                files: Vec::new(),
+                complete: true,
+                unread: Vec::new(),
+            };
             let mut entries = 0;
-            let complete = walk(dir, "", pattern, &mut files, &mut entries);
-            (files, complete)
+            listing.complete = walk(dir, "", pattern, &mut listing, &mut entries);
+            listing
         }
     };
-    files.sort();
-    files.dedup();
-    (files, complete)
+    listing.files.sort();
+    listing.files.dedup();
+    listing
 }
 
 /// Adds the files under `dir`, whose path relative to the root is `at`, to
-/// `files`, in name order, leaving out hidden ones and not following
+/// `listing`, in name order, leaving out hidden ones and not following
 /// symbolic links, entering only the directories the pattern `pattern`
 /// reaches and none of `BUILT` the pattern does not name, counting the
-/// entries visited in `entries` and stopping at `CAP` of them. Returns
-/// whether it saw the whole tree.
+/// entries visited in `entries` and stopping at `CAP` of them. A directory
+/// it cannot read it notes in `listing`. Returns whether it saw all there
+/// was up to the cap.
 fn walk(
     dir: &Path,
     at: &str,
     pattern: &[&str],
-    files: &mut Vec<String>,
+    listing: &mut Listing,
     entries: &mut usize,
 ) -> bool {
-    let Ok(listing) = fs::read_dir(dir) else {
+    let Ok(entries_in) = fs::read_dir(dir) else {
+        let at = if at.is_empty() { "." } else { at };
+        listing.unread.push(at.to_string());
         return true;
     };
-    let mut listing: Vec<(String, fs::DirEntry)> = listing
+    let mut entries_in: Vec<(String, fs::DirEntry)> = entries_in
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
@@ -216,13 +242,13 @@ fn walk(
     // The first names up to the room the cap leaves, and one over it so
     // that the cap is seen hit: a huge directory is not sorted whole.
     let room = CAP - *entries + 1;
-    let cut = listing.len() > room;
+    let cut = entries_in.len() > room;
     if cut {
-        listing.select_nth_unstable_by(room, |a, b| a.0.cmp(&b.0));
-        listing.truncate(room);
+        entries_in.select_nth_unstable_by(room, |a, b| a.0.cmp(&b.0));
+        entries_in.truncate(room);
     }
-    listing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    for (name, entry) in listing {
+    entries_in.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (name, entry) in entries_in {
         let name = name.as_str();
         let path = if at.is_empty() {
             name.to_string()
@@ -246,11 +272,11 @@ fn walk(
         }
         *entries += 1;
         if kind.is_dir() {
-            if !walk(&entry.path(), &path, pattern, files, entries) {
+            if !walk(&entry.path(), &path, pattern, listing, entries) {
                 return false;
             }
         } else {
-            files.push(path);
+            listing.files.push(path);
         }
     }
     !cut
@@ -301,7 +327,7 @@ fn segment(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
     use serde_json::json;
 
@@ -492,6 +518,19 @@ mod tests {
             "the temporary directory is in a git repository"
         );
         let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern }));
+        // A directory that cannot be read is named, and the rest listed.
+        let private = dir.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::write(private.join("p.rs"), "").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&private).is_err() {
+            assert_eq!(
+                list("*.rs"),
+                "a.rs\nsrc/b.rs\nsrc/deep/c.rs\n[3 files matching *.rs; private could not be read]"
+            );
+        }
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&private).unwrap();
         // Built directories are left out, unless the pattern names them.
         for file in ["node_modules/m.js", "target/t.rs"] {
             fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
