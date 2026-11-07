@@ -8,14 +8,16 @@
 //! model, the sampling, and each session's conversation with it, as a
 //! [`Chat`], and speaks the [`protocol`].
 //!
-//! The model has one sequence's state. The server gives each session its
-//! own by saving the state of the session that last used the model, and
-//! restoring the one that uses it next, when they change over: a request
-//! runs whole, so sessions take turns at reply granularity, and a swap
-//! costs a copy of the key/value caches and recurrent states, which is
-//! paid only when the turn passes from one session to another.
+//! The model's weights are shared, and each session has a sequence of its
+//! own on the device: its key/value caches, its linear layers' recurrent
+//! states, and what the drafter carries over. The server allocates as many
+//! sequences as it has room for sessions when it starts, and a session
+//! takes one when it opens and gives it back when it closes; a session
+//! that finds none free is refused. Changing from one session's sequence to
+//! another's copies nothing.
 //!
-//! Requests are served one at a time, in the order they arrive. The ones
+//! Requests are served one at a time, in the order they arrive, each whole,
+//! so sessions take turns with the model at reply granularity. The ones
 //! that need no model, such as measuring a turn, are answered at once, by
 //! the thread that reads the connection.
 
@@ -148,12 +150,13 @@ fn prune(dir: &Path) {
 }
 
 /// What the server says of itself before the model is loaded: the model,
-/// the device it runs on, as the command line names them, and the context
-/// it was asked for, if it was.
+/// the device it runs on, as the command line names them, the context it
+/// was asked for, if it was, and how many sessions it has room for.
 pub struct Hello {
     pub model: String,
     pub device: String,
     pub context: Option<usize>,
+    pub room: usize,
 }
 
 /// A connection, as the threads share it: where its responses are written,
@@ -275,8 +278,9 @@ impl Server {
         }
     }
 
-    /// Serves the connections with `model`, loaded on `device` at `size`,
-    /// in `format`, each session sampling with what `sampler` makes of the
+    /// Serves the connections with `model`, loaded on `device` at `size`
+    /// with a sequence for each of the sessions the size has room for, in
+    /// `format`, each session sampling with what `sampler` makes of the
     /// temperature it asks for, until the server has gone the idle time
     /// without a session, or was asked to go and its sessions have ended.
     pub fn run(
@@ -293,11 +297,7 @@ impl Server {
         }
         let pool = Rc::new(RefCell::new(Pool {
             model,
-            active: None,
-            len: 0,
-            mark: 0,
-            verifying: None,
-            saved: HashMap::new(),
+            free: (0..size.sessions).rev().collect(),
         }));
         let mut sessions: HashMap<usize, Chat<Shared>> = HashMap::new();
         loop {
@@ -336,11 +336,7 @@ impl Server {
                     Entry::Occupied(_) => {
                         Err("a session is already open on this connection".into())
                     }
-                    Entry::Vacant(entry) => {
-                        let shared = Shared {
-                            id,
-                            pool: pool.clone(),
-                        };
+                    Entry::Vacant(entry) => Shared::take(&pool).and_then(|shared| {
                         Chat::new(shared, format.clone(), sampler(temperature)).map(|mut chat| {
                             chat.set_drafts(speculate);
                             let opened = Opened {
@@ -350,14 +346,21 @@ impl Server {
                                 sampling: Sampling::of(chat.sampler()),
                                 state: state(&chat),
                             };
+                            eprintln!("session {id} opened on sequence {}", shared_id(&chat));
                             entry.insert(chat);
-                            eprintln!("session {id} opened");
                             Response::Opened(opened)
                         })
-                    }
+                    }),
                 },
                 request => match sessions.get_mut(&id) {
-                    Some(chat) => serve(chat, request, &peer),
+                    Some(chat) => {
+                        let response = serve(chat, request, &peer);
+                        // A reply that failed part way may leave a batch
+                        // being verified: it is committed before another
+                        // session has the model.
+                        chat.settle();
+                        response
+                    }
                     None => Err("no session is open on this connection".into()),
                 },
             };
@@ -453,6 +456,7 @@ fn read(
                 model: inner.hello.model.clone(),
                 device: inner.hello.device.clone(),
                 context: inner.hello.context,
+                room: inner.hello.room,
                 sessions: inner.sessions.load(Ordering::Relaxed),
             }),
             Request::Retire => {
@@ -653,141 +657,97 @@ impl Sampling {
     }
 }
 
-/// The model, shared by the sessions: whose state it holds, how many
-/// positions of it, and the states of the sessions it does not.
+/// The model, shared by the sessions, and the numbers of its sequences
+/// that no session has.
 struct Pool {
     model: Box<dyn LanguageModel>,
-    active: Option<usize>,
-    /// Positions of the active session's sequence the model has committed.
-    len: usize,
-    /// Where the active session's mark is.
-    mark: usize,
-    /// Where the batch being verified starts, while one is.
-    verifying: Option<usize>,
-    saved: HashMap<usize, Vec<u8>>,
-}
-
-impl Pool {
-    /// Makes session `id`'s state the model's, if it is not already: the
-    /// active session's state is saved, and `id`'s restored, if `restore`
-    /// and it has one, and otherwise the model starts afresh.
-    fn activate(&mut self, id: usize, restore: bool) {
-        if self.active == Some(id) {
-            return;
-        }
-        if let Some(old) = self.active.take()
-            && self.len > 0
-        {
-            let state = self
-                .model
-                .save(self.len)
-                .expect("a model that is shared saves its state");
-            self.saved.insert(old, state);
-        }
-        self.active = Some(id);
-        match self.saved.remove(&id).filter(|_| restore) {
-            Some(state) => {
-                self.len = self
-                    .model
-                    .restore(&state)
-                    .expect("a state the model saved restores");
-            }
-            None => {
-                self.model.reset();
-                self.len = 0;
-            }
-        }
-    }
-
-    /// Forgets session `id`: its saved state, or its turn on the model.
-    fn forget(&mut self, id: usize) {
-        self.saved.remove(&id);
-        if self.active == Some(id) {
-            self.active = None;
-            self.len = 0;
-        }
-    }
+    free: Vec<usize>,
 }
 
 /// A session's handle on the shared model: a language model that is the
-/// model with the session's state in it, swapping it in as it is used.
+/// model running the session's own sequence, which it selects as it is
+/// used, and gives back when it is dropped.
 struct Shared {
     id: usize,
     pool: Rc<RefCell<Pool>>,
 }
 
+impl Shared {
+    /// Takes a sequence no session has, as before any token, or fails if
+    /// every one is taken.
+    fn take(pool: &Rc<RefCell<Pool>>) -> Result<Self, Box<dyn Error>> {
+        let mut p = pool.borrow_mut();
+        let Some(id) = p.free.pop() else {
+            return Err(
+                "the dwim server has no room for another session: quit one, or start the server with more --sessions"
+                    .into(),
+            );
+        };
+        p.model.select_sequence(id)?;
+        p.model.reset();
+        drop(p);
+        Ok(Self {
+            id,
+            pool: pool.clone(),
+        })
+    }
+
+    /// The model, running this session's sequence.
+    fn model(&self) -> std::cell::RefMut<'_, Box<dyn LanguageModel>> {
+        let mut pool = self.pool.borrow_mut();
+        pool.model
+            .select_sequence(self.id)
+            .expect("no batch is verified across requests");
+        std::cell::RefMut::map(pool, |pool| &mut pool.model)
+    }
+}
+
+/// The number of the sequence a session's chat runs on.
+fn shared_id(chat: &Chat<Shared>) -> usize {
+    chat.model().id
+}
+
 impl Drop for Shared {
     fn drop(&mut self) {
-        self.pool.borrow_mut().forget(self.id);
+        self.pool.borrow_mut().free.push(self.id);
     }
 }
 
 impl LanguageModel for Shared {
     fn save(&self, len: usize) -> Option<Vec<u8>> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        pool.model.save(len)
+        self.model().save(len)
     }
 
     fn restore(&mut self, state: &[u8]) -> crate::models::Result<usize> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, false);
-        let len = pool.model.restore(state)?;
-        pool.len = len;
-        Ok(len)
+        self.model().restore(state)
     }
 
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        let logits = pool.model.forward(tokens, pos);
-        pool.len = pos + tokens.len();
-        logits
+        self.model().forward(tokens, pos)
     }
 
     fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        pool.model.draft(token, pos, k)
+        self.model().draft(token, pos, k)
     }
 
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        pool.verifying = Some(pos);
-        pool.model.verify(tokens, pos)
+        self.model().verify(tokens, pos)
     }
 
     fn rewind(&mut self, keep: usize) {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        pool.model.rewind(keep);
-        if let Some(pos) = pool.verifying.take() {
-            pool.len = pos + keep;
-        }
+        self.model().rewind(keep)
     }
 
     fn mark(&mut self) -> bool {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        let marked = pool.model.mark();
-        pool.mark = pool.len;
-        marked
+        self.model().mark()
     }
 
     fn rewind_to_mark(&mut self) -> crate::models::Result<()> {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, true);
-        pool.model.rewind_to_mark()?;
-        pool.len = pool.mark;
-        Ok(())
+        self.model().rewind_to_mark()
     }
 
     fn reset(&mut self) {
-        let mut pool = self.pool.borrow_mut();
-        pool.activate(self.id, false);
-        pool.model.reset();
-        pool.len = 0;
+        self.model().reset()
     }
 
     fn max_len(&self) -> usize {
@@ -814,14 +774,18 @@ mod tests {
             model: "tiny".to_string(),
             device: "cpu".to_string(),
             context: None,
+            room: 2,
         };
         let server = Server::bind(&path, hello).unwrap();
         let handle = thread::spawn(move || {
             let tokenizer = Tokenizer::tiny();
             let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-            let model = Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
+            let mut model =
+                Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
+            model.add_sequence().unwrap();
             let format = Format::new(tokenizer).unwrap();
             let size = Size {
+                sessions: 2,
                 context: 1 << 12,
                 model: 0,
                 conversation: 0,
@@ -920,6 +884,29 @@ mod tests {
         a.replay(&[Turn::User("hi".to_string())]).unwrap();
         assert!(a.tokens() > start && a.tokens() < tokens);
 
+        // A third session finds no room, until one of the two closes, and
+        // then it starts afresh on the sequence given back.
+        let refused = Connection::connect(&path)
+            .unwrap()
+            .open(None, 0, |_| {})
+            .err()
+            .unwrap();
+        assert!(refused.to_string().contains("no room"), "{refused}");
+        drop(b);
+        // The server hears of the close on a thread of its own, so the
+        // open may come first, and is tried again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut c = loop {
+            match Connection::connect(&path).unwrap().open(None, 0, |_| {}) {
+                Ok(client) => break client,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        c.system("Be brief.", |_, _| {}).unwrap();
+        assert_eq!(c.tokens(), start);
+        let b = c;
+
         // The server goes once asked to, and its sessions are gone.
         let mut connection = Connection::connect(&path).unwrap();
         let welcome = connection.hello().unwrap();
@@ -974,12 +961,22 @@ mod tests {
     }
 
     #[test]
+    fn a_welcome_from_an_older_build_is_read() {
+        let older = r#"{"Welcome":{"build":"0.0.10-1-2","pid":7,"model":"qwen3.8-27b","device":"gpu","context":null,"sessions":1}}"#;
+        let Response::Welcome(welcome) = serde_json::from_str(older).unwrap() else {
+            panic!("not a welcome");
+        };
+        assert_eq!((welcome.pid, welcome.room, welcome.sessions), (7, 0, 1));
+    }
+
+    #[test]
     fn an_idle_server_exits() {
         let path = env::temp_dir().join(format!("dwim-test-idle-{}.sock", process::id()));
         let hello = Hello {
             model: "tiny".to_string(),
             device: "cpu".to_string(),
             context: Some(7),
+            room: 1,
         };
         let mut server = Server::bind(&path, hello).unwrap();
         server.set_idle(Duration::from_millis(200));
@@ -1000,6 +997,7 @@ mod tests {
                     Format::new(tokenizer).unwrap(),
                     "cpu".to_string(),
                     Size {
+                        sessions: 1,
                         context: 1 << 12,
                         model: 0,
                         conversation: 0,

@@ -20,15 +20,20 @@ use crate::{
 /// Runs the server with the model as `settings` have it, until it exits.
 pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let path = server::socket_path();
+    let sessions = settings.sessions.unwrap_or(model::SESSIONS);
+    if sessions == 0 {
+        return Err("a server needs room for one session at least".into());
+    }
     let hello = Hello {
         model: settings.model.clone(),
         device: settings.device.to_string(),
         context: settings.context,
+        room: sessions,
     };
     let server = Server::bind(&path, hello)?;
     eprintln!("listening on {}", path.display());
     let mut stderr = Stderr::new();
-    let loaded = match session::load_model(settings, |status| {
+    let loaded = match session::load_model(settings, sessions, |status| {
         stderr.report(&status);
         server.status(&status);
     }) {

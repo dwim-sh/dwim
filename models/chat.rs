@@ -525,6 +525,13 @@ impl<M: LanguageModel> Chat<M> {
         Ok(())
     }
 
+    /// Commits the batch being verified, if there is one, as far as the
+    /// reply got through it: a reply that fails part way may leave one,
+    /// which the next token fed would commit otherwise.
+    pub fn settle(&mut self) {
+        self.commit();
+    }
+
     /// Where the conversation's time has gone so far.
     pub fn stats(&self) -> Stats {
         self.stats

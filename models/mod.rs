@@ -85,6 +85,24 @@ pub trait LanguageModel {
 
     /// Longest sequence the state has room for.
     fn max_len(&self) -> usize;
+
+    /// Allocates another sequence, with state of its own and room for as
+    /// many tokens as the first, beside the model's others, which share its
+    /// weights, and returns its number. A model starts with one sequence,
+    /// number 0, which it runs until another is selected.
+    fn add_sequence(&mut self) -> Result<usize> {
+        Err("this model runs one sequence".into())
+    }
+
+    /// Has the model run sequence `id` from here on: every other method
+    /// is of the sequence selected. Fails while a batch is being verified.
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        if id == 0 {
+            Ok(())
+        } else {
+            Err(format!("no sequence {id}").into())
+        }
+    }
 }
 
 impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
@@ -126,6 +144,14 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn max_len(&self) -> usize {
         (**self).max_len()
+    }
+
+    fn add_sequence(&mut self) -> Result<usize> {
+        (**self).add_sequence()
+    }
+
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        (**self).select_sequence(id)
     }
 }
 

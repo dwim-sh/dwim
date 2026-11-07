@@ -24,9 +24,10 @@ compiles the Vulkan kernels.
   process, or a `server::Client`.
 * `server/`: the server that has the model, which every session is a client
   of over a Unix socket, since the model fits in memory once: `protocol` is
-  what they say to each other, `client` the session's end of it. Sessions
-  take turns with the model, a reply at a time, the server swapping each
-  one's state in as its turn comes.
+  what they say to each other, `client` the session's end of it. The
+  weights are shared and each session has a sequence of its own on the
+  device, its key/value caches and recurrent states; sessions take turns
+  with the model a reply at a time.
 * `tools/`: the tools, one file each, and `call`, which parses a call as the
   model writes it.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,

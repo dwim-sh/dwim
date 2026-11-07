@@ -109,7 +109,10 @@ fn project(dir: &Path) -> String {
 /// The headings `--help` lists the options under, each with its options by
 /// name. Every option has to be under one of them, which a test checks.
 const GROUPS: &[(&str, &[&str])] = &[
-    ("The model:", &["--context", "--device", "--model"]),
+    (
+        "The model:",
+        &["--context", "--device", "--model", "--sessions"],
+    ),
     (
         "Thinking and sampling:",
         &[
@@ -168,11 +171,12 @@ fn layout(output: &str, size: Option<model::Size>) -> String {
     let mut options = options(output);
     if let (Some(size), Some((_, description))) = (size, options.get_mut("--context")) {
         *description = format!(
-            "tokens of conversation the model has room for (default: {} on this machine, \
-             taking {} beside the model's {})",
+            "tokens of conversation each session has room for (default: {} on this machine, \
+             taking {} a session beside the model's {}, with room for {} sessions)",
             size.context,
             model::bytes(size.conversation),
-            model::bytes(size.model)
+            model::bytes(size.model),
+            size.sessions
         );
     }
     let mut text = format!("{USAGE}\n\n");
@@ -331,6 +335,7 @@ mod tests {
     #[test]
     fn help_fits_the_width() {
         let size = model::Size {
+            sessions: 2,
             context: 65536,
             model: 17_000_000_000,
             conversation: 3_000_000_000,

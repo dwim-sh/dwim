@@ -45,8 +45,11 @@ pub struct Settings {
     /// The model's name, which is the one model's.
     pub model: String,
     pub device: Device,
-    /// Tokens of conversation to make room for, or as many as fit.
+    /// Tokens of conversation to make room for in each session, or as
+    /// many as fit.
     pub context: Option<usize>,
+    /// Sessions to make room for at once, or the default.
+    pub sessions: Option<usize>,
     /// Most tokens of a thought, if they are limited.
     pub thinking_budget: Option<usize>,
     pub effort: harness::Effort,
@@ -103,10 +106,11 @@ pub fn fetch_model(
 }
 
 /// Fetches the model if needed, opens the device, and loads the model
-/// onto it in this process, reporting each stage to `on_status`: what the
-/// server does, and `bench`.
+/// onto it in this process, with room for `sessions` sequences, reporting
+/// each stage to `on_status`: what the server does, and `bench`.
 pub fn load_model(
     settings: &Settings,
+    sessions: usize,
     mut on_status: impl FnMut(Status),
 ) -> Result<LoadedModel, Box<dyn Error>> {
     let dir = fetch_model(settings, &mut on_status)?;
@@ -115,11 +119,14 @@ pub fn load_model(
     let name = device.name();
     on_status(Status::Device(name.clone()));
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let size = model::size(&gguf, &device, settings.context)?;
+    let size = model::size(&gguf, &device, settings.context, sessions)?;
     on_status(Status::Sized(size));
-    let model = device.load(gguf.clone(), size.context, |done, total| {
+    let mut model = device.load(gguf.clone(), size.context, |done, total| {
         on_status(Status::Weights { done, total })
     })?;
+    for _ in 1..sessions {
+        model.add_sequence()?;
+    }
     Ok(LoadedModel {
         model,
         tokenizer,
@@ -243,6 +250,15 @@ fn difference(welcome: &Welcome, settings: &Settings) -> Option<String> {
             settings.device.to_string().to_uppercase()
         ));
     }
+    if let Some(sessions) = settings.sessions
+        && welcome.room != sessions
+    {
+        return Some(format!(
+            "has room for {} {}, not {sessions}",
+            welcome.room,
+            plural(welcome.room, "session")
+        ));
+    }
     if let Some(context) = settings.context
         && welcome.context != Some(context)
     {
@@ -288,6 +304,10 @@ fn spawn(settings: &Settings) -> Result<(), Box<dyn Error>> {
     if let Some(context) = settings.context {
         args.push("--context".to_string());
         args.push(context.to_string());
+    }
+    if let Some(sessions) = settings.sessions {
+        args.push("--sessions".to_string());
+        args.push(sessions.to_string());
     }
     let log = match log_path() {
         Some(path) => {

@@ -28,6 +28,12 @@ const DEFAULT_CONTEXT: usize = 16384;
 /// its second message, to no avail.
 const MIN_CONTEXT: usize = 16384;
 
+/// Sessions the model has room for at once, unless the command line says:
+/// on a 32 GiB Mac, the memory beside the weights has room for two with a
+/// context of twenty-odd thousand tokens each, and three would each have
+/// less than [`MIN_CONTEXT`].
+pub const SESSIONS: usize = 2;
+
 /// Memory left free besides what the model takes, when its context is
 /// fitted to the memory free: for the device's scratch buffers, the
 /// driver, and whatever else starts in the meantime.
@@ -112,16 +118,22 @@ impl Opened {
     }
 }
 
-/// The size of the model on `device`, with room for `context` tokens of
-/// conversation, or as many as fit in the memory it has free.
-pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size, Box<dyn Error>> {
+/// The size of the model on `device`, with room for `sessions` sessions
+/// of `context` tokens of conversation each, or as many as fit in the
+/// memory it has free.
+pub fn size(
+    gguf: &Gguf,
+    device: &Opened,
+    context: Option<usize>,
+    sessions: usize,
+) -> Result<Size, Box<dyn Error>> {
     // Past the positions the model was trained on, its attention degrades.
     let config = qwen35::Config::load(gguf)?;
     let trained = config.context_length;
     let memory = qwen35::Memory::of(&config, gguf)?;
     let context = match context {
         Some(context) => context,
-        None => fit(&memory, device, trained),
+        None => fit(&memory, device, trained, sessions),
     };
     if context == 0 || context > trained {
         return Err(format!(
@@ -130,20 +142,22 @@ pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size
         .into());
     }
     Ok(Size {
+        sessions,
         context,
         model: memory.fixed,
-        conversation: memory.per_token * context as u64,
+        conversation: memory.per_sequence + memory.per_token * context as u64,
     })
 }
 
-/// Tokens of conversation that fit in the memory `device` has free,
-/// beside a model of `memory` and some headroom: a whole number of
-/// thousands, at least [`MIN_CONTEXT`], and at most `trained`.
-fn fit(memory: &qwen35::Memory, device: &Opened, trained: usize) -> usize {
+/// Tokens of conversation each of `sessions` sessions has room for in the
+/// memory the device has free beside the model, in whole thousands, at
+/// least [`MIN_CONTEXT`], and no more than the model was trained for.
+fn fit(memory: &qwen35::Memory, device: &Opened, trained: usize, sessions: usize) -> usize {
     let Some(free) = device.memory() else {
         return DEFAULT_CONTEXT.min(trained);
     };
-    let room = free.saturating_sub(memory.fixed + HEADROOM) / memory.per_token;
+    let each = free.saturating_sub(memory.fixed + HEADROOM) / sessions.max(1) as u64;
+    let room = each.saturating_sub(memory.per_sequence) / memory.per_token;
     let tokens = (room as usize).min(trained) / 1024 * 1024;
     tokens.max(MIN_CONTEXT).min(trained)
 }
@@ -156,15 +170,24 @@ pub fn default_size(device: opts::Device) -> Option<Size> {
         return None;
     }
     let gguf = open(&dir).ok()?;
-    size(&gguf, &Opened::open(device).ok()?, None).ok()
+    size(&gguf, &Opened::open(device).ok()?, None, SESSIONS).ok()
 }
 
 /// `size` as words: the memory the model takes, and the tokens of context
 /// and the memory they take.
 pub fn describe(size: &Size) -> String {
+    if size.sessions == 1 {
+        return format!(
+            "model: {} · context: {} tokens ({})",
+            bytes(size.model),
+            size.context,
+            bytes(size.conversation)
+        );
+    }
     format!(
-        "model: {} · context: {} tokens ({})",
+        "model: {} · {} sessions · context: {} tokens ({}) each",
         bytes(size.model),
+        size.sessions,
         size.context,
         bytes(size.conversation)
     )

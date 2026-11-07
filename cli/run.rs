@@ -1100,6 +1100,10 @@ fn model_listing(
                 model::bytes(size.conversation)
             ),
         ));
+        rows.push((
+            "sessions",
+            format!("room for {} at once, sharing the model", size.sessions),
+        ));
     }
     report(header, table(rows), columns)
 }

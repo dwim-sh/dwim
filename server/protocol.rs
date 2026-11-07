@@ -125,7 +125,11 @@ pub enum Response {
 
 /// Who the server is: its build, its process, the model it has or is
 /// loading, the device it runs on, the context it was asked for, if it was
-/// asked for one, and how many sessions it has.
+/// asked for one, how many sessions it has room for, and how many it has.
+///
+/// A session reads this from a server of any build, to find out whether to
+/// replace it, so a field added to it has a default, for a server that
+/// does not send it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Welcome {
     pub build: String,
@@ -133,6 +137,8 @@ pub struct Welcome {
     pub model: String,
     pub device: String,
     pub context: Option<usize>,
+    #[serde(default)]
+    pub room: usize,
     pub sessions: usize,
 }
 
@@ -199,12 +205,14 @@ pub enum Status {
     Busy,
 }
 
-/// Tokens of conversation the model has room for, and the device memory
-/// it takes: `model` bytes for the weights, activations, and recurrent
-/// states, whatever the context, and `conversation` bytes more for the
-/// tokens of context.
+/// How many sessions the model has room for at once, the tokens of
+/// conversation each has room for, and the device memory they take:
+/// `model` bytes for the weights and the activations, which the sessions
+/// share, and `conversation` bytes more for each session, for its recurrent
+/// states and its tokens of context.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Size {
+    pub sessions: usize,
     pub context: usize,
     pub model: u64,
     pub conversation: u64,

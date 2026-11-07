@@ -2,7 +2,7 @@
 //! one: the tokenizer over a tiny vocabulary, and a model that says what
 //! it is told to.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::models::{LanguageModel, Result, Tokenizer, chat};
 
@@ -23,6 +23,10 @@ pub struct Scripted {
     pending: Option<bool>,
     /// Where the mark is, in tokens fed, if one has been made.
     mark: Option<usize>,
+    /// The sequence it is running, and the others' tokens fed, replies
+    /// under way, and marks, by number.
+    sequence: usize,
+    parked: HashMap<usize, Parked>,
     vocab: usize,
     /// How the chat template opens a reply, with the thought open or with
     /// an empty one when the reply is to be made without thinking.
@@ -47,6 +51,8 @@ impl Scripted {
             saying: VecDeque::new(),
             pending: None,
             mark: None,
+            sequence: 0,
+            parked: HashMap::new(),
             vocab: tokenizer.vocab_size(),
             opening: chat::opening(tokenizer, true).unwrap(),
             unthinking: chat::opening(tokenizer, false).unwrap(),
@@ -82,6 +88,9 @@ impl Scripted {
         }
     }
 }
+
+/// A sequence the model is not running, as it was left.
+type Parked = (Vec<u32>, VecDeque<u32>, Option<bool>, Option<usize>);
 
 impl LanguageModel for Scripted {
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
@@ -181,5 +190,32 @@ impl LanguageModel for Scripted {
 
     fn max_len(&self) -> usize {
         self.max_len
+    }
+
+    fn add_sequence(&mut self) -> Result<usize> {
+        let id = self.parked.len() + 1;
+        self.parked.insert(id, Default::default());
+        Ok(id)
+    }
+
+    /// Parks the sequence it is running, and takes up sequence `id`: its
+    /// scripts are shared, said in turn whichever sequence asks.
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        if id == self.sequence {
+            return Ok(());
+        }
+        let (fed, saying, pending, mark) = self
+            .parked
+            .remove(&id)
+            .ok_or_else(|| format!("no sequence {id}"))?;
+        let old = (
+            std::mem::replace(&mut self.fed, fed),
+            std::mem::replace(&mut self.saying, saying),
+            std::mem::replace(&mut self.pending, pending),
+            std::mem::replace(&mut self.mark, mark),
+        );
+        self.parked.insert(self.sequence, old);
+        self.sequence = id;
+        Ok(())
     }
 }
