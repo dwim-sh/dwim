@@ -122,13 +122,6 @@ pub struct Size {
     pub conversation: u64,
 }
 
-impl Size {
-    /// Bytes of device memory the model and its context take together.
-    pub fn bytes(&self) -> u64 {
-        self.model + self.conversation
-    }
-}
-
 /// The size of the model on `device`, with room for `context` tokens of
 /// conversation, or as many as fit in the memory it has free.
 pub fn size(gguf: &Gguf, device: &Opened, context: Option<usize>) -> Result<Size, Box<dyn Error>> {
@@ -176,14 +169,13 @@ pub fn default_size(device: opts::Device) -> Option<Size> {
     size(&gguf, &Opened::open(device).ok()?, None).ok()
 }
 
-/// `size` as words: the tokens of context, and the memory the model and
-/// they take.
+/// `size` as words: the memory the model takes, and the tokens of context
+/// and the memory they take.
 pub fn describe(size: &Size) -> String {
     format!(
-        "{} tokens of context, {} of memory: {} for the model and {} for the context",
-        size.context,
-        bytes(size.bytes()),
+        "model: {} · context: {} tokens ({})",
         bytes(size.model),
+        size.context,
         bytes(size.conversation)
     )
 }

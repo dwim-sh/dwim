@@ -165,7 +165,7 @@ fn layout(output: &str, size: Option<model::Size>) -> String {
     if let (Some(size), Some((_, description))) = (size, options.get_mut("--context")) {
         *description = format!(
             "tokens of conversation the model has room for (default: {} on this machine, \
-             taking {} of memory beside the {} the model takes)",
+             taking {} beside the model's {})",
             size.context,
             model::bytes(size.conversation),
             model::bytes(size.model)
