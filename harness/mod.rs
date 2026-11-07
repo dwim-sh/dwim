@@ -12,7 +12,8 @@
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
 //! them as they happen. The tools live in `crate::tools`. The system prompt
 //! pushes the model to use them rather than answer from memory or ask the
-//! user for a command, and carries the project's own instructions. Where
+//! user for a command, lists the skills found in the project and the
+//! user's, and carries the project's own instructions. Where
 //! the model is, and what the project looks like, go ahead of the first
 //! message instead, since a model won't always go looking on its own: they
 //! change from one run to the next, and keeping them out of the system
@@ -42,12 +43,21 @@ use std::{
 };
 
 use crate::models::{Chat, Chunk, LanguageModel, Turn};
+use crate::skills::{Skill, find};
 use crate::tools::{ToolCall, Tools, bash, read};
 
 pub use crate::harness::log::Log;
 
 /// Most of a project's `AGENTS.md` that goes into the system prompt.
 const MAX_INSTRUCTIONS: usize = 32 << 10;
+
+/// Most bytes of a skill's description in the skills listed in the system
+/// prompt.
+const MAX_DESCRIPTION: usize = 1024;
+
+/// Most bytes of the skills listed in the system prompt: a line each, so
+/// that a directory of many skills takes little of the context.
+const MAX_SKILLS: usize = 8 << 10;
 
 /// Most of the files in the working directory the system prompt lists.
 const MAX_FILES: usize = 50;
@@ -248,15 +258,55 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    prompt.push_str(&tools(!crate::skills::find(dir).skills.is_empty()));
+    let skills = find(dir).skills;
+    prompt.push_str(&tools(!skills.is_empty()));
     prompt.push_str("\n\n");
     prompt.push_str(&instructions());
+    let section = skills_section(&skills);
+    if !section.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
         prompt.push_str(&instructions);
     }
     prompt
+}
+
+/// The `# Skills` section of the system prompt, empty when `skills` is
+/// empty: what a skill is, one `- name: description` line per skill in
+/// order, each description cut to [`MAX_DESCRIPTION`] bytes, and how to
+/// use the skill tool. Lines stop being added once the listing's lines
+/// would pass [`MAX_SKILLS`] bytes together; the skills left out are
+/// counted in one last line.
+pub fn skills_section(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut listing = String::new();
+    let mut listed = 0;
+    for skill in skills {
+        let line = format!(
+            "- {}: {}\n",
+            skill.name,
+            truncate(&skill.description, MAX_DESCRIPTION)
+        );
+        if listing.len() + line.len() > MAX_SKILLS {
+            break;
+        }
+        listing.push_str(&line);
+        listed += 1;
+    }
+    if listed < skills.len() {
+        let omitted = skills.len() - listed;
+        let word = if omitted == 1 { "skill" } else { "skills" };
+        listing.push_str(&format!("- and {omitted} more {word}, not listed\n"));
+    }
+    format!(
+        "# Skills\n\nA skill is a set of instructions for one kind of task, in a SKILL.md file with the files it needs beside it. The skills here, each with what it is for:\n\n{listing}\nWhen a task matches a skill's description, or the user names one, call the skill tool with its name before you start on the task, and follow the instructions it returns. A path in them is relative to the skill's directory, which the result names: read those files with read, and run scripts with bash. Don't load a skill the task doesn't match."
+    )
 }
 
 /// The tools, declared as the model's chat template puts them: the start of
@@ -1635,5 +1685,59 @@ mod tests {
         assert!(!files.contains(".git"));
         assert!(environment.contains("\nGit repository: yes"));
         assert!(environment.contains("\nDate: "));
+    }
+
+    #[test]
+    fn lists_the_skills() {
+        assert_eq!(skills_section(&[]), "");
+        let skill = Skill {
+            name: "demo".to_string(),
+            description: "Does a demo.".to_string(),
+            dir: PathBuf::from("skills/demo"),
+        };
+        let section = skills_section(std::slice::from_ref(&skill));
+        assert!(section.starts_with("# Skills\n\n"), "{section}");
+        assert!(section.contains("- demo: Does a demo."), "{section}");
+        assert!(section.ends_with("doesn't match."), "{section}");
+        // A long description is cut to the most of one.
+        let skill = Skill {
+            name: "long".to_string(),
+            description: "a".repeat(2000),
+            dir: PathBuf::from("skills/long"),
+        };
+        let section = skills_section(&[skill]);
+        assert!(
+            section.contains(&format!("- long: {}…", "a".repeat(1024))),
+            "{section}"
+        );
+        // Many skills: the listing stops, and the rest are counted.
+        let skills = (0..500).map(|i| Skill {
+            name: format!("skill-{i}"),
+            description: "a".repeat(100),
+            dir: PathBuf::from(format!("skills/skill-{i}")),
+        });
+        let section = skills_section(&skills.collect::<Vec<_>>());
+        assert!(section.len() < MAX_SKILLS + 1024, "{}", section.len());
+        // The last of the listing's lines, ahead of the closing paragraph.
+        let listing = section
+            .split("The skills here, each with what it is for:\n\n")
+            .nth(1)
+            .unwrap()
+            .split("\nWhen a task matches")
+            .next()
+            .unwrap();
+        let last = listing.lines().last().unwrap();
+        assert!(last.starts_with("- and "), "{last}");
+        assert!(last.ends_with("more skills, not listed"), "{last}");
+    }
+
+    #[test]
+    fn system_prompt_is_unchanged_without_skills() {
+        // The user's home directory may hold skills; skip then.
+        let dir = scratch();
+        if !find(&dir).skills.is_empty() {
+            return;
+        }
+        assert!(!system_prompt(&dir, Effort::Medium).contains("# Skills"));
     }
 }
