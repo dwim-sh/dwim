@@ -28,16 +28,7 @@ on a line of its own, and the account the model gives after a hundred
 tool calls, are answered with word to go on, with the tools on, up to ten
 times in a turn.
 .SH OPTIONS
-.TP
-.BI \-\-model " model"
-Model to run (default:
-.BR qwen3.8\-27b ).
-.TP
-.BI \-\-device " device"
-Device to run the model on:
-.B gpu
-(default), or
-.BR cpu .
+.SS The model
 .TP
 .BI \-\-context " tokens"
 Maximum conversation length in tokens.
@@ -63,22 +54,62 @@ earlier messages, and the most recent exchanges without their thoughts.
 A reply that runs out of room is stopped short and goes on after a
 compaction.
 .TP
-.B \-\-download
-Download the model if it is not yet, print the path of its weights, and
-exit. Does nothing but print the path when the model is there, so it can
-provision a machine or a container ahead of the first session, and name
-the weights for another program.
+.BI \-\-device " device"
+Device to run the model on:
+.B gpu
+(default), or
+.BR cpu .
 .TP
-.B \-\-bench
-Instead of a session, time the model at several depths of context and
-print a table of tokens a second: at each of 1k, 8k, 32k, 64k and 128k
-tokens of context, as many of them as the context has room for, the rate
-it reads a page of 2048 tokens, and the rate it generates 32 tokens one
-at a time. The context is filled with text to each depth in turn, which
-takes as long as reading that much, and a row is printed as each depth
-is done.
-.B \-\-context
-bounds the depths timed.
+.BI \-\-model " model"
+Model to run (default:
+.BR qwen3.8\-27b ).
+.SS Thinking and sampling
+.TP
+.BI \-\-reasoning\-effort " effort"
+How much the model reasons before it replies:
+.BR xhigh ,
+.B medium
+(default), or
+.BR low .
+The model's chat template asks for it with a line at the start of the
+system prompt, for
+.B xhigh
+and
+.B low
+only.
+The model's makers advise
+.B medium
+for the model's long reasoning, and find that
+.B low
+thinks about as long as
+.BR xhigh .
+.TP
+.BI \-\-speculate " n"
+Tokens the model drafts ahead and verifies in one pass; 0 decodes a token
+at a time (default: 4).
+.TP
+.BI \-\-temperature " t"
+Sample at temperature
+.I t
+instead of the one the model file recommends; 0 always picks the
+likeliest token.
+.TP
+.BI \-\-thinking\-budget " tokens"
+Most tokens the model may think at a time before it is made to act, or 0
+for no limit (default: 2048).
+The model thinks before every reply, and tends to think at length; a
+thought that repeats itself is ended whatever the budget. A thought that runs to
+the budget is ended with a sentence in the model's own voice, as the
+model's makers end one: before the model has called a tool in the turn, that
+it will check what it recalls with one; after, that it will go with what it
+has worked out from the results rather than go over it again.
+A turn ends when the model replies with text alone, or, after a hundred
+tool calls without a reply, when it is asked to say what it has done and
+what remains.
+After twenty calls in a row that change no file, a call's result ends with
+a reminder to make the change it has found and check it, or to say what it
+still needs to find out.
+.SS The session
 .TP
 .BI \-\-shell " program"
 Run the model's shell commands through
@@ -105,51 +136,6 @@ start, as
 .B Ctrl\-O
 does.
 .TP
-.BI \-\-thinking\-budget " tokens"
-Most tokens the model may think at a time before it is made to act, or 0
-for no limit (default: 2048).
-The model thinks before every reply, and tends to think at length; a
-thought that repeats itself is ended whatever the budget. A thought that runs to
-the budget is ended with a sentence in the model's own voice, as the
-model's makers end one: before the model has called a tool in the turn, that
-it will check what it recalls with one; after, that it will go with what it
-has worked out from the results rather than go over it again.
-A turn ends when the model replies with text alone, or, after a hundred
-tool calls without a reply, when it is asked to say what it has done and
-what remains.
-After twenty calls in a row that change no file, a call's result ends with
-a reminder to make the change it has found and check it, or to say what it
-still needs to find out.
-.TP
-.BI \-\-reasoning\-effort " effort"
-How much the model reasons before it replies:
-.BR xhigh ,
-.B medium
-(default), or
-.BR low .
-The model's chat template asks for it with a line at the start of the
-system prompt, for
-.B xhigh
-and
-.B low
-only.
-The model's makers advise
-.B medium
-for the model's long reasoning, and find that
-.B low
-thinks about as long as
-.BR xhigh .
-.TP
-.BI \-\-temperature " t"
-Sample at temperature
-.I t
-instead of the one the model file recommends; 0 always picks the
-likeliest token.
-.TP
-.BI \-\-speculate " n"
-Tokens the model drafts ahead and verifies in one pass; 0 decodes a token
-at a time (default: 4).
-.TP
 .BI \-\-transcript " file"
 Write the session's transcript to
 .I file
@@ -157,12 +143,30 @@ instead of a new file under
 .IR ~/.local/state/dwim/projects/ .
 .B /dev/null
 keeps none.
+.SS Instead of a session
 .TP
-.B \-\-version
-Print the version and exit.
+.B \-\-bench
+Instead of a session, time the model at several depths of context and
+print a table of tokens a second: at each of 1k, 8k, 32k, 64k and 128k
+tokens of context, as many of them as the context has room for, the rate
+it reads a page of 2048 tokens, and the rate it generates 32 tokens one
+at a time. The context is filled with text to each depth in turn, which
+takes as long as reading that much, and a row is printed as each depth
+is done.
+.B \-\-context
+bounds the depths timed.
+.TP
+.B \-\-download
+Download the model if it is not yet, print the path of its weights, and
+exit. Does nothing but print the path when the model is there, so it can
+provision a machine or a container ahead of the first session, and name
+the weights for another program.
 .TP
 .B \-\-help
 Display usage information.
+.TP
+.B \-\-version
+Print the version and exit.
 .SH INTERACTIVE SHELL
 The shell reads one message at a time.
 Anything you type is sent to the agent.
