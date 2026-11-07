@@ -15,7 +15,10 @@ mod grep;
 pub mod read;
 mod write;
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 
@@ -237,6 +240,28 @@ fn optional_number(arguments: &Value, key: &str, what: &str) -> Result<Option<u6
 /// empty.
 fn directory(arguments: &Value) -> Option<&str> {
     string(arguments, "path").filter(|path| !path.is_empty())
+}
+
+/// Checks that `path`, taken from `dir`, is `dir` or below it, symbolic
+/// links resolved, as the tools that search require of where they are
+/// pointed: the rest of the disk is not the project's. Says why otherwise:
+/// `tool` does not search outside, or the path or `dir` cannot be
+/// resolved.
+fn within(tool: &str, dir: &Path, path: &str) -> Result<(), String> {
+    let (target, root) = match (fs::canonicalize(dir.join(path)), fs::canonicalize(dir)) {
+        (Ok(target), Ok(root)) => (target, root),
+        (Err(error), _) => return Err(format!("{path} cannot be resolved: {error}")),
+        (_, Err(error)) => {
+            return Err(format!("the working directory cannot be resolved: {error}"));
+        }
+    };
+    if target.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{tool} searches the working directory and the directories under it; {path} is outside it. Use bash for other places."
+        ))
+    }
 }
 
 /// How a search reads on screen: the pattern, and where it is looked for.

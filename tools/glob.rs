@@ -15,7 +15,7 @@ use std::{fs, path::Path, process::Command};
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, directory, plural, required, search};
+use crate::tools::{Parameter, Signature, Tool, directory, plural, required, search, within};
 
 const NAME: &str = "glob";
 
@@ -62,7 +62,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     if !root.is_dir() {
         return Err(format!("{path} is not a directory"));
     }
-    within(dir, path)?;
+    within(NAME, dir, path)?;
     let segments: Vec<&str> = pattern
         .trim_start_matches("./")
         .split('/')
@@ -129,26 +129,6 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     };
     lines.push(format!("[{count} {what}{among}{advice}{unread}]"));
     Ok(lines.join("\n"))
-}
-
-/// Checks that `path`, taken from `dir`, is `dir` or below it, symbolic
-/// links resolved, or says why the tool will not search it: it is
-/// outside, or it or `dir` cannot be resolved.
-fn within(dir: &Path, path: &str) -> Result<(), String> {
-    let (target, root) = match (fs::canonicalize(dir.join(path)), fs::canonicalize(dir)) {
-        (Ok(target), Ok(root)) => (target, root),
-        (Err(error), _) => return Err(format!("{path} cannot be resolved: {error}")),
-        (_, Err(error)) => {
-            return Err(format!("the working directory cannot be resolved: {error}"));
-        }
-    };
-    if target.starts_with(root) {
-        Ok(())
-    } else {
-        Err(format!(
-            "glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
-        ))
-    }
 }
 
 /// Directories the walk leaves out unless the pattern names them: where
@@ -408,7 +388,7 @@ mod tests {
         let at = dir.to_str().unwrap();
         let refused = |path: &str| {
             format!(
-                "error: glob searches the working directory and the directories under it; {path} is outside it. Use bash with find for other places."
+                "error: glob searches the working directory and the directories under it; {path} is outside it. Use bash for other places."
             )
         };
         // Above the working directory, by its absolute path or a relative one.
@@ -437,12 +417,12 @@ mod tests {
         );
         // A path that cannot be resolved is not called outside.
         assert!(
-            within(&src, "gone")
+            within(NAME, &src, "gone")
                 .unwrap_err()
                 .starts_with("gone cannot be resolved: ")
         );
         assert!(
-            within(&dir.join("gone"), "deep")
+            within(NAME, &dir.join("gone"), "deep")
                 .unwrap_err()
                 .starts_with("deep cannot be resolved: ")
         );
