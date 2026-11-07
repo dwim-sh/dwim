@@ -892,9 +892,7 @@ impl App {
         Ok(())
     }
 
-    /// What the model is doing, with a spinner, while it's busy. Numbers that
-    /// would otherwise shift the line are padded to a fixed width, so it does
-    /// not shift as they change.
+    /// What the model is doing, with a spinner, while it's busy.
     fn status(&self) -> Option<Line> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
         let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
@@ -934,16 +932,19 @@ impl App {
                     Segment::Note => "Compacting…",
                 },
                 start,
-                format!(
-                    "{:>5} tok/s · {}esc to interrupt",
-                    rate(tokens as f64, start.elapsed())
-                        .map_or(String::new(), |rate| format!("{rate:.1}")),
-                    match (self.segment, self.verbose) {
+                {
+                    // No rate before a second has passed or a token arrived,
+                    // and the word `tok/s` is left out with it.
+                    let mut details = rate(tokens as f64, start.elapsed())
+                        .map_or(String::new(), |rate| format!("{rate:>5.1} tok/s · "));
+                    details.push_str(match (self.segment, self.verbose) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
                         (Segment::Thought, true) => "ctrl+o to hide · ",
                         (Segment::Text | Segment::Note, _) => "",
-                    }
-                ),
+                    });
+                    details.push_str("esc to interrupt");
+                    details
+                },
             ),
         };
         let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
