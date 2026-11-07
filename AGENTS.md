@@ -22,6 +22,8 @@ compiles the Vulkan kernels.
   session transcript.
 * `tools/`: the tools, one file each, and `call`, which parses a call as the
   model writes it.
+* `skills/`: the agent skills, `SKILL.md` files of instructions for a kind
+  of task, found and parsed.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,
   `vulkan` (WGSL kernels compiled to SPIR-V at build time), and `metal`
   (MSL kernels compiled when the device opens). `quant` is the 4- and 8-bit

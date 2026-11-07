@@ -21,6 +21,11 @@ is given,
 answers it without the shell and exits: the reply goes to standard output and
 nothing else does, while progress, the model's thinking, the commands it runs,
 and their output go to standard error.
+A prompt starting with
+.B /
+names a skill, as
+.BI /skill " arguments"
+does in the shell.
 As no one is there to answer the model, it runs in auto mode: a reply
 with no command that does not end with
 .B DONE
@@ -208,6 +213,17 @@ on a line of its own, and the account it gives after a hundred tool
 calls, are answered with word to go on, up to ten times in a turn.
 It is off in the shell unless turned on.
 .TP
+.B /skills
+List the skills installed, with their directories, and the
+.B SKILL.md
+files skipped, with why.
+.TP
+.BI /skill " arguments"
+Send the skill's instructions, as its
+.B skill
+tool would load them, followed by the arguments, as the message;
+a skill named like a command yields to the command.
+.TP
 .B /help
 List the commands and the keys.
 .PP
@@ -235,6 +251,32 @@ on a line with text clears it.
 If present in the working directory, its contents are given to the agent as
 project instructions.
 .TP
+.I .dwim/skills/
+A directory of skills, each a directory holding a
+.B SKILL.md
+whose frontmatter between
+.B \-\-\-
+lines gives a
+.B description
+and, optionally, a
+.B name
+(the directory's name otherwise), followed by instructions for one
+kind of task. The agent is told each skill's name and description in its
+system prompt and loads the instructions with its
+.B skill
+tool when a task matches or the user names the skill. Skills are also looked
+for in
+.I .agents/skills/
+and
+.I .claude/skills/
+here, and under the home directory in
+.I $XDG_CONFIG_HOME/dwim/skills/
+.RI ( ~/.config/dwim/skills/ ),
+.I ~/.agents/skills/
+and
+.IR ~/.claude/skills/ ,
+the first of a name winning in that order.
+.TP
 .I ~/.cache/huggingface/hub/models\-\-bartowski\-\-Qwen3.8\-27B\-GGUF/
 The model, downloaded on first use from its repository on Hugging Face at a
 pinned revision, and kept in the Hugging Face cache as the
@@ -258,9 +300,10 @@ on every system.
 The model's state after the system prompt, saved when a prompt is first
 read and taken up by later runs with the same model and prompt in place of
 reading it again. The prompt changes only with the project's
-.BR AGENTS.md ,
-since where the agent is, the files there, the branch and the date go with
-the first message instead, and the newest four states are kept. On macOS the
+.B AGENTS.md
+and the skills installed, since where the agent is, the files there, the
+branch and the date go with the first message instead, and the newest four
+states are kept. On macOS the
 directory is
 .I ~/Library/Caches/dwim/states/
 instead.
