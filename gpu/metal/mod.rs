@@ -691,10 +691,15 @@ struct LenParams {
 
 /// The most of the machine's memory a model may take, as a fraction: the
 /// weights and caches are wired while the model runs, and the system and
-/// the applications beside it need the rest. Half leaves 16 GiB of a 32
-/// GiB Mac: with the kernel's own few gigabytes wired too, a model given
-/// nine sixteenths left the machine paging while a browser was open.
-const SHARE: (u64, u64) = (1, 2);
+/// the applications beside it need the rest. Nine sixteenths is 18 GiB
+/// of a 32 GiB Mac, which gives Qwen3.8-27B, whose weights and states
+/// take 16.9 GB before any token of context, some fifty thousand tokens
+/// in 19 GB. Half, 16 GiB, held Bonsai with room to spare, but holds this
+/// model with none: the context fell to the floor, and the conversation
+/// was compacted at its second message. With the kernel's own few
+/// gigabytes wired too, this share has left the machine paging while a
+/// browser was open; less would leave the model no context to work in.
+const SHARE: (u64, u64) = (9, 16);
 
 impl Device for Metal {
     type Buffer = Buffer;
