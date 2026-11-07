@@ -86,19 +86,30 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         "." => pattern.to_string(),
         path => format!("{pattern} in {path}"),
     };
+    // The note: how many matched, and how to see the rest where the
+    // pattern matched more than are shown or the walk stopped short.
+    let count = match found.len() {
+        0 => "no files match".to_string(),
+        n if n > MOST => format!("the first {MOST} of {n} files matching"),
+        n => format!("{n} {} matching", plural(n as u64, "file", "files")),
+    };
     let among = if complete {
         String::new()
     } else {
         format!(" among the first {CAP} entries walked")
     };
-    if found.is_empty() {
-        return Ok(if complete {
-            format!("[no files match {what}]")
-        } else {
-            format!("[no files match {what}{among}; narrow the path to search further]")
-        });
-    }
-    let shown: Vec<String> = found
+    let narrow = match (found.len() > MOST, complete) {
+        (true, false) => Some("the pattern or the path"),
+        (true, true) => Some("the pattern"),
+        (false, false) => Some("the path"),
+        (false, true) => None,
+    };
+    let advice = match narrow {
+        Some(narrow) if found.is_empty() => format!("; narrow {narrow} to search further"),
+        Some(narrow) => format!("; narrow {narrow} for the rest"),
+        None => String::new(),
+    };
+    let mut lines: Vec<String> = found
         .iter()
         .take(MOST)
         .map(|file| match path {
@@ -106,26 +117,8 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
             path => format!("{}/{file}", path.trim_end_matches('/')),
         })
         .collect();
-    let note = if found.len() > MOST {
-        format!(
-            "[the first {MOST} of {} files matching {what}{among}; narrow the pattern{} for the rest]",
-            found.len(),
-            if complete { "" } else { " or the path" }
-        )
-    } else if !complete {
-        format!(
-            "[{} {} matching {what}{among}; narrow the path for the rest]",
-            found.len(),
-            plural(found.len() as u64, "file", "files")
-        )
-    } else {
-        format!(
-            "[{} {} matching {what}]",
-            found.len(),
-            plural(found.len() as u64, "file", "files")
-        )
-    };
-    Ok(format!("{}\n{note}", shown.join("\n")))
+    lines.push(format!("[{count} {what}{among}{advice}]"));
+    Ok(lines.join("\n"))
 }
 
 /// Checks that `path`, taken from `dir`, is `dir` or below it, symbolic
