@@ -3,7 +3,10 @@
 //! under the directory, `src/*.rs` those right in `src/`, and
 //! `src/**/*_test.go` those anywhere below it. Left with `bash` alone, the
 //! model ran `find` and `ls -R` over `target/` and `node_modules/`, and
-//! its preview was full before it reached the project's own files. The
+//! its preview was full before it reached the project's own files. Where
+//! there is no git to ignore those, the tool's own walk leaves them out
+//! and enters only the directories the pattern can reach, so that a cap
+//! on the walk does not fall before the files the pattern names. The
 //! search stays within the working directory: asked for `README*` in `/`,
 //! the model once had the tool walk the whole disk for a minute and got
 //! back a page of other projects' READMEs.
@@ -78,7 +81,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     } else {
         segments
     };
-    let (files, complete) = files(&root);
+    let (files, complete) = files(&root, &segments);
     let found: Vec<&String> = files
         .iter()
         .filter(|file| matches(&segments, &file.split('/').collect::<Vec<_>>()))
@@ -138,12 +141,18 @@ fn within(dir: &Path, root: &Path) -> bool {
     }
 }
 
-/// The files under `dir`, as paths relative to it with `/` between their
-/// parts, in order, hidden files and directories left out: what git lists
-/// where `dir` is in a repository, which leaves out what it ignores too,
-/// and otherwise everything up to `CAP` entries. The flag says whether the
-/// list is complete, which it is not when the walk hit the cap.
-fn files(dir: &Path) -> (Vec<String>, bool) {
+/// Directories the walk leaves out unless the pattern names them: where
+/// there is no git to ignore them, they hold more files than the project.
+const BUILT: [&str; 2] = ["node_modules", "target"];
+
+/// The files under `dir` the pattern `pattern` could match, as paths
+/// relative to `dir` with `/` between their parts, in order, hidden files
+/// and directories left out: what git lists where `dir` is in a
+/// repository, which leaves out what it ignores too, and otherwise what
+/// a walk of the directories the pattern reaches finds, up to `CAP`
+/// entries. The flag says whether the list is complete, which it is not
+/// when the walk hit the cap.
+fn files(dir: &Path, pattern: &[&str]) -> (Vec<String>, bool) {
     let listed = Command::new("git")
         .args([
             "ls-files",
@@ -172,7 +181,7 @@ fn files(dir: &Path) -> (Vec<String>, bool) {
         None => {
             let mut files = Vec::new();
             let mut entries = 0;
-            let complete = walk(dir, "", &mut files, &mut entries);
+            let complete = walk(dir, "", pattern, &mut files, &mut entries);
             (files, complete)
         }
     };
@@ -183,9 +192,17 @@ fn files(dir: &Path) -> (Vec<String>, bool) {
 
 /// Adds the files under `dir`, whose path relative to the root is `at`, to
 /// `files`, in name order, leaving out hidden ones and not following
-/// symbolic links, counting the entries visited in `entries` and stopping
-/// at `CAP` of them. Returns whether it saw the whole tree.
-fn walk(dir: &Path, at: &str, files: &mut Vec<String>, entries: &mut usize) -> bool {
+/// symbolic links, entering only the directories the pattern `pattern`
+/// reaches and none of `BUILT` the pattern does not name, counting the
+/// entries visited in `entries` and stopping at `CAP` of them. Returns
+/// whether it saw the whole tree.
+fn walk(
+    dir: &Path,
+    at: &str,
+    pattern: &[&str],
+    files: &mut Vec<String>,
+    entries: &mut usize,
+) -> bool {
     let Ok(listing) = fs::read_dir(dir) else {
         return true;
     };
@@ -199,26 +216,48 @@ fn walk(dir: &Path, at: &str, files: &mut Vec<String>, entries: &mut usize) -> b
         if name.starts_with('.') {
             continue;
         }
-        if *entries == CAP {
-            return false;
-        }
-        *entries += 1;
         let path = if at.is_empty() {
             name.to_string()
         } else {
             format!("{at}/{name}")
         };
-        match entry.file_type() {
-            Ok(kind) if kind.is_dir() => {
-                if !walk(&entry.path(), &path, files, entries) {
-                    return false;
-                }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let wanted = if kind.is_dir() {
+            reaches(pattern, &path.split('/').collect::<Vec<_>>())
+                && (!BUILT.contains(&name) || pattern.contains(&name))
+        } else {
+            kind.is_file()
+        };
+        if !wanted {
+            continue;
+        }
+        if *entries == CAP {
+            return false;
+        }
+        *entries += 1;
+        if kind.is_dir() {
+            if !walk(&entry.path(), &path, pattern, files, entries) {
+                return false;
             }
-            Ok(kind) if kind.is_file() => files.push(path),
-            _ => {}
+        } else {
+            files.push(path);
         }
     }
     true
+}
+
+/// Whether a file in the directory `parts`, or in one below it, could
+/// match the pattern `pattern`, both split at their slashes: whether a
+/// walk need enter it.
+fn reaches(pattern: &[&str], parts: &[&str]) -> bool {
+    match (pattern.first(), parts.first()) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(&"**"), Some(_)) => reaches(&pattern[1..], parts) || reaches(pattern, &parts[1..]),
+        (Some(part), Some(name)) => segment(part, name) && reaches(&pattern[1..], &parts[1..]),
+    }
 }
 
 /// Whether the path `parts` matches the pattern `pattern`, both split at
@@ -433,14 +472,37 @@ mod tests {
                 .success(),
             "the temporary directory is in a git repository"
         );
+        let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern }));
+        // Built directories are left out, unless the pattern names them.
+        for file in ["node_modules/m.js", "target/t.rs"] {
+            fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+            fs::write(dir.join(file), "").unwrap();
+        }
+        assert_eq!(
+            list("*.rs"),
+            "a.rs\nsrc/b.rs\nsrc/deep/c.rs\n[3 files matching *.rs]"
+        );
+        assert_eq!(list("*.js"), "[no files match *.js]");
+        assert_eq!(
+            list("node_modules/*.js"),
+            "node_modules/m.js\n[1 file matching node_modules/*.js]"
+        );
         fs::create_dir(dir.join("many")).unwrap();
         for i in 0..CAP + 1000 {
             fs::write(dir.join(format!("many/{i:05}.txt")), "").unwrap();
         }
-        let list = |pattern: &str| run_in(&dir, &json!({ "pattern": pattern }));
-        // In name order, the walk visits a.rs, docs, docs/x.md and many,
-        // then as many files in many as the cap leaves, and never src.
-        let walked = CAP - 4;
+        // For a name anywhere, the walk visits a.rs, docs, docs/x.md and
+        // many in name order, then as many files in many as the cap
+        // leaves, and never src.
+        assert_eq!(
+            list("*.md"),
+            format!(
+                "docs/x.md\n[1 file matching *.md among the first {CAP} entries walked; narrow the path for the rest]"
+            )
+        );
+        // For a pattern that names its directories, it enters those alone:
+        // a.rs and many, then the files in many; or just src.
+        let walked = CAP - 2;
         let found = list("many/*.txt");
         let lines: Vec<&str> = found.lines().collect();
         assert_eq!(lines.len(), MOST + 1);
@@ -451,17 +513,10 @@ mod tests {
                 "[the first {MOST} of {walked} files matching many/*.txt among the first {CAP} entries walked; narrow the pattern or the path for the rest]"
             )
         );
+        assert_eq!(list("src/*.rs"), "src/b.rs\n[1 file matching src/*.rs]");
         assert_eq!(
-            list("*.md"),
-            format!(
-                "docs/x.md\n[1 file matching *.md among the first {CAP} entries walked; narrow the path for the rest]"
-            )
-        );
-        assert_eq!(
-            list("src/*.rs"),
-            format!(
-                "[no files match src/*.rs among the first {CAP} entries walked; narrow the path to search further]"
-            )
+            list("src/**/*.rs"),
+            "src/b.rs\nsrc/deep/c.rs\n[2 files matching src/**/*.rs]"
         );
         // Under the cap, the list is whole again.
         assert_eq!(
@@ -487,5 +542,14 @@ mod tests {
         assert!(!m("src/*/a.rs", "src/a.rs"));
         assert!(m("?.rs", "a.rs") && !m("?.rs", "ab.rs"));
         assert!(segment("a*b*c", "aXbYc") && !segment("a*b", "ac"));
+        let r = |pattern: &str, dir: &str| {
+            let pattern: Vec<&str> = pattern.split('/').collect();
+            let dir: Vec<&str> = dir.split('/').collect();
+            reaches(&pattern, &dir)
+        };
+        assert!(r("src/*.rs", "src") && !r("src/*.rs", "docs"));
+        assert!(!r("src/*.rs", "src/deep") && r("src/**/*.rs", "src/deep"));
+        assert!(r("**/*.rs", "src/deep") && r("src/**", "src/deep"));
+        assert!(r("*/deep/*.rs", "src") && !r("*/deep/*.rs", "src/shallow"));
     }
 }
