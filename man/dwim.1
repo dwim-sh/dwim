@@ -21,6 +21,11 @@ is given,
 answers it without the shell and exits: the reply goes to standard output and
 nothing else does, while progress, the model's thinking, the commands it runs,
 and their output go to standard error.
+A prompt starting with
+.B /
+names a skill, as
+.BI /skill " arguments"
+does in the shell.
 As no one is there to answer the model, it runs in auto mode: a reply
 with no command that does not end with
 .B DONE
@@ -207,6 +212,17 @@ given on the command line: a reply that does not end with
 on a line of its own, and the account it gives after a hundred tool
 calls, are answered with word to go on, up to ten times in a turn.
 It is off in the shell unless turned on.
+.TP
+.B /skills
+List the skills installed, with their directories, and the
+.B SKILL.md
+files skipped, with why.
+.TP
+.BI /skill " arguments"
+Send the skill's instructions, as its
+.B skill
+tool would load them, followed by the arguments, as the message;
+a skill named like a command yields to the command.
 .TP
 .B /help
 List the commands and the keys.

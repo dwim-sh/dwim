@@ -1,11 +1,16 @@
 //! Answering one prompt and exiting, without the shell.
 //!
 //! The model's reply goes to standard output and nothing else does, so that
-//! a script can read the reply on its own. Getting ready, what the model is
-//! thinking, the commands it runs, and what they printed all go to standard
-//! error.
+//! a script can read the reply on its own. A prompt starting with `/` names
+//! a skill, as `/skill arguments` in the shell does: the skill's
+//! instructions, loaded the way the skill's tool would load them, followed
+//! by the arguments after the first whitespace, are the message sent;
+//! without one, the prompt is sent as before. Getting ready, what the model
+//! is thinking, the commands it runs, and what they printed all go to
+//! standard error.
 
 use std::{
+    env,
     error::Error,
     io::{self, Write},
     ops::ControlFlow,
@@ -14,6 +19,7 @@ use std::{
 };
 
 use dwim::harness::{Event, Log};
+use dwim::skills;
 
 use crate::session::{self, Settings, Stderr};
 
@@ -36,7 +42,15 @@ pub fn once(
     // No one is here to answer the model, so it goes on by itself.
     loaded.harness.set_auto(true);
     let mut printer = Printer::default();
-    loaded.harness.send(prompt, |event| {
+    let message = match prompt.strip_prefix('/') {
+        None => prompt.to_string(),
+        Some(rest) => {
+            let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let skills = skills::find(&env::current_dir()?).skills;
+            skills::invoke(&skills, name, arguments)?
+        }
+    };
+    loaded.harness.send(&message, |event| {
         printer.print(event);
         ControlFlow::Continue(())
     })?;

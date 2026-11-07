@@ -24,6 +24,7 @@ use crossterm::{
 use dwim::gpu::BACKEND;
 use dwim::harness::{self, Event, Log};
 use dwim::models::qwen35;
+use dwim::skills::{self, Found, Skill};
 
 use crate::{
     fetch::Progress,
@@ -54,6 +55,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let model = settings.model.clone();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
+    let cwd = env::current_dir().unwrap_or_default();
     {
         let stop = stop.clone();
         thread::spawn(move || {
@@ -71,7 +73,8 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         device_name: None,
         size: None,
         transcript,
-        cwd: env::current_dir().unwrap_or_default(),
+        cwd: cwd.clone(),
+        skills: skills::find(&cwd),
         input: Input::default(),
         history: Vec::new(),
         recalled: None,
@@ -151,7 +154,7 @@ fn auto_notice(auto: bool) -> String {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 9] = [
     (
         "/model",
         "the model, the device it runs on, and its context window",
@@ -166,6 +169,11 @@ const COMMANDS: [(&str, &str); 7] = [
     (
         "/auto on|off",
         "go on by itself until it says it is done, or ask",
+    ),
+    ("/skills", "the skills installed, and the files skipped"),
+    (
+        "/<skill> [arguments]",
+        "send a skill's instructions, with the arguments after them",
     ),
     ("/help", "this list"),
 ];
@@ -182,12 +190,17 @@ enum Command {
     /// Ask whether auto mode is on, or set it.
     Auto,
     SetAuto(bool),
+    /// List the skills.
+    Skills,
+    /// Invoke a skill by name, with the arguments that follow it.
+    Skill(String, String),
     Help,
 }
 
 impl Command {
-    /// The command `text` names, or what is wrong with it.
-    fn parse(text: &str) -> Result<Self, String> {
+    /// The command `text` names, with `skills` to name a skill, or what is
+    /// wrong with it.
+    fn parse(text: &str, skills: &[Skill]) -> Result<Self, String> {
         let (name, argument) = text
             .trim()
             .split_once(char::is_whitespace)
@@ -211,6 +224,11 @@ impl Command {
             ("auto", Some("on")) => Ok(Command::SetAuto(true)),
             ("auto", Some("off")) => Ok(Command::SetAuto(false)),
             ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
+            ("skills", None) => Ok(Command::Skills),
+            ("skills", Some(_)) => Err("/skills takes nothing".to_string()),
+            (name, arguments) if skills.iter().any(|skill| skill.name == name) => Ok(
+                Command::Skill(name.to_string(), arguments.unwrap_or_default().to_string()),
+            ),
             _ => Err(format!("Unknown command /{text} · /help lists them")),
         }
     }
@@ -353,6 +371,9 @@ struct App {
     /// Where the transcript is kept, if one is.
     transcript: Option<PathBuf>,
     cwd: PathBuf,
+    /// The skills in the working directory and the user's, as found when
+    /// the shell started.
+    skills: Found,
     input: Input,
     /// Messages sent so far, and which one is recalled into the input.
     history: Vec<String>,
@@ -535,11 +556,23 @@ impl App {
         }
         self.lines.push(Line::new());
 
-        let request = match message.strip_prefix('/').map(Command::parse) {
+        let parsed = message
+            .strip_prefix('/')
+            .map(|text| Command::parse(text, &self.skills.skills));
+        let request = match parsed {
             None => Request::Message(message),
             Some(Ok(Command::Compact)) => Request::Compact,
             Some(Ok(Command::SetThinkingBudget(tokens))) => Request::ThinkingBudget(tokens),
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
+            Some(Ok(Command::Skill(name, arguments))) => {
+                match skills::invoke(&self.skills.skills, &name, &arguments) {
+                    Ok(message) => Request::Message(message),
+                    Err(error) => {
+                        self.say(&notice(error));
+                        return;
+                    }
+                }
+            }
             Some(Ok(command)) => {
                 self.command(command);
                 return;
@@ -800,12 +833,38 @@ impl App {
                 Some(path) => format!("Transcript in {}", tilde(path)),
                 None => "No transcript is kept".to_string(),
             }),
+            Command::Skills if self.skills.skills.is_empty() && self.skills.skipped.is_empty() => {
+                notice(
+                    "No skills: none in .dwim/skills, .agents/skills or .claude/skills here, or under your home directory",
+                )
+            }
+            Command::Skills => {
+                let skills = self.skills.skills.iter().map(|skill| {
+                    format!(
+                        "{}: {} ({})",
+                        skill.name,
+                        skill.description,
+                        tilde(&skill.dir)
+                    )
+                });
+                let skipped = self
+                    .skills
+                    .skipped
+                    .iter()
+                    .map(|(path, reason)| format!("skipped {}: {reason}", tilde(path)));
+                report(
+                    vec![span("● "), span("Skills").bold()],
+                    skills.chain(skipped),
+                    columns,
+                )
+            }
             Command::Help => help(columns),
             Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
             Command::Auto => notice(auto_notice(self.auto)),
-            Command::Compact | Command::SetThinkingBudget(_) | Command::SetAuto(_) => {
-                return;
-            }
+            Command::Compact
+            | Command::SetThinkingBudget(_)
+            | Command::SetAuto(_)
+            | Command::Skill(..) => return,
         };
         self.say(&lines);
     }
@@ -1137,34 +1196,60 @@ mod tests {
 
     #[test]
     fn parses_the_commands() {
-        assert!(matches!(Command::parse("compact"), Ok(Command::Compact)));
-        assert!(matches!(Command::parse("help "), Ok(Command::Help)));
+        let demo = Skill {
+            name: "demo".into(),
+            description: "A demo.".into(),
+            dir: PathBuf::from("x/demo"),
+        };
         assert!(matches!(
-            Command::parse("thinking-budget"),
+            Command::parse("compact", &[]),
+            Ok(Command::Compact)
+        ));
+        assert!(matches!(Command::parse("help ", &[]), Ok(Command::Help)));
+        assert!(matches!(
+            Command::parse("thinking-budget", &[]),
             Ok(Command::ThinkingBudget)
         ));
         assert!(matches!(
-            Command::parse("thinking-budget 100"),
+            Command::parse("thinking-budget 100", &[]),
             Ok(Command::SetThinkingBudget(Some(100)))
         ));
         assert!(matches!(
-            Command::parse("thinking-budget 0"),
+            Command::parse("thinking-budget 0", &[]),
             Ok(Command::SetThinkingBudget(None))
         ));
-        assert!(Command::parse("thinking-budget lots").is_err());
+        assert!(Command::parse("thinking-budget lots", &[]).is_err());
         assert!(matches!(
-            Command::parse("auto on"),
+            Command::parse("auto on", &[]),
             Ok(Command::SetAuto(true))
         ));
-        assert!(matches!(Command::parse("auto"), Ok(Command::Auto)));
-        assert!(Command::parse("auto maybe").is_err());
-        assert!(Command::parse("model now").is_err());
+        assert!(matches!(Command::parse("auto", &[]), Ok(Command::Auto)));
+        assert!(Command::parse("auto maybe", &[]).is_err());
+        assert!(Command::parse("model now", &[]).is_err());
         assert!(
-            Command::parse("nothing").is_err_and(|e| e.starts_with("Unknown command /nothing"))
+            Command::parse("nothing", &[])
+                .is_err_and(|e| e.starts_with("Unknown command /nothing"))
         );
+        assert!(matches!(
+            Command::parse("demo", std::slice::from_ref(&demo)),
+            Ok(Command::Skill(name, arguments)) if name == "demo" && arguments.is_empty()
+        ));
+        assert!(matches!(
+            Command::parse("demo fix the build", std::slice::from_ref(&demo)),
+            Ok(Command::Skill(name, arguments)) if name == "demo" && arguments == "fix the build"
+        ));
+        assert!(Command::parse("demo", &[]).is_err_and(|e| e.starts_with("Unknown command /demo")));
+        assert!(matches!(Command::parse("skills", &[]), Ok(Command::Skills)));
+        assert!(Command::parse("skills x", &[]).is_err());
+        let help = Skill {
+            name: "help".into(),
+            description: "Helpful.".into(),
+            dir: PathBuf::from("x/help"),
+        };
+        assert!(matches!(Command::parse("help", &[help]), Ok(Command::Help)));
         // Every command has its line in the help.
-        for name in ["model", "stats", "transcript", "compact", "help"] {
-            assert!(Command::parse(name).is_ok(), "{name}");
+        for name in ["model", "stats", "transcript", "compact", "skills", "help"] {
+            assert!(Command::parse(name, &[]).is_ok(), "{name}");
             assert!(
                 COMMANDS
                     .iter()

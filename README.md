@@ -55,6 +55,9 @@ ahead of time.
   or more, decoding several tokens at a time with the drafter its file
   ships.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
+- **Skills.** Skills in `.dwim/skills/` (and `.agents/skills/`,
+  `.claude/skills/`, here or in your home directory) are listed to the
+  agent, loaded when a task matches, and invoked by hand with `/name`.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.
   Commands run without confirmation and without a time limit, until they

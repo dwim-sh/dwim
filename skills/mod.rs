@@ -218,6 +218,21 @@ pub fn find(dir: &Path) -> Found {
     scan(&roots(dir))
 }
 
+/// The message invoking the skill `name` with `arguments` sends: the skill's
+/// instructions as [`load`] gives them, followed by a blank line and the
+/// arguments when they are not empty.
+pub fn invoke(skills: &[Skill], name: &str, arguments: &str) -> Result<String, String> {
+    let skill = skills
+        .iter()
+        .find(|skill| skill.name == name)
+        .ok_or_else(|| format!("no skill called '{name}'"))?;
+    let mut message = load(skill)?;
+    if !arguments.is_empty() {
+        message.push_str(&format!("\n\n{arguments}"));
+    }
+    Ok(message)
+}
+
 /// The skill's instructions as the model gets them: its `SKILL.md`'s body
 /// after the frontmatter, whole when there is no frontmatter, named with
 /// the directory it is in, with the files of that directory beside it.
@@ -275,7 +290,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{FILE, Skill, load, parse, roots, scan};
+    use super::{FILE, Skill, invoke, load, parse, roots, scan};
 
     #[test]
     fn parses_the_frontmatter() {
@@ -468,6 +483,37 @@ mod tests {
         };
         let err = load(&missing).unwrap_err();
         assert!(err.starts_with("cannot read "), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invokes_a_skill_with_arguments() {
+        let dir = std::env::temp_dir().join(format!("dwim-skill-invoke-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let one = dir.join("one");
+        fs::create_dir_all(&one).unwrap();
+        fs::write(
+            one.join("SKILL.md"),
+            "---\nname: one\ndescription: One.\n---\nDo one.\n",
+        )
+        .unwrap();
+        let one = Skill {
+            name: "one".into(),
+            description: "One.".into(),
+            dir: one,
+        };
+        let message = invoke(std::slice::from_ref(&one), "one", "x").unwrap();
+        assert!(
+            message.starts_with("<skill name=\"one\" directory="),
+            "{message}"
+        );
+        assert!(message.ends_with("\n\nx"), "{message}");
+        let message = invoke(std::slice::from_ref(&one), "one", "").unwrap();
+        assert!(!message.ends_with("\n\n"), "{message}");
+        assert_eq!(
+            invoke(&[one], "two", "x").unwrap_err(),
+            "no skill called 'two'"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
