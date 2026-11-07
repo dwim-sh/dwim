@@ -16,7 +16,8 @@ use std::{
 use serde_json::Value;
 
 use crate::tools::{
-    Parameter, Signature, Tool, cut, directory, plural, required, search, string, without_ending,
+    Parameter, Signature, Tool, cut, directory, plural, required, search, string, within,
+    without_ending,
 };
 
 const NAME: &str = "grep";
@@ -38,7 +39,7 @@ fn signature() -> Signature {
             Parameter::string("pattern", "The regular expression to search for."),
             Parameter::string(
                 "path",
-                "The file or directory to search (default: the working directory).",
+                "The file or directory to search, the working directory or one below it (default: the working directory).",
             )
             .optional(),
             Parameter::string(
@@ -69,14 +70,15 @@ fn ripgrep() -> bool {
     })
 }
 
-/// Searches as `arguments` ask, in `dir` or a path taken from it,
-/// returning what the model should see.
+/// Searches as `arguments` ask, in `dir` or a path taken from it, which
+/// must be `dir` or below it, returning what the model should see.
 fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     let pattern = required(arguments, NAME, "pattern")?;
     if pattern.is_empty() {
         return Err("the pattern is empty".to_string());
     }
     let path = directory(arguments).unwrap_or(".");
+    within(NAME, dir, path)?;
     let glob = string(arguments, "glob").filter(|glob| !glob.is_empty());
     let mut command = if ripgrep() {
         let mut command = Command::new("rg");
@@ -193,9 +195,10 @@ mod tests {
 
     use super::*;
 
-    /// Runs the call in `arguments`, as the model sees the result.
-    fn run(arguments: &Value) -> String {
-        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
+    /// Runs the call in `arguments` with `dir` as the working directory,
+    /// as the model sees the result.
+    fn run(dir: &Path, arguments: &Value) -> String {
+        crate::tools::Output::of(super::run(dir, arguments), false).text
     }
 
     /// A directory of its own with a few files in it.
@@ -213,32 +216,49 @@ mod tests {
     fn finds_lines_with_their_file_and_number() {
         let dir = project();
         let at = dir.to_str().unwrap();
-        let found = run(&json!({ "pattern": "alpha", "path": at }));
+        let found = run(&dir, &json!({ "pattern": "alpha", "path": at }));
         assert_eq!(
             found,
             format!(
                 "{at}/a.rs:1:fn alpha() {{}}\n{at}/sub/b.txt:1:alpha beta\n[2 matches for alpha in {at}]"
             )
         );
-        let found = run(&json!({ "pattern": "alpha", "path": at, "glob": "*.rs" }));
+        let found = run(
+            &dir,
+            &json!({ "pattern": "alpha", "path": at, "glob": "*.rs" }),
+        );
         assert_eq!(
             found,
             format!("{at}/a.rs:1:fn alpha() {{}}\n[1 match for alpha in {at} (*.rs)]")
         );
-        let found = run(&json!({ "pattern": "gam+a", "path": format!("{at}/sub/b.txt") }));
+        let found = run(
+            &dir,
+            &json!({ "pattern": "gam+a", "path": format!("{at}/sub/b.txt") }),
+        );
         assert_eq!(
             found,
             format!("{at}/sub/b.txt:2:gamma\n[1 match for gam+a in {at}/sub/b.txt]")
         );
         assert_eq!(
-            run(&json!({ "pattern": "delta", "path": at })),
+            run(&dir, &json!({ "pattern": "delta", "path": at })),
             format!("[no matches for delta in {at}]")
         );
         assert!(
-            run(&json!({ "pattern": "(", "path": at })).starts_with("error: "),
+            run(&dir, &json!({ "pattern": "(", "path": at })).starts_with("error: "),
             "a malformed pattern is an error"
         );
-        assert!(run(&json!({ "path": at })).starts_with("error: grep needs"));
+        assert!(run(&dir, &json!({ "path": at })).starts_with("error: grep needs"));
+        // Outside the working directory, the search is refused.
+        assert_eq!(
+            run(&dir.join("sub"), &json!({ "pattern": "alpha", "path": at })),
+            format!(
+                "error: grep searches the working directory and the directories under it; {at} is outside it. Use bash for other places."
+            )
+        );
+        assert_eq!(
+            run(&dir, &json!({ "pattern": "README", "path": "/" })),
+            "error: grep searches the working directory and the directories under it; / is outside it. Use bash for other places."
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -248,7 +268,7 @@ mod tests {
         let at = dir.to_str().unwrap();
         let text: String = (1..=150).map(|i| format!("needle {i}\n")).collect();
         fs::write(dir.join("many.txt"), text).unwrap();
-        let found = run(&json!({ "pattern": "needle", "path": at }));
+        let found = run(&dir, &json!({ "pattern": "needle", "path": at }));
         let lines: Vec<&str> = found.lines().collect();
         assert_eq!(lines.len(), MOST + 1, "{found}");
         assert_eq!(lines[0], format!("{at}/many.txt:1:needle 1"));
