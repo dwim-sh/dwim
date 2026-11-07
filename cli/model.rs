@@ -24,8 +24,12 @@ const STATES_KEPT: usize = 4;
 const DEFAULT_CONTEXT: usize = 16384;
 
 /// Fewest tokens of conversation the model is given room for when it
-/// fits it to the memory free: room for the system prompt and a few turns.
-const MIN_CONTEXT: usize = 4096;
+/// fits it to the memory free: room for the system prompt, which runs to
+/// a few thousand tokens with the project's `AGENTS.md`, the note a
+/// compaction writes, and a few turns. At 4096, the system prompt alone
+/// took four fifths of the window, and the conversation was compacted at
+/// its second message, to no avail.
+const MIN_CONTEXT: usize = 16384;
 
 /// Memory left free besides what the model takes, when its context is
 /// fitted to the memory free: for the device's scratch buffers, the
