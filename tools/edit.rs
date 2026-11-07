@@ -4,15 +4,20 @@
 //! sees its change made without reading the file again. The string to
 //! replace is matched as the model copies it from a page: exactly, or but
 //! for the white space at the ends of its lines, or but for how far they
-//! are indented. A line a page cut matches by its start, and is kept
-//! whole: the model has not seen the rest of it, so an edit that would
-//! change or drop it is refused, and one that copies it as the page shows
-//! it, cut, writes it back whole. A string that matches more than once is
-//! refused, with the lines it matches at, and the line it begins at,
-//! given, says which. Left to itself, the model
-//! edits by an old string and a new, in Python through bash, and reads
-//! the file back after each to see that it took: this is that, as a tool,
-//! with the reading back in the result.
+//! are indented. The lines match whole; a string of one line that is no
+//! line of the file, but is part of one, is replaced within that line, as
+//! a word of a long line of prose is: the model copies the words it
+//! changes rather than the line they are on, and an error that said only
+//! that the string was not found sent it looking for hidden characters
+//! in a line it had copied right. A line a page cut matches by its start,
+//! and is kept whole: the model has not seen the rest of it, so an edit
+//! that would change or drop it is refused, and one that copies it as the
+//! page shows it, cut, writes it back whole. A string that matches more
+//! than once is refused, with the lines it matches at, and the line it
+//! begins at, given, says which. Left to itself, the model edits by an
+//! old string and a new, in Python through bash, and reads the file back
+//! after each to see that it took: this is that, as a tool, with the
+//! reading back in the result.
 //!
 //! An empty new string removes the lines. The call format puts a value on
 //! lines of its own between its tags, so a value of one blank line and an
@@ -53,12 +58,12 @@ pub const TOOL: Tool = Tool {
 
 fn signature() -> Signature {
     Signature {
-        description: "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.".to_string(),
+        description: "Replace one occurrence of old_string in a file with new_string, and show the lines as they now stand, numbered, with how later lines moved. Copy old_string from read exactly: the fewest lines that find the place, the lines that change and a line or two around them, or a part of one line; a change in several places is several edits. If it could match more than once, give start, the line it begins at. Empty new_string removes the lines; to put a blank line in their place, include the line before them in both strings. A line read cut with … is kept whole: copy it, cut, into new_string too.".to_string(),
         parameters: vec![
             Parameter::string("path", "The file to edit."),
             Parameter::string(
                 "old_string",
-                "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them.",
+                "The lines to replace, as read shows them, without their numbers: the lines that change and a line or two around them; or a part of one line.",
             ),
             Parameter::string("new_string", "The lines to put in their place."),
             Parameter::integer(
@@ -112,15 +117,27 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         .map(|line| String::from_utf8_lossy(without_ending(line)))
         .collect();
     let (found, tier) = find(&texts, &wanted);
-    let at = place(&found, start, &lines, &wanted, path)?;
-    let (first, last) = (at + 1, at + wanted.len());
-    let new = fitted(&lines[at..last], &wanted, new, tier).map_err(|line| {
-        format!(
-            "line {} of {path} is longer than read shows, cut at {} bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
-            at + line + 1,
-            read::LINE
-        )
-    })?;
+    let within = match (found.is_empty(), wanted.as_slice()) {
+        (true, [want]) => inside(&lines, want),
+        _ => Vec::new(),
+    };
+    let (at, last, new) = if within.is_empty() {
+        let at = place(&found, start, &lines, &wanted, path)?;
+        let last = at + wanted.len();
+        let new = fitted(&lines[at..last], &wanted, new, tier).map_err(|line| {
+            format!(
+                "line {} of {path} is longer than read shows, cut at {} bytes, and old_string has it cut, so you have not seen all of it; to keep it, put it in new_string as read shows it, with its …; to change it, use bash; nothing changed",
+                at + line + 1,
+                read::LINE
+            )
+        })?;
+        (at, last, new)
+    } else {
+        let (at, offset) = one_inside(&within, start, path)?;
+        let new = spliced(without_ending(lines[at]), offset, wanted[0].len(), new);
+        (at, at + 1, new)
+    };
+    let first = at + 1;
 
     let updated = replaced(&lines, first, last, &new);
     fs::write(&file, &updated).map_err(|e| format!("cannot write {path}: {e}"))?;
@@ -132,6 +149,7 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
         (first - 1 + added + CONTEXT).min(now.len()),
     );
     let what = match added {
+        _ if !within.is_empty() => format!("part of line {first} replaced"),
         0 => format!("lines {first}–{last} removed"),
         added => format!(
             "lines {first}–{last} replaced by {added} {}",
@@ -177,6 +195,22 @@ fn place(
     let count = lines.len();
     match (found, start) {
         ([], _) => {
+            let partial = wanted
+                .iter()
+                .enumerate()
+                .filter(|(_, want)| !want.trim().is_empty())
+                .find_map(|(k, want)| {
+                    lines
+                        .iter()
+                        .position(|line| part_of(without_ending(line), want))
+                        .map(|at| (k + 1, at + 1))
+                });
+            let why = match partial {
+                Some((k, at)) => format!(
+                    ": line {k} of it is part of line {at}, not the whole line, and lines match whole"
+                ),
+                None => String::new(),
+            };
             let around = match start {
                 Some(start) if start >= 1 && start <= count => format!(
                     ". The lines around {start} stand as:\n{}",
@@ -189,7 +223,7 @@ fn place(
                 _ => "; read the lines and copy them".to_string(),
             };
             Err(format!(
-                "old_string not found in {path}; nothing changed{around}"
+                "old_string not found in {path}{why}; nothing changed{around}"
             ))
         }
         ([at], _) => Ok(*at),
@@ -210,6 +244,106 @@ fn place(
             list(many)
         )),
     }
+}
+
+/// Where `want`, a one-line old string that is no line of `lines`, the
+/// lines of the file, is part of one: the index of the line and the byte
+/// it begins at, for each place, in order.
+fn inside(lines: &[&[u8]], want: &str) -> Vec<(usize, usize)> {
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(at, line)| {
+            occurrences(without_ending(line), want.as_bytes()).map(move |offset| (at, offset))
+        })
+        .collect()
+}
+
+/// Whether `want` is part of `line` but not the whole of it, white space
+/// at the ends aside.
+fn part_of(line: &[u8], want: &str) -> bool {
+    occurrences(line, want.as_bytes()).next().is_some()
+        && String::from_utf8_lossy(line).trim() != want.trim()
+}
+
+/// The bytes of `text` at which `pattern` begins, left to right, without
+/// overlap; none for an empty pattern.
+fn occurrences<'a>(text: &'a [u8], pattern: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        if pattern.is_empty() {
+            return None;
+        }
+        let at = text[from..]
+            .windows(pattern.len())
+            .position(|window| window == pattern)?
+            + from;
+        from = at + pattern.len();
+        Some(at)
+    })
+}
+
+/// The one place of `places`, where a one-line old string is `inside` the
+/// lines of the file, to edit: the only one, or the only one in line
+/// `start`; or the error the model is told, with the lines the string is
+/// part of, or how often it is part of the one line.
+fn one_inside(
+    places: &[(usize, usize)],
+    start: Option<usize>,
+    path: &str,
+) -> Result<(usize, usize), String> {
+    let mut lines: Vec<usize> = places.iter().map(|&(at, _)| at).collect();
+    lines.dedup();
+    let chosen: Vec<(usize, usize)> = match start {
+        Some(start) => places
+            .iter()
+            .filter(|&&(at, _)| at + 1 == start)
+            .copied()
+            .collect(),
+        None => places.to_vec(),
+    };
+    match (chosen.as_slice(), start) {
+        ([one], _) => Ok(*one),
+        ([], Some(start)) => Err(format!(
+            "old_string is part of lines {} of {path}, and not of line {start}; nothing changed",
+            list(&lines)
+        )),
+        (_, None) if lines.len() > 1 => Err(format!(
+            "old_string is part of lines {} of {path}; give start, the line of the one you mean; nothing changed",
+            list(&lines)
+        )),
+        // Several in the one line, or in the line start names.
+        (several, _) => Err(format!(
+            "old_string is part of line {} of {path} {} times; copy more of the line, so that it is once; nothing changed",
+            several[0].0 + 1,
+            several.len()
+        )),
+    }
+}
+
+/// `line`, a line of the file without its ending, with the `len` bytes at
+/// `offset` replaced by `text`, the new string, as lines: one, or more if
+/// `text` has more, the first and the last keeping what was around the
+/// old string.
+fn spliced(line: &[u8], offset: usize, len: usize, text: &str) -> Vec<Vec<u8>> {
+    let parts = split(text);
+    let (head, tail) = (&line[..offset], &line[offset + len..]);
+    let count = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let mut line = Vec::new();
+            if i == 0 {
+                line.extend_from_slice(head);
+            }
+            line.extend_from_slice(part.as_bytes());
+            if i + 1 == count {
+                line.extend_from_slice(tail);
+            }
+            line
+        })
+        .collect()
 }
 
 /// The lines of `text`, without their endings.
@@ -658,6 +792,120 @@ mod tests {
             )
         );
         assert_eq!(file.text(), FIVE);
+    }
+
+    #[test]
+    fn replaces_a_part_of_one_line_within_it() {
+        // A word of a wrapped line of prose, as the model copies it.
+        let text = "# Notes\n\nThe coding style is in `CLAUDE.md`. Commit messages say what changed,\nand why.\n";
+        let file = File::new(text);
+        let result = file.edit("`CLAUDE.md`", "`AGENTS.md`");
+        assert_eq!(
+            file.text(),
+            "# Notes\n\nThe coding style is in `AGENTS.md`. Commit messages say what changed,\nand why.\n"
+        );
+        assert_eq!(
+            result,
+            format!(
+                "1\t# Notes\n2\t\n3\tThe coding style is in `AGENTS.md`. Commit messages say what changed,\n4\tand why.\n\
+                 [{}: part of line 3 replaced; 4 lines in all]",
+                file.path()
+            )
+        );
+        // A new string of several lines breaks the line there.
+        let file = File::new(text);
+        file.edit(". Commit", ".\nCommit");
+        assert_eq!(
+            file.text(),
+            "# Notes\n\nThe coding style is in `CLAUDE.md`.\nCommit messages say what changed,\nand why.\n"
+        );
+        // An empty new string takes the part out of the line.
+        let file = File::new(text);
+        file.edit(" Commit messages say what changed,", "");
+        assert_eq!(
+            file.text(),
+            "# Notes\n\nThe coding style is in `CLAUDE.md`.\nand why.\n"
+        );
+        // A whole line comes first: a string that is a line of the file,
+        // and part of another, is the line.
+        let file = File::new("ab\na\nc\n");
+        file.edit("a", "x");
+        assert_eq!(file.text(), "ab\nx\nc\n");
+        // Part of a line read cut, which the model has seen, is replaced,
+        // and the rest of the line kept.
+        let long = format!("{} old {}", "y".repeat(read::LINE), "y".repeat(read::LINE));
+        let file = File::new(&format!("{long}\nend\n"));
+        file.edit(" old ", " new ");
+        assert_eq!(
+            file.text(),
+            format!(
+                "{} new {}\nend\n",
+                "y".repeat(read::LINE),
+                "y".repeat(read::LINE)
+            )
+        );
+        // Several lines are matched whole or not at all.
+        let file = File::new(text);
+        let result = file.edit("style is in `CLAUDE.md`.\nand why.", "x");
+        assert_eq!(
+            result,
+            format!(
+                "error: old_string not found in {}: line 1 of it is part of line 3, not the whole line, and lines match whole; nothing changed; read the lines and copy them",
+                file.path()
+            )
+        );
+        assert_eq!(file.text(), text);
+        // Line endings do not count as part of a line.
+        let file = File::new("one\r\ntwo\r\n");
+        file.edit("ne", "NE");
+        assert_eq!(file.text(), "oNE\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn refuses_a_part_of_a_line_that_is_there_twice_unless_told_where() {
+        let text = "a b a\nb a\nc\n";
+        // In one line twice: more of the line is needed.
+        let file = File::new(text);
+        let result = file.edit("a", "x");
+        assert_eq!(
+            result,
+            format!(
+                "error: old_string is part of lines 1, 2 of {}; give start, the line of the one you mean; nothing changed",
+                file.path()
+            )
+        );
+        let result = file.edit_at("a", "x", 1);
+        assert_eq!(
+            result,
+            format!(
+                "error: old_string is part of line 1 of {} 2 times; copy more of the line, so that it is once; nothing changed",
+                file.path()
+            )
+        );
+        let result = file.edit_at("a", "x", 3);
+        assert_eq!(
+            result,
+            format!(
+                "error: old_string is part of lines 1, 2 of {}, and not of line 3; nothing changed",
+                file.path()
+            )
+        );
+        assert_eq!(file.text(), text);
+        // Once in the line start names, the edit is made there.
+        let result = file.edit_at("a", "x", 2);
+        assert!(result.starts_with("1\ta b a\n2\tb x\n3\tc"), "{result}");
+        assert_eq!(file.text(), "a b a\nb x\nc\n");
+        // Twice in one line and nowhere else, without a start.
+        let file = File::new("a b a\nc\n");
+        let result = file.edit("a", "x");
+        assert_eq!(
+            result,
+            format!(
+                "error: old_string is part of line 1 of {} 2 times; copy more of the line, so that it is once; nothing changed",
+                file.path()
+            )
+        );
+        assert_eq!(file.text(), "a b a\nc\n");
     }
 
     #[test]
