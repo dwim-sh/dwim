@@ -77,9 +77,14 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 /// which spells out a tag stays text: a command that prints `<|im_end|>`
 /// cannot end the turn or start another.
 ///
-/// The whole conversation, including earlier thoughts, stays in the model's
-/// state, as the model's chat template preserves thinking by default. Each
-/// turn runs the model over only its new tokens.
+/// A reply's thought leaves the model's state once the reply is made, as
+/// the chat template leaves earlier thoughts out: the model is rewound to
+/// where the reply began and reads the reply back with an empty thought,
+/// as the template writes a reply already made, which is also how
+/// [`Chat::replay`] writes one. A reply stopped short for room keeps its
+/// thought, for the note that compacts the conversation to be written
+/// from it. Everything else stays, and each turn runs the model over only
+/// its new tokens.
 ///
 /// Qwen models call tools from inside the thought as well as after it: a
 /// `<tool_call>` tag followed by a `<function=…>` block ends the thought
@@ -571,9 +576,12 @@ impl<M: LanguageModel> Chat<M> {
     }
 
     /// A reply already made as a turn: an empty thought, its text, and its
-    /// tool calls as written, each in a `<tool_call>` block.
+    /// tool calls as written, each in a `<tool_call>` block. The newlines
+    /// the model puts between the thought and the text are the template's
+    /// to write, so the text's leading newlines are left out.
     fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>> {
         let mut content = closed_thought(&self.tokenizer)?;
+        let text = text.trim_start_matches('\n');
         content.extend(self.tokenizer.encode(&format!("\n\n{text}"))?);
         for (i, call) in calls.iter().enumerate() {
             if i > 0 {
@@ -612,11 +620,18 @@ impl<M: LanguageModel> Chat<M> {
 
     /// Generates the assistant's reply to the conversation so far.
     fn generate(&mut self, mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>) -> Result<Reply> {
+        // Where the reply begins, to rewind to once it is made.
+        self.commit();
+        let start = self.len;
+        let marked = self.model.mark();
+        let thought_before = self.stats.thought.tokens;
         let prompt = opening(&self.tokenizer, true)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
         let mut reply = Reply::default();
+        // The reply's text as shown, to feed back without the thought.
+        let mut shown = String::new();
         let mut thinking = true;
         let mut thought = 0;
         let mut call: Option<String> = None;
@@ -773,6 +788,7 @@ impl<M: LanguageModel> Chat<M> {
                     None if thinking => on_chunk(Chunk::Thought(&chunk)),
                     None => {
                         replied |= !chunk.trim().is_empty();
+                        shown.push_str(&chunk);
                         on_chunk(Chunk::Text(&chunk))
                     }
                 }
@@ -795,6 +811,24 @@ impl<M: LanguageModel> Chat<M> {
         self.feed(&end, Kind::Prompt)?;
         if interrupted {
             reply.calls.clear();
+        }
+
+        // A reply made with a thought is fed back without it, as `replay`
+        // writes a reply already made: the model is rewound to where the
+        // reply began and reads the text and the calls as a prompt. That
+        // costs a pass over them, against a thought of up to the budget
+        // that would stay in the context. They fit where the reply did,
+        // but for a text that encodes to more tokens than it was written
+        // in, which is left as it is. A reply stopped short for room keeps
+        // its thought: a compaction follows, and its note is written from
+        // what the model has thought so far.
+        if marked && !reply.cut && self.stats.thought.tokens > thought_before {
+            let turn = self.reply(&shown, &reply.calls)?;
+            if start + turn.len() <= self.model.max_len() {
+                self.model.rewind_to_mark()?;
+                self.len = start;
+                self.feed(&turn, Kind::Prompt)?;
+            }
         }
         Ok(reply)
     }
@@ -989,14 +1023,22 @@ mod tests {
             stats.answer.tokens,
             chat.tokenizer.encode("\n\nAn answer.").unwrap().len()
         );
+        // The reply as made is fed, then taken out once it is fed back
+        // without its thought.
+        let made = chat
+            .tokenizer
+            .encode_with_special(
+                "<|im_start|>assistant\n<think>\nA thought.\n</think>\n\nAn answer.<|im_end|>\n",
+            )
+            .unwrap();
         assert_eq!(
             stats.prompt.tokens + stats.thought.tokens + stats.answer.tokens,
-            chat.model.fed.len()
+            chat.model.fed.len() + made.len()
         );
     }
 
     #[test]
-    fn preserves_thoughts_across_user_turns() {
+    fn drops_a_thought_once_the_reply_is_made() {
         let mut chat = chat(&[
             "First thought.\n</think>\n\nOne.",
             "Second thought.\n</think>\n\nTwo.",
@@ -1014,16 +1056,18 @@ mod tests {
         .unwrap();
         assert_eq!(thoughts, "First thought.\n");
         assert_eq!(reply.trim(), "One.");
+        assert!(chat.stats().thought.tokens > 0);
 
         chat.send("second", |_| ControlFlow::Continue(())).unwrap();
+        // Each reply was made with its thought, and stands without it.
         let expected = chat
             .tokenizer
             .encode_with_special(concat!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n",
                 "<|im_start|>user\nfirst<|im_end|>\n",
-                "<|im_start|>assistant\n<think>\nFirst thought.\n</think>\n\nOne.<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\nOne.<|im_end|>\n",
                 "<|im_start|>user\nsecond<|im_end|>\n",
-                "<|im_start|>assistant\n<think>\nSecond thought.\n</think>\n\nTwo.<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\nTwo.<|im_end|>\n",
             ))
             .unwrap();
         assert_eq!(chat.model.fed, expected);
@@ -1031,7 +1075,51 @@ mod tests {
     }
 
     #[test]
-    fn preserves_tool_exchange_thoughts_on_the_next_user_turn() {
+    fn feeds_a_reply_back_as_a_replay_writes_it() {
+        let call = "\n<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>\n";
+        let first = format!("Check.\n</think>\n\nChecking.\n<tool_call>{call}</tool_call>");
+        let mut replayed = chat(&[]);
+        let mut chat = chat(&[&first, "Known.\n</think>\n\nMonday."]);
+        let mut checking = String::new();
+        let calls = chat.send("date?", text(&mut checking)).unwrap().calls;
+        assert_eq!(calls, [call.to_string()]);
+        let mut monday = String::new();
+        chat.respond(&["Mon".to_string()], text(&mut monday))
+            .unwrap();
+        assert_eq!(monday.trim(), "Monday.");
+
+        // The context is what a replay of the transcript gives.
+        let turns = [
+            Turn::User("date?".to_string()),
+            Turn::Reply {
+                text: checking,
+                calls,
+            },
+            Turn::Results(vec!["Mon".to_string()]),
+            Turn::Reply {
+                text: monday,
+                calls: Vec::new(),
+            },
+        ];
+        replayed.replay(&turns).unwrap();
+        assert_eq!(chat.model.fed, replayed.model.fed);
+        assert_eq!(chat.tokens(), replayed.tokens());
+        assert_eq!(
+            chat.tokens(),
+            turns
+                .iter()
+                .map(|turn| chat.measure(turn).unwrap())
+                .sum::<usize>()
+                + chat
+                    .tokenizer
+                    .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
+                    .unwrap()
+                    .len()
+        );
+    }
+
+    #[test]
+    fn drops_the_thoughts_of_a_tool_exchange() {
         let call = "<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>";
         let first = format!("Check the date.\n</think>\n\n<tool_call>\n{call}\n</tool_call>");
         let second = "The date is known.\n</think>\n\nMonday.";
@@ -1053,18 +1141,18 @@ mod tests {
             .encode_with_special(&format!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n\
                  <|im_start|>user\ndate?<|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n{first}<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{call}\n</tool_call><|im_end|>\n\
                  <|im_start|>user\n<tool_response>\nMon\n</tool_response><|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n{second}<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\nMonday.<|im_end|>\n\
                  <|im_start|>user\nthanks<|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n{third}<|im_end|>\n"
+                 <|im_start|>assistant\n<think>\n\n</think>\n\nBye.<|im_end|>\n"
             ))
             .unwrap();
         assert_eq!(chat.model.fed, expected);
     }
 
     #[test]
-    fn closes_and_preserves_an_interrupted_thought() {
+    fn closes_an_interrupted_thought_and_drops_it() {
         let mut chat = chat(&[
             "X unfinished.</think>\n\nUnseen.",
             "Continue.\n</think>\n\nDone.",
@@ -1081,9 +1169,9 @@ mod tests {
             .encode_with_special(concat!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n",
                 "<|im_start|>user\nfirst<|im_end|>\n",
-                "<|im_start|>assistant\n<think>\nX\n</think>\n\n<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n",
                 "<|im_start|>user\nsecond<|im_end|>\n",
-                "<|im_start|>assistant\n<think>\nContinue.\n</think>\n\nDone.<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\nDone.<|im_end|>\n",
             ))
             .unwrap();
         assert_eq!(chat.model.fed, expected);
@@ -1173,11 +1261,21 @@ mod tests {
         assert!(reply.is_empty(), "the thought never ended: {reply}");
         assert!(chat.tokens() <= max_len - 40, "{} tokens", chat.tokens());
         let fed = &chat.model.fed;
+        // The reply is ended properly, and keeps its thought, as a reply
+        // stopped short does.
         let ending = chat
             .tokenizer
             .encode_with_special("\n</think>\n\n<|im_end|>\n")
             .unwrap();
         assert!(fed.ends_with(&ending), "the reply is ended properly");
+        let empty = chat
+            .tokenizer
+            .encode_with_special("<think>\n\n</think>")
+            .unwrap();
+        assert!(
+            !fed.windows(empty.len()).any(|w| w == empty),
+            "the thought stays for the note"
+        );
 
         // The reserve is room for a plain answer, which may use it.
         let answer = chat
@@ -1418,8 +1516,8 @@ mod tests {
             .encode_with_special("<think>\nOne two\n\nEnough.\n</think>\n\n")
             .unwrap();
         assert!(
-            chat.model.fed.windows(closed.len()).any(|w| w == closed),
-            "the thought is closed after the limit"
+            !chat.model.fed.windows(closed.len()).any(|w| w == closed),
+            "the thought is dropped once the reply is made"
         );
         assert_eq!(
             chat.stats().thought.tokens,
@@ -1528,15 +1626,17 @@ mod tests {
         assert_eq!(replied.calls, [format!("\n{call}\n")]);
         assert_eq!(thoughts, "Let me check the date.\n");
         assert!(reply.trim().is_empty(), "{reply:?}");
+        // Once made, the reply stands as a replay writes one: the call
+        // after an empty thought.
         let expected = chat
             .tokenizer
             .encode_with_special(&format!(
-                "<|im_start|>assistant\n<think>\nLet me check the date.\n<tool_call>\n{call}\n</tool_call><|im_end|>\n"
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{call}\n</tool_call><|im_end|>\n"
             ))
             .unwrap();
         assert!(
             chat.model.fed.ends_with(&expected),
-            "the reply is kept as written"
+            "the reply stands without its thought"
         );
         assert!(!replied.thought_ended);
     }

@@ -63,6 +63,20 @@ pub trait LanguageModel {
         unreachable!("the model does not draft")
     }
 
+    /// Marks the sequence so far, keeping what
+    /// [`rewind_to_mark`](Self::rewind_to_mark) needs to take it up again
+    /// from here, if the model can: returns whether it did. A mark is kept
+    /// until the next, or until the model is reset or restored.
+    fn mark(&mut self) -> bool {
+        false
+    }
+
+    /// Puts the model back at the mark, forgetting the positions after
+    /// it: the next tokens start where the mark was made.
+    fn rewind_to_mark(&mut self) -> Result<()> {
+        Err("this model cannot rewind to a mark".into())
+    }
+
     /// Forgets the sequence so far, so that the next tokens start at
     /// position 0.
     fn reset(&mut self);
@@ -94,6 +108,14 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn rewind(&mut self, keep: usize) {
         (**self).rewind(keep)
+    }
+
+    fn mark(&mut self) -> bool {
+        (**self).mark()
+    }
+
+    fn rewind_to_mark(&mut self) -> Result<()> {
+        (**self).rewind_to_mark()
     }
 
     fn reset(&mut self) {

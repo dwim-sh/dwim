@@ -227,7 +227,7 @@ mod tests {
 
     use crate::harness::{
         STEPS_PROMPT,
-        tests::{harness, reply, send},
+        tests::{harness, reply, reply_saying, send},
     };
     use crate::models::Tokenizer;
 
@@ -236,10 +236,11 @@ mod tests {
     #[test]
     fn compacts_when_the_context_fills() {
         // Every message is answered with a call and then with text, each
-        // after a thought of 300 bytes, which the tiny tokenizer makes
-        // 300 tokens: the context fills in a few messages.
+        // saying 300 bytes, which the tiny tokenizer makes 300 tokens: the
+        // context fills in a few messages. The thoughts leave it as each
+        // reply is made, so they are short.
         let max_len = 8000;
-        let scripts: Vec<String> = (0..40).map(|i| reply(300, i % 2 == 0)).collect();
+        let scripts: Vec<String> = (0..40).map(|i| reply_saying(10, 300, i % 2 == 0)).collect();
         let mut harness = harness(
             &scripts,
             max_len,
@@ -310,7 +311,7 @@ mod tests {
         );
         assert!(turns.iter().any(|turn| matches!(turn, Turn::Results(_))));
         assert!(
-            matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim() == "Ok."),
+            matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim().ends_with("Ok.")),
             "{:?}",
             turns.last()
         );
@@ -350,11 +351,14 @@ mod tests {
 
     #[test]
     fn goes_on_after_a_reply_stopped_short() {
-        // Replies of 1800 tokens, after a first message that carries the
-        // environment: the fourth runs into the reserve, is stopped, and
-        // goes on after the compaction it prompts.
+        // Replies after thoughts of 1800 tokens, which leave the context as
+        // each reply is made, after a first message that carries the
+        // environment; then one whose thought runs into the reserve, is
+        // stopped, and goes on after the compaction it prompts.
         let max_len = 8000;
-        let scripts: Vec<String> = (0..8).map(|_| reply(1800, false)).collect();
+        let scripts: Vec<String> = (0..8)
+            .map(|i| reply(if i == 3 { 8000 } else { 1800 }, false))
+            .collect();
         let mut harness = harness(&scripts, max_len, " go on.");
         // The replies are long thoughts: not the budget's business here.
         harness.set_thinking_budget(None);

@@ -10,7 +10,10 @@
 //! changes. The GPU then runs the same tokens: the prompt in pieces of
 //! every size its kernels tell apart, and the continuation a token at a
 //! time, as when the model writes; after every piece, its next-token
-//! distribution must agree with the CPU's.
+//! distribution must agree with the CPU's. Then it runs them again with a
+//! detour: halfway through the prompt it marks its state, runs other
+//! tokens, and rewinds to the mark, as the chat does to drop a thought,
+//! and must agree with the CPU's straight run just the same.
 
 use std::{
     error::Error,
@@ -200,34 +203,37 @@ fn run() -> Result<bool> {
     let mut agreed = true;
     for round in 0..args.repeat {
         for (name, want) in &expected {
-            let got = want.replay(&mut gpu);
-            let (mut worst, mut tops) = ((0.0, 0, 0), 0);
-            for ((&(end, piece), got), want) in want.checks.iter().zip(&got).zip(&want.logits) {
-                let kl = kl(want, got);
-                if kl > worst.0 {
-                    worst = (kl, end, piece);
+            for detour in [false, true] {
+                let got = want.replay(&mut gpu, detour);
+                let (mut worst, mut tops) = ((0.0, 0, 0), 0);
+                for ((&(end, piece), got), want) in want.checks.iter().zip(&got).zip(&want.logits) {
+                    let kl = kl(want, got);
+                    if kl > worst.0 {
+                        worst = (kl, end, piece);
+                    }
+                    tops += usize::from(argmax(got) == argmax(want));
                 }
-                tops += usize::from(argmax(got) == argmax(want));
+                let ok = worst.0 < MAX_KL;
+                let (kl, end, piece) = worst;
+                println!(
+                    "{} {name}{}{}: KL at most {kl:.2e} (after token {end}, run {}); the same \
+                     top token at {tops} of {}",
+                    if ok { "ok  " } else { "FAIL" },
+                    if detour { " rewound" } else { "" },
+                    if args.repeat > 1 {
+                        format!(" #{}", round + 1)
+                    } else {
+                        String::new()
+                    },
+                    if piece == 1 {
+                        "alone".to_string()
+                    } else {
+                        format!("in {piece}")
+                    },
+                    want.checks.len(),
+                );
+                agreed &= ok;
             }
-            let ok = worst.0 < MAX_KL;
-            let (kl, end, piece) = worst;
-            println!(
-                "{} {name}{}: KL at most {kl:.2e} (after token {end}, run {}); the same top token \
-                 at {tops} of {}",
-                if ok { "ok  " } else { "FAIL" },
-                if args.repeat > 1 {
-                    format!(" #{}", round + 1)
-                } else {
-                    String::new()
-                },
-                if piece == 1 {
-                    "alone".to_string()
-                } else {
-                    format!("in {piece}")
-                },
-                want.checks.len(),
-            );
-            agreed &= ok;
         }
     }
     Ok(agreed)
@@ -256,35 +262,40 @@ impl Run {
             logits: Vec::new(),
         };
         run.prompt = run.tokens.len();
-        let (checks, logits) = run.run(cpu, CONTINUATION);
+        let (checks, logits) = run.run(cpu, CONTINUATION, false);
         run.checks = checks;
         run.logits = logits;
         Ok(run)
     }
 
     /// Runs the tokens through the model as [`record`](Self::record) did,
-    /// and returns the logits after each piece.
-    fn replay<D: Device>(&self, model: &mut Model<D>) -> Vec<Vec<f32>> {
+    /// and returns the logits after each piece. With `detour`, the model
+    /// is marked halfway through the prompt, runs the continuation's
+    /// tokens there, and is rewound to the mark before the prompt goes on.
+    fn replay<D: Device>(&self, model: &mut Model<D>, detour: bool) -> Vec<Vec<f32>> {
         let mut run = Self {
             tokens: self.tokens.clone(),
             prompt: self.prompt,
             checks: Vec::new(),
             logits: Vec::new(),
         };
-        run.run(model, 0).1
+        run.run(model, 0, detour).1
     }
 
-    /// Runs the prompt through `model` in pieces, then each token after it
-    /// alone, adding `write` more chosen from the logits, and returns where
-    /// each piece ended, with its size, and the logits after it.
+    /// Runs the prompt through `model` in pieces, with a detour halfway if
+    /// asked, then each token after it alone, adding `write` more chosen
+    /// from the logits, and returns where each piece ended, with its size,
+    /// and the logits after it.
     fn run<D: Device>(
         &mut self,
         model: &mut Model<D>,
         write: usize,
+        detour: bool,
     ) -> (Vec<(usize, usize)>, Vec<Vec<f32>>) {
         model.reset();
         let (mut checks, mut logits) = (Vec::new(), Vec::new());
         let mut pos = 0;
+        let mut detour = detour;
         for &size in PIECES.iter().cycle() {
             if pos == self.prompt {
                 break;
@@ -293,6 +304,14 @@ impl Run {
             logits.push(model.forward(&self.tokens[pos..pos + size], pos));
             pos += size;
             checks.push((pos - 1, size));
+            if detour && pos >= self.prompt / 2 {
+                assert!(model.mark(), "the model marks its state");
+                model.forward(&self.tokens[self.prompt..], pos);
+                model
+                    .rewind_to_mark()
+                    .expect("the model rewinds to the mark");
+                detour = false;
+            }
         }
         while pos < self.tokens.len() || pos < self.prompt + write {
             if pos == self.tokens.len() {

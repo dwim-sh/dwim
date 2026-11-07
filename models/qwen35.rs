@@ -269,9 +269,13 @@ impl Memory {
         }
         let attention = (0..c.layers).filter(|&i| c.is_attention(i)).count();
         let linear = c.layers - attention;
+        // The activations of a batch, and a row of hidden state a mark
+        // keeps for the drafter.
         let mut activations =
-            BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab;
-        let states = linear * (2 * c.conv_width() + c.ssm_width());
+            BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab + c.hidden;
+        // Two convolution states and one recurrent state per linear layer,
+        // and a copy of each for a mark.
+        let states = linear * (3 * c.conv_width() + 2 * c.ssm_width());
         // The drafter has a key/value cache of its own, and verifying a
         // batch keeps the linear layers' states run through it apart, their
         // inputs for it, the hidden state after every token, and every
@@ -1005,6 +1009,7 @@ impl<D: Device> LanguageModel for Model<D> {
         }
         s.parity = true;
         s.verified.clear();
+        s.marked = false;
         if self.draft.is_some() {
             let floats: Vec<f32> = take(c.hidden * 4)?
                 .chunks_exact(4)
@@ -1157,6 +1162,65 @@ impl<D: Device> LanguageModel for Model<D> {
         }
     }
 
+    /// Copies the linear layers' states aside, on the device, and the
+    /// hidden state carried over for the drafter. The attention layers'
+    /// caches need no copy, the drafter's among them: attention reads only
+    /// the positions before the token's, so the positions after the mark
+    /// are written over as the sequence goes on from it again.
+    fn mark(&mut self) -> bool {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        assert!(s.verified.is_empty(), "a batch is being verified");
+        for slot in 0..s.ssm_state.len() {
+            // The convolution reads the batch before from one buffer of the
+            // pair or the other, by the parity.
+            let conv = &s.conv_state[slot][if s.parity { 0 } else { 1 }];
+            d.copy(&mut s.mark_conv[slot], 0, conv, 0, c.conv_width());
+            d.copy(
+                &mut s.mark_ssm[slot],
+                0,
+                &s.ssm_state[slot],
+                0,
+                c.ssm_width(),
+            );
+        }
+        // Carried over only for a drafter.
+        if s.carry {
+            d.copy(&mut s.mark_hidden, 0, &s.hidden, 0, c.hidden);
+        }
+        s.mark_carry = s.carry;
+        s.marked = true;
+        true
+    }
+
+    /// Copies the linear layers' states back from the mark, and the hidden
+    /// state carried over for the drafter.
+    fn rewind_to_mark(&mut self) -> Result<()> {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        if !s.marked {
+            return Err("no mark to rewind to".into());
+        }
+        if !s.verified.is_empty() {
+            return Err("a batch is being verified".into());
+        }
+        for slot in 0..s.ssm_state.len() {
+            let [conv, _] = &mut s.conv_state[slot];
+            d.copy(conv, 0, &s.mark_conv[slot], 0, c.conv_width());
+            d.copy(
+                &mut s.ssm_state[slot],
+                0,
+                &s.mark_ssm[slot],
+                0,
+                c.ssm_width(),
+            );
+        }
+        s.parity = true;
+        if s.mark_carry {
+            d.copy(&mut s.hidden, 0, &s.mark_hidden, 0, c.hidden);
+        }
+        s.carry = s.mark_carry;
+        Ok(())
+    }
+
     /// Zeroes the linear layers' states, as they were before any token,
     /// and forgets what was carried over for the drafter. The attention
     /// layers' caches need no clearing: attention reads only the positions
@@ -1172,6 +1236,7 @@ impl<D: Device> LanguageModel for Model<D> {
         s.parity = false;
         s.carry = false;
         s.verified.clear();
+        s.marked = false;
     }
 
     fn max_len(&self) -> usize {
@@ -1229,6 +1294,15 @@ struct State<D: Device> {
     ssm_scratch: Vec<D::Buffer>,
     qkv_saved: Vec<D::Buffer>,
     ab_saved: Vec<D::Buffer>,
+    /// The linear layers' states as they were at the mark, a convolution
+    /// state and a recurrent state per layer, and the hidden state carried
+    /// over for the drafter then, if one was; and whether a mark has been
+    /// made.
+    mark_conv: Vec<D::Buffer>,
+    mark_ssm: Vec<D::Buffer>,
+    mark_hidden: D::Buffer,
+    mark_carry: bool,
+    marked: bool,
 }
 
 impl<D: Device> State<D> {
@@ -1288,6 +1362,11 @@ impl<D: Device> State<D> {
             ab_saved: (0..if c.drafter { slots } else { 0 })
                 .map(|_| d.alloc(BATCH * 2 * c.v_heads))
                 .collect(),
+            mark_conv: (0..slots).map(|_| d.alloc(conv_width)).collect(),
+            mark_ssm: (0..slots).map(|_| d.alloc(c.ssm_width())).collect(),
+            mark_hidden: d.alloc(c.hidden),
+            mark_carry: false,
+            marked: false,
         }
     }
 
@@ -1571,6 +1650,65 @@ mod tests {
         assert_ne!(whole.forward(&[3, 17, 42, 7, 9], 7), fresh);
         whole.reset();
         assert_eq!(whole.forward(&[3, 17, 42, 7, 9], 0), fresh);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs a sequence through the model on `device` three ways, and
+    /// returns the logits after it each time, with what the drafter then
+    /// drafts: straight through; with a detour of other tokens after the
+    /// first five, which stay as if they were the sequence's; and with the
+    /// detour taken from a mark that is rewound to before the sequence
+    /// goes on.
+    fn rewinding<D: Device>(path: &Path, device: D) -> [(Vec<f32>, Vec<u32>); 3] {
+        let gguf = Arc::new(Gguf::open(path).unwrap());
+        let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
+        let rest: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
+        model.forward(&[3, 17, 42, 7, 9], 0);
+        let straight = (model.forward(&rest, 5), model.draft(8, 45, 3));
+        model.reset();
+        model.forward(&[3, 17, 42, 7, 9], 0);
+        model.forward(&[11, 2, 30], 5);
+        model.forward(&[8], 8);
+        let detoured = (model.forward(&rest, 9), model.draft(8, 49, 3));
+        model.reset();
+        model.forward(&[3, 17, 42, 7, 9], 0);
+        assert!(model.mark());
+        model.forward(&[11, 2, 30], 5);
+        model.forward(&[8], 8);
+        model.rewind_to_mark().unwrap();
+        let rewound = (model.forward(&rest, 5), model.draft(8, 45, 3));
+        [straight, detoured, rewound]
+    }
+
+    #[test]
+    fn rewinds_to_a_mark() {
+        let dir = std::env::temp_dir().join(format!("dwim-qwen35-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path);
+        // The detour leaves the linear layers' states behind, and the
+        // rewind takes them back: the same logits as without the detour,
+        // and the same drafts after them.
+        let [straight, detoured, rewound] = rewinding(&path, Cpu);
+        assert_ne!(straight.0, detoured.0);
+        assert_eq!(straight.0, rewound.0);
+        assert_eq!(straight.1, rewound.1);
+        if let Ok(gpu) = Gpu::new() {
+            let [straight, _, rewound] = rewinding(&path, gpu);
+            close(&rewound.0, &straight.0, 2e-3, "rewound on the GPU");
+            assert_eq!(straight.1, rewound.1);
+        } else {
+            eprintln!("skipping the GPU rewind: no GPU");
+        }
+        // There is no mark to rewind to before one is made, nor after a
+        // reset.
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        let mut model = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        assert!(model.rewind_to_mark().is_err());
+        model.forward(&[3, 17], 0);
+        assert!(model.mark());
+        model.reset();
+        assert!(model.rewind_to_mark().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
