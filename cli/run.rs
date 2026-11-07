@@ -1012,8 +1012,9 @@ fn tilde(path: &Path) -> String {
 }
 
 /// The model, for the `/model` command: its source and its weights on
-/// disk, the device it runs on and how much conversation it has room for,
-/// as a table of labels and values.
+/// disk, the device it runs on, how much conversation it has room for, and
+/// the memory it and the conversation take, as a table of labels and
+/// values.
 fn model_listing(
     name: &str,
     device: Device,
@@ -1054,12 +1055,14 @@ fn model_listing(
         ("device", on),
     ];
     if let Some(size) = size {
+        rows.push(("context", format!("{} tokens", size.context)));
         rows.push((
-            "context",
+            "memory",
             format!(
-                "{} tokens in {} of memory",
-                size.context,
-                model::bytes(size.bytes)
+                "{}: {} for the model and {} for the context",
+                model::bytes(size.bytes()),
+                model::bytes(size.model),
+                model::bytes(size.conversation)
             ),
         ));
     }
