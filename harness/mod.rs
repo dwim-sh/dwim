@@ -1030,12 +1030,23 @@ mod tests {
     /// A reply after a thought of `thought` bytes, either with text alone
     /// or calling `bash`.
     pub fn reply(thought: usize, call: bool) -> String {
+        reply_saying(thought, 0, call)
+    }
+
+    /// A reply after a thought of `thought` bytes that says `text` bytes
+    /// of text, and then either ends or calls `bash`.
+    pub fn reply_saying(thought: usize, text: usize, call: bool) -> String {
         let body = if call {
             "<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n</parameter>\n</function>\n</tool_call>"
         } else {
             "Ok."
         };
-        format!("{}\n</think>\n\n{body}", filler(thought))
+        let text = if text > 0 {
+            format!("{}\n", filler(text))
+        } else {
+            String::new()
+        };
+        format!("{}\n</think>\n\n{text}{body}", filler(thought))
     }
 
     /// A harness around a scripted model with room for `max_len` tokens,
@@ -1429,10 +1440,11 @@ mod tests {
 
     #[test]
     fn logs_the_whole_session() {
-        // A call and its result, then replies of 1800 tokens until one is
-        // stopped short and goes on after a compaction.
+        // A call and its result, then replies after thoughts of 1800
+        // tokens, which leave the context as each reply is made, and one
+        // whose thought is stopped short and goes on after a compaction.
         let mut scripts = vec![reply(100, true), reply(100, false)];
-        scripts.extend((0..8).map(|_| reply(1800, false)));
+        scripts.extend((0..8).map(|i| reply(if i == 2 { 8000 } else { 1800 }, false)));
         let mut harness = harness(&scripts, 8000, " go on.");
         // The long thoughts are to be stopped short for room, not ended
         // at the budget.

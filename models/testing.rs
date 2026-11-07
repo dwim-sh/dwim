@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::models::{LanguageModel, Tokenizer, chat};
+use crate::models::{LanguageModel, Result, Tokenizer, chat};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
@@ -20,6 +20,8 @@ pub struct Scripted {
     /// reply, and with the thought closed, so the next sampled token
     /// starts one.
     pending: Option<bool>,
+    /// Where the mark is, in tokens fed, if one has been made.
+    mark: Option<usize>,
     vocab: usize,
     /// How the chat template opens a reply, with the thought open or with
     /// an empty one when the reply is to be made without thinking.
@@ -43,6 +45,7 @@ impl Scripted {
             answer: None,
             saying: VecDeque::new(),
             pending: None,
+            mark: None,
             vocab: tokenizer.vocab_size(),
             opening: chat::opening(tokenizer, true).unwrap(),
             unthinking: chat::opening(tokenizer, false).unwrap(),
@@ -135,10 +138,25 @@ impl LanguageModel for Scripted {
         logits
     }
 
+    fn mark(&mut self) -> bool {
+        self.mark = Some(self.fed.len());
+        true
+    }
+
+    /// Forgets the tokens fed since the mark.
+    fn rewind_to_mark(&mut self) -> Result<()> {
+        let mark = self.mark.ok_or("no mark to rewind to")?;
+        self.fed.truncate(mark);
+        self.saying.clear();
+        self.pending = None;
+        Ok(())
+    }
+
     fn reset(&mut self) {
         self.fed.clear();
         self.saying.clear();
         self.pending = None;
+        self.mark = None;
     }
 
     fn max_len(&self) -> usize {
