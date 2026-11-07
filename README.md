@@ -82,6 +82,34 @@ it reads:
 man dwim
 ```
 
+## Using dwim from Claude Code or Codex
+
+dwim does well on one clear, bounded task with everything it needs in the
+prompt, and badly on anything vague or spread over several steps: its
+context is small and it cannot ask you anything. So let a frontier model
+do the planning, and dwim the typing. The
+[dwim skills](https://github.com/dwim-sh/skills) teach an agent such as
+Claude Code or Codex to split the work that way:
+
+```console
+npx skills add dwim-sh/skills
+```
+
+Then, in the agent, ask for the change "with dwim":
+
+1. `/dwim-plan` reads the code, decides the design, and writes one
+   self-contained task file per commit under `.dwim/plans/<name>/`, with
+   a `PLAN.md` that holds the goal, the design, the checks, and the steps
+   as a checklist. It runs nothing: you read the plan and edit what you
+   want.
+2. `/dwim-do` hands the next task file to dwim, watches the run, reviews
+   the change as it would a pull request, fixes and verifies it, commits
+   it with `Generated-by: dwim`, and ticks the step off. `/dwim-do all`
+   goes on until a step fails review or none remain.
+
+The frontier model spends its tokens on the decisions and the review, and
+dwim, on your own GPU, on the code.
+
 ## License
 
 [MIT](LICENSE.md).
