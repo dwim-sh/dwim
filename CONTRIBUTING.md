@@ -129,3 +129,18 @@ pushes nothing. Pushing the tag runs `.github/workflows/release.yml`, which
 checks that the tag matches `Cargo.toml`, builds `dwim` for Apple silicon
 macOS and x86-64 and ARM64 Linux, and publishes them as a GitHub release.
 `https://dwim.sh/install.sh` installs the latest release from there.
+
+## Maintenance
+
+Two agent skills help keep the code easy for agents and people to work in:
+
+* [`untangle-codebase`](https://skill-sets.md/skills/caldoai/skills/untangle-codebase/)
+  refactors the whole codebase in one pass, so a change needs less of it
+  read and breaks less without anyone noticing. It is installed in
+  `.agents/skills/`, and `/untangle-codebase` runs it, optionally on one
+  area or concern.
+* [BeautifulRust](https://github.com/morganlinton/BeautifulRust) teaches
+  an agent idiomatic Rust: `rust-best-practices` steers code as it is
+  written, and `rust-review` reviews a file, a module or a diff and
+  reports what to fix, citing the rule each finding breaks. Where it and
+  `AGENTS.md` disagree, `AGENTS.md` wins.
