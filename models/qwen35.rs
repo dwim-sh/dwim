@@ -11,7 +11,7 @@
 //! file ends with a layer that predicts the token after the next, which the
 //! model drafts with.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
@@ -236,13 +236,16 @@ impl Config {
     }
 }
 
-/// Device memory the model takes, in bytes: `fixed` for its weights,
-/// activations, and recurrent states, and `per_token` more for each token
-/// of context, for the key/value caches and the rotary position embedding
-/// table.
+/// Device memory the model takes, in bytes: `fixed` for its weights and
+/// the activations, which the sequences share, and for each sequence,
+/// `per_sequence` for its recurrent states and `per_token` more for each
+/// token of its context, for the key/value caches. The rotary position
+/// embedding table, which the sequences share, is counted with each, at a
+/// few hundred bytes a token.
 #[derive(Clone, Copy, Debug)]
 pub struct Memory {
     pub fixed: u64,
+    pub per_sequence: u64,
     pub per_token: u64,
 }
 
@@ -269,27 +272,32 @@ impl Memory {
         }
         let attention = (0..c.layers).filter(|&i| c.is_attention(i)).count();
         let linear = c.layers - attention;
-        // The activations of a batch, and a row of hidden state a mark
-        // keeps for the drafter.
-        let mut activations =
-            BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate) + c.vocab + c.hidden;
-        // Two convolution states and one recurrent state per linear layer,
-        // and a copy of each for a mark.
-        let states = linear * (3 * c.conv_width() + 2 * c.ssm_width());
-        // The drafter has a key/value cache of its own, and verifying a
-        // batch keeps the linear layers' states run through it apart, their
-        // inputs for it, the hidden state after every token, and every
+        // The activations of a batch, and the copy a mark keeps of a
+        // sequence's linear layers' states and of the row of hidden state
+        // carried over for the drafter.
+        let mut activations = BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate)
+            + c.vocab
+            + linear * (c.conv_width() + c.ssm_width())
+            + c.hidden;
+        // A sequence's two convolution states and one recurrent state per
+        // linear layer, and the hidden state after each token of a batch,
+        // for the drafter.
+        let sequence = linear * (2 * c.conv_width() + c.ssm_width()) + (BATCH + 1) * c.hidden;
+        // The drafter has a key/value cache of its own in each sequence,
+        // and verifying a batch keeps the linear layers' states run through
+        // it apart, their inputs for it, the drafter's output, and every
         // token's logits.
         let caches = attention + c.drafter as usize;
         if c.drafter {
             activations += linear
                 * (c.ssm_width() + BATCH * (2 * c.k_dim() + c.v_dim() + 2 * c.v_heads))
-                + (BATCH + 2) * c.hidden
+                + c.hidden
                 + MAX_DRAFTS * c.vocab;
         }
         let kv_dim = c.kv_heads * c.head_dim;
         Ok(Self {
-            fixed: (weights + 4 * (activations + states)) as u64,
+            fixed: (weights + 4 * activations) as u64,
+            per_sequence: 4 * sequence as u64,
             per_token: (2 * caches * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
         })
     }
@@ -310,6 +318,11 @@ pub struct Model<D: Device> {
     /// it.
     draft: Option<Draft<D>>,
     state: State<D>,
+    /// The sequences besides the one the model is running, by number, and
+    /// how many key/value caches and linear layers' states a sequence has.
+    parked: HashMap<usize, Sequence<D>>,
+    caches: usize,
+    slots: usize,
 }
 
 /// The layer that predicts the token after the next, to draft with: a full
@@ -448,6 +461,9 @@ impl<D: Device> Model<D> {
             lm_head,
             draft,
             state,
+            parked: HashMap::new(),
+            caches,
+            slots,
         })
     }
 
@@ -471,7 +487,7 @@ impl<D: Device> Model<D> {
             p.layer(s, layer, n, pos, verify);
         }
         if !verify {
-            s.parity = !s.parity;
+            s.seq.parity = !s.seq.parity;
         }
         let Some(draft) = &self.draft else {
             // Only the last token's logits are wanted.
@@ -485,10 +501,10 @@ impl<D: Device> Model<D> {
         // The normalized hidden state after every token, for the drafter,
         // in the rows after the one carried over.
         p.normalize(&mut s.xh, &s.x, &self.norm, n);
-        d.copy(&mut s.hidden, c.hidden, &s.xh, 0, n * c.hidden);
+        d.copy(&mut s.seq.hidden, c.hidden, &s.xh, 0, n * c.hidden);
         if verify {
-            s.verified = tokens.to_vec();
-            s.verified_at = pos;
+            s.seq.verified = tokens.to_vec();
+            s.seq.verified_at = pos;
             d.resize(&mut s.logits, n * c.vocab);
             d.matmul(&mut s.logits, &self.lm_head, &s.xh);
             return d.read(&s.logits);
@@ -500,7 +516,7 @@ impl<D: Device> Model<D> {
         // The drafter catches up: it runs at every position whose next
         // token is known, from the one carried over if there is one, and
         // the hidden state after the batch is carried over for the next.
-        let first = if s.carry { 0 } else { 1 };
+        let first = if s.seq.carry { 0 } else { 1 };
         p.drafter(
             s,
             draft,
@@ -581,13 +597,13 @@ impl<'a, D: Device> Pass<'a, D> {
                 d.rmsnorm(&mut s.k, k_norm, eps);
                 d.rope(&mut s.q, &s.rope, pos, c.heads, c.head_dim, c.rot_dim);
                 d.rope(&mut s.k, &s.rope, pos, c.kv_heads, c.head_dim, c.rot_dim);
-                d.store(&mut s.k_cache[*cache], pos * kv_dim, &s.k);
-                d.store(&mut s.v_cache[*cache], pos * kv_dim, &s.v);
+                d.store(&mut s.seq.k_cache[*cache], pos * kv_dim, &s.k);
+                d.store(&mut s.seq.v_cache[*cache], pos * kv_dim, &s.v);
                 d.attention(
                     &mut s.att,
                     &s.q,
-                    &s.k_cache[*cache],
-                    &s.v_cache[*cache],
+                    &s.seq.k_cache[*cache],
+                    &s.seq.v_cache[*cache],
                     pos,
                     c.heads,
                     c.head_dim,
@@ -623,7 +639,7 @@ impl<'a, D: Device> Pass<'a, D> {
                     d.copy(
                         &mut s.ssm_scratch[*slot],
                         0,
-                        &s.ssm_state[*slot],
+                        &s.seq.ssm_state[*slot],
                         0,
                         c.ssm_width(),
                     );
@@ -631,15 +647,15 @@ impl<'a, D: Device> Pass<'a, D> {
                 // The convolution reads the tokens before the batch from
                 // one state buffer and leaves the ones after it in the
                 // other.
-                let [a, b] = &mut s.conv_state[*slot];
-                let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
+                let [a, b] = &mut s.seq.conv_state[*slot];
+                let (state, state_out) = if s.seq.parity { (&*a, b) } else { (&*b, a) };
                 d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
                 d.l2norm(&mut s.q, c.state_dim, eps);
                 d.l2norm(&mut s.k, c.state_dim, eps);
                 let ssm = if verify {
                     &mut s.ssm_scratch[*slot]
                 } else {
-                    &mut s.ssm_state[*slot]
+                    &mut s.seq.ssm_state[*slot]
                 };
                 d.delta_net(
                     &mut s.att,
@@ -670,7 +686,7 @@ impl<'a, D: Device> Pass<'a, D> {
     }
 
     /// Runs the drafter at `rows` positions from `pos`: each fed the
-    /// hidden state in a row of `s.hidden` from `first` on, or, chaining
+    /// hidden state in a row of `s.seq.hidden` from `first` on, or, chaining
     /// drafts, the drafter's own last output, and the token that followed
     /// the position. Leaves its output, normalized, in `s.xh`: what it
     /// predicts the token after from, through the model's head.
@@ -696,7 +712,13 @@ impl<'a, D: Device> Pass<'a, D> {
         if chain {
             d.copy(&mut s.xh, 0, &s.drafted, 0, c.hidden);
         } else {
-            d.copy(&mut s.xh, 0, &s.hidden, first * c.hidden, rows * c.hidden);
+            d.copy(
+                &mut s.xh,
+                0,
+                &s.seq.hidden,
+                first * c.hidden,
+                rows * c.hidden,
+            );
         }
         d.rmsnorm(&mut s.xh, &draft.hidden_norm, c.eps);
         d.matmul(&mut s.x, &draft.embed_proj, &s.xb);
@@ -913,7 +935,7 @@ impl<D: Device> LanguageModel for Model<D> {
     /// state, then, for a drafter, the hidden state carried over for it.
     fn save(&self, len: usize) -> Option<Vec<u8>> {
         let (c, d, s) = (&self.config, &self.device, &self.state);
-        if !s.verified.is_empty() || (self.draft.is_some() && !s.carry) {
+        if !s.seq.verified.is_empty() || (self.draft.is_some() && !s.seq.carry) {
             return None;
         }
         let kv_dim = c.kv_heads * c.head_dim;
@@ -922,8 +944,8 @@ impl<D: Device> LanguageModel for Model<D> {
         out.extend_from_slice(&STATE_VERSION.to_le_bytes());
         for value in [
             len,
-            s.k_cache.len(),
-            s.ssm_state.len(),
+            s.seq.k_cache.len(),
+            s.seq.ssm_state.len(),
             kv_dim,
             c.conv_width(),
             c.ssm_width(),
@@ -931,20 +953,20 @@ impl<D: Device> LanguageModel for Model<D> {
         ] {
             out.extend_from_slice(&(value as u64).to_le_bytes());
         }
-        for cache in s.k_cache.iter().chain(&s.v_cache) {
+        for cache in s.seq.k_cache.iter().chain(&s.seq.v_cache) {
             out.extend(d.read_cache(cache, len * kv_dim));
         }
-        for slot in 0..s.ssm_state.len() {
+        for slot in 0..s.seq.ssm_state.len() {
             // The convolution reads the batch before from one buffer of the
             // pair or the other, by the parity.
-            let conv = &s.conv_state[slot][if s.parity { 0 } else { 1 }];
-            for buf in [conv, &s.ssm_state[slot]] {
+            let conv = &s.seq.conv_state[slot][if s.seq.parity { 0 } else { 1 }];
+            for buf in [conv, &s.seq.ssm_state[slot]] {
                 out.extend(d.read(buf).iter().flat_map(|v| v.to_le_bytes()));
             }
         }
         if self.draft.is_some() {
             out.extend(
-                d.read(&s.hidden)[..c.hidden]
+                d.read(&s.seq.hidden)[..c.hidden]
                     .iter()
                     .flat_map(|v| v.to_le_bytes()),
             );
@@ -976,8 +998,8 @@ impl<D: Device> LanguageModel for Model<D> {
         let len = header[0];
         if header[1..]
             != [
-                s.k_cache.len(),
-                s.ssm_state.len(),
+                s.seq.k_cache.len(),
+                s.seq.ssm_state.len(),
                 kv_dim,
                 c.conv_width(),
                 c.ssm_width(),
@@ -986,19 +1008,19 @@ impl<D: Device> LanguageModel for Model<D> {
         {
             return Err("a saved state of another model".into());
         }
-        if len > s.max_len {
+        if len > s.seq.max_len {
             return Err(
                 format!("a saved state of {len} tokens does not fit in the context").into(),
             );
         }
-        for cache in s.k_cache.iter_mut().chain(&mut s.v_cache) {
+        for cache in s.seq.k_cache.iter_mut().chain(&mut s.seq.v_cache) {
             d.write_cache(cache, take(cache_bytes(len * kv_dim))?);
         }
-        for slot in 0..s.ssm_state.len() {
-            let [conv, _] = &mut s.conv_state[slot];
+        for slot in 0..s.seq.ssm_state.len() {
+            let [conv, _] = &mut s.seq.conv_state[slot];
             for (buf, width) in [
                 (conv, c.conv_width()),
-                (&mut s.ssm_state[slot], c.ssm_width()),
+                (&mut s.seq.ssm_state[slot], c.ssm_width()),
             ] {
                 let floats: Vec<f32> = take(width * 4)?
                     .chunks_exact(4)
@@ -1007,9 +1029,11 @@ impl<D: Device> LanguageModel for Model<D> {
                 d.write(buf, &floats);
             }
         }
-        s.parity = true;
-        s.verified.clear();
-        s.marked = false;
+        s.seq.parity = true;
+        s.seq.verified.clear();
+        if s.marked == Some(s.seq.id) {
+            s.marked = None;
+        }
         if self.draft.is_some() {
             let floats: Vec<f32> = take(c.hidden * 4)?
                 .chunks_exact(4)
@@ -1017,8 +1041,8 @@ impl<D: Device> LanguageModel for Model<D> {
                 .collect();
             d.resize(&mut s.xb, c.hidden);
             d.write(&mut s.xb, &floats);
-            d.copy(&mut s.hidden, 0, &s.xb, 0, c.hidden);
-            s.carry = true;
+            d.copy(&mut s.seq.hidden, 0, &s.xb, 0, c.hidden);
+            s.seq.carry = true;
         }
         Ok(len)
     }
@@ -1028,10 +1052,13 @@ impl<D: Device> LanguageModel for Model<D> {
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         assert!(!tokens.is_empty(), "no tokens to run");
         assert!(
-            pos + tokens.len() <= self.state.max_len,
+            pos + tokens.len() <= self.state.seq.max_len,
             "tokens past the end of the cache"
         );
-        assert!(self.state.verified.is_empty(), "a batch is being verified");
+        assert!(
+            self.state.seq.verified.is_empty(),
+            "a batch is being verified"
+        );
         let mut logits = Vec::new();
         for (i, batch) in tokens.chunks(BATCH).enumerate() {
             logits = self.forward_batch(batch, pos + i * BATCH, false);
@@ -1055,8 +1082,8 @@ impl<D: Device> LanguageModel for Model<D> {
         };
         let (c, d) = (p.c, p.d);
         let s = &mut self.state;
-        let k = k.min(MAX_DRAFTS).min(s.max_len.saturating_sub(pos + 1));
-        if !s.carry || !s.verified.is_empty() || pos == 0 || k == 0 {
+        let k = k.min(MAX_DRAFTS).min(s.seq.max_len.saturating_sub(pos + 1));
+        if !s.seq.carry || !s.seq.verified.is_empty() || pos == 0 || k == 0 {
             return Vec::new();
         }
         let mut drafts = Vec::with_capacity(k);
@@ -1075,7 +1102,7 @@ impl<D: Device> LanguageModel for Model<D> {
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         assert!(self.draft.is_some(), "the model does not draft");
         assert!(
-            self.state.verified.is_empty() && self.state.carry,
+            self.state.seq.verified.is_empty() && self.state.seq.carry,
             "a batch is being verified, or none was run before"
         );
         assert!(
@@ -1084,7 +1111,7 @@ impl<D: Device> LanguageModel for Model<D> {
             tokens.len()
         );
         assert!(
-            pos + tokens.len() <= self.state.max_len,
+            pos + tokens.len() <= self.state.seq.max_len,
             "tokens past the end of the cache"
         );
         self.forward_batch(tokens, pos, true)
@@ -1104,15 +1131,15 @@ impl<D: Device> LanguageModel for Model<D> {
         };
         let (c, d) = (p.c, p.d);
         let s = &mut self.state;
-        let n = s.verified.len();
+        let n = s.seq.verified.len();
         assert!(
             n > 0 && (1..=n).contains(&keep),
             "keeping {keep} tokens of a batch of {n} being verified"
         );
-        let tokens = std::mem::take(&mut s.verified);
+        let tokens = std::mem::take(&mut s.seq.verified);
         if keep == n {
-            for slot in 0..s.ssm_state.len() {
-                std::mem::swap(&mut s.ssm_state[slot], &mut s.ssm_scratch[slot]);
+            for slot in 0..s.seq.ssm_state.len() {
+                std::mem::swap(&mut s.seq.ssm_state[slot], &mut s.ssm_scratch[slot]);
             }
         } else {
             s.batch(d, keep);
@@ -1136,8 +1163,8 @@ impl<D: Device> LanguageModel for Model<D> {
                 d.resize(&mut s.k, keep * k_dim);
                 d.resize(&mut s.v, keep * v_dim);
                 d.resize(&mut s.att, keep * v_dim);
-                let [a, b] = &mut s.conv_state[*slot];
-                let (state, state_out) = if s.parity { (&*a, b) } else { (&*b, a) };
+                let [a, b] = &mut s.seq.conv_state[*slot];
+                let (state, state_out) = if s.seq.parity { (&*a, b) } else { (&*b, a) };
                 d.conv(&mut s.q, &mut s.k, &mut s.v, state_out, &s.qkv, state, conv);
                 d.l2norm(&mut s.q, c.state_dim, c.eps);
                 d.l2norm(&mut s.k, c.state_dim, c.eps);
@@ -1148,16 +1175,24 @@ impl<D: Device> LanguageModel for Model<D> {
                     &s.v,
                     &s.ab,
                     decay,
-                    &mut s.ssm_state[*slot],
+                    &mut s.seq.ssm_state[*slot],
                     c.k_heads,
                     c.v_heads,
                     c.state_dim,
                 );
             }
         }
-        s.parity = !s.parity;
+        s.seq.parity = !s.seq.parity;
         if let Some(draft) = &self.draft {
-            p.drafter(s, draft, keep, s.verified_at - 1, 0, false, &tokens[..keep]);
+            p.drafter(
+                s,
+                draft,
+                keep,
+                s.seq.verified_at - 1,
+                0,
+                false,
+                &tokens[..keep],
+            );
             s.carry_over(d, keep);
         }
     }
@@ -1169,26 +1204,26 @@ impl<D: Device> LanguageModel for Model<D> {
     /// are written over as the sequence goes on from it again.
     fn mark(&mut self) -> bool {
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
-        assert!(s.verified.is_empty(), "a batch is being verified");
-        for slot in 0..s.ssm_state.len() {
+        assert!(s.seq.verified.is_empty(), "a batch is being verified");
+        for slot in 0..s.seq.ssm_state.len() {
             // The convolution reads the batch before from one buffer of the
             // pair or the other, by the parity.
-            let conv = &s.conv_state[slot][if s.parity { 0 } else { 1 }];
+            let conv = &s.seq.conv_state[slot][if s.seq.parity { 0 } else { 1 }];
             d.copy(&mut s.mark_conv[slot], 0, conv, 0, c.conv_width());
             d.copy(
                 &mut s.mark_ssm[slot],
                 0,
-                &s.ssm_state[slot],
+                &s.seq.ssm_state[slot],
                 0,
                 c.ssm_width(),
             );
         }
         // Carried over only for a drafter.
-        if s.carry {
-            d.copy(&mut s.mark_hidden, 0, &s.hidden, 0, c.hidden);
+        if s.seq.carry {
+            d.copy(&mut s.mark_hidden, 0, &s.seq.hidden, 0, c.hidden);
         }
-        s.mark_carry = s.carry;
-        s.marked = true;
+        s.mark_carry = s.seq.carry;
+        s.marked = Some(s.seq.id);
         true
     }
 
@@ -1196,28 +1231,28 @@ impl<D: Device> LanguageModel for Model<D> {
     /// state carried over for the drafter.
     fn rewind_to_mark(&mut self) -> Result<()> {
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
-        if !s.marked {
+        if s.marked != Some(s.seq.id) {
             return Err("no mark to rewind to".into());
         }
-        if !s.verified.is_empty() {
+        if !s.seq.verified.is_empty() {
             return Err("a batch is being verified".into());
         }
-        for slot in 0..s.ssm_state.len() {
-            let [conv, _] = &mut s.conv_state[slot];
+        for slot in 0..s.seq.ssm_state.len() {
+            let [conv, _] = &mut s.seq.conv_state[slot];
             d.copy(conv, 0, &s.mark_conv[slot], 0, c.conv_width());
             d.copy(
-                &mut s.ssm_state[slot],
+                &mut s.seq.ssm_state[slot],
                 0,
                 &s.mark_ssm[slot],
                 0,
                 c.ssm_width(),
             );
         }
-        s.parity = true;
+        s.seq.parity = true;
         if s.mark_carry {
-            d.copy(&mut s.hidden, 0, &s.mark_hidden, 0, c.hidden);
+            d.copy(&mut s.seq.hidden, 0, &s.mark_hidden, 0, c.hidden);
         }
-        s.carry = s.mark_carry;
+        s.seq.carry = s.mark_carry;
         Ok(())
     }
 
@@ -1227,20 +1262,55 @@ impl<D: Device> LanguageModel for Model<D> {
     /// before the token's.
     fn reset(&mut self) {
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
-        for slot in 0..s.ssm_state.len() {
-            for conv in &mut s.conv_state[slot] {
+        for slot in 0..s.seq.ssm_state.len() {
+            for conv in &mut s.seq.conv_state[slot] {
                 d.write(conv, &vec![0.0; c.conv_width()]);
             }
-            d.write(&mut s.ssm_state[slot], &vec![0.0; c.ssm_width()]);
+            d.write(&mut s.seq.ssm_state[slot], &vec![0.0; c.ssm_width()]);
         }
-        s.parity = false;
-        s.carry = false;
-        s.verified.clear();
-        s.marked = false;
+        s.seq.parity = false;
+        s.seq.carry = false;
+        s.seq.verified.clear();
+        if s.marked == Some(s.seq.id) {
+            s.marked = None;
+        }
     }
 
     fn max_len(&self) -> usize {
-        self.state.max_len
+        self.state.seq.max_len
+    }
+
+    /// Allocates another sequence of the length the first has, on the
+    /// device, as before any token.
+    fn add_sequence(&mut self) -> Result<usize> {
+        let id = self.parked.len() + 1;
+        let seq = Sequence::new(
+            &self.config,
+            &self.device,
+            id,
+            self.state.seq.max_len,
+            self.caches,
+            self.slots,
+        );
+        self.parked.insert(id, seq);
+        Ok(id)
+    }
+
+    /// Swaps the sequence the model runs for another: nothing is copied.
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        if self.state.seq.id == id {
+            return Ok(());
+        }
+        if !self.state.seq.verified.is_empty() {
+            return Err("a batch is being verified".into());
+        }
+        let mut seq = self
+            .parked
+            .remove(&id)
+            .ok_or_else(|| format!("no sequence {id}"))?;
+        std::mem::swap(&mut self.state.seq, &mut seq);
+        self.parked.insert(seq.id, seq);
+        Ok(())
     }
 }
 
@@ -1268,6 +1338,39 @@ struct State<D: Device> {
     gate_ffn: D::Buffer,
     intermediate: usize,
     logits: D::Buffer,
+    rope: D::Buffer,
+    /// The drafter's own output, from one drafted token to the next.
+    drafted: D::Buffer,
+    /// For a batch being verified, which the sequence it is of has the
+    /// tokens of: the linear layers' recurrent states run through it, kept
+    /// apart from the real ones until the accepted tokens are committed;
+    /// and each linear layer's convolution inputs and gates for it, to
+    /// commit from. A sequence is not changed for another while one is
+    /// being verified.
+    ssm_scratch: Vec<D::Buffer>,
+    qkv_saved: Vec<D::Buffer>,
+    ab_saved: Vec<D::Buffer>,
+    /// The linear layers' states as they were at the mark, a convolution
+    /// state and a recurrent state per layer, and the hidden state carried
+    /// over for the drafter then, if one was; and which sequence's they
+    /// are, if a mark has been made. A mark is one sequence's at a time:
+    /// marking another forgets it.
+    mark_conv: Vec<D::Buffer>,
+    mark_ssm: Vec<D::Buffer>,
+    mark_hidden: D::Buffer,
+    mark_carry: bool,
+    marked: Option<usize>,
+    /// The sequence the model is running.
+    seq: Sequence<D>,
+}
+
+/// A sequence's own state, which the model keeps one of for each sequence
+/// it runs, while the weights and the buffers it computes in are shared:
+/// the key/value caches of the attention layers, holding every position
+/// seen so far in 8-bit blocks; the convolution and recurrent states of the
+/// linear attention layers; and what the drafter carries over.
+struct Sequence<D: Device> {
+    id: usize,
     k_cache: Vec<D::Cache>,
     v_cache: Vec<D::Cache>,
     /// Two per linear layer, the batch's inputs coming from one and its
@@ -1275,40 +1378,56 @@ struct State<D: Device> {
     conv_state: Vec<[D::Buffer; 2]>,
     parity: bool,
     ssm_state: Vec<D::Buffer>,
-    rope: D::Buffer,
     max_len: usize,
     /// For the drafter, which runs a position behind the model: the
     /// normalized hidden state after each token of the latest batch, in
     /// the rows after the first, which holds the one after the token
-    /// before the batch, carried over; whether it holds one; and the
-    /// drafter's own output, from one drafted token to the next.
+    /// before the batch, carried over; and whether it holds one.
     hidden: D::Buffer,
     carry: bool,
-    drafted: D::Buffer,
-    /// A batch being verified: its tokens and the position of the first;
-    /// the linear layers' recurrent states run through it, kept apart from
-    /// the real ones until the accepted tokens are committed; and each
-    /// linear layer's convolution inputs and gates for it, to commit from.
+    /// A batch being verified: its tokens and the position of the first.
     verified: Vec<u32>,
     verified_at: usize,
-    ssm_scratch: Vec<D::Buffer>,
-    qkv_saved: Vec<D::Buffer>,
-    ab_saved: Vec<D::Buffer>,
-    /// The linear layers' states as they were at the mark, a convolution
-    /// state and a recurrent state per layer, and the hidden state carried
-    /// over for the drafter then, if one was; and whether a mark has been
-    /// made.
-    mark_conv: Vec<D::Buffer>,
-    mark_ssm: Vec<D::Buffer>,
-    mark_hidden: D::Buffer,
-    mark_carry: bool,
-    marked: bool,
+}
+
+impl<D: Device> Sequence<D> {
+    /// Allocates the state of sequence `id`, of up to `max_len` tokens,
+    /// with `caches` key/value caches and `slots` linear layers' states,
+    /// all as before any token.
+    fn new(c: &Config, d: &D, id: usize, max_len: usize, caches: usize, slots: usize) -> Self {
+        let kv_dim = c.kv_heads * c.head_dim;
+        let conv_width = c.conv_width();
+        let zeroed = |len: usize| {
+            let mut buf = d.alloc(len);
+            d.write(&mut buf, &vec![0.0; len]);
+            buf
+        };
+        Self {
+            id,
+            k_cache: (0..caches)
+                .map(|_| d.alloc_cache(max_len * kv_dim))
+                .collect(),
+            v_cache: (0..caches)
+                .map(|_| d.alloc_cache(max_len * kv_dim))
+                .collect(),
+            conv_state: (0..slots)
+                .map(|_| [zeroed(conv_width), zeroed(conv_width)])
+                .collect(),
+            parity: false,
+            ssm_state: (0..slots).map(|_| zeroed(c.ssm_width())).collect(),
+            max_len,
+            hidden: d.alloc((BATCH + 1) * c.hidden),
+            carry: false,
+            verified: Vec::new(),
+            verified_at: 0,
+        }
+    }
 }
 
 impl<D: Device> State<D> {
-    /// Allocates state for sequences of up to `max_len` tokens.
+    /// Allocates the buffers, and the first sequence, number 0, for
+    /// sequences of up to `max_len` tokens.
     fn new(c: &Config, d: &D, max_len: usize, caches: usize, slots: usize) -> Self {
-        let kv_dim = c.kv_heads * c.head_dim;
         let widths = c.widths();
         let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] =
             widths.map(|width| d.alloc(BATCH * width));
@@ -1333,26 +1452,8 @@ impl<D: Device> State<D> {
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
             logits: d.alloc(if c.drafter { MAX_DRAFTS + 1 } else { 1 } * c.vocab),
-            k_cache: (0..caches)
-                .map(|_| d.alloc_cache(max_len * kv_dim))
-                .collect(),
-            v_cache: (0..caches)
-                .map(|_| d.alloc_cache(max_len * kv_dim))
-                .collect(),
-            conv_state: (0..slots)
-                .map(|_| [d.alloc(conv_width), d.alloc(conv_width)])
-                .collect(),
-            parity: false,
-            ssm_state: (0..slots)
-                .map(|_| d.alloc(c.v_heads * c.state_dim * c.state_dim))
-                .collect(),
             rope,
-            max_len,
-            hidden: d.alloc((BATCH + 1) * c.hidden),
-            carry: false,
             drafted: d.alloc(c.hidden),
-            verified: Vec::new(),
-            verified_at: 0,
             ssm_scratch: (0..if c.drafter { slots } else { 0 })
                 .map(|_| d.alloc(c.ssm_width()))
                 .collect(),
@@ -1366,7 +1467,8 @@ impl<D: Device> State<D> {
             mark_ssm: (0..slots).map(|_| d.alloc(c.ssm_width())).collect(),
             mark_hidden: d.alloc(c.hidden),
             mark_carry: false,
-            marked: false,
+            marked: None,
+            seq: Sequence::new(c, d, 0, max_len, caches, slots),
         }
     }
 
@@ -1375,9 +1477,9 @@ impl<D: Device> State<D> {
     fn carry_over(&mut self, d: &D, n: usize) {
         let hidden = self.widths[0];
         d.resize(&mut self.xb, hidden);
-        d.copy(&mut self.xb, 0, &self.hidden, n * hidden, hidden);
-        d.copy(&mut self.hidden, 0, &self.xb, 0, hidden);
-        self.carry = true;
+        d.copy(&mut self.xb, 0, &self.seq.hidden, n * hidden, hidden);
+        d.copy(&mut self.seq.hidden, 0, &self.xb, 0, hidden);
+        self.seq.carry = true;
     }
 
     /// Sizes the buffers for a batch of `n` tokens.
@@ -1854,6 +1956,85 @@ mod tests {
         assert_eq!(resumed.restore(&state).unwrap(), 5);
         assert_eq!(resumed.draft(11, 5, 4), drafts);
         assert_eq!(resumed.forward(&[11], 5), model.forward(&[11], 5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs two sequences on the model on `device`, interleaved batch by
+    /// batch, with a verified draft and a mark rewound to in one while the
+    /// other waits, and returns each one's logits and drafts at the end.
+    fn interleaving<D: Device>(path: &Path, device: D) -> [(Vec<f32>, Vec<u32>); 2] {
+        let gguf = Arc::new(Gguf::open(path).unwrap());
+        let mut model = Model::load(gguf, device, 64, |_, _| {}).unwrap();
+        let other = model.add_sequence().unwrap();
+        let rest: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
+        model.forward(&[3, 17, 42, 7, 9], 0);
+        model.select_sequence(other).unwrap();
+        model.forward(&[1, 2, 3], 0);
+        model.select_sequence(0).unwrap();
+        assert!(model.mark());
+        model.forward(&[11, 2, 30], 5);
+        model.select_sequence(other).unwrap();
+        // The mark is the first sequence's: this one has none.
+        assert!(model.rewind_to_mark().is_err());
+        let drafts = model.draft(4, 3, 2);
+        let mut batch = vec![4];
+        batch.extend(&drafts);
+        model.verify(&batch, 3);
+        // Not while the batch is being verified.
+        assert!(model.select_sequence(0).is_err());
+        model.rewind(1);
+        model.select_sequence(0).unwrap();
+        model.rewind_to_mark().unwrap();
+        let first = (model.forward(&rest, 5), model.draft(8, 45, 3));
+        model.select_sequence(other).unwrap();
+        let second = (model.forward(&[5, 6], 4), model.draft(7, 6, 3));
+        [first, second]
+    }
+
+    #[test]
+    fn sequences_keep_their_own_state() {
+        let dir = std::env::temp_dir().join(format!("dwim-qwen35-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        synthetic(&path);
+        // Each sequence alone, on a model of its own.
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        let rest: Vec<u32> = (0..40).map(|i| (i * 5 % 43) as u32).collect();
+        let mut alone = Model::load(gguf.clone(), Cpu, 64, |_, _| {}).unwrap();
+        alone.forward(&[3, 17, 42, 7, 9], 0);
+        let first = (alone.forward(&rest, 5), alone.draft(8, 45, 3));
+        alone.reset();
+        alone.forward(&[1, 2, 3, 4], 0);
+        let second = (alone.forward(&[5, 6], 4), alone.draft(7, 6, 3));
+        // The same, interleaved on one model: nothing of one sequence
+        // reaches the other.
+        let [got_first, got_second] = interleaving(&path, Cpu);
+        assert_eq!(got_first, first);
+        assert_eq!(got_second, second);
+        if let Ok(gpu) = Gpu::new() {
+            let [got_first, got_second] = interleaving(&path, gpu);
+            close(
+                &got_first.0,
+                &first.0,
+                2e-3,
+                "the first sequence on the GPU",
+            );
+            close(
+                &got_second.0,
+                &second.0,
+                2e-3,
+                "the second sequence on the GPU",
+            );
+            assert_eq!(got_first.1, first.1);
+            assert_eq!(got_second.1, second.1);
+        } else {
+            eprintln!("skipping the GPU sequences: no GPU");
+        }
+        // A sequence it does not have.
+        let mut model = Model::load(gguf, Cpu, 64, |_, _| {}).unwrap();
+        assert!(model.select_sequence(1).is_err());
+        assert_eq!(model.add_sequence().unwrap(), 1);
+        assert!(model.select_sequence(1).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

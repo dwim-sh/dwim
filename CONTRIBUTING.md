@@ -39,6 +39,19 @@ and nothing else does, so `dwim "…" 2>/dev/null` gives the reply alone, while
 progress, the model's thinking, the commands it runs, and their output go to
 standard error.
 
+The model is loaded by a server, `dwim --serve`, which a session starts
+itself when none is listening and which exits after ten minutes without a
+session, so a second session, in another terminal, finds the model loaded
+and takes turns with the first. The weights are shared, and each session
+has its own key/value caches and recurrent states on the device, room for
+`--sessions` of them (two by default) allocated when the server starts.
+The server is the same binary as the
+session: after a rebuild, the next session finds the running server is from
+another build and replaces it, if it has no sessions, so a stale one is not
+served by mistake. What the server reports goes to
+`~/.local/state/dwim/server.log` (`~/Library/Application Support/dwim/` on
+macOS).
+
 ## Verifying a change
 
 ```

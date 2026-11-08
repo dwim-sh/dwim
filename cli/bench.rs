@@ -34,7 +34,7 @@ const FILLER: &str = include_str!("bench.rs");
 /// a second, reading and generating, on standard output.
 pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let mut stderr = Stderr::new();
-    let loaded = session::load_model(settings, |loading| stderr.report(&loading))?;
+    let loaded = session::load_model(settings, 1, |status| stderr.report(&status))?;
     let mut model = loaded.model;
     let depths = depths(model.max_len());
     if depths.is_empty() {

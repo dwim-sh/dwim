@@ -29,7 +29,7 @@ pub fn once(
     let started = Instant::now();
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
-    let mut loaded = session::load(settings, log, |loading| stderr.report(&loading))?;
+    let mut loaded = session::load(settings, log, move |status| stderr.report(&status))?;
     if let Some(path) = transcript {
         eprintln!("transcript in {}", path.display());
     }

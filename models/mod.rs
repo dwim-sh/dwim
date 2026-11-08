@@ -11,10 +11,12 @@ mod sampler;
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Answer, Chat, Chunk, DRAFTS, Reply, Stats, Tally, Turn};
+pub use chat::{Answer, Chat, Chunk, DRAFTS, Format, Reply, Stats, Tally, Turn};
 pub use gguf::Gguf;
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
+
+use std::ops::ControlFlow;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -83,6 +85,24 @@ pub trait LanguageModel {
 
     /// Longest sequence the state has room for.
     fn max_len(&self) -> usize;
+
+    /// Allocates another sequence, with state of its own and room for as
+    /// many tokens as the first, beside the model's others, which share its
+    /// weights, and returns its number. A model starts with one sequence,
+    /// number 0, which it runs until another is selected.
+    fn add_sequence(&mut self) -> Result<usize> {
+        Err("this model runs one sequence".into())
+    }
+
+    /// Has the model run sequence `id` from here on: every other method
+    /// is of the sequence selected. Fails while a batch is being verified.
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        if id == 0 {
+            Ok(())
+        } else {
+            Err(format!("no sequence {id}").into())
+        }
+    }
 }
 
 impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
@@ -125,6 +145,14 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
     fn max_len(&self) -> usize {
         (**self).max_len()
     }
+
+    fn add_sequence(&mut self) -> Result<usize> {
+        (**self).add_sequence()
+    }
+
+    fn select_sequence(&mut self, id: usize) -> Result<()> {
+        (**self).select_sequence(id)
+    }
 }
 
 /// The cosines and sines of the angles rotary position embeddings rotate
@@ -142,4 +170,166 @@ pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
         }
     }
     table
+}
+
+/// A conversation with the model, as the harness holds one: a [`Chat`] on
+/// a model in this process, or one kept with the server that has the
+/// model, and reached over its socket. The methods are [`Chat`]'s.
+pub trait Conversation {
+    /// Opens the conversation with a system prompt, reporting how many of
+    /// its tokens the model has read so far, out of how many, as it goes.
+    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()>;
+
+    /// Forgets the conversation, so that a system prompt can open another.
+    fn clear(&mut self) -> Result<()>;
+
+    /// Feeds `turns` as the conversation so far, without a reply to them.
+    fn replay(&mut self, turns: &[Turn]) -> Result<()>;
+
+    /// Number of tokens `turn` takes when fed.
+    fn measure(&mut self, turn: &Turn) -> Result<usize>;
+
+    /// Most tokens a plain answer to `message` takes with its framing, if
+    /// it is limited to `limit` tokens.
+    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize>;
+
+    /// Number of tokens in the conversation so far.
+    fn tokens(&self) -> usize;
+
+    /// Number of tokens the conversation has room for in all.
+    fn capacity(&self) -> usize;
+
+    /// Tokens the conversation has room for before the reserve.
+    fn free(&self) -> usize;
+
+    /// Keeps `tokens` of the context free: a reply stops short of them.
+    fn reserve(&mut self, tokens: usize);
+
+    /// Most tokens a thought may run to, if they are limited.
+    fn thought_limit(&self) -> Option<usize>;
+
+    /// Ends a thought that runs to `tokens`, if they are limited, or that
+    /// repeats itself, with `closing` written into it as the model's own.
+    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str);
+
+    /// Feeds the results of the tool calls the last reply made, without a
+    /// reply.
+    fn feed_results(&mut self, outputs: &[String]) -> Result<()>;
+
+    /// Where the conversation's time has gone so far.
+    fn stats(&self) -> Stats;
+
+    /// The sampler the model's tokens are picked with.
+    fn sampler(&self) -> &Sampler;
+
+    /// Sends a message from the user, streaming the reply to `on_chunk`,
+    /// which ends it early by breaking.
+    fn send(
+        &mut self,
+        message: &str,
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply>;
+
+    /// Sends the results of the tool calls the last reply made, and
+    /// streams the reply to them like `send`.
+    fn respond(
+        &mut self,
+        outputs: &[String],
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply>;
+
+    /// Has the model answer `message` plainly, under `heads` in turn, in
+    /// at most `limit` tokens, streaming the answer to `on_text`.
+    fn answer(
+        &mut self,
+        message: &str,
+        heads: &[&str],
+        limit: usize,
+        on_text: impl FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<Answer>;
+}
+
+impl<M: LanguageModel> Conversation for Chat<M> {
+    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        Chat::system(self, text, on_progress)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        Chat::clear(self);
+        Ok(())
+    }
+
+    fn replay(&mut self, turns: &[Turn]) -> Result<()> {
+        Chat::replay(self, turns)
+    }
+
+    fn measure(&mut self, turn: &Turn) -> Result<usize> {
+        Chat::measure(self, turn)
+    }
+
+    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize> {
+        Chat::answer_tokens(self, message, limit)
+    }
+
+    fn tokens(&self) -> usize {
+        Chat::tokens(self)
+    }
+
+    fn capacity(&self) -> usize {
+        Chat::capacity(self)
+    }
+
+    fn free(&self) -> usize {
+        Chat::free(self)
+    }
+
+    fn reserve(&mut self, tokens: usize) {
+        Chat::reserve(self, tokens)
+    }
+
+    fn thought_limit(&self) -> Option<usize> {
+        Chat::thought_limit(self)
+    }
+
+    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
+        Chat::limit_thoughts(self, tokens, closing)
+    }
+
+    fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
+        Chat::feed_results(self, outputs)
+    }
+
+    fn stats(&self) -> Stats {
+        Chat::stats(self)
+    }
+
+    fn sampler(&self) -> &Sampler {
+        Chat::sampler(self)
+    }
+
+    fn send(
+        &mut self,
+        message: &str,
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply> {
+        Chat::send(self, message, on_chunk)
+    }
+
+    fn respond(
+        &mut self,
+        outputs: &[String],
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply> {
+        Chat::respond(self, outputs, on_chunk)
+    }
+
+    fn answer(
+        &mut self,
+        message: &str,
+        heads: &[&str],
+        limit: usize,
+        on_text: impl FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<Answer> {
+        Chat::answer(self, message, heads, limit, on_text)
+    }
 }

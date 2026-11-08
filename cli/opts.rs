@@ -15,10 +15,15 @@ pub struct Opts {
     #[argh(option, default = "Device::Gpu")]
     pub device: Device,
 
-    /// tokens of conversation the model has room for (default: as many
-    /// as fit in the device's free memory)
+    /// tokens of conversation each session has room for (default: as
+    /// many as fit in the device's free memory, shared among the sessions)
     #[argh(option, arg_name = "tokens")]
     pub context: Option<usize>,
+
+    /// most sessions the model has room for at once, each with state and
+    /// a context of its own beside the weights they share (default: 2)
+    #[argh(option, arg_name = "n")]
+    pub sessions: Option<usize>,
 
     /// download the model if it is not yet, print the path of its weights,
     /// and exit
@@ -37,6 +42,11 @@ pub struct Opts {
     /// context, and print tokens a second for each
     #[argh(switch)]
     pub bench: bool,
+
+    /// run the server that has the model, which sessions connect to, in the
+    /// foreground; a session starts one itself when none is running
+    #[argh(switch)]
+    pub serve: bool,
 
     /// show the model's thinking and the files it reads in the shell,
     /// which ctrl+o toggles
@@ -89,6 +99,7 @@ impl Opts {
             model: self.model.clone(),
             device: self.device,
             context: self.context,
+            sessions: self.sessions,
             thinking_budget: budget(self.thinking_budget),
             effort: self.reasoning_effort,
             temperature: self.temperature,

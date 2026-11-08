@@ -10,7 +10,8 @@ modules, `cli/` and `testing/difftest/` are its two binaries, and `build.rs`
 compiles the Vulkan kernels.
 
 * `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI,
-  and `bench`, which times the model at depths of context.
+  `serve`, which runs the server, and `bench`, which times the model at
+  depths of context.
 * `models/`: the language model: `gguf` reads the weights file, `quants`
   unpacks the block formats llama.cpp quantizes to, `tokenizer` builds the
   BPE tokenizer from it, `qwen35` is the transformer as operations on a
@@ -19,7 +20,14 @@ compiles the Vulkan kernels.
 * `harness/`: the agent around the model: the system prompt (which includes
   this file), the tool loop, compaction near the end of the context, the
   thinking budget if one is set and the cap on a turn's calls, and the
-  session transcript.
+  session transcript. It runs on a `Conversation`: a `Chat` in the same
+  process, or a `server::Client`.
+* `server/`: the server that has the model, which every session is a client
+  of over a Unix socket, since the model fits in memory once: `protocol` is
+  what they say to each other, `client` the session's end of it. The
+  weights are shared and each session has a sequence of its own on the
+  device, its key/value caches and recurrent states; sessions take turns
+  with the model a reply at a time.
 * `tools/`: the tools, one file each, and `call`, which parses a call as the
   model writes it.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,

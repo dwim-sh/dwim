@@ -31,16 +31,17 @@ times in a turn.
 .SS The model
 .TP
 .BI \-\-context " tokens"
-Maximum conversation length in tokens.
+Maximum conversation length of each session, in tokens.
 Cannot exceed the model's supported context length.
 Larger values reserve more memory on the selected device at startup.
 .B \-\-help
 shows the default on this machine, and
 .B dwim
-says how many tokens it gives the model, and how much memory the model and
-they take, before it loads it.
+says how many tokens it gives each session, and how much memory the model
+and they take, before it loads it.
 By default, as many as fit in the memory the device has free besides the
-model and 256 MB to spare, in thousands, and no fewer than 16384:
+model and 256 MB to spare, shared evenly among the sessions it has room
+for, in thousands, and no fewer than 16384:
 a GPU's free memory as its driver reports it, which for a GPU that shares
 the host's memory is no more than the host has available; on a Mac, as
 much as Metal recommends the GPU use, and no more than the host has
@@ -67,6 +68,13 @@ Device to run the model on:
 .BI \-\-model " model"
 Model to run (default:
 .BR qwen3.8\-27b ).
+.TP
+.BI \-\-sessions " n"
+Most sessions the server has room for at once (default: 2). The weights
+are shared, and each session has a sequence of its own on the device, its
+key/value caches and recurrent states, allocated when the server starts:
+more sessions leave each less context. A session beyond them is refused
+until one ends.
 .SS Thinking and sampling
 .TP
 .BI \-\-reasoning\-effort " effort"
@@ -169,6 +177,24 @@ the weights for another program.
 .B \-\-help
 Display usage information.
 .TP
+.B \-\-serve
+Run the server that has the model, in the foreground, until it has gone
+ten minutes without a session. The model takes most of the memory a
+machine has, so one process loads it, and every session is a client of
+that process over a Unix socket: a session starts the server itself when
+none is listening, detached, with its standard error in a log, so this is
+for running it by hand or under a service manager.
+.BR \-\-model ,
+.BR \-\-device ,
+.B \-\-context
+and
+.B \-\-sessions
+are the server's: a session that asks for others than the server has gets
+the server replaced if it has no sessions, and an error if it has.
+Sessions take turns with the model, a reply at a time, each with its own
+conversation on the device; a session whose turn it is not waits, and
+says so.
+.TP
 .B \-\-version
 Print the version and exit.
 .SH INTERACTIVE SHELL
@@ -207,6 +233,18 @@ given on the command line: a reply that does not end with
 on a line of its own, and the account it gives after a hundred tool
 calls, are answered with word to go on, up to ten times in a turn.
 It is off in the shell unless turned on.
+.TP
+.BR /server " stop | start | restart"
+Alone, show the dwim server the model runs in: its process, how many
+sessions it has open of how many it has room for, and its log.
+.B stop
+stops it, to give its memory back, and the next message starts it again;
+.B start
+starts it now;
+.B restart
+stops it and starts it again, from the dwim installed now.
+The session goes on where it was, with the conversation read back into
+the server. A server with other sessions open is not stopped.
 .TP
 .B /help
 List the commands and the keys.
@@ -311,6 +349,18 @@ streams, at least once a second, so a session that is killed leaves its
 transcript up to then. Transcripts are not removed. On macOS the
 directory is
 .I ~/Library/Application Support/dwim/projects/
+instead.
+.TP
+.I $XDG_RUNTIME_DIR/dwim-<uid>.sock
+The socket the server listens on, in the temporary directory where there
+is no runtime directory, as on macOS. A session connects to it, and starts
+a server when nothing answers.
+.TP
+.I ~/.local/state/dwim/server.log
+Where a server that a session started writes what it reports: how
+loading went, each session opened and closed, and why it exited. On macOS
+the file is
+.I ~/Library/Application Support/dwim/server.log
 instead.
 .TP
 .I $TMPDIR/dwim-<pid>-<n>/

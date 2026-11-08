@@ -8,7 +8,7 @@
 **A coding agent that runs on your own GPU.**
 
 The agent, the model, and the engine that runs it, in one Rust program:
-no API key, no server, and nothing leaves your machine.
+no API key, no cloud, and nothing leaves your machine.
 
 [![Model: Qwen3.8-27B](https://img.shields.io/badge/Model-Qwen3.8--27B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-27B)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
@@ -55,6 +55,10 @@ ahead of time.
   or more, decoding several tokens at a time with the drafter its file
   ships.
 - **Fast local inference.** Metal on macOS, Vulkan on Linux.
+- **Built-in local inference server.** The model is loaded once, in a
+  `dwim` server that every `dwim` you run connects to. The first one starts
+  it in the background, and it exits when idle. Sessions share the weights,
+  and each has its own context on the GPU, so you can run several at once.
 - **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
   a container or a virtual machine, and does not confine the model itself.
   Commands run without confirmation and without a time limit, until they
@@ -68,6 +72,11 @@ the model reads files, runs commands, and answers.
 <div align="center">
   <img src=".github/assets/session.png" width="760" alt="A dwim session: after typing Explain this codebase to me in one sentence, the model reads README.md and replies with one sentence">
 </div>
+
+Run `dwim` in another terminal and it connects to the same server, ready in
+a moment instead of loading the model again. Two sessions fit at once by
+default, each with its own context; `--sessions` sets how many, and
+`/server` in the shell shows, stops, or restarts the server.
 
 To ask one thing and exit, give the prompt on the command line:
 

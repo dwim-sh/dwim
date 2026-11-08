@@ -11,7 +11,7 @@
 use std::{error::Error, fmt::Write};
 
 use crate::harness::{Entry, Event, Harness, OnEvent, environment};
-use crate::models::{Chat, LanguageModel, Turn};
+use crate::models::{Conversation, Turn};
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -50,7 +50,7 @@ pub const CONTINUE: &str = "Your reply was stopped short because the context win
 
 /// Reserves room in `chat` for the prompt and the note that a compaction
 /// takes, and returns the most tokens the note may take.
-pub fn reserve<M: LanguageModel>(chat: &mut Chat<M>) -> Result<usize, Box<dyn Error>> {
+pub fn reserve<C: Conversation>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
     let note_tokens = (chat.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
     let reserve = chat.answer_tokens(NOTE_PROMPT, note_tokens)?;
     chat.reserve(reserve);
@@ -62,8 +62,8 @@ pub fn reserve<M: LanguageModel>(chat: &mut Chat<M>) -> Result<usize, Box<dyn Er
 /// high-water mark. Returns whether the input may go in: not if the
 /// compaction was interrupted, and an error if the input cannot fit
 /// even so.
-pub fn make_room<M: LanguageModel>(
-    harness: &mut Harness<M>,
+pub fn make_room<C: Conversation>(
+    harness: &mut Harness<C>,
     input: &Turn,
     more: usize,
     on_event: OnEvent,
@@ -85,8 +85,8 @@ pub fn make_room<M: LanguageModel>(
 }
 
 /// Compacts the conversation, as [`Harness::compact`] does.
-pub fn compact<M: LanguageModel>(
-    harness: &mut Harness<M>,
+pub fn compact<C: Conversation>(
+    harness: &mut Harness<C>,
     on_event: OnEvent,
 ) -> Result<bool, Box<dyn Error>> {
     if harness.transcript.is_empty() {
@@ -128,7 +128,7 @@ pub fn compact<M: LanguageModel>(
     );
     let turns: Vec<Turn> = kept.iter().map(|(turn, _)| turn.clone()).collect();
 
-    harness.chat.clear();
+    harness.chat.clear()?;
     (harness.restart)(&mut harness.chat)?;
     harness.chat.replay(&turns)?;
     harness.transcript.clear();

@@ -22,14 +22,14 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::gpu::BACKEND;
-use dwim::harness::{self, Event, Log};
+use dwim::harness::{self, Event, Harness, Log};
 use dwim::models::qwen35;
+use dwim::server::Client;
 
 use crate::{
-    fetch::Progress,
     model::{self, Size},
     opts::{self, Device},
-    session::{self, Loading, Settings},
+    session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
 
@@ -75,11 +75,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         input: Input::default(),
         history: Vec::new(),
         recalled: None,
-        status: Status::Loading {
-            since: Instant::now(),
-            done: 0,
-            total: 0,
-        },
+        status: Status::Connecting(Instant::now()),
         started: Instant::now(),
         loading: Duration::ZERO,
         stats: harness::Stats::default(),
@@ -114,7 +110,11 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     // loading, there is no transcript to end.
     let loaded = !matches!(
         app.status,
-        Status::Downloading { .. } | Status::Loading { .. }
+        Status::Downloading { .. }
+            | Status::Connecting(_)
+            | Status::Restarting(_)
+            | Status::Starting { .. }
+            | Status::Opening(_)
     );
     app.stop.store(true, Ordering::Relaxed);
     drop(app);
@@ -151,7 +151,7 @@ fn auto_notice(auto: bool) -> String {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 8] = [
     (
         "/model",
         "the model, the device it runs on, and its context window",
@@ -167,8 +167,22 @@ const COMMANDS: [(&str, &str); 7] = [
         "/auto on|off",
         "go on by itself until it says it is done, or ask",
     ),
+    (
+        "/server stop|start|restart",
+        "the dwim server the model runs in; stop, start or restart it",
+    ),
     ("/help", "this list"),
 ];
+
+/// What the `/server` command asks of the server.
+#[derive(Clone, Copy)]
+enum ServerAction {
+    /// Show the server: who it is and how many sessions it has.
+    Show,
+    Stop,
+    Start,
+    Restart,
+}
 
 /// A slash command, as the user types it after the slash.
 enum Command {
@@ -182,6 +196,7 @@ enum Command {
     /// Ask whether auto mode is on, or set it.
     Auto,
     SetAuto(bool),
+    Server(ServerAction),
     Help,
 }
 
@@ -211,6 +226,11 @@ impl Command {
             ("auto", Some("on")) => Ok(Command::SetAuto(true)),
             ("auto", Some("off")) => Ok(Command::SetAuto(false)),
             ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
+            ("server", None) => Ok(Command::Server(ServerAction::Show)),
+            ("server", Some("stop")) => Ok(Command::Server(ServerAction::Stop)),
+            ("server", Some("start")) => Ok(Command::Server(ServerAction::Start)),
+            ("server", Some("restart")) => Ok(Command::Server(ServerAction::Restart)),
+            ("server", Some(_)) => Err("/server takes stop, start or restart".to_string()),
             _ => Err(format!("Unknown command /{text} · /help lists them")),
         }
     }
@@ -227,14 +247,20 @@ enum Request {
     ThinkingBudget(Option<usize>),
     /// Turn auto mode on or off, as the `/auto` command asks.
     Auto(bool),
+    /// Show, stop, start or restart the server, as the `/server` command
+    /// asks.
+    Server(ServerAction),
 }
 
 /// What the model thread reports back.
 enum Reply {
-    /// How far along loading the model is.
-    Loading(Loading),
+    /// What the server is doing while the session waits on it.
+    Status(session::Status),
     /// The model is ready for a message, and how long loading it took.
     Ready(Duration),
+    /// The session is open on the server again, and goes on with what was
+    /// asked of it.
+    Reopened,
     /// Something that happened in the turn.
     Event(Event),
     /// Something to tell the user, in place of a reply.
@@ -260,11 +286,23 @@ fn work(
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(settings, log, |loading| {
-        let _ = replies.send(Reply::Loading(loading));
+    let loaded = session::load(settings, log, {
+        let replies = replies.clone();
+        move |status| {
+            let _ = replies.send(Reply::Status(status));
+        }
     })?;
     let mut harness = loaded.harness;
     let _ = replies.send(Reply::Ready(loaded.loading));
+    // Whether the session's server was stopped, so the next request that
+    // needs the model opens it on another.
+    let mut stopped = false;
+    let on_status = || {
+        let replies = replies.clone();
+        move |status| {
+            let _ = replies.send(Reply::Status(status));
+        }
+    };
 
     for request in requests {
         let on_event = |event: Event| {
@@ -275,8 +313,22 @@ fn work(
                 ControlFlow::Continue(())
             }
         };
+        if stopped && matches!(request, Request::Message(_) | Request::Compact) {
+            if let Err(e) = session::reopen(settings, &mut harness, on_status()) {
+                let _ = replies.send(Reply::Error(e.to_string()));
+                let _ = replies.send(Reply::Done(harness.stats()));
+                continue;
+            }
+            stopped = false;
+            let _ = replies.send(Reply::Reopened);
+        }
         let result = match request {
             Request::Message(message) => harness.send(&message, on_event),
+            Request::Server(action) => {
+                server(settings, &mut harness, &mut stopped, action, on_status).map(|notice| {
+                    let _ = replies.send(Reply::Notice(notice));
+                })
+            }
             Request::Compact => harness.compact(on_event).map(|compacted| {
                 if !compacted && !stop.load(Ordering::Relaxed) {
                     let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
@@ -301,20 +353,96 @@ fn work(
     Ok(())
 }
 
+/// Does what `/server` asks, `action`, for the session `harness` runs,
+/// which `stopped` says is not on a server: returns what to tell of it.
+/// `on_status` makes what is told what the server does as it starts.
+fn server<F: FnMut(session::Status) + 'static>(
+    settings: &Settings,
+    harness: &mut Harness<Client>,
+    stopped: &mut bool,
+    action: ServerAction,
+    on_status: impl Fn() -> F,
+) -> Result<String, Box<dyn Error>> {
+    match action {
+        ServerAction::Show => Ok(match session::running() {
+            None => "No dwim server is running · the next message starts it".to_string(),
+            Some(welcome) => {
+                let device = if *stopped {
+                    welcome.device.to_uppercase()
+                } else {
+                    harness.conversation().device().to_string()
+                };
+                let mut notice = format!(
+                    "dwim server {} · {} on {device} · {} of {} {} open",
+                    welcome.pid,
+                    welcome.model,
+                    welcome.sessions,
+                    welcome.room,
+                    if welcome.room == 1 {
+                        "session"
+                    } else {
+                        "sessions"
+                    },
+                );
+                if !session::same_build(&welcome) {
+                    notice.push_str(" · from another build of dwim");
+                }
+                if let Some(path) = session::log_path() {
+                    notice.push_str(&format!(" · log {}", tilde(&path)));
+                }
+                notice
+            }
+        }),
+        ServerAction::Stop if *stopped => {
+            Ok("The dwim server is stopped · the next message starts it".to_string())
+        }
+        ServerAction::Stop => {
+            session::stop(harness.conversation())?;
+            *stopped = true;
+            Ok("Stopped the dwim server · the next message starts it again".to_string())
+        }
+        ServerAction::Start if !*stopped => {
+            Ok("The dwim server is running · /server restart restarts it".to_string())
+        }
+        ServerAction::Start | ServerAction::Restart => {
+            if !*stopped {
+                session::stop(harness.conversation())?;
+                *stopped = true;
+            }
+            session::reopen(settings, harness, on_status())?;
+            *stopped = false;
+            Ok(match action {
+                ServerAction::Start => "Started the dwim server",
+                _ => "Restarted the dwim server",
+            }
+            .to_string())
+        }
+    }
+}
+
 /// What the model is doing.
 enum Status {
-    /// Downloading one of the model's files, since when.
+    /// Downloading one of the model's files, since when: how many bytes so
+    /// far, out of how many if that is known.
     Downloading {
         since: Instant,
-        progress: Progress,
+        file: String,
+        done: u64,
+        total: Option<u64>,
     },
-    /// Loading the weights, since when: how many tensors so far, out of how
-    /// many.
-    Loading {
+    /// Reaching the server, since when.
+    Connecting(Instant),
+    /// Waiting for a server that is not as asked for to go, since when.
+    Restarting(Instant),
+    /// Waiting for the server to start up, since when: how many of the
+    /// model's tensors it has loaded so far, out of how many, once it says.
+    Starting {
         since: Instant,
         done: usize,
         total: usize,
     },
+    /// Opening a session on the server, since when.
+    Opening(Instant),
     /// Reading the system prompt, since when: how many of its tokens so
     /// far, out of how many.
     Prompting {
@@ -325,6 +453,8 @@ enum Status {
     Idle,
     /// Reading the prompt, before the first token of the reply.
     Reading(Instant),
+    /// Waiting for the model, which another session has, since when.
+    Waiting(Instant),
     Generating {
         start: Instant,
         tokens: usize,
@@ -430,7 +560,10 @@ impl App {
         let busy = !matches!(self.status, Status::Idle);
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                if matches!(self.status, Status::Reading(_) | Status::Generating { .. }) {
+                if matches!(
+                    self.status,
+                    Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+                ) {
                     self.interrupt();
                 } else if !self.input.is_empty() {
                     self.input.take();
@@ -483,7 +616,10 @@ impl App {
 
     /// Stops the reply being generated, if any.
     fn interrupt(&mut self) {
-        if matches!(self.status, Status::Reading(_) | Status::Generating { .. }) {
+        if matches!(
+            self.status,
+            Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+        ) {
             self.stop.store(true, Ordering::Relaxed);
             self.interrupted = true;
         }
@@ -540,6 +676,7 @@ impl App {
             Some(Ok(Command::Compact)) => Request::Compact,
             Some(Ok(Command::SetThinkingBudget(tokens))) => Request::ThinkingBudget(tokens),
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
+            Some(Ok(Command::Server(action))) => Request::Server(action),
             Some(Ok(command)) => {
                 self.command(command);
                 return;
@@ -562,11 +699,12 @@ impl App {
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
         match reply {
-            Reply::Loading(loading) => self.loading(loading),
+            Reply::Status(status) => self.status_update(status),
             Reply::Ready(loading) => {
                 self.loading = loading;
                 self.status = Status::Idle;
             }
+            Reply::Reopened => self.status = Status::Reading(Instant::now()),
             Reply::Event(event) => self.event(event),
             Reply::Done(stats) => {
                 self.stats = stats;
@@ -607,35 +745,64 @@ impl App {
         Ok(())
     }
 
-    /// Shows how far along loading the model is.
-    fn loading(&mut self, loading: Loading) {
-        match loading {
-            Loading::Downloading(progress) => {
+    /// Shows what the server is doing while the session waits on it.
+    fn status_update(&mut self, status: session::Status) {
+        match status {
+            session::Status::Downloading { file, done, total } => {
                 // Time each file on its own, so the speed is of this one.
-                let since = match self.status {
+                let since = match &self.status {
                     Status::Downloading {
-                        since,
-                        progress: last,
-                    } if last.file == progress.file => since,
+                        since, file: last, ..
+                    } if *last == file => *since,
                     _ => Instant::now(),
                 };
-                self.status = Status::Downloading { since, progress };
+                self.status = Status::Downloading {
+                    since,
+                    file,
+                    done,
+                    total,
+                };
             }
-            Loading::Device(name) => self.device_name = Some(name),
-            Loading::Sized(size) => self.size = Some(size),
-            Loading::Weights { done, total } => {
+            session::Status::Device(name) => self.device_name = Some(name),
+            session::Status::Sized(size) => self.size = Some(size),
+            session::Status::Weights { done, total } => {
                 let since = match self.status {
-                    Status::Loading { since, .. } => since,
+                    Status::Starting { since, .. } => since,
                     _ => Instant::now(),
                 };
-                self.status = Status::Loading { since, done, total };
+                self.status = if done >= total {
+                    Status::Opening(Instant::now())
+                } else {
+                    Status::Starting { since, done, total }
+                };
             }
-            Loading::Prompting { read, total } => {
+            session::Status::Restarting => self.status = Status::Restarting(Instant::now()),
+            session::Status::Starting => {
+                self.status = Status::Starting {
+                    since: Instant::now(),
+                    done: 0,
+                    total: 0,
+                };
+            }
+            session::Status::Opening => {
+                // A server this session started opens it once loaded.
+                if !matches!(self.status, Status::Starting { .. }) {
+                    self.status = Status::Opening(Instant::now());
+                }
+            }
+            session::Status::Prompting { read, total } => {
                 let since = match self.status {
                     Status::Prompting { since, .. } => since,
                     _ => Instant::now(),
                 };
                 self.status = Status::Prompting { since, read, total };
+            }
+            session::Status::Busy => {
+                let since = match self.status {
+                    Status::Reading(since) | Status::Waiting(since) => since,
+                    _ => Instant::now(),
+                };
+                self.status = Status::Waiting(since);
             }
         }
     }
@@ -803,7 +970,10 @@ impl App {
             Command::Help => help(columns),
             Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
             Command::Auto => notice(auto_notice(self.auto)),
-            Command::Compact | Command::SetThinkingBudget(_) | Command::SetAuto(_) => {
+            Command::Compact
+            | Command::SetThinkingBudget(_)
+            | Command::SetAuto(_)
+            | Command::Server(_) => {
                 return;
             }
         };
@@ -902,18 +1072,23 @@ impl App {
         };
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
-            Status::Downloading { since, progress } => (
+            Status::Downloading {
+                since, done, total, ..
+            } => (
                 "Downloading model…",
                 since,
-                download_details(progress, since.elapsed()),
+                download_details(done, total, since.elapsed()),
             ),
-            Status::Loading { since, done, total } => (
-                match self.device {
-                    Device::Cpu => "Loading model…",
-                    Device::Gpu => "Loading model to GPU…",
-                },
+            Status::Connecting(since) => ("Connecting to dwim server…", since, seconds(since)),
+            Status::Restarting(since) => ("Restarting dwim server…", since, seconds(since)),
+            Status::Opening(since) => ("Opening a session…", since, seconds(since)),
+            Status::Starting { since, done, total } => (
+                "Starting dwim server…",
                 since,
-                format!("{} · {}", percent(done, total), seconds(since)),
+                match total {
+                    0 => seconds(since),
+                    _ => format!("{} · {}", percent(done, total).trim_start(), seconds(since)),
+                },
             ),
             Status::Prompting { since, read, total } => (
                 "Reading system prompt…",
@@ -924,6 +1099,14 @@ impl App {
                 "Reading…",
                 since,
                 format!("{} · esc to interrupt", seconds(since)),
+            ),
+            Status::Waiting(since) => (
+                "Waiting for the model…",
+                since,
+                format!(
+                    "another session has it · {} · esc to interrupt",
+                    seconds(since)
+                ),
             ),
             Status::Generating { start, tokens } => (
                 match self.segment {
@@ -971,8 +1154,7 @@ fn rate(done: f64, elapsed: Duration) -> Option<f64> {
 /// How a download is going: how much of the file has arrived, out of how
 /// much, at what speed, and the time left once the file's size is known.
 /// The fields are padded to fixed widths, as the status line's are.
-fn download_details(progress: Progress, elapsed: Duration) -> String {
-    let Progress { done, total, .. } = progress;
+fn download_details(done: u64, total: Option<u64>, elapsed: Duration) -> String {
     let mut details = format!("{:>8}", model::bytes(done));
     if let Some(total) = total {
         details.push_str(&format!(
@@ -1066,6 +1248,10 @@ fn model_listing(
                 size.context,
                 model::bytes(size.conversation)
             ),
+        ));
+        rows.push((
+            "sessions",
+            format!("room for {} at once, sharing the model", size.sessions),
         ));
     }
     report(header, table(rows), columns)
