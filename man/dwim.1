@@ -234,6 +234,18 @@ on a line of its own, and the account it gives after a hundred tool
 calls, are answered with word to go on, up to ten times in a turn.
 It is off in the shell unless turned on.
 .TP
+.BR /server " stop | start | restart"
+Alone, show the dwim server the model runs in: its process, how many
+sessions it has open of how many it has room for, and its log.
+.B stop
+stops it, to give its memory back, and the next message starts it again;
+.B start
+starts it now;
+.B restart
+stops it and starts it again, from the dwim installed now.
+The session goes on where it was, with the conversation read back into
+the server. A server with other sessions open is not stopped.
+.TP
 .B /help
 List the commands and the keys.
 .PP

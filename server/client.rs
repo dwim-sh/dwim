@@ -4,6 +4,7 @@
 use std::{
     error::Error,
     io::{self, BufRead, BufReader, Write},
+    net::Shutdown,
     ops::ControlFlow,
     os::unix::net::UnixStream,
     path::Path,
@@ -156,6 +157,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Ends the session: the server is told it is over, and whatever is
+    /// asked of it after fails.
+    pub fn close(&mut self) {
+        let _ = self.connection.writer.shutdown(Shutdown::Both);
+    }
+
     /// The name of the device the model runs on.
     pub fn device(&self) -> &str {
         &self.device

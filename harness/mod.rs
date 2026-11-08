@@ -646,6 +646,33 @@ impl<C: Conversation> Harness<C> {
         self.log = log;
     }
 
+    /// The conversation the harness runs on.
+    pub fn conversation(&mut self) -> &mut C {
+        &mut self.chat
+    }
+
+    /// Goes on with the conversation on `chat`, a conversation opened
+    /// afresh with the system prompt, in place of the one it was on: reads
+    /// the conversation so far back into it, with where the agent is ahead
+    /// of the first message if that went ahead of it when it was sent.
+    pub fn reopen(&mut self, chat: C) -> Result<(), Box<dyn Error>> {
+        self.chat = chat;
+        let mut turns: Vec<Turn> = self
+            .transcript
+            .iter()
+            .map(|entry| entry.turn.clone())
+            .collect();
+        if self.environment.is_none()
+            && let (Some(Turn::User(message)), Some(first)) =
+                (turns.first_mut(), self.transcript.first())
+            && !first.prompt
+        {
+            *message = format!("{}\n\n{message}", environment(&self.dir));
+        }
+        self.chat.replay(&turns)?;
+        Ok(())
+    }
+
     /// Where the conversation's time has gone so far.
     pub fn stats(&self) -> Stats {
         Stats {
@@ -1052,6 +1079,15 @@ mod tests {
     /// A harness around a scripted model with room for `max_len` tokens,
     /// which says `scripts` in turn and `note` when asked for a note.
     pub fn harness(scripts: &[String], max_len: usize, note: &str) -> Harness<Chat<Scripted>> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        Harness::new(chat(scripts, max_len, note), dir, |chat| {
+            chat.system("Be brief.", |_, _| {})
+        })
+        .unwrap()
+    }
+
+    /// A conversation as `harness` has it, opened with its system prompt.
+    fn chat(scripts: &[String], max_len: usize, note: &str) -> Chat<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
@@ -1062,8 +1098,21 @@ mod tests {
         )
         .unwrap();
         chat.system("Be brief.", |_, _| {}).unwrap();
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap()
+        chat
+    }
+
+    #[test]
+    fn a_reopened_conversation_reads_back_as_it_was() {
+        // The conversation read back into a fresh one, as when the server
+        // is restarted, takes as many tokens as it did, with where the
+        // agent is ahead of the first message as it was sent.
+        let scripts = [reply(20, false), reply(20, false)];
+        let mut harness = harness(&scripts, 8000, "");
+        send(&mut harness, "one");
+        send(&mut harness, "two");
+        let tokens = harness.chat.tokens();
+        harness.reopen(chat(&[], 8000, "")).unwrap();
+        assert_eq!(harness.chat.tokens(), tokens);
     }
 
     /// The records of the log at `path`, which is removed.

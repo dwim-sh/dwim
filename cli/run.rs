@@ -22,8 +22,9 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::gpu::BACKEND;
-use dwim::harness::{self, Event, Log};
+use dwim::harness::{self, Event, Harness, Log};
 use dwim::models::qwen35;
+use dwim::server::Client;
 
 use crate::{
     model::{self, Size},
@@ -150,7 +151,7 @@ fn auto_notice(auto: bool) -> String {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 8] = [
     (
         "/model",
         "the model, the device it runs on, and its context window",
@@ -166,8 +167,22 @@ const COMMANDS: [(&str, &str); 7] = [
         "/auto on|off",
         "go on by itself until it says it is done, or ask",
     ),
+    (
+        "/server stop|start|restart",
+        "the dwim server the model runs in; stop, start or restart it",
+    ),
     ("/help", "this list"),
 ];
+
+/// What the `/server` command asks of the server.
+#[derive(Clone, Copy)]
+enum ServerAction {
+    /// Show the server: who it is and how many sessions it has.
+    Show,
+    Stop,
+    Start,
+    Restart,
+}
 
 /// A slash command, as the user types it after the slash.
 enum Command {
@@ -181,6 +196,7 @@ enum Command {
     /// Ask whether auto mode is on, or set it.
     Auto,
     SetAuto(bool),
+    Server(ServerAction),
     Help,
 }
 
@@ -210,6 +226,11 @@ impl Command {
             ("auto", Some("on")) => Ok(Command::SetAuto(true)),
             ("auto", Some("off")) => Ok(Command::SetAuto(false)),
             ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
+            ("server", None) => Ok(Command::Server(ServerAction::Show)),
+            ("server", Some("stop")) => Ok(Command::Server(ServerAction::Stop)),
+            ("server", Some("start")) => Ok(Command::Server(ServerAction::Start)),
+            ("server", Some("restart")) => Ok(Command::Server(ServerAction::Restart)),
+            ("server", Some(_)) => Err("/server takes stop, start or restart".to_string()),
             _ => Err(format!("Unknown command /{text} · /help lists them")),
         }
     }
@@ -226,6 +247,9 @@ enum Request {
     ThinkingBudget(Option<usize>),
     /// Turn auto mode on or off, as the `/auto` command asks.
     Auto(bool),
+    /// Show, stop, start or restart the server, as the `/server` command
+    /// asks.
+    Server(ServerAction),
 }
 
 /// What the model thread reports back.
@@ -234,6 +258,9 @@ enum Reply {
     Status(session::Status),
     /// The model is ready for a message, and how long loading it took.
     Ready(Duration),
+    /// The session is open on the server again, and goes on with what was
+    /// asked of it.
+    Reopened,
     /// Something that happened in the turn.
     Event(Event),
     /// Something to tell the user, in place of a reply.
@@ -267,6 +294,15 @@ fn work(
     })?;
     let mut harness = loaded.harness;
     let _ = replies.send(Reply::Ready(loaded.loading));
+    // Whether the session's server was stopped, so the next request that
+    // needs the model opens it on another.
+    let mut stopped = false;
+    let on_status = || {
+        let replies = replies.clone();
+        move |status| {
+            let _ = replies.send(Reply::Status(status));
+        }
+    };
 
     for request in requests {
         let on_event = |event: Event| {
@@ -277,8 +313,22 @@ fn work(
                 ControlFlow::Continue(())
             }
         };
+        if stopped && matches!(request, Request::Message(_) | Request::Compact) {
+            if let Err(e) = session::reopen(settings, &mut harness, on_status()) {
+                let _ = replies.send(Reply::Error(e.to_string()));
+                let _ = replies.send(Reply::Done(harness.stats()));
+                continue;
+            }
+            stopped = false;
+            let _ = replies.send(Reply::Reopened);
+        }
         let result = match request {
             Request::Message(message) => harness.send(&message, on_event),
+            Request::Server(action) => {
+                server(settings, &mut harness, &mut stopped, action, on_status).map(|notice| {
+                    let _ = replies.send(Reply::Notice(notice));
+                })
+            }
             Request::Compact => harness.compact(on_event).map(|compacted| {
                 if !compacted && !stop.load(Ordering::Relaxed) {
                     let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
@@ -301,6 +351,73 @@ fn work(
         let _ = replies.send(Reply::Done(harness.stats()));
     }
     Ok(())
+}
+
+/// Does what `/server` asks, `action`, for the session `harness` runs,
+/// which `stopped` says is not on a server: returns what to tell of it.
+/// `on_status` makes what is told what the server does as it starts.
+fn server<F: FnMut(session::Status) + 'static>(
+    settings: &Settings,
+    harness: &mut Harness<Client>,
+    stopped: &mut bool,
+    action: ServerAction,
+    on_status: impl Fn() -> F,
+) -> Result<String, Box<dyn Error>> {
+    match action {
+        ServerAction::Show => Ok(match session::running() {
+            None => "No dwim server is running · the next message starts it".to_string(),
+            Some(welcome) => {
+                let device = if *stopped {
+                    welcome.device.to_uppercase()
+                } else {
+                    harness.conversation().device().to_string()
+                };
+                let mut notice = format!(
+                    "dwim server {} · {} on {device} · {} of {} {} open",
+                    welcome.pid,
+                    welcome.model,
+                    welcome.sessions,
+                    welcome.room,
+                    if welcome.room == 1 {
+                        "session"
+                    } else {
+                        "sessions"
+                    },
+                );
+                if !session::same_build(&welcome) {
+                    notice.push_str(" · from another build of dwim");
+                }
+                if let Some(path) = session::log_path() {
+                    notice.push_str(&format!(" · log {}", tilde(&path)));
+                }
+                notice
+            }
+        }),
+        ServerAction::Stop if *stopped => {
+            Ok("The dwim server is stopped · the next message starts it".to_string())
+        }
+        ServerAction::Stop => {
+            session::stop(harness.conversation())?;
+            *stopped = true;
+            Ok("Stopped the dwim server · the next message starts it again".to_string())
+        }
+        ServerAction::Start if !*stopped => {
+            Ok("The dwim server is running · /server restart restarts it".to_string())
+        }
+        ServerAction::Start | ServerAction::Restart => {
+            if !*stopped {
+                session::stop(harness.conversation())?;
+                *stopped = true;
+            }
+            session::reopen(settings, harness, on_status())?;
+            *stopped = false;
+            Ok(match action {
+                ServerAction::Start => "Started the dwim server",
+                _ => "Restarted the dwim server",
+            }
+            .to_string())
+        }
+    }
 }
 
 /// What the model is doing.
@@ -559,6 +676,7 @@ impl App {
             Some(Ok(Command::Compact)) => Request::Compact,
             Some(Ok(Command::SetThinkingBudget(tokens))) => Request::ThinkingBudget(tokens),
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
+            Some(Ok(Command::Server(action))) => Request::Server(action),
             Some(Ok(command)) => {
                 self.command(command);
                 return;
@@ -586,6 +704,7 @@ impl App {
                 self.loading = loading;
                 self.status = Status::Idle;
             }
+            Reply::Reopened => self.status = Status::Reading(Instant::now()),
             Reply::Event(event) => self.event(event),
             Reply::Done(stats) => {
                 self.stats = stats;
@@ -667,7 +786,7 @@ impl App {
             }
             session::Status::Opening => {
                 // A server this session started opens it once loaded.
-                if matches!(self.status, Status::Connecting(_)) {
+                if !matches!(self.status, Status::Starting { .. }) {
                     self.status = Status::Opening(Instant::now());
                 }
             }
@@ -851,7 +970,10 @@ impl App {
             Command::Help => help(columns),
             Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
             Command::Auto => notice(auto_notice(self.auto)),
-            Command::Compact | Command::SetThinkingBudget(_) | Command::SetAuto(_) => {
+            Command::Compact
+            | Command::SetThinkingBudget(_)
+            | Command::SetAuto(_)
+            | Command::Server(_) => {
                 return;
             }
         };

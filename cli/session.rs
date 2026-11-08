@@ -144,9 +144,49 @@ pub fn load_model(
 pub fn load(
     settings: &Settings,
     log: Log,
-    mut on_status: impl FnMut(Status) + 'static,
+    on_status: impl FnMut(Status) + 'static,
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
+    let (client, system) = open(settings, on_status)?;
+    let device = client.device().to_string();
+    let cwd = env::current_dir()?;
+    let mut harness = Harness::new(client, &cwd, {
+        let system = system.clone();
+        move |client: &mut Client| client.start(&system, |_, _| {}).map(|_| ())
+    })?;
+    harness.set_thinking_budget(settings.thinking_budget);
+    if let Some(shell) = settings.shell.clone() {
+        harness.set_shell(shell);
+    }
+    harness.keep_log(log, &settings.model, &device, &system);
+    Ok(Loaded {
+        harness,
+        loading: loading.elapsed(),
+    })
+}
+
+/// Opens the session over on a server, starting one if none is running,
+/// after the one it was on stopped, and reads the conversation so far
+/// back into it. `on_status` is told what the server is doing, as with
+/// [`load`].
+pub fn reopen(
+    settings: &Settings,
+    harness: &mut Harness<Client>,
+    on_status: impl FnMut(Status) + 'static,
+) -> Result<(), Box<dyn Error>> {
+    let (client, _) = open(settings, on_status)?;
+    harness.reopen(client)
+}
+
+/// Reaches the server, starting one if none is running, and opens a
+/// session on it with the system prompt for the working directory, which
+/// it returns with the session. `on_status` is told what the server is
+/// doing meanwhile, and after, when the session waits for another's
+/// request.
+fn open(
+    settings: &Settings,
+    mut on_status: impl FnMut(Status) + 'static,
+) -> Result<(Client, String), Box<dyn Error>> {
     let connection = connect(settings, &mut on_status)?;
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
@@ -166,26 +206,47 @@ pub fn load(
     if !size_told {
         on_status(Status::Sized(client.size()));
     }
-    let cwd = env::current_dir()?;
-    let system = harness::system_prompt(&cwd, settings.effort);
+    let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     client.start(&system, |read, total| {
         on_status(Status::Prompting { read, total })
     })?;
     client.on_status(on_status);
-    let device = client.device().to_string();
-    let mut harness = Harness::new(client, &cwd, {
-        let system = system.clone();
-        move |client: &mut Client| client.start(&system, |_, _| {}).map(|_| ())
-    })?;
-    harness.set_thinking_budget(settings.thinking_budget);
-    if let Some(shell) = settings.shell.clone() {
-        harness.set_shell(shell);
+    Ok((client, system))
+}
+
+/// The server listening, as it says who it is, if one is.
+pub fn running() -> Option<Welcome> {
+    Connection::connect(&server::socket_path())
+        .ok()?
+        .hello()
+        .ok()
+}
+
+/// Stops the server `client` is a session on, if it has no other: asks it
+/// to go, ends the session, and waits for the server to exit.
+pub fn stop(client: &mut Client) -> Result<(), Box<dyn Error>> {
+    let mut connection =
+        Connection::connect(&server::socket_path()).map_err(|_| "no dwim server is running")?;
+    let welcome = connection.hello()?;
+    let others = welcome.sessions.saturating_sub(1);
+    if others > 0 {
+        return Err(format!(
+            "the dwim server has {others} other {}: quit {} first",
+            plural(others, "session"),
+            if others == 1 { "it" } else { "them" }
+        )
+        .into());
     }
-    harness.keep_log(log, &settings.model, &device, &system);
-    Ok(Loaded {
-        harness,
-        loading: loading.elapsed(),
-    })
+    connection.retire()?;
+    drop(connection);
+    client.close();
+    wait_for_exit(welcome.pid);
+    Ok(())
+}
+
+/// Whether `welcome` is from a server of this build of dwim.
+pub fn same_build(welcome: &Welcome) -> bool {
+    welcome.build == server::build()
 }
 
 /// Connects to the server, starting one when none is listening. A server
