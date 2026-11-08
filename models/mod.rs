@@ -26,15 +26,11 @@ pub trait LanguageModel {
     /// The model's state after the first `len` positions, as bytes for
     /// [`restore`](Self::restore) to take up from, if the model can give
     /// it.
-    fn save(&self, _len: usize) -> Option<Vec<u8>> {
-        None
-    }
+    fn save(&self, len: usize) -> Option<Vec<u8>>;
 
     /// Puts the model in a state [`save`](Self::save) gave, and returns
     /// how many positions it holds.
-    fn restore(&mut self, _state: &[u8]) -> Result<usize> {
-        Err("this model cannot restore a state".into())
-    }
+    fn restore(&mut self, state: &[u8]) -> Result<usize>;
 
     /// Runs `tokens`, the first at position `pos`, through the model, and
     /// returns the logits for the token that follows the last of them.
@@ -46,38 +42,28 @@ pub trait LanguageModel {
     /// drafter and nothing is being verified, and none otherwise. The
     /// token and the drafts are then run as one batch by
     /// [`verify`](Self::verify).
-    fn draft(&mut self, _token: u32, _pos: usize, _k: usize) -> Vec<u32> {
-        Vec::new()
-    }
+    fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32>;
 
     /// Runs `tokens`, the first at position `pos`, as a batch to be
     /// verified: a token picked and the tokens drafted after it. Returns
     /// the logits after each, a row per token, and commits none of them
     /// until [`rewind`](Self::rewind) says how many to keep. Only for a
     /// model that drafted them.
-    fn verify(&mut self, _tokens: &[u32], _pos: usize) -> Vec<f32> {
-        unreachable!("the model does not draft")
-    }
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
 
     /// Commits the first `keep` tokens of the batch being verified, one at
     /// least, and drops the rest.
-    fn rewind(&mut self, _keep: usize) {
-        unreachable!("the model does not draft")
-    }
+    fn rewind(&mut self, keep: usize);
 
     /// Marks the sequence so far, keeping what
     /// [`rewind_to_mark`](Self::rewind_to_mark) needs to take it up again
     /// from here, if the model can: returns whether it did. A mark is kept
     /// until the next, or until the model is reset or restored.
-    fn mark(&mut self) -> bool {
-        false
-    }
+    fn mark(&mut self) -> bool;
 
     /// Puts the model back at the mark, forgetting the positions after
     /// it: the next tokens start where the mark was made.
-    fn rewind_to_mark(&mut self) -> Result<()> {
-        Err("this model cannot rewind to a mark".into())
-    }
+    fn rewind_to_mark(&mut self) -> Result<()>;
 
     /// Forgets the sequence so far, so that the next tokens start at
     /// position 0.
@@ -90,19 +76,11 @@ pub trait LanguageModel {
     /// many tokens as the first, beside the model's others, which share its
     /// weights, and returns its number. A model starts with one sequence,
     /// number 0, which it runs until another is selected.
-    fn add_sequence(&mut self) -> Result<usize> {
-        Err("this model runs one sequence".into())
-    }
+    fn add_sequence(&mut self) -> Result<usize>;
 
     /// Has the model run sequence `id` from here on: every other method
     /// is of the sequence selected. Fails while a batch is being verified.
-    fn select_sequence(&mut self, id: usize) -> Result<()> {
-        if id == 0 {
-            Ok(())
-        } else {
-            Err(format!("no sequence {id}").into())
-        }
-    }
+    fn select_sequence(&mut self, id: usize) -> Result<()>;
 }
 
 impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
@@ -174,7 +152,7 @@ pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
 
 /// A conversation with the model, as the harness holds one: a [`Chat`] on
 /// a model in this process, or one kept with the server that has the
-/// model, and reached over its socket. The methods are [`Chat`]'s.
+/// model, and reached over its socket.
 pub trait Conversation {
     /// Opens the conversation with a system prompt, reporting how many of
     /// its tokens the model has read so far, out of how many, as it goes.
@@ -247,89 +225,4 @@ pub trait Conversation {
         limit: usize,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer>;
-}
-
-impl<M: LanguageModel> Conversation for Chat<M> {
-    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        Chat::system(self, text, on_progress)
-    }
-
-    fn clear(&mut self) -> Result<()> {
-        Chat::clear(self);
-        Ok(())
-    }
-
-    fn replay(&mut self, turns: &[Turn]) -> Result<()> {
-        Chat::replay(self, turns)
-    }
-
-    fn measure(&mut self, turn: &Turn) -> Result<usize> {
-        Chat::measure(self, turn)
-    }
-
-    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize> {
-        Chat::answer_tokens(self, message, limit)
-    }
-
-    fn tokens(&self) -> usize {
-        Chat::tokens(self)
-    }
-
-    fn capacity(&self) -> usize {
-        Chat::capacity(self)
-    }
-
-    fn free(&self) -> usize {
-        Chat::free(self)
-    }
-
-    fn reserve(&mut self, tokens: usize) {
-        Chat::reserve(self, tokens)
-    }
-
-    fn thought_limit(&self) -> Option<usize> {
-        Chat::thought_limit(self)
-    }
-
-    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
-        Chat::limit_thoughts(self, tokens, closing)
-    }
-
-    fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
-        Chat::feed_results(self, outputs)
-    }
-
-    fn stats(&self) -> Stats {
-        Chat::stats(self)
-    }
-
-    fn sampler(&self) -> &Sampler {
-        Chat::sampler(self)
-    }
-
-    fn send(
-        &mut self,
-        message: &str,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        Chat::send(self, message, on_chunk)
-    }
-
-    fn respond(
-        &mut self,
-        outputs: &[String],
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        Chat::respond(self, outputs, on_chunk)
-    }
-
-    fn answer(
-        &mut self,
-        message: &str,
-        heads: &[&str],
-        limit: usize,
-        on_text: impl FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Answer> {
-        Chat::answer(self, message, heads, limit, on_text)
-    }
 }

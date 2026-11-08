@@ -106,7 +106,7 @@ pub fn fetch_model(
 }
 
 /// Fetches the model if needed, opens the device, and loads the model
-/// onto it in this process, with room for `sessions` sequences, reporting
+/// onto it in this process, sized for `sessions` sequences, reporting
 /// each stage to `on_status`: what the server does, and `bench`.
 pub fn load_model(
     settings: &Settings,
@@ -121,12 +121,9 @@ pub fn load_model(
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let size = model::size(&gguf, &device, settings.context, sessions)?;
     on_status(Status::Sized(size));
-    let mut model = device.load(gguf.clone(), size.context, |done, total| {
+    let model = device.load(gguf.clone(), size.context, |done, total| {
         on_status(Status::Weights { done, total })
     })?;
-    for _ in 1..sessions {
-        model.add_sequence()?;
-    }
     Ok(LoadedModel {
         model,
         tokenizer,
