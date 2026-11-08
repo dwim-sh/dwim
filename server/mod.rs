@@ -45,7 +45,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::models::{Chat, Chunk, Format, LanguageModel, Sampler, qwen35};
+use crate::models::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, qwen35};
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, Size, State, Status, Welcome,
 };
@@ -557,7 +557,7 @@ fn serve(
             Response::Ok(state(chat))
         }
         Request::Clear => {
-            chat.clear();
+            chat.clear()?;
             Response::Ok(state(chat))
         }
         Request::Replay { turns } => {

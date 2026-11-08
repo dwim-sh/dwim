@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{LanguageModel, Result, Sampler, Tokenizer};
+use crate::models::{Conversation, LanguageModel, Result, Sampler, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -380,53 +380,6 @@ impl<M: LanguageModel> Chat<M> {
         })
     }
 
-    /// Opens the conversation with a system prompt, reporting how many of
-    /// its tokens the model has read so far, out of how many, as it goes.
-    /// Tags in the prompt, such as `<tool_call>`, are encoded as special
-    /// tokens.
-    pub fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        if self.len != 0 {
-            return Err("the conversation has already started".into());
-        }
-        let content = self.format.tokenizer.encode_with_special(text)?;
-        let turn = self.format.turn("system", content)?;
-        self.read(&turn, on_progress)
-    }
-
-    /// Forgets the conversation, so that a system prompt or a saved state
-    /// can open another.
-    pub fn clear(&mut self) {
-        // A batch being verified goes with the conversation.
-        self.speculation = None;
-        self.model.reset();
-        self.len = 0;
-    }
-
-    /// Feeds `turns` to the model as the conversation so far, without a
-    /// reply to them, as the template writes a conversation over: a reply
-    /// already made with an empty thought before it, since the template
-    /// leaves earlier thoughts out. Fails when the turns do not fit in the
-    /// context window.
-    pub fn replay(&mut self, turns: &[Turn]) -> Result<()> {
-        let mut tokens = Vec::new();
-        for turn in turns {
-            tokens.extend(self.format.encode(turn)?);
-        }
-        self.read(&tokens, |_, _| {})
-    }
-
-    /// Number of tokens `turn` takes when fed, as `replay` writes it.
-    pub fn measure(&self, turn: &Turn) -> Result<usize> {
-        self.format.measure(turn)
-    }
-
-    /// Most tokens a plain answer to `message` takes with its framing, if
-    /// it is limited to `limit` tokens: what [`Chat::answer`] needs room
-    /// for. Fails only if the message cannot be encoded.
-    pub fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
-        self.format.answer_tokens(message, limit)
-    }
-
     /// Feeds `tokens` a batch at a time, reporting how many so far, out of
     /// how many, as it goes.
     fn read(&mut self, tokens: &[u32], mut on_progress: impl FnMut(usize, usize)) -> Result<()> {
@@ -438,19 +391,9 @@ impl<M: LanguageModel> Chat<M> {
         Ok(())
     }
 
-    /// Number of tokens in the conversation so far.
-    pub fn tokens(&self) -> usize {
-        self.len
-    }
-
     /// The model the conversation runs on.
     pub fn model(&self) -> &M {
         &self.model
-    }
-
-    /// The sampler the model's tokens are picked with.
-    pub fn sampler(&self) -> &Sampler {
-        &self.sampler
     }
 
     /// Sets how many tokens the model drafts after each token picked, for
@@ -458,46 +401,6 @@ impl<M: LanguageModel> Chat<M> {
     /// time. A model without a drafter does regardless.
     pub fn set_drafts(&mut self, drafts: usize) {
         self.drafts = drafts;
-    }
-
-    /// Most tokens a thought may run to, if they are limited.
-    pub fn thought_limit(&self) -> Option<usize> {
-        self.thought_limit
-    }
-
-    /// Number of tokens the conversation has room for in all.
-    pub fn capacity(&self) -> usize {
-        self.model.max_len()
-    }
-
-    /// Tokens the conversation has room for before the reserve: what a
-    /// message and the reply to it may take.
-    pub fn free(&self) -> usize {
-        self.capacity().saturating_sub(self.len + self.reserve)
-    }
-
-    /// Keeps `tokens` of the context free: a reply stops short of them, so
-    /// that there is always room after it for a short exchange, such as
-    /// one that compacts the conversation.
-    pub fn reserve(&mut self, tokens: usize) {
-        self.reserve = tokens;
-    }
-
-    /// Ends a thought that runs to `tokens`, if they are limited, or that
-    /// repeats itself: `closing` is written into it as the model's own, and
-    /// the thought is closed, so that the model goes on to act or reply
-    /// instead of thinking in circles.
-    pub fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
-        self.thought_limit = tokens;
-        self.closing = Some(closing.to_string());
-    }
-
-    /// Feeds the results of the tool calls the last reply made, in order,
-    /// each in a `<tool_response>` block as text, without a reply: a
-    /// message follows.
-    pub fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
-        let turn = self.format.results(outputs)?;
-        self.feed(&turn, Kind::Prompt).map(|_| ())
     }
 
     /// Whether a reply may go on: whether there is room for one more token
@@ -530,137 +433,6 @@ impl<M: LanguageModel> Chat<M> {
     /// which the next token fed would commit otherwise.
     pub fn settle(&mut self) {
         self.commit();
-    }
-
-    /// Where the conversation's time has gone so far.
-    pub fn stats(&self) -> Stats {
-        self.stats
-    }
-
-    /// Sends a message from the user, streaming the reply to `on_chunk` as
-    /// it is generated, and returns what the reply came to. The reply ends
-    /// early if `on_chunk` breaks, and then makes no calls.
-    pub fn send(
-        &mut self,
-        message: &str,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        let turn = self.format.user(message)?;
-        self.feed(&turn, Kind::Prompt)?;
-        self.generate(on_chunk)
-    }
-
-    /// Sends a message from the user and has the model answer it plainly:
-    /// without thinking, without tool calls, and in at most `limit` tokens,
-    /// streaming the answer to `on_text` as it is generated. The answer is
-    /// what the reserve is for, so it may use it.
-    ///
-    /// The answer is written under `heads` in turn: each head is written
-    /// into the reply as the model's own, and the model goes on from it
-    /// until it ends the reply or uses the head's share of what is left of
-    /// `limit`, when the next head is written and the model goes on from
-    /// that. So an answer the model ends early still has every head, and
-    /// the last head has room of its own. With no heads, the model writes
-    /// the whole answer. An answer cut for room in the context has every
-    /// head all the same, unless there is no room for even them. The
-    /// answer returned has the heads in it.
-    pub fn answer(
-        &mut self,
-        message: &str,
-        heads: &[&str],
-        limit: usize,
-        mut on_text: impl FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Answer> {
-        let turn = self.format.user(message)?;
-        self.feed(&turn, Kind::Prompt)?;
-        let prompt = opening(&self.format.tokenizer, false)?;
-        let mut logits = self.feed(&prompt, Kind::Prompt)?;
-
-        let mut text = Utf8Stream::default();
-        let mut answer = String::new();
-        let end = self.format.end_of_reply(false)?;
-        let heads: Vec<(&str, Vec<u32>)> = heads
-            .iter()
-            .map(|head| Ok((*head, self.format.tokenizer.encode(head)?)))
-            .collect::<Result<_>>()?;
-        // Tokens of the heads yet to be written. Each section leaves room
-        // for them, so that an answer cut for room still has every head:
-        // only the sections are cut short.
-        let mut ahead: usize = heads.iter().map(|(_, tokens)| tokens.len()).sum();
-        let mut cut = false;
-        // A section for each head, or one for the whole answer.
-        let sections = heads.len().max(1);
-        let mut left = limit;
-        'sections: for i in 0..sections {
-            if let Some((head, tokens)) = heads.get(i) {
-                ahead -= tokens.len();
-                // Only the first head can want for room, with the heads
-                // after it and the end: each section leaves room for the
-                // heads after it.
-                if self.len + tokens.len() + ahead + end.len() > self.model.max_len() {
-                    cut = true;
-                    break;
-                }
-                left = left.saturating_sub(tokens.len());
-                // The head goes through the stream like the tokens: a
-                // character the last section was cut in the middle of is
-                // shown as the stray bytes it is, before the head, rather
-                // than glued to what the model says after it.
-                let chunk = text.push(head.as_bytes());
-                answer.push_str(&chunk);
-                let flow = on_text(&chunk);
-                logits = self.feed(tokens, Kind::Answer)?;
-                if flow.is_break() {
-                    break;
-                }
-            }
-            // The section's share of what is left: an even share with the
-            // sections to come, so that the last has whatever is left.
-            let share = left / (sections - i);
-            for _ in 0..share {
-                if !self.room(ahead + end.len(), 0) {
-                    // The section ends here, and so does each to come,
-                    // after its head.
-                    cut = true;
-                    break;
-                }
-                for token in [
-                    self.format.think,
-                    self.format.think_end,
-                    self.format.tool_call,
-                ] {
-                    logits[token as usize] = f32::NEG_INFINITY;
-                }
-                let token = self.pick(&logits);
-                if token == self.format.im_end || token == self.format.end_of_text {
-                    break;
-                }
-                let chunk = text.push(self.format.tokenizer.decode(token));
-                answer.push_str(&chunk);
-                let flow = on_text(&chunk);
-                logits = self.step(token, Kind::Answer)?;
-                left -= 1;
-                if flow.is_break() {
-                    break 'sections;
-                }
-            }
-        }
-        self.feed(&end, Kind::Prompt)?;
-        Ok(Answer { text: answer, cut })
-    }
-
-    /// Sends the results of the tool calls the last reply made, in order,
-    /// and streams the reply to them like `send`. Each result goes in a
-    /// `<tool_response>` block, as text: a result that contains the text
-    /// of a tag is not mistaken for the tag.
-    pub fn respond(
-        &mut self,
-        outputs: &[String],
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        let turn = self.format.results(outputs)?;
-        self.feed(&turn, Kind::Prompt)?;
-        self.generate(on_chunk)
     }
 
     /// Generates the assistant's reply to the conversation so far.
@@ -986,6 +758,183 @@ impl<M: LanguageModel> Chat<M> {
     }
 }
 
+impl<M: LanguageModel> Conversation for Chat<M> {
+    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        if self.len != 0 {
+            return Err("the conversation has already started".into());
+        }
+        let content = self.format.tokenizer.encode_with_special(text)?;
+        let turn = self.format.turn("system", content)?;
+        self.read(&turn, on_progress)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.speculation = None;
+        self.model.reset();
+        self.len = 0;
+        Ok(())
+    }
+
+    fn replay(&mut self, turns: &[Turn]) -> Result<()> {
+        let mut tokens = Vec::new();
+        for turn in turns {
+            tokens.extend(self.format.encode(turn)?);
+        }
+        self.read(&tokens, |_, _| {})
+    }
+
+    fn measure(&mut self, turn: &Turn) -> Result<usize> {
+        self.format.measure(turn)
+    }
+
+    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize> {
+        self.format.answer_tokens(message, limit)
+    }
+
+    fn tokens(&self) -> usize {
+        self.len
+    }
+
+    fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
+    fn thought_limit(&self) -> Option<usize> {
+        self.thought_limit
+    }
+
+    fn capacity(&self) -> usize {
+        self.model.max_len()
+    }
+
+    fn free(&self) -> usize {
+        self.capacity().saturating_sub(self.len + self.reserve)
+    }
+
+    fn reserve(&mut self, tokens: usize) {
+        self.reserve = tokens;
+    }
+
+    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
+        self.thought_limit = tokens;
+        self.closing = Some(closing.to_string());
+    }
+
+    fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
+        let turn = self.format.results(outputs)?;
+        self.feed(&turn, Kind::Prompt).map(|_| ())
+    }
+
+    fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    fn send(
+        &mut self,
+        message: &str,
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply> {
+        let turn = self.format.user(message)?;
+        self.feed(&turn, Kind::Prompt)?;
+        self.generate(on_chunk)
+    }
+
+    fn answer(
+        &mut self,
+        message: &str,
+        heads: &[&str],
+        limit: usize,
+        mut on_text: impl FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<Answer> {
+        let turn = self.format.user(message)?;
+        self.feed(&turn, Kind::Prompt)?;
+        let prompt = opening(&self.format.tokenizer, false)?;
+        let mut logits = self.feed(&prompt, Kind::Prompt)?;
+
+        let mut text = Utf8Stream::default();
+        let mut answer = String::new();
+        let end = self.format.end_of_reply(false)?;
+        let heads: Vec<(&str, Vec<u32>)> = heads
+            .iter()
+            .map(|head| Ok((*head, self.format.tokenizer.encode(head)?)))
+            .collect::<Result<_>>()?;
+        // Tokens of the heads yet to be written. Each section leaves room
+        // for them, so that an answer cut for room still has every head:
+        // only the sections are cut short.
+        let mut ahead: usize = heads.iter().map(|(_, tokens)| tokens.len()).sum();
+        let mut cut = false;
+        // A section for each head, or one for the whole answer.
+        let sections = heads.len().max(1);
+        let mut left = limit;
+        'sections: for i in 0..sections {
+            if let Some((head, tokens)) = heads.get(i) {
+                ahead -= tokens.len();
+                // Only the first head can want for room, with the heads
+                // after it and the end: each section leaves room for the
+                // heads after it.
+                if self.len + tokens.len() + ahead + end.len() > self.model.max_len() {
+                    cut = true;
+                    break;
+                }
+                left = left.saturating_sub(tokens.len());
+                // The head goes through the stream like the tokens: a
+                // character the last section was cut in the middle of is
+                // shown as the stray bytes it is, before the head, rather
+                // than glued to what the model says after it.
+                let chunk = text.push(head.as_bytes());
+                answer.push_str(&chunk);
+                let flow = on_text(&chunk);
+                logits = self.feed(tokens, Kind::Answer)?;
+                if flow.is_break() {
+                    break;
+                }
+            }
+            // The section's share of what is left: an even share with the
+            // sections to come, so that the last has whatever is left.
+            let share = left / (sections - i);
+            for _ in 0..share {
+                if !self.room(ahead + end.len(), 0) {
+                    // The section ends here, and so does each to come,
+                    // after its head.
+                    cut = true;
+                    break;
+                }
+                for token in [
+                    self.format.think,
+                    self.format.think_end,
+                    self.format.tool_call,
+                ] {
+                    logits[token as usize] = f32::NEG_INFINITY;
+                }
+                let token = self.pick(&logits);
+                if token == self.format.im_end || token == self.format.end_of_text {
+                    break;
+                }
+                let chunk = text.push(self.format.tokenizer.decode(token));
+                answer.push_str(&chunk);
+                let flow = on_text(&chunk);
+                logits = self.step(token, Kind::Answer)?;
+                left -= 1;
+                if flow.is_break() {
+                    break 'sections;
+                }
+            }
+        }
+        self.feed(&end, Kind::Prompt)?;
+        Ok(Answer { text: answer, cut })
+    }
+
+    fn respond(
+        &mut self,
+        outputs: &[String],
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Reply> {
+        let turn = self.format.results(outputs)?;
+        self.feed(&turn, Kind::Prompt)?;
+        self.generate(on_chunk)
+    }
+}
+
 /// Whether a thought is going round in circles: its tokens so far, how
 /// often each window of [`REPEAT_WINDOW`] of them has been written, and
 /// whether one has been written [`REPEATS`] times.
@@ -1245,7 +1194,7 @@ mod tests {
         let call = "\n<function=bash>\n<parameter=command>\ndate\n</parameter>\n</function>\n";
         let mut chat = chat(&["First.\n</think>\n\nOne.", "Later.\n</think>\n\nAnother."]);
         chat.send("first", |_| ControlFlow::Continue(())).unwrap();
-        chat.clear();
+        chat.clear().unwrap();
         assert_eq!(chat.tokens(), 0);
         chat.system("Be brief.", |_, _| {}).unwrap();
         let turns = [
@@ -1506,7 +1455,7 @@ mod tests {
         // under it.
         let tokenizer = Tokenizer::tiny();
         let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
-        let measure = Chat::new(
+        let mut measure = Chat::new(
             Scripted::new(&tokenizer, &[], 1 << 16),
             Format::new(Tokenizer::tiny()).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),

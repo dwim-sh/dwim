@@ -174,7 +174,7 @@ pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
 
 /// A conversation with the model, as the harness holds one: a [`Chat`] on
 /// a model in this process, or one kept with the server that has the
-/// model, and reached over its socket. The methods are [`Chat`]'s.
+/// model, and reached over its socket.
 pub trait Conversation {
     /// Opens the conversation with a system prompt, reporting how many of
     /// its tokens the model has read so far, out of how many, as it goes.
@@ -247,89 +247,4 @@ pub trait Conversation {
         limit: usize,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer>;
-}
-
-impl<M: LanguageModel> Conversation for Chat<M> {
-    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        Chat::system(self, text, on_progress)
-    }
-
-    fn clear(&mut self) -> Result<()> {
-        Chat::clear(self);
-        Ok(())
-    }
-
-    fn replay(&mut self, turns: &[Turn]) -> Result<()> {
-        Chat::replay(self, turns)
-    }
-
-    fn measure(&mut self, turn: &Turn) -> Result<usize> {
-        Chat::measure(self, turn)
-    }
-
-    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize> {
-        Chat::answer_tokens(self, message, limit)
-    }
-
-    fn tokens(&self) -> usize {
-        Chat::tokens(self)
-    }
-
-    fn capacity(&self) -> usize {
-        Chat::capacity(self)
-    }
-
-    fn free(&self) -> usize {
-        Chat::free(self)
-    }
-
-    fn reserve(&mut self, tokens: usize) {
-        Chat::reserve(self, tokens)
-    }
-
-    fn thought_limit(&self) -> Option<usize> {
-        Chat::thought_limit(self)
-    }
-
-    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
-        Chat::limit_thoughts(self, tokens, closing)
-    }
-
-    fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
-        Chat::feed_results(self, outputs)
-    }
-
-    fn stats(&self) -> Stats {
-        Chat::stats(self)
-    }
-
-    fn sampler(&self) -> &Sampler {
-        Chat::sampler(self)
-    }
-
-    fn send(
-        &mut self,
-        message: &str,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        Chat::send(self, message, on_chunk)
-    }
-
-    fn respond(
-        &mut self,
-        outputs: &[String],
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        Chat::respond(self, outputs, on_chunk)
-    }
-
-    fn answer(
-        &mut self,
-        message: &str,
-        heads: &[&str],
-        limit: usize,
-        on_text: impl FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Answer> {
-        Chat::answer(self, message, heads, limit, on_text)
-    }
 }
