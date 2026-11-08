@@ -278,14 +278,14 @@ impl Server {
         }
     }
 
-    /// Serves the connections with `model`, loaded on `device` at `size`
-    /// with a sequence for each of the sessions the size has room for, in
-    /// `format`, each session sampling with what `sampler` makes of the
+    /// Serves the connections with `model`, loaded on `device` at `size`,
+    /// giving it a sequence for each of the sessions the size has room
+    /// for, in `format`, each session sampling with what `sampler` makes of the
     /// temperature it asks for, until the server has gone the idle time
     /// without a session, or was asked to go and its sessions have ended.
     pub fn run(
         self,
-        model: Box<dyn LanguageModel>,
+        mut model: Box<dyn LanguageModel>,
         format: Format,
         device: String,
         size: Size,
@@ -295,10 +295,12 @@ impl Server {
         if inner.format.set(format.clone()).is_err() {
             return Err("the server has run already".into());
         }
-        let pool = Rc::new(RefCell::new(Pool {
-            model,
-            free: (0..size.sessions).rev().collect(),
-        }));
+        let mut free = vec![0];
+        for _ in 1..size.sessions {
+            free.push(model.add_sequence()?);
+        }
+        free.reverse();
+        let pool = Rc::new(RefCell::new(Pool { model, free }));
         let mut sessions: HashMap<usize, Chat<Shared>> = HashMap::new();
         loop {
             if inner.retiring.load(Ordering::Relaxed) && sessions.is_empty() {
@@ -780,9 +782,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let tokenizer = Tokenizer::tiny();
             let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-            let mut model =
-                Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
-            model.add_sequence().unwrap();
+            let model = Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
             let format = Format::new(tokenizer).unwrap();
             let size = Size {
                 sessions: 2,
