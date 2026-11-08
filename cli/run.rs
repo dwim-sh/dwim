@@ -74,11 +74,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         input: Input::default(),
         history: Vec::new(),
         recalled: None,
-        status: Status::Loading {
-            since: Instant::now(),
-            done: 0,
-            total: 0,
-        },
+        status: Status::Connecting(Instant::now()),
         started: Instant::now(),
         loading: Duration::ZERO,
         stats: harness::Stats::default(),
@@ -113,7 +109,11 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     // loading, there is no transcript to end.
     let loaded = !matches!(
         app.status,
-        Status::Downloading { .. } | Status::Loading { .. }
+        Status::Downloading { .. }
+            | Status::Connecting(_)
+            | Status::Restarting(_)
+            | Status::Starting { .. }
+            | Status::Opening(_)
     );
     app.stop.store(true, Ordering::Relaxed);
     drop(app);
@@ -313,13 +313,19 @@ enum Status {
         done: u64,
         total: Option<u64>,
     },
-    /// Loading the weights, since when: how many tensors so far, out of how
-    /// many.
-    Loading {
+    /// Reaching the server, since when.
+    Connecting(Instant),
+    /// Waiting for a server that is not as asked for to go, since when.
+    Restarting(Instant),
+    /// Waiting for the server to start up, since when: how many of the
+    /// model's tensors it has loaded so far, out of how many, once it says.
+    Starting {
         since: Instant,
         done: usize,
         total: usize,
     },
+    /// Opening a session on the server, since when.
+    Opening(Instant),
     /// Reading the system prompt, since when: how many of its tokens so
     /// far, out of how many.
     Prompting {
@@ -642,10 +648,28 @@ impl App {
             session::Status::Sized(size) => self.size = Some(size),
             session::Status::Weights { done, total } => {
                 let since = match self.status {
-                    Status::Loading { since, .. } => since,
+                    Status::Starting { since, .. } => since,
                     _ => Instant::now(),
                 };
-                self.status = Status::Loading { since, done, total };
+                self.status = if done >= total {
+                    Status::Opening(Instant::now())
+                } else {
+                    Status::Starting { since, done, total }
+                };
+            }
+            session::Status::Restarting => self.status = Status::Restarting(Instant::now()),
+            session::Status::Starting => {
+                self.status = Status::Starting {
+                    since: Instant::now(),
+                    done: 0,
+                    total: 0,
+                };
+            }
+            session::Status::Opening => {
+                // A server this session started opens it once loaded.
+                if matches!(self.status, Status::Connecting(_)) {
+                    self.status = Status::Opening(Instant::now());
+                }
             }
             session::Status::Prompting { read, total } => {
                 let since = match self.status {
@@ -933,13 +957,16 @@ impl App {
                 since,
                 download_details(done, total, since.elapsed()),
             ),
-            Status::Loading { since, done, total } => (
-                match self.device {
-                    Device::Cpu => "Loading model…",
-                    Device::Gpu => "Loading model to GPU…",
-                },
+            Status::Connecting(since) => ("Connecting to dwim server…", since, seconds(since)),
+            Status::Restarting(since) => ("Restarting dwim server…", since, seconds(since)),
+            Status::Opening(since) => ("Opening a session…", since, seconds(since)),
+            Status::Starting { since, done, total } => (
+                "Starting dwim server…",
                 since,
-                format!("{} · {}", percent(done, total), seconds(since)),
+                match total {
+                    0 => seconds(since),
+                    _ => format!("{} · {}", percent(done, total).trim_start(), seconds(since)),
+                },
             ),
             Status::Prompting { since, read, total } => (
                 "Reading system prompt…",

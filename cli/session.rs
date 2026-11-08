@@ -147,7 +147,8 @@ pub fn load(
     mut on_status: impl FnMut(Status) + 'static,
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
-    let connection = connect(settings)?;
+    let connection = connect(settings, &mut on_status)?;
+    on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
     // through, is told of the device and the size afterwards instead.
     let (mut device_told, mut size_told) = (false, false);
@@ -192,7 +193,10 @@ pub fn load(
 /// another context than asked for, is asked to go and replaced if it has
 /// no sessions; with sessions, it is an error, since two servers would not
 /// fit in memory.
-fn connect(settings: &Settings) -> Result<Connection, Box<dyn Error>> {
+fn connect(
+    settings: &Settings,
+    on_status: &mut impl FnMut(Status),
+) -> Result<Connection, Box<dyn Error>> {
     let path = server::socket_path();
     let mut started: Option<Instant> = None;
     loop {
@@ -208,6 +212,7 @@ fn connect(settings: &Settings) -> Result<Connection, Box<dyn Error>> {
                     )
                     .into());
                 }
+                on_status(Status::Restarting);
                 connection.retire()?;
                 drop(connection);
                 wait_for_exit(welcome.pid);
@@ -219,6 +224,7 @@ fn connect(settings: &Settings) -> Result<Connection, Box<dyn Error>> {
         match started {
             None => {
                 spawn(settings)?;
+                on_status(Status::Starting);
                 started = Some(Instant::now());
             }
             Some(since) if since.elapsed() > STARTING => {
@@ -359,6 +365,9 @@ pub struct Stderr {
     stage: String,
     /// The device the model loads onto, once it is open.
     device: String,
+    /// Whether this is a session that started the server, which reports
+    /// the server's loading as its starting up.
+    starting: bool,
 }
 
 impl Stderr {
@@ -367,6 +376,7 @@ impl Stderr {
             terminal: io::stderr().is_terminal(),
             stage: String::new(),
             device: String::new(),
+            starting: false,
         }
     }
 
@@ -384,6 +394,11 @@ impl Stderr {
             ),
             Status::Device(name) => self.device.clone_from(name),
             Status::Sized(size) => eprintln!("{}", model::describe(size)),
+            Status::Weights { done, total } if self.starting => self.stage(
+                "starting dwim server".to_string(),
+                &format!("{}%", done * 100 / (*total).max(1)),
+                done >= total,
+            ),
             Status::Weights { done, total } => self.stage(
                 if self.device.is_empty() {
                     "loading the model".to_string()
@@ -398,6 +413,12 @@ impl Stderr {
                 &format!("{read}/{total}"),
                 read >= total,
             ),
+            Status::Restarting => self.stage("restarting dwim server".to_string(), "", false),
+            Status::Starting => {
+                self.starting = true;
+                self.stage("starting dwim server".to_string(), "", false)
+            }
+            Status::Opening => {}
             Status::Busy => self.stage(
                 "waiting for another session's turn with the model".to_string(),
                 "",

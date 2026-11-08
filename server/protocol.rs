@@ -203,6 +203,17 @@ pub enum Status {
     /// The model is busy with another session's request, and this one
     /// waits its turn.
     Busy,
+    /// The server running is not as the session asks for, so the session
+    /// asks it to go, to start another. The session tells itself this; a
+    /// server never sends it.
+    Restarting,
+    /// No server was running as the session asks for, so the session
+    /// started one and waits for it. The session tells itself this; a
+    /// server never sends it.
+    Starting,
+    /// The session reached a server, and opens a conversation on it. The
+    /// session tells itself this; a server never sends it.
+    Opening,
 }
 
 /// How many sessions the model has room for at once, the tokens of
