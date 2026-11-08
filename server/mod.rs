@@ -755,6 +755,19 @@ impl LanguageModel for Shared {
     fn max_len(&self) -> usize {
         self.pool.borrow().model.max_len()
     }
+
+    /// A session runs the one sequence it took.
+    fn add_sequence(&mut self) -> crate::models::Result<usize> {
+        Err("a session runs one sequence".into())
+    }
+
+    fn select_sequence(&mut self, id: usize) -> crate::models::Result<()> {
+        if id == 0 {
+            Ok(())
+        } else {
+            Err("a session runs one sequence".into())
+        }
+    }
 }
 
 #[cfg(test)]

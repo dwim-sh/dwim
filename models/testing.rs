@@ -167,12 +167,24 @@ impl LanguageModel for Scripted {
         Ok(self.fed.len())
     }
 
+    /// Drafts nothing: the scripts are said a token at a time.
+    fn draft(&mut self, _token: u32, _pos: usize, _k: usize) -> Vec<u32> {
+        Vec::new()
+    }
+
+    fn verify(&mut self, _tokens: &[u32], _pos: usize) -> Vec<f32> {
+        unreachable!("a scripted model drafts nothing")
+    }
+
+    fn rewind(&mut self, _keep: usize) {
+        unreachable!("a scripted model drafts nothing")
+    }
+
     fn mark(&mut self) -> bool {
         self.mark = Some(self.fed.len());
         true
     }
 
-    /// Forgets the tokens fed since the mark.
     fn rewind_to_mark(&mut self) -> Result<()> {
         let mark = self.mark.ok_or("no mark to rewind to")?;
         self.fed.truncate(mark);
