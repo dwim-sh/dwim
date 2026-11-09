@@ -108,10 +108,11 @@ Then, in the agent, ask for the change "with dwim":
    a `PLAN.md` that holds the goal, the design, the checks, and the steps
    as a checklist. It runs nothing: you read the plan and edit what you
    want.
-2. `/dwim-do` hands the next task file to dwim, watches the run, reviews
-   the change as it would a pull request, fixes and verifies it, commits
-   it with `Generated-by: dwim`, and ticks the step off. `/dwim-do all`
-   goes on until a step fails review or none remain.
+2. `/dwim-do` runs the plan step by step: it hands each task file to
+   dwim, watches the run, reviews the change as it would a pull request,
+   fixes and verifies it, commits it with `Generated-by: dwim`, ticks the
+   step off, and goes on to the next until a step fails review or none
+   remain. `/dwim-do next` or `/dwim-do 3` runs just one step.
 
 The main agent spends its tokens on the decisions and the review, and
 dwim, on your own GPU, on the code.
