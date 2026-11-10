@@ -14,7 +14,7 @@
 //! an hour without an edit.
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader},
     path::Path,
 };
@@ -92,16 +92,17 @@ fn run(dir: &Path, arguments: &Value) -> Result<String, String> {
     let path = required(arguments, NAME, "path")?;
     let (start, lines) = range(arguments)?;
     let most = lines.unwrap_or(PAGE);
-    let file = File::open(dir.join(path))
-        .map(BufReader::new)
-        .map_err(|e| format!("cannot read {path}: {e}"))?;
-    let directory = file
-        .get_ref()
-        .metadata()
-        .is_ok_and(|metadata| metadata.is_dir());
-    if directory {
+    let full = dir.join(path);
+    let metadata = fs::metadata(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if metadata.is_dir() {
         return Err(format!("{path} is a directory; list it with glob"));
     }
+    if !metadata.is_file() {
+        return Err(format!("{path} is not a regular file"));
+    }
+    let file = File::open(&full)
+        .map(BufReader::new)
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
     page(file, path, start.unwrap_or(1), most).map_err(|e| format!("reading {path}: {e}"))
 }
 
@@ -428,6 +429,10 @@ mod tests {
             read("/nonexistent/file", None).starts_with("error: cannot read /nonexistent/file: ")
         );
         assert!(read("/", None).starts_with("error: / is a directory"));
+        assert_eq!(
+            read("/dev/null", None),
+            "error: /dev/null is not a regular file"
+        );
         assert_eq!(
             run(&serde_json::json!({ "path": "Cargo.toml", "start": "abc" })),
             "error: 'start' is a line number"
