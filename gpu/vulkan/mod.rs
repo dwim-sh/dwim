@@ -22,9 +22,8 @@ use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, host, quant};
 /// filled while the device copies from the other.
 const STAGING: usize = 64 << 20;
 
-/// Tokens a workgroup of the bf16 and block-quantized matmul kernels takes
-/// at once.
-const BF16_TOKENS: usize = 8;
+/// Tokens a workgroup of the matmul kernels takes at once.
+const TOKENS: usize = 8;
 
 /// Command buffers in the ring, and kernels recorded into one before it is
 /// submitted.
@@ -1081,16 +1080,15 @@ impl Device for Vulkan {
         // grid as wide as the GPU allows, and the tokens eight at a time,
         // each group of them a row of the grid. The block-quantized kernels
         // bind the scales after the quants.
-        let (kernel, per_group, tokens, x) = match w.format {
-            Format::Bf16 => (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf),
-            Format::Q4_0 => (self.kernels.matmul_q4_0, 1, BF16_TOKENS, x.buf),
-            Format::Q8_0 => (self.kernels.matmul_q8_0, 1, BF16_TOKENS, x.buf),
+        let kernel = match w.format {
+            Format::Bf16 => self.kernels.matmul_bf16,
+            Format::Q4_0 => self.kernels.matmul_q4_0,
+            Format::Q8_0 => self.kernels.matmul_q8_0,
         };
-        let count = rows.div_ceil(per_group);
-        let width = count.min(self.max_groups as usize);
+        let width = rows.min(self.max_groups as usize);
         let groups = (
             width as u32,
-            (count.div_ceil(width) * n.div_ceil(tokens)) as u32,
+            (rows.div_ceil(width) * n.div_ceil(TOKENS)) as u32,
         );
         let params = MatmulParams {
             rows: rows as u32,
@@ -1099,9 +1097,9 @@ impl Device for Vulkan {
             stride: width as u32,
         };
         if w.scales == vk::Buffer::null() {
-            self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
+            self.dispatch(kernel, &[out.buf, w.buf, x.buf], &params, groups);
         } else {
-            self.dispatch(kernel, &[out.buf, w.buf, w.scales, x], &params, groups);
+            self.dispatch(kernel, &[out.buf, w.buf, w.scales, x.buf], &params, groups);
         }
     }
 
