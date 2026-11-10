@@ -4,8 +4,11 @@
 //! error, with a line of how it ended that is always there. A command
 //! that runs to its timeout is killed, with what it started, and the
 //! model is told, so that a test that hangs or a server that was never
-//! going to end does not hold the session until the user notices. A stream
-//! that outgrows its preview is shown by its start and its end, and is
+//! going to end does not hold the session until the user notices. What a
+//! command leaves running in the background with its output still open is
+//! killed once the command ends, since the pipes would never close; with
+//! its output sent elsewhere, it runs on. A stream that outgrows its
+//! preview is shown by its start and its end, and is
 //! kept whole in a file of the tool's own, which the result names along
 //! with the line to `read` it from, so the model can get the rest with
 //! that tool instead of running the command again. A pipeline ends with
@@ -45,7 +48,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -79,7 +82,7 @@ pub const TOOL: Tool = Tool {
 
 fn signature() -> Signature {
     Signature {
-        description: "Run a shell command in the working directory and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed.".to_string(),
+        description: "Run a shell command in the working directory and return what it printed and its exit code (a pipeline's is that of its last command to fail). Long output is cut to its start and end, and kept whole in a file the result names for `read`. A command still running at its timeout is killed. So is anything it leaves running in the background with its output not redirected.".to_string(),
         parameters: vec![
             Parameter::string("command", "The command to run."),
             Parameter::integer(
@@ -111,6 +114,13 @@ fn run(tools: &mut Tools, arguments: &Value) -> Result<String, String> {
 /// for a build or a test run, short enough that a command that hangs, or
 /// a server that was never going to end, does not hold the session long.
 pub const TIMEOUT: u64 = 300;
+
+/// How long the command's pipes may stay open once the shell has
+/// exited, before what it left running with them is killed.
+const GRACE: Duration = Duration::from_millis(500);
+
+/// The line before the status when that happened.
+const LEFT_RUNNING: &str = "[stopped what the command left running in the background with its output open; send a server's output to a file to keep it running]";
 
 /// What the model is told for a command that would take away changes it
 /// has made to the project's tracked files.
@@ -237,13 +247,28 @@ impl Bash {
         let mut stderr = Stream::new("stderr", self);
         let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let (done, finished) = mpsc::channel::<()>();
+        let (closed, drained) = mpsc::channel::<()>();
+        let mut left_running = false;
         let timed_out = AtomicBool::new(false);
         // Each pipe is read on its own thread, so that neither fills up and
         // blocks the command while the other is being read; a third kills
         // the command's process group at the timeout, which closes the
-        // pipes too, unless the command ends first.
+        // pipes too, unless the command ends first. Once the shell has
+        // exited, what it left running in the background with its output
+        // still open would keep the pipes from ever closing, so after a
+        // grace it is killed too, with a line that says so.
         let waited = thread::scope(|s| {
-            s.spawn(|| stderr.drain(err));
+            let (stdout, stderr) = (&mut stdout, &mut stderr);
+            let closed1 = closed.clone();
+            let closed2 = closed.clone();
+            s.spawn(move || {
+                stdout.drain(out);
+                let _ = closed1.send(());
+            });
+            s.spawn(move || {
+                stderr.drain(err);
+                let _ = closed2.send(());
+            });
             if let Some(timeout) = timeout {
                 let timed_out = &timed_out;
                 s.spawn(move || {
@@ -253,9 +278,27 @@ impl Bash {
                     }
                 });
             }
-            stdout.drain(out);
             let waited = child.wait();
             let _ = done.send(());
+            // The shell has exited; wait a grace for the pipes to close on
+            // their own. If they have not, and something of the command's
+            // is still running, kill it, which closes them. With nothing
+            // left running, the readers are still catching up on what it
+            // printed, and the scope waits for them.
+            let deadline = Instant::now() + GRACE;
+            for _ in 0..2 {
+                if drained
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_err()
+                {
+                    let group = -(pid as libc::pid_t);
+                    if unsafe { libc::kill(group, 0) } == 0 {
+                        left_running = true;
+                        unsafe { libc::kill(group, libc::SIGKILL) };
+                    }
+                    break;
+                }
+            }
             waited
         });
         let status = match waited {
@@ -265,6 +308,11 @@ impl Bash {
             ),
             Ok(status) => ended(status),
             Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
+        };
+        let status = if left_running {
+            format!("{LEFT_RUNNING}\n{status}")
+        } else {
+            status
         };
         Ok(report(&stdout, &stderr, &status))
     }
@@ -727,6 +775,37 @@ mod tests {
             )
             .starts_with("error: 'timeout' is")
         );
+    }
+
+    #[test]
+    fn stops_what_a_command_leaves_running_with_its_output() {
+        // What a command leaves running in the background with the pipes
+        // still open is killed once the command ends, so the call returns
+        // instead of waiting on it.
+        let mut bash = Bash::default();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            sh("sleep 30 & echo started", &mut bash),
+            format!("started\n{LEFT_RUNNING}\n[exit code 0]")
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            run(
+                &mut bash,
+                &serde_json::json!({ "command": "sleep 30 &", "timeout": 0 })
+            ),
+            format!("{LEFT_RUNNING}\n[exit code 0]")
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        // With its output sent elsewhere, it runs on: the pipes close when
+        // the command ends, and nothing is stopped.
+        let start = std::time::Instant::now();
+        assert_eq!(
+            sh("sleep 2 >/dev/null 2>&1 & echo started", &mut bash),
+            "started\n[exit code 0]"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
