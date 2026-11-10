@@ -579,8 +579,6 @@ struct MatmulParams {
     rows: u32,
     cols: u32,
     n: u32,
-    /// Splits of the columns, for the kernels that take them.
-    splits: u32,
 }
 
 #[repr(C)]
@@ -923,7 +921,6 @@ impl Device for Metal {
             rows: rows as u32,
             cols: cols as u32,
             n: n as u32,
-            splits: 1,
         };
         // Each SIMD group takes one row of bf16 weights for eight tokens.
         if w.format == Format::Bf16 {

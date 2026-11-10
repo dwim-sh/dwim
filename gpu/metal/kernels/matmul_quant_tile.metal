@@ -20,7 +20,6 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
-    uint splits;
 };
 
 #ifndef BITS

@@ -797,7 +797,6 @@ struct MatmulParams {
     cols: u32,
     n: u32,
     stride: u32,
-    splits: u32,
 }
 
 #[repr(C)]
@@ -1098,7 +1097,6 @@ impl Device for Vulkan {
             cols: cols as u32,
             n: n as u32,
             stride: width as u32,
-            splits: 1,
         };
         if w.scales == vk::Buffer::null() {
             self.dispatch(kernel, &[out.buf, w.buf, x], &params, groups);
