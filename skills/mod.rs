@@ -192,8 +192,9 @@ pub fn roots(dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// The skills in `roots`, each a directory of skill directories, sorted
-/// by name, with the SKILL.md files skipped and why. Hidden directories
+/// The skills in `roots`, each a directory of skill directories, in the
+/// order of the roots and by name within each, so that the project's come
+/// ahead of the user's, with the SKILL.md files skipped and why. Hidden directories
 /// are left out, and of two skills of a name the one in the earlier root
 /// wins, the other skipped as shadowed by it; a root that cannot be read
 /// is empty.
@@ -235,7 +236,6 @@ pub fn scan(roots: &[PathBuf]) -> Found {
             }
         }
     }
-    found.skills.sort_by(|a, b| a.name.cmp(&b.name));
     found
 }
 
@@ -437,7 +437,7 @@ mod tests {
     fn scans_the_roots_in_order() {
         let dir = std::env::temp_dir().join(format!("dwim-skills-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
-        for sub in ["a/one", "a/two", "b/one", "b/.hidden", "b/bad"] {
+        for sub in ["a/one", "a/two", "b/one", "b/.hidden", "b/bad", "b/first"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         fs::write(
@@ -461,6 +461,11 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("b/bad/SKILL.md"), "---\nname: bad\n---\n").unwrap();
+        fs::write(
+            dir.join("b/first/SKILL.md"),
+            "---\nname: first\ndescription: From b, first by name.\n---\n",
+        )
+        .unwrap();
 
         let found = scan(&[dir.join("a"), dir.join("b")]);
         assert_eq!(
@@ -475,6 +480,12 @@ mod tests {
                     name: "two".into(),
                     description: "From a too.".into(),
                     dir: dir.join("a/two"),
+                },
+                // After the earlier root's, though first by name.
+                Skill {
+                    name: "first".into(),
+                    description: "From b, first by name.".into(),
+                    dir: dir.join("b/first"),
                 },
             ]
         );

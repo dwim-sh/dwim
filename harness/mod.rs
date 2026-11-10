@@ -277,10 +277,11 @@ pub fn system_prompt(dir: &Path, effort: Effort) -> String {
 
 /// The `# Skills` section of the system prompt, empty when `skills` is
 /// empty: what a skill is, one `- name: description` line per skill in
-/// order, each description cut to [`MAX_DESCRIPTION`] bytes, and how to
-/// use the skill tool. Lines stop being added once the listing's lines
-/// would pass [`MAX_SKILLS`] bytes together; the skills left out are
-/// counted in one last line.
+/// the order given, the project's ahead of the user's, each description
+/// cut to [`MAX_DESCRIPTION`] bytes, and how to use the skill tool.
+/// Lines stop being added once the listing's lines would pass
+/// [`MAX_SKILLS`] bytes together; the skills left out are counted in one
+/// last line.
 pub fn skills_section(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
