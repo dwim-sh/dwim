@@ -1,13 +1,13 @@
 //! Answering one prompt and exiting, without the shell.
 //!
 //! The model's reply goes to standard output and nothing else does, so that
-//! a script can read the reply on its own. A prompt starting with `/` names
-//! a skill, as `/skill arguments` in the shell does: the skill's
-//! instructions, loaded the way the skill's tool would load them, followed
-//! by the arguments after the first whitespace, are the message sent;
-//! without one, the prompt is sent as before. Getting ready, what the model
-//! is thinking, the commands it runs, and what they printed all go to
-//! standard error.
+//! a script can read the reply on its own. A prompt starting with `/` and
+//! the name of a skill invokes it, as `/skill arguments` in the shell does:
+//! the skill's instructions, loaded the way the skill's tool would load
+//! them, followed by the arguments after the first whitespace, are the
+//! message sent. Any other prompt, such as one starting with a path, is sent
+//! as it is. Getting ready, what the model is thinking, the commands it
+//! runs, and what they printed all go to standard error.
 
 use std::{
     env,
@@ -19,9 +19,23 @@ use std::{
 };
 
 use dwim::harness::{Event, Log};
-use dwim::skills;
+use dwim::skills::{self, Skill};
 
 use crate::session::{self, Settings, Stderr};
+
+/// The message `prompt` sends: a skill's instructions with the arguments
+/// after them, when it is `/` and one of `skills`' names, or the prompt as
+/// it is.
+fn message(prompt: &str, skills: &[Skill]) -> Result<String, String> {
+    let Some(rest) = prompt.strip_prefix('/') else {
+        return Ok(prompt.to_string());
+    };
+    let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if !skills.iter().any(|skill| skill.name == name) {
+        return Ok(prompt.to_string());
+    }
+    skills::invoke(skills, name, arguments.trim())
+}
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone, keeping a transcript of it in `log`;
@@ -36,22 +50,16 @@ pub fn once(
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
     let skills = skills::find(&env::current_dir()?).skills;
-    let mut loaded = session::load(settings, skills.clone(), log, |loading| {
-        stderr.report(&loading)
-    })?;
+    // Before the model loads, so that a skill that cannot be read says so
+    // at once.
+    let message = message(prompt, &skills)?;
+    let mut loaded = session::load(settings, skills, log, |loading| stderr.report(&loading))?;
     if let Some(path) = transcript {
         eprintln!("transcript in {}", path.display());
     }
     // No one is here to answer the model, so it goes on by itself.
     loaded.harness.set_auto(true);
     let mut printer = Printer::default();
-    let message = match prompt.strip_prefix('/') {
-        None => prompt.to_string(),
-        Some(rest) => {
-            let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            skills::invoke(&skills, name, arguments)?
-        }
-    };
     loaded.harness.send(&message, |event| {
         printer.print(event);
         ControlFlow::Continue(())
@@ -139,5 +147,43 @@ impl Drop for Printer {
         if self.replied {
             println!();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use dwim::skills::Skill;
+
+    use super::message;
+
+    #[test]
+    fn sends_a_skill_or_the_prompt_as_it_is() {
+        let dir = std::env::temp_dir().join(format!("dwim-once-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: greet\ndescription: Greets.\n---\nSay hello.\n",
+        )
+        .unwrap();
+        let skills = [Skill {
+            name: "greet".into(),
+            description: "Greets.".into(),
+            dir: dir.clone(),
+        }];
+        let sent = message("/greet Pekka", &skills).unwrap();
+        assert!(sent.starts_with("<skill name=\"greet\""), "{sent}");
+        assert!(sent.ends_with("\n\nPekka"), "{sent}");
+        for prompt in [
+            "fix the build",
+            "/etc/nginx/nginx.conf has a syntax error, fix it",
+            "/tmp is full",
+            "/gret Pekka",
+        ] {
+            assert_eq!(message(prompt, &skills).unwrap(), prompt);
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -23,9 +23,10 @@ nothing else does, while progress, the model's thinking, the commands it runs,
 and their output go to standard error.
 A prompt starting with
 .B /
-names a skill, as
+and a skill's name invokes the skill, as
 .BI /skill " arguments"
-does in the shell.
+does in the shell; any other prompt, one starting with a path too, is sent
+as it is.
 As no one is there to answer the model, it runs in auto mode: a reply
 with no command that does not end with
 .B DONE
