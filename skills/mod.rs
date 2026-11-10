@@ -27,7 +27,8 @@ pub struct Skill {
     pub dir: PathBuf,
 }
 
-/// The skills found, and the SKILL.md files skipped, each with why.
+/// The skills found, and the SKILL.md files skipped, each with why: one
+/// that does not parse, or one shadowed by a skill of its name found first.
 #[derive(Debug, Default)]
 pub struct Found {
     pub skills: Vec<Skill>,
@@ -194,10 +195,10 @@ pub fn roots(dir: &Path) -> Vec<PathBuf> {
 /// The skills in `roots`, each a directory of skill directories, sorted
 /// by name, with the SKILL.md files skipped and why. Hidden directories
 /// are left out, and of two skills of a name the one in the earlier root
-/// wins; a root that cannot be read is empty.
+/// wins, the other skipped as shadowed by it; a root that cannot be read
+/// is empty.
 pub fn scan(roots: &[PathBuf]) -> Found {
     let mut found = Found::default();
-    let mut seen = Vec::new();
     for root in roots {
         let Ok(entries) = fs::read_dir(root) else {
             continue;
@@ -223,11 +224,13 @@ pub fn scan(roots: &[PathBuf]) -> Found {
                 }
             };
             match parse(&text, &entry.path()) {
-                Ok(skill) if !seen.contains(&skill.name) => {
-                    seen.push(skill.name.clone());
-                    found.skills.push(skill);
-                }
-                Ok(_) => {}
+                Ok(skill) => match found.skills.iter().find(|s| s.name == skill.name) {
+                    Some(first) => found.skipped.push((
+                        path,
+                        format!("shadowed by {}", first.dir.join(FILE).display()),
+                    )),
+                    None => found.skills.push(skill),
+                },
                 Err(error) => found.skipped.push((path, error)),
             }
         }
@@ -477,7 +480,13 @@ mod tests {
         );
         assert_eq!(
             found.skipped,
-            vec![(dir.join("b/bad/SKILL.md"), "no description".to_string())]
+            vec![
+                (dir.join("b/bad/SKILL.md"), "no description".to_string()),
+                (
+                    dir.join("b/one/SKILL.md"),
+                    format!("shadowed by {}", dir.join("a/one/SKILL.md").display())
+                ),
+            ]
         );
         fs::remove_dir_all(&dir).unwrap();
     }
