@@ -104,7 +104,7 @@ impl Sampler {
         let floor = self.min_p * probs[0];
         let mut kept = 0.0;
         let mut n = 0;
-        while n < probs.len() && kept < self.top_p && probs[n] >= floor {
+        while n < probs.len() && (n == 0 || kept < self.top_p && probs[n] >= floor) {
             kept += probs[n];
             n += 1;
         }
@@ -174,6 +174,24 @@ mod tests {
         let mut sampler = Sampler::new(1.0, 1000, 1.0, 1.0, 1);
         for _ in 0..20 {
             assert_eq!(sampler.sample(&logits), 7);
+        }
+    }
+
+    #[test]
+    fn keeps_the_most_likely_whatever_the_cut() {
+        let mut logits = vec![0.0; 1000];
+        logits[7] = 5.0;
+        logits[300] = 4.0;
+        let samplers = [
+            Sampler::new(1.0, 20, 0.0, 0.0, 1),
+            Sampler::new(1.0, 20, -1.0, 0.0, 1),
+            Sampler::new(1.0, 20, 1.0, 2.0, 1),
+        ];
+        for mut sampler in samplers {
+            for _ in 0..20 {
+                assert_eq!(sampler.sample(&logits), 7);
+            }
+            assert_eq!(sampler.verify(&logits, 7), (7, true));
         }
     }
 }
