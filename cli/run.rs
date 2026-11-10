@@ -155,6 +155,14 @@ fn auto_notice(auto: bool) -> String {
     }
 }
 
+/// Whether `name` is one of the shell's commands, which a skill of its
+/// name yields to, given arguments or not.
+fn is_command(name: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|(usage, _)| usage[1..].split(' ').next() == Some(name))
+}
+
 /// The slash commands, each with the line `/help` says of it.
 const COMMANDS: [(&str, &str); 9] = [
     (
@@ -228,9 +236,14 @@ impl Command {
             ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
             ("skills", None) => Ok(Command::Skills),
             ("skills", Some(_)) => Err("/skills takes nothing".to_string()),
-            (name, arguments) if skills.iter().any(|skill| skill.name == name) => Ok(
-                Command::Skill(name.to_string(), arguments.unwrap_or_default().to_string()),
-            ),
+            (name, arguments)
+                if !is_command(name) && skills.iter().any(|skill| skill.name == name) =>
+            {
+                Ok(Command::Skill(
+                    name.to_string(),
+                    arguments.unwrap_or_default().to_string(),
+                ))
+            }
             _ => Err(format!("Unknown command /{text} · /help lists them")),
         }
     }
@@ -1249,7 +1262,14 @@ mod tests {
             description: "Helpful.".into(),
             dir: PathBuf::from("x/help"),
         };
-        assert!(matches!(Command::parse("help", &[help]), Ok(Command::Help)));
+        assert!(matches!(
+            Command::parse("help", std::slice::from_ref(&help)),
+            Ok(Command::Help)
+        ));
+        // With arguments too, the command's own error rather than the skill.
+        assert!(
+            Command::parse("help me", &[help]).is_err_and(|e| e.starts_with("Unknown command"))
+        );
         // Every command has its line in the help.
         for name in ["model", "stats", "transcript", "compact", "skills", "help"] {
             assert!(Command::parse(name, &[]).is_ok(), "{name}");
