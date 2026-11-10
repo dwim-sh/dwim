@@ -54,15 +54,31 @@ fn split(text: &str) -> Option<(&str, &str)> {
 }
 
 /// The value without the quotes around it, if it starts and ends with the
-/// same one, `"` or `'`.
+/// same one, `"` or `'`, and with what is escaped inside them undone: `''`
+/// within single quotes, and `\"` and `\\` within double quotes.
 fn unquote(value: &str) -> String {
     let Some(first) = value.chars().next() else {
         return value.to_string();
     };
-    if (first == '"' || first == '\'') && value.len() >= 2 && value.ends_with(first) {
-        return value[1..value.len() - 1].to_string();
+    if !(first == '"' || first == '\'') || value.len() < 2 || !value.ends_with(first) {
+        return value.to_string();
     }
-    value.to_string()
+    let inner = &value[1..value.len() - 1];
+    if first == '\'' {
+        return inner.replace("''", "'");
+    }
+    let mut unescaped = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some(next @ ('"' | '\\'))) => {
+                unescaped.push(next);
+                chars.next();
+            }
+            _ => unescaped.push(c),
+        }
+    }
+    unescaped
 }
 
 /// A run of whitespace in a value, collapsed to one space.
@@ -73,19 +89,21 @@ fn collapse(value: &str) -> String {
 /// A skill, from the text of the SKILL.md in `dir`, or what is wrong with
 /// it: no frontmatter, no description, or a name that is not lowercase
 /// letters, digits and dashes, or is longer than 64 characters. The name
-/// is the directory's when the frontmatter gives none.
+/// is the directory's when the frontmatter gives none, or gives it empty.
 pub fn parse(text: &str, dir: &Path) -> Result<Skill, String> {
     let Some((frontmatter, _)) = split(text) else {
         return Err("no frontmatter".to_string());
     };
-    let mut values: HashMap<String, String> = HashMap::new();
+    // Each key's value as written, with the lines continuing it, and
+    // whether it is a block (`>` or `|`), whose text is taken as it is.
+    let mut values: HashMap<String, (String, bool)> = HashMap::new();
     let mut last: Option<String> = None;
     for line in frontmatter.lines() {
         if line.starts_with([' ', '\t']) {
             if let Some(key) = &last {
                 let continued = collapse(line);
                 if !continued.is_empty() {
-                    let value = values.get_mut(key).unwrap();
+                    let (value, _) = values.get_mut(key).unwrap();
                     *value = if value.is_empty() {
                         continued
                     } else {
@@ -104,18 +122,23 @@ pub fn parse(text: &str, dir: &Path) -> Result<Skill, String> {
         }
         let raw = collapse(&line[colon + 1..]);
         let value = if matches!(raw.as_str(), ">" | ">-" | "|" | "|-") {
-            String::new()
+            (String::new(), true)
         } else {
-            unquote(&raw)
+            (raw, false)
         };
         last = Some(key.to_string());
         values.insert(key.to_string(), value);
     }
+    let values: HashMap<String, String> = values
+        .into_iter()
+        .map(|(key, (value, block))| (key, if block { value } else { unquote(&value) }))
+        .collect();
     let Some(description) = values.get("description").filter(|d| !d.is_empty()) else {
         return Err("no description".to_string());
     };
     let name = values
         .get("name")
+        .filter(|name| !name.is_empty())
         .cloned()
         .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into());
     if name.is_empty() {
@@ -333,6 +356,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(skill.description, "A continued");
+
+        // A quoted value continued on the next line loses its quotes, and
+        // what is escaped in it is undone.
+        let skill = parse(
+            "---\nname: wrapped\ndescription: \"Use when \\\"asked\\\"\n  to deploy.\"\n---\n",
+            Path::new("x/wrapped"),
+        )
+        .unwrap();
+        assert_eq!(skill.description, "Use when \"asked\" to deploy.");
+        let skill = parse(
+            "---\nname: single\ndescription: 'It''s here.'\n---\n",
+            Path::new("x/single"),
+        )
+        .unwrap();
+        assert_eq!(skill.description, "It's here.");
+        // A block's text is kept as it is, quotes and all.
+        let skill = parse(
+            "---\nname: literal\ndescription: |\n  \"Quoted.\"\n---\n",
+            Path::new("x/literal"),
+        )
+        .unwrap();
+        assert_eq!(skill.description, "\"Quoted.\"");
+
+        // An empty name is the directory's.
+        for empty in ["name:", "name: \"\""] {
+            let skill = parse(
+                &format!("---\n{empty}\ndescription: Has one.\n---\n"),
+                Path::new("x/unnamed"),
+            )
+            .unwrap();
+            assert_eq!(skill.name, "unnamed");
+        }
 
         let skill = parse(
             "---\nname: keyed\ndescription: Has one.\nlicense: MIT\n---\n",
