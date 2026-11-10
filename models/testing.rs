@@ -34,6 +34,10 @@ pub struct Scripted {
     unthinking: Vec<u32>,
     end: u32,
     max_len: usize,
+    /// How many tokens it says before it holds, and what it holds on.
+    hold: Option<(usize, Box<dyn FnMut() + Send>)>,
+    /// How many tokens it has said of the reply under way.
+    said: usize,
 }
 
 impl Scripted {
@@ -58,7 +62,17 @@ impl Scripted {
             unthinking: chat::opening(tokenizer, false).unwrap(),
             end: tokenizer.special(chat::IM_END).unwrap(),
             max_len,
+            hold: None,
+            said: 0,
         }
+    }
+
+    /// Has the model call `hold` once it has said `after` tokens of a
+    /// reply, and go on when it returns, so that a test can have it wait
+    /// partway into a reply for what the test needs to happen first.
+    pub fn holds(mut self, after: usize, hold: impl FnMut() + Send + 'static) -> Self {
+        self.hold = Some((after, Box::new(hold)));
+        self
     }
 
     /// Has the model say `text` whenever it is asked for a plain answer,
@@ -116,11 +130,19 @@ impl LanguageModel for Scripted {
             if self.fed.ends_with(&self.unthinking) {
                 self.pending = Some(true);
                 self.saying.clear();
+                self.said = 0;
             } else if self.fed.ends_with(&self.opening) {
                 self.pending = Some(false);
                 self.saying.clear();
+                self.said = 0;
             }
         } else {
+            self.said += 1;
+            if let Some((after, hold)) = &mut self.hold
+                && self.said == *after
+            {
+                hold();
+            }
             if let Some(unthinking) = self.pending.take() {
                 self.saying = self.script(unthinking).into();
             }
