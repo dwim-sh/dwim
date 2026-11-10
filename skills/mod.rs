@@ -261,7 +261,8 @@ pub fn invoke(skills: &[Skill], name: &str, arguments: &str) -> Result<String, S
 
 /// The skill's instructions as the model gets them: its `SKILL.md`'s body
 /// after the frontmatter, whole when there is no frontmatter, named with
-/// the directory it is in, with the files of that directory beside it.
+/// the directory it is in, which paths in it are relative to, with the
+/// files of that directory beside it.
 pub fn load(skill: &Skill) -> Result<String, String> {
     let path = skill.dir.join(FILE);
     let text =
@@ -294,19 +295,26 @@ pub fn load(skill: &Skill) -> Result<String, String> {
     } else {
         files.join(", ")
     };
-    let tail = if files.is_empty() {
+    let files = if files.is_empty() {
         String::from("No other files are there.")
     } else {
-        format!(
-            "Paths in these instructions are relative to {}. Files there besides {FILE}: {files}",
-            skill.dir.display()
-        )
+        format!("Files there besides {FILE}: {files}")
     };
+    let dir = skill.dir.display().to_string();
     Ok(format!(
-        "<skill name=\"{}\" directory=\"{}\">\n{body}\n</skill>\n\n{tail}",
+        "<skill name=\"{}\" directory=\"{}\">\n{body}\n</skill>\n\nPaths in these instructions are relative to {dir}. {files}",
         skill.name,
-        skill.dir.display()
+        escape(&dir)
     ))
+}
+
+/// `text` as an attribute's value in a tag: with `&`, `"`, `<` and `>`
+/// written as entities.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -550,12 +558,36 @@ mod tests {
             text.contains("No frontmatter here.\nJust the body.\n</skill>"),
             "{text}"
         );
-        assert!(text.ends_with("No other files are there."), "{text}");
+        assert!(
+            text.ends_with(&format!(
+                "Paths in these instructions are relative to {}. No other files are there.",
+                two.dir.display()
+            )),
+            "{text}"
+        );
         let missing = Skill {
             name: "gone".into(),
             description: "Gone.".into(),
             dir: dir.join("gone"),
         };
+        // A directory is escaped in the tag, though not in the text.
+        let odd = dir.join("a \"b\" <c> & d");
+        fs::create_dir_all(&odd).unwrap();
+        fs::write(odd.join("SKILL.md"), "Odd.\n").unwrap();
+        let odd = Skill {
+            name: "odd".into(),
+            description: "Odd.".into(),
+            dir: odd,
+        };
+        let text = load(&odd).unwrap();
+        assert!(
+            text.contains("a &quot;b&quot; &lt;c&gt; &amp; d\">\nOdd.\n</skill>"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("relative to {}. ", odd.dir.display())),
+            "{text}"
+        );
         let err = load(&missing).unwrap_err();
         assert!(err.starts_with("cannot read "), "{err}");
         fs::remove_dir_all(&dir).unwrap();
