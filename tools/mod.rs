@@ -158,14 +158,19 @@ pub struct Tools {
 
 impl Tools {
     /// The tools working in `dir`: a path a call gives is taken from
-    /// there, `bash` runs there, and `skill` loads the skills of the
-    /// project there and of the user.
+    /// there, and `bash` runs there. `skill` has no skills to load until
+    /// [`Tools::set_skills`] gives it some.
     pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
             bash: Bash::default(),
-            skills: crate::skills::find(dir).skills,
+            skills: Vec::new(),
         }
+    }
+
+    /// Gives `skill` the skills it loads.
+    pub fn set_skills(&mut self, skills: Vec<Skill>) {
+        self.skills = skills;
     }
 
     /// Runs bash commands through `shell`, as `shell -c command`, instead

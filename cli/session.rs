@@ -12,6 +12,7 @@ use std::{
 
 use dwim::harness::{self, Harness, Log};
 use dwim::models::{Chat, Gguf, LanguageModel, Tokenizer};
+use dwim::skills::Skill;
 
 use crate::{
     fetch,
@@ -111,10 +112,11 @@ pub fn load_model(
 }
 
 /// Loads the model, opens the conversation with the system prompt for the
-/// working directory, and builds the harness around it with `settings`,
-/// keeping a transcript in `log`.
+/// working directory, listing `skills`, and builds the harness around it
+/// with `settings`, keeping a transcript in `log`.
 pub fn load(
     settings: &Settings,
+    skills: Vec<Skill>,
     log: Log,
     mut on_loading: impl FnMut(Loading),
 ) -> Result<Loaded, Box<dyn Error>> {
@@ -123,7 +125,7 @@ pub fn load(
     let mut chat = Chat::new(loaded.model, loaded.tokenizer, sampler)?;
     chat.set_drafts(settings.speculate);
     let cwd = env::current_dir()?;
-    let system = harness::system_prompt(&cwd, settings.effort);
+    let system = harness::system_prompt(&cwd, settings.effort, &skills);
     model::start(&mut chat, &system, |read, total| {
         on_loading(Loading::Prompting { read, total })
     })?;
@@ -131,6 +133,7 @@ pub fn load(
         let system = system.clone();
         move |chat| model::start(chat, &system, |_, _| {}).map(|_| ())
     })?;
+    harness.set_skills(skills);
     harness.set_thinking_budget(settings.thinking_budget);
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);

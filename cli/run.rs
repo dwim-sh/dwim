@@ -56,11 +56,13 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
     let cwd = env::current_dir().unwrap_or_default();
+    let found = skills::find(&cwd);
     {
         let stop = stop.clone();
+        let skills = found.skills.clone();
         thread::spawn(move || {
             let _done = done;
-            if let Err(e) = work(&settings, log, requests_rx, &replies_tx, &stop) {
+            if let Err(e) = work(&settings, skills, log, requests_rx, &replies_tx, &stop) {
                 let _ = replies_tx.send(Reply::Failed(e.to_string()));
             }
         });
@@ -74,7 +76,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         size: None,
         transcript,
         cwd: cwd.clone(),
-        skills: skills::find(&cwd),
+        skills: found,
         input: Input::default(),
         history: Vec::new(),
         recalled: None,
@@ -269,16 +271,17 @@ enum Reply {
     Failed(String),
 }
 
-/// Loads the model and answers messages until the UI hangs up, keeping a
-/// transcript in `log`.
+/// Loads the model, with `skills` to load, and answers messages until the
+/// UI hangs up, keeping a transcript in `log`.
 fn work(
     settings: &Settings,
+    skills: Vec<Skill>,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(settings, log, |loading| {
+    let loaded = session::load(settings, skills, log, |loading| {
         let _ = replies.send(Reply::Loading(loading));
     })?;
     let mut harness = loaded.harness;

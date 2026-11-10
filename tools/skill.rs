@@ -61,6 +61,7 @@ mod tests {
         .unwrap();
         fs::write(skill_dir.join("scripts/run.sh"), "").unwrap();
         let mut tools = Tools::new(&dir);
+        tools.set_skills(crate::skills::find(&dir).skills);
         let call = ToolCall::parse(r#"{"name": "skill", "arguments": {"name": "demo"}}"#).unwrap();
         let output = tools.run(&call);
         assert!(

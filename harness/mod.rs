@@ -43,7 +43,7 @@ use std::{
 };
 
 use crate::models::{Chat, Chunk, LanguageModel, Turn};
-use crate::skills::{Skill, find};
+use crate::skills::Skill;
 use crate::tools::{ToolCall, Tools, bash, read};
 
 pub use crate::harness::log::Log;
@@ -248,21 +248,20 @@ impl std::str::FromStr for Effort {
 }
 
 /// The system prompt for an agent working in `dir`, reasoning at
-/// `effort`: the template's line for the effort, if it has one, the tools,
-/// then how to behave, and the project's own instructions from its
-/// `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
+/// `effort`, with `skills` to load: the template's line for the effort, if
+/// it has one, the tools, then how to behave, the skills if there are any,
+/// and the project's own instructions from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
 /// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, effort: Effort) -> String {
+pub fn system_prompt(dir: &Path, effort: Effort, skills: &[Skill]) -> String {
     let mut prompt = String::new();
     if let Some(line) = effort.instruction() {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    let skills = find(dir).skills;
     prompt.push_str(&tools(!skills.is_empty()));
     prompt.push_str("\n\n");
     prompt.push_str(&instructions());
-    let section = skills_section(&skills);
+    let section = skills_section(skills);
     if !section.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
@@ -656,6 +655,12 @@ impl<M: LanguageModel> Harness<M> {
     /// while the model, and its reading and editing of files, stay here.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.tools.set_shell(shell);
+    }
+
+    /// Gives the `skill` tool `skills` to load: those the system prompt
+    /// lists.
+    pub fn set_skills(&mut self, skills: Vec<Skill>) {
+        self.tools.set_skills(skills);
     }
 
     /// Sets how many tool calls in a row without one that changed a file
@@ -1637,9 +1642,9 @@ mod tests {
         // the tools, and none for medium, the default.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(Effort::default(), Effort::Medium);
-        assert!(system_prompt(dir, Effort::Medium).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Effort::Medium, &[]).starts_with("# Tools\n"));
         for (effort, word) in [(Effort::Xhigh, "xhigh"), (Effort::Low, "low")] {
-            let prompt = system_prompt(dir, effort);
+            let prompt = system_prompt(dir, effort, &[]);
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -1652,7 +1657,7 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Effort::Medium);
+        let prompt = system_prompt(dir, Effort::Medium, &[]);
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
@@ -1733,12 +1738,19 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_is_unchanged_without_skills() {
-        // The user's home directory may hold skills; skip then.
+    fn system_prompt_lists_the_skills_given() {
         let dir = scratch();
-        if !find(&dir).skills.is_empty() {
-            return;
-        }
-        assert!(!system_prompt(&dir, Effort::Medium).contains("# Skills"));
+        let prompt = system_prompt(&dir, Effort::Medium, &[]);
+        assert!(!prompt.contains("# Skills"));
+        assert!(!prompt.contains("\"name\": \"skill\""));
+        let skill = Skill {
+            name: "demo".to_string(),
+            description: "Does a demo.".to_string(),
+            dir: dir.join("demo"),
+        };
+        let prompt = system_prompt(&dir, Effort::Medium, &[skill]);
+        assert!(prompt.contains("# Skills"));
+        assert!(prompt.contains("- demo: Does a demo."));
+        assert!(prompt.contains("\"name\": \"skill\""));
     }
 }

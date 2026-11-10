@@ -35,7 +35,10 @@ pub fn once(
     let started = Instant::now();
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
-    let mut loaded = session::load(settings, log, |loading| stderr.report(&loading))?;
+    let skills = skills::find(&env::current_dir()?).skills;
+    let mut loaded = session::load(settings, skills.clone(), log, |loading| {
+        stderr.report(&loading)
+    })?;
     if let Some(path) = transcript {
         eprintln!("transcript in {}", path.display());
     }
@@ -46,7 +49,6 @@ pub fn once(
         None => prompt.to_string(),
         Some(rest) => {
             let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            let skills = skills::find(&env::current_dir()?).skills;
             skills::invoke(&skills, name, arguments)?
         }
     };
