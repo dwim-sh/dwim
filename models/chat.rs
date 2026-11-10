@@ -969,14 +969,31 @@ struct Utf8Stream {
 impl Utf8Stream {
     fn push(&mut self, bytes: &[u8]) -> String {
         self.pending.extend_from_slice(bytes);
-        let complete = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            // An incomplete character at the end: wait for the rest.
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            Err(_) => self.pending.len(),
-        };
-        let text = String::from_utf8_lossy(&self.pending[..complete]).into_owned();
-        self.pending.drain(..complete);
+        let mut text = String::new();
+        let mut at = 0;
+        loop {
+            match std::str::from_utf8(&self.pending[at..]) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    at = self.pending.len();
+                    break;
+                }
+                Err(e) => {
+                    let valid = &self.pending[at..at + e.valid_up_to()];
+                    text.push_str(std::str::from_utf8(valid).expect("checked"));
+                    at += e.valid_up_to();
+                    match e.error_len() {
+                        // An incomplete character at the end: wait for the rest.
+                        None => break,
+                        Some(len) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            at += len;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending.drain(..at);
         text
     }
 }
@@ -1737,5 +1754,27 @@ mod tests {
             .flat_map(|&t| tokenizer.decode(t).to_vec())
             .collect();
         assert!(String::from_utf8_lossy(&bytes).contains(hostile));
+    }
+
+    #[test]
+    fn utf8_stream_holds_back_only_an_incomplete_end() {
+        // A character split across pushes is held back until it is whole.
+        let mut stream = Utf8Stream::default();
+        assert_eq!(stream.push(&[0xe4, 0xbd]), "");
+        assert_eq!(stream.push(&[0xa0]), "你");
+
+        // An invalid byte is replaced, without flushing the incomplete
+        // character that follows it.
+        let mut stream = Utf8Stream::default();
+        assert_eq!(stream.push(&[0xff, 0xe4, 0xbd]), "\u{FFFD}");
+        assert_eq!(stream.push(&[0xa0]), "你");
+
+        let mut stream = Utf8Stream::default();
+        assert_eq!(stream.push(b"a\xffb"), "a\u{FFFD}b");
+
+        // An incomplete character followed by more bytes is invalid, and
+        // the error covers the two bytes.
+        let mut stream = Utf8Stream::default();
+        assert_eq!(stream.push(&[0xe4, 0xbd, 0x41]), "\u{FFFD}A");
     }
 }
