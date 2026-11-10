@@ -779,8 +779,10 @@ mod tests {
     use super::*;
 
     /// A server on a socket of its own, serving a scripted model that says
-    /// `scripts` in turn, on a thread that ends when the server exits.
-    fn server(scripts: &[&str]) -> (PathBuf, thread::JoinHandle<()>) {
+    /// `scripts` in turn, on a thread that ends when the server exits. If
+    /// `hold` is given, the model holds once it has said that many tokens,
+    /// until the server has been asked to interrupt a reply.
+    fn server(scripts: &[&str], hold: Option<usize>) -> (PathBuf, thread::JoinHandle<()>) {
         static SERVERS: AtomicUsize = AtomicUsize::new(0);
         let n = SERVERS.fetch_add(1, Ordering::Relaxed);
         let path = env::temp_dir().join(format!("dwim-test-{}-{n}.sock", process::id()));
@@ -792,10 +794,28 @@ mod tests {
             room: 2,
         };
         let server = Server::bind(&path, hello).unwrap();
+        let inner = server.inner.clone();
         let handle = thread::spawn(move || {
             let tokenizer = Tokenizer::tiny();
             let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-            let model = Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
+            let mut model =
+                Scripted::new(&tokenizer, &scripts, 1 << 12).answers(&tokenizer, "noted");
+            if let Some(after) = hold {
+                // It goes on after a while regardless, for the reply to
+                // run to its end and the test to fail on it, rather than
+                // hang, if the interrupt never comes.
+                model = model.holds(after, move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline
+                        && !inner
+                            .peers()
+                            .values()
+                            .any(|peer| peer.interrupted.load(Ordering::Relaxed))
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            }
             let format = Format::new(tokenizer).unwrap();
             let size = Size {
                 sessions: 2,
@@ -837,12 +857,15 @@ mod tests {
 
     #[test]
     fn sessions_take_turns_with_their_own_state() {
-        let (path, handle) = server(&[
-            "</think>\n\nOne.",
-            "</think>\n\nTwo.",
-            "</think>\n\nThree.",
-            "</think>\n\nFour.",
-        ]);
+        let (path, handle) = server(
+            &[
+                "</think>\n\nOne.",
+                "</think>\n\nTwo.",
+                "</think>\n\nThree.",
+                "</think>\n\nFour.",
+            ],
+            None,
+        );
         let mut a = open(&path);
         let mut b = open(&path);
         a.system("Be brief.", |_, _| {}).unwrap();
@@ -936,12 +959,18 @@ mod tests {
     #[test]
     fn a_reply_is_interrupted_and_the_session_goes_on() {
         let thought: String = (1..).map(|i: u32| i.to_string()).take(200).collect();
-        let (path, handle) = server(&[
-            &format!(
-                "{thought}</think>\n\nSaid.<tool_call>\n<function=bash>\n<parameter=command>\necho\n</parameter>\n</function>\n</tool_call>"
-            ),
-            "</think>\n\nNext.",
-        ]);
+        // The model holds partway into the thought until the server has
+        // heard the interrupt, so that the interrupt lands inside the reply
+        // however the threads are scheduled.
+        let (path, handle) = server(
+            &[
+                &format!(
+                    "{thought}</think>\n\nSaid.<tool_call>\n<function=bash>\n<parameter=command>\necho\n</parameter>\n</function>\n</tool_call>"
+                ),
+                "</think>\n\nNext.",
+            ],
+            Some(20),
+        );
         let mut client = open(&path);
         client.system("Be brief.", |_, _| {}).unwrap();
         let mut thoughts = 0;
@@ -957,9 +986,9 @@ mod tests {
                 }
             })
             .unwrap();
-        // The reply ended early: a few more tokens may have come before
-        // the server heard, but not the whole thought, and the call it was
-        // about to make is dropped.
+        // The reply ended at the first token after the model went on: the
+        // rest of the thought, and the call it was about to make, were
+        // never said.
         assert!(thoughts < 100, "{thoughts}");
         assert!(reply.calls.is_empty());
         let (next, _) = ask(&mut client, "on");
