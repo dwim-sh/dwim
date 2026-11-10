@@ -9,11 +9,7 @@
 
 use std::{error::Error, io::Cursor, slice, sync::Mutex};
 
-use ash::{
-    ext::memory_budget,
-    khr::{push_descriptor, shader_float16_int8},
-    vk,
-};
+use ash::{ext::memory_budget, khr::push_descriptor, vk};
 
 use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, host, quant};
 
@@ -235,9 +231,7 @@ impl Vulkan {
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
             instance.get_physical_device_properties2(physical, &mut props2);
-            let needed = vk::SubgroupFeatureFlags::BASIC
-                | vk::SubgroupFeatureFlags::ARITHMETIC
-                | vk::SubgroupFeatureFlags::SHUFFLE;
+            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC;
             if !subgroup.supported_operations.contains(needed) || subgroup.subgroup_size < 16 {
                 return Err(format!("{name} lacks the subgroup operations the kernels use").into());
             }
@@ -245,21 +239,12 @@ impl Vulkan {
             let budget = extensions
                 .iter()
                 .any(|ext| ext.extension_name_as_c_str() == Ok(memory_budget::NAME));
-            for needed in [push_descriptor::NAME, shader_float16_int8::NAME] {
-                if !extensions
-                    .iter()
-                    .any(|ext| ext.extension_name_as_c_str() == Ok(needed))
-                {
-                    return Err(format!("{name} lacks {}", needed.to_string_lossy()).into());
-                }
-            }
-            let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
-            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut float16);
-            instance.get_physical_device_features2(physical, &mut features);
-            if float16.shader_float16 == 0 {
-                return Err(
-                    format!("{name} lacks 16-bit float arithmetic, which the kernels use").into(),
-                );
+            let needed = push_descriptor::NAME;
+            if !extensions
+                .iter()
+                .any(|ext| ext.extension_name_as_c_str() == Ok(needed))
+            {
+                return Err(format!("{name} lacks {}", needed.to_string_lossy()).into());
             }
 
             // A compute-only queue family when there is one: the graphics
@@ -280,16 +265,10 @@ impl Vulkan {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&[1.0])];
-            let extension_names = [
-                push_descriptor::NAME.as_ptr(),
-                shader_float16_int8::NAME.as_ptr(),
-            ];
-            let mut float16 =
-                vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+            let extension_names = [push_descriptor::NAME.as_ptr()];
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
-                .enabled_extension_names(&extension_names)
-                .push_next(&mut float16);
+                .enabled_extension_names(&extension_names);
             let device = instance.create_device(physical, &device_info, None)?;
             let push = push_descriptor::Device::new(&instance, &device);
             let queue = device.get_device_queue(family, 0);
