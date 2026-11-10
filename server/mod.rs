@@ -292,9 +292,8 @@ impl Server {
         sampler: impl Fn(Option<f32>) -> Sampler,
     ) -> Result<(), Box<dyn Error>> {
         let inner = &self.inner;
-        if inner.format.set(format.clone()).is_err() {
-            return Err("the server has run already".into());
-        }
+        // Set once: `run` takes the server, so it runs only once.
+        let _ = inner.format.set(format.clone());
         let mut free = vec![0];
         for _ in 1..size.sessions {
             free.push(model.add_sequence()?);
