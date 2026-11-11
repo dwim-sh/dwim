@@ -22,7 +22,7 @@ pub struct Opts {
 
     /// most sessions the model has room for at once, each with state and
     /// a context of its own beside the weights they share (default: 2)
-    #[argh(option, arg_name = "n")]
+    #[argh(option, arg_name = "n", from_str_fn(sessions))]
     pub sessions: Option<usize>,
 
     /// download the model if it is not yet, print the path of its weights,
@@ -69,7 +69,7 @@ pub struct Opts {
 
     /// sampling temperature (default: what the model file recommends; 0
     /// always picks the likeliest token)
-    #[argh(option, arg_name = "t")]
+    #[argh(option, arg_name = "t", from_str_fn(temperature))]
     pub temperature: Option<f32>,
 
     /// tokens the model drafts ahead and verifies in one pass, or 0 to
@@ -115,6 +115,23 @@ pub fn budget(tokens: usize) -> Option<usize> {
     (tokens > 0).then_some(tokens)
 }
 
+/// A number of sessions as `--sessions` takes it: 1 or more.
+fn sessions(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("a server needs room for one session at least".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err("expected a number of sessions, 1 or more".to_string()),
+    }
+}
+
+/// A temperature as `--temperature` takes it: a number, 0 or more.
+fn temperature(value: &str) -> Result<f32, String> {
+    match value.parse::<f32>() {
+        Ok(t) if t.is_finite() && t >= 0.0 => Ok(t),
+        _ => Err("expected a temperature, a number 0 or more".to_string()),
+    }
+}
+
 /// Where to run the model.
 #[derive(Clone, Copy)]
 pub enum Device {
@@ -129,5 +146,41 @@ impl argh::FromArgValue for Device {
             "gpu" => Ok(Device::Gpu),
             _ => Err(format!("unknown device '{value}' (expected gpu or cpu)")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use argh::FromArgs;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Opts, String> {
+        Opts::from_args(&["dwim"], args).map_err(|e| e.output)
+    }
+
+    #[test]
+    fn refuses_options_out_of_range() {
+        let err = parse(&["--sessions", "0"]).err().expect("--sessions 0");
+        assert!(err.contains("a server needs room for one session at least"));
+
+        assert!(parse(&["--sessions", "x"]).is_err());
+        assert_eq!(parse(&["--sessions", "3"]).unwrap().sessions, Some(3));
+
+        let err = parse(&["--temperature", "nan"])
+            .err()
+            .expect("--temperature nan");
+        assert!(err.contains("a number 0 or more"));
+        let err = parse(&["--temperature", "inf"])
+            .err()
+            .expect("--temperature inf");
+        assert!(err.contains("a number 0 or more"));
+        assert!(parse(&["--temperature", "-1"]).is_err());
+
+        assert_eq!(
+            parse(&["--temperature", "0"]).unwrap().temperature,
+            Some(0.0)
+        );
+        assert_eq!(parse(&[]).unwrap().sessions, None);
     }
 }
