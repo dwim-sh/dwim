@@ -292,9 +292,8 @@ impl Server {
         sampler: impl Fn(Option<f32>) -> Sampler,
     ) -> Result<(), Box<dyn Error>> {
         let inner = &self.inner;
-        if inner.format.set(format.clone()).is_err() {
-            return Err("the server has run already".into());
-        }
+        // Set once: `run` takes the server, so it runs only once.
+        let _ = inner.format.set(format.clone());
         let mut free = vec![0];
         for _ in 1..size.sessions {
             free.push(model.add_sequence()?);
@@ -462,8 +461,11 @@ fn read(
                 sessions: inner.sessions.load(Ordering::Relaxed),
             }),
             Request::Retire => {
-                inner.retiring.store(true, Ordering::Relaxed);
-                let _ = fs::remove_file(&inner.path);
+                // Only the retire that sets `retiring` unlinks the socket: by
+                // a later one, a new server may have bound the path.
+                if !inner.retiring.swap(true, Ordering::Relaxed) {
+                    let _ = fs::remove_file(&inner.path);
+                }
                 Response::Retired {
                     sessions: inner.sessions.load(Ordering::Relaxed),
                 }
@@ -994,9 +996,16 @@ mod tests {
         let (next, _) = ask(&mut client, "on");
         assert_eq!(next.trim(), "Next.");
 
-        // A server with no sessions exits once idle.
+        // A retired server exits once its session closes. Only the first
+        // retire unlinks the socket: a second, after another server has bound
+        // the path, leaves that one's socket be.
         let mut connection = Connection::connect(&path).unwrap();
         connection.retire().unwrap();
+        assert!(!path.exists());
+        fs::write(&path, "").unwrap();
+        connection.retire().unwrap();
+        assert!(path.exists());
+        fs::remove_file(&path).unwrap();
         drop(connection);
         drop(client);
         handle.join().unwrap();
