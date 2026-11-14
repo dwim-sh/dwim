@@ -1,20 +1,6 @@
-//! The one model, Qwen3.8-27B, as the command line shows it: how much of
-//! it is fetched, and its size in words.
+//! The model's size as the command line shows it, in words.
 
-use std::{fs, path::Path};
-
-use dwim::inference::{Size, qwen35};
-
-/// How much of the model is in `dir`: how many of its files, and their
-/// size in bytes.
-pub fn on_disk(dir: &Path) -> (usize, u64) {
-    qwen35::FILES
-        .iter()
-        .filter_map(|file| fs::metadata(dir.join(file.name)).ok())
-        .fold((0, 0), |(files, bytes), metadata| {
-            (files + 1, bytes + metadata.len())
-        })
-}
+use dwim::inference::Size;
 
 /// `size` as words: the memory the model takes, and the tokens of context
 /// and the memory they take.
