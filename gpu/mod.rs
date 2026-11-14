@@ -8,29 +8,34 @@
 mod tests;
 
 pub mod cpu;
-#[cfg(target_vendor = "apple")]
-pub mod metal;
 pub mod quant;
 pub mod vulkan;
 
 pub use cpu::Cpu;
-#[cfg(target_vendor = "apple")]
-pub use metal::Metal;
 pub use vulkan::Vulkan;
 
-/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-#[cfg(target_vendor = "apple")]
-pub type Gpu = Metal;
-/// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-#[cfg(not(target_vendor = "apple"))]
-pub type Gpu = Vulkan;
+// The one place the platform decides anything here: Metal is built on
+// Apple's alone, where it is the GPU device, and Vulkan is elsewhere.
+cfg_select! {
+    target_vendor = "apple" => {
+        pub mod metal;
 
-/// The name of the API [`Gpu`] drives the GPU through.
-#[cfg(target_vendor = "apple")]
-pub const BACKEND: &str = "Metal";
-/// The name of the API [`Gpu`] drives the GPU through.
-#[cfg(not(target_vendor = "apple"))]
-pub const BACKEND: &str = "Vulkan";
+        pub use metal::Metal;
+
+        /// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
+        pub type Gpu = Metal;
+
+        /// The name of the API [`Gpu`] drives the GPU through.
+        pub const BACKEND: &str = "Metal";
+    }
+    _ => {
+        /// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
+        pub type Gpu = Vulkan;
+
+        /// The name of the API [`Gpu`] drives the GPU through.
+        pub const BACKEND: &str = "Vulkan";
+    }
+}
 
 /// Taps of the causal convolution in linear attention.
 pub const CONV_KERNEL: usize = 4;

@@ -19,6 +19,7 @@ use std::{
 use dwim::harness::{self, Harness, Log};
 use dwim::models::{Gguf, LanguageModel, Tokenizer};
 use dwim::server::{self, Client, Connection, protocol::Welcome};
+use dwim::sys;
 
 use crate::{
     fetch,
@@ -345,9 +346,7 @@ fn plural(n: usize, word: &str) -> String {
 /// Waits for the process `pid` to exit, up to a while.
 fn wait_for_exit(pid: u32) {
     let deadline = Instant::now() + RETIRING;
-    // SAFETY: a signal of 0 sends nothing, and only asks whether the
-    // process is there.
-    while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < deadline {
+    while sys::process::alive(pid) && Instant::now() < deadline {
         thread::sleep(POLL);
     }
 }
@@ -407,12 +406,7 @@ fn spawn(settings: &Settings) -> Result<(), Box<dyn Error>> {
 /// (`~/.local/state`, or on macOS, where there is none, `~/Library/Application
 /// Support`).
 pub fn log_path() -> Option<PathBuf> {
-    Some(
-        dirs::state_dir()
-            .or_else(dirs::data_local_dir)?
-            .join("dwim")
-            .join("server.log"),
-    )
+    Some(sys::dirs::state()?.join("dwim").join("server.log"))
 }
 
 /// What the server is doing, as it is told on standard error: a line

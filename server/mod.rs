@@ -49,6 +49,7 @@ use crate::models::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, q
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, Size, State, Status, Welcome,
 };
+use crate::sys;
 
 pub use crate::server::client::{Client, Connection};
 
@@ -63,10 +64,8 @@ const STATES_KEPT: usize = 4;
 /// Where the server listens: in the user's runtime directory, or the
 /// temporary directory where there is none, named for the user.
 pub fn socket_path() -> PathBuf {
-    let dir = dirs::runtime_dir().unwrap_or_else(env::temp_dir);
-    // SAFETY: getuid takes nothing and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    dir.join(format!("dwim-{uid}.sock"))
+    let dir = sys::dirs::runtime().unwrap_or_else(env::temp_dir);
+    dir.join(format!("dwim-{}.sock", sys::user::id()))
 }
 
 /// Which build of dwim this is: its version, and the size and the
@@ -126,7 +125,7 @@ fn state_path(prompt: &str) -> Option<PathBuf> {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     Some(
-        dirs::cache_dir()?
+        sys::dirs::cache()?
             .join("dwim")
             .join("states")
             .join(format!("{hash:016x}.bin")),

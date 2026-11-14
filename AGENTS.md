@@ -36,8 +36,9 @@ compiles the Vulkan kernels.
   block weight formats.
 * `sys/`: what is asked of the operating system, a directory for each
   (`darwin`, `linux`) with the same modules, re-exported as `sys::memory`
-  and so on for the one being built for. Code that differs by system goes
-  here, not behind a `cfg` where it is used.
+  and so on for the one being built for, and `unix` for what both do the
+  same way, re-exported whichever is being built for. Code that differs by
+  system goes here, not behind a `cfg` where it is used.
 * `scripts/`: `swebench.py` runs SWE-bench Lite; `release` cuts a release.
 * `testing/`: `difftest`, differential testing of the GPU against the CPU
   with the real weights.

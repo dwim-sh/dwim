@@ -6,6 +6,7 @@ use std::{fmt::Write, path::Path, time::Duration};
 use crossterm::style::Stylize;
 use dwim::gpu::BACKEND;
 use dwim::models::qwen35;
+use dwim::sys;
 
 use crate::{
     model::{self, Size},
@@ -221,7 +222,7 @@ pub fn rate(done: f64, elapsed: Duration) -> Option<f64> {
 
 /// A path, with the home directory as `~`.
 pub fn tilde(path: &Path) -> String {
-    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
+    match sys::dirs::home().and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),

@@ -16,12 +16,12 @@ use std::{
     fs::File,
     io::{self, Read},
     path::Path,
-    ptr, slice,
 };
 
 use crate::{
     gpu::{Tensor, bf16, quant},
     models::{Result, quants},
+    sys::mmap::Map,
 };
 
 /// A metadata value.
@@ -167,16 +167,11 @@ impl Info {
 
 /// A GGUF file mapped into memory.
 pub struct Gguf {
-    map: *const u8,
-    len: usize,
+    map: Map,
     data_start: usize,
     meta: BTreeMap<String, Value>,
     tensors: BTreeMap<String, Info>,
 }
-
-// The mapping is read-only and shared freely.
-unsafe impl Send for Gguf {}
-unsafe impl Sync for Gguf {}
 
 struct Reader<R> {
     inner: R,
@@ -280,22 +275,8 @@ impl Gguf {
             .unwrap_or(32) as usize;
         let data_start = r.read.div_ceil(alignment) * alignment;
 
-        let map = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                std::os::unix::io::AsRawFd::as_raw_fd(&file),
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error().into());
-        }
         Ok(Self {
-            map: map as *const u8,
-            len,
+            map: Map::new(&file, len)?,
             data_start,
             meta,
             tensors,
@@ -358,10 +339,10 @@ impl Gguf {
         let info = self.info(name)?;
         let start = self.data_start + info.offset as usize;
         let size = info.size()?;
-        if start + size > self.len {
+        if start + size > self.map.len() {
             return Err(format!("tensor '{name}' runs past the end of the file").into());
         }
-        Ok(unsafe { slice::from_raw_parts(self.map.add(start), size) })
+        Ok(&self.map[start..start + size])
     }
 
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>> {
@@ -430,14 +411,6 @@ impl Gguf {
         }
         let row = row_bytes(info.dtype, out.len())?;
         dequantize_row(info.dtype, &self.bytes(name)?[index * row..][..row], out)
-    }
-}
-
-impl Drop for Gguf {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.map as *mut libc::c_void, self.len);
-        }
     }
 }
 

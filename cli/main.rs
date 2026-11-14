@@ -17,7 +17,7 @@ use std::{
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
 use dwim::models::qwen35;
-use dwim::sys::memory;
+use dwim::sys::{self, memory};
 
 use opts::Opts;
 use session::Stderr;
@@ -79,7 +79,7 @@ fn log(path: Option<PathBuf>) -> Result<Log, Box<dyn Error>> {
         return Log::create(&path)
             .map_err(|e| format!("cannot write the transcript to {}: {e}", path.display()).into());
     }
-    let Some(dir) = dirs::state_dir().or_else(dirs::data_local_dir) else {
+    let Some(dir) = sys::dirs::state() else {
         return Ok(Log::none());
     };
     let path = dir

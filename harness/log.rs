@@ -13,7 +13,7 @@
 
 use std::{
     fmt::Display,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
@@ -24,7 +24,10 @@ use crate::models::Sampler;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::harness::{Stats, now};
+use crate::{
+    harness::{Stats, now},
+    sys,
+};
 
 /// Longest the streamed text being gathered goes without being written.
 const REWRITE: Duration = Duration::from_secs(1);
@@ -66,12 +69,8 @@ impl Log {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         Ok(Self {
-            file: Some(options.open(path)?),
+            file: Some(sys::fs::create_private(path)?),
             path: Some(path.to_path_buf()),
             start: Instant::now(),
             pending: None,

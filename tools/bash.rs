@@ -34,10 +34,7 @@ use std::{
     env,
     fs::{self, DirBuilder, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{
-        fs::DirBuilderExt,
-        process::{CommandExt, ExitStatusExt},
-    },
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -50,7 +47,10 @@ use std::{
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
+use crate::{
+    sys,
+    tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string},
+};
 
 const NAME: &str = "bash";
 
@@ -221,14 +221,7 @@ impl Bash {
         // with the command's ID, so that the timeout ends what the
         // command started along with it, and with no controlling
         // terminal, so that nothing it runs can open the user's.
-        unsafe {
-            shell.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        sys::process::own_session(&mut shell);
         let mut child = shell
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.shell.display()))?;
@@ -249,7 +242,7 @@ impl Bash {
                 s.spawn(move || {
                     if finished.recv_timeout(timeout).is_err() {
                         timed_out.store(true, Ordering::Relaxed);
-                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                        sys::process::kill_group(pid);
                     }
                 });
             }
@@ -346,19 +339,11 @@ fn sweep(tmp: &Path) {
             .and_then(|pid| pid.parse::<u32>().ok());
         if let Some(pid) = pid
             && pid != process::id()
-            && !alive(pid)
+            && !sys::process::alive(pid)
         {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
-}
-
-/// Whether a process with `pid` is running. Signal 0 checks without
-/// sending anything, and is refused for another user's process, which is
-/// running all the same.
-fn alive(pid: u32) -> bool {
-    let refused = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
-    !refused || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// One stream of a command's output as it is read: its first [`PREVIEW`]
@@ -573,24 +558,12 @@ fn char_start(bytes: &[u8]) -> usize {
 
 /// How a command ended, as the last line of its result.
 fn ended(status: ExitStatus) -> String {
-    match (status.code(), status.signal()) {
+    match (status.code(), sys::process::signal(status)) {
         (Some(code), _) => format!("[exit code {code}]"),
         (None, Some(signal)) => {
-            let name = match signal {
-                libc::SIGHUP => " (SIGHUP)",
-                libc::SIGINT => " (SIGINT)",
-                libc::SIGQUIT => " (SIGQUIT)",
-                libc::SIGILL => " (SIGILL)",
-                libc::SIGABRT => " (SIGABRT)",
-                libc::SIGFPE => " (SIGFPE)",
-                libc::SIGKILL => " (SIGKILL)",
-                libc::SIGBUS => " (SIGBUS)",
-                libc::SIGSEGV => " (SIGSEGV)",
-                libc::SIGPIPE => " (SIGPIPE)",
-                libc::SIGALRM => " (SIGALRM)",
-                libc::SIGTERM => " (SIGTERM)",
-                _ => "",
-            };
+            let name = sys::process::signal_name(signal)
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
             format!("[killed by signal {signal}{name}]")
         }
         (None, None) => format!("[{status}]"),
