@@ -3,9 +3,9 @@ mod fetch;
 mod model;
 mod once;
 mod opts;
-mod run;
 mod serve;
 mod session;
+mod shell;
 mod tui;
 
 use std::{
@@ -57,7 +57,7 @@ fn main() {
         }
         let log = log(opts.transcript)?;
         match prompt.trim() {
-            "" => run::run(settings, opts.thinking, log),
+            "" => shell::run(settings, opts.thinking, log),
             prompt => once::once(&settings, prompt, opts.stats, log),
         }
     });

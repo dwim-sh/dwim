@@ -2,18 +2,15 @@
 //! answering above it. The model runs on a thread of its own so the screen
 //! stays responsive while it downloads, loads, and generates.
 
+mod cmd;
+mod view;
+mod worker;
+
 use std::{
     env,
     error::Error,
-    fmt::Write,
-    ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
-    },
-    thread,
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 
@@ -21,48 +18,32 @@ use crossterm::{
     event::{self, Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim::gpu::BACKEND;
-use dwim::harness::{self, Event, Harness, Log};
-use dwim::models::qwen35;
-use dwim::server::Client;
+use dwim::harness::{self, Event, Log};
 
 use crate::{
-    model::{self, Size},
-    opts::{self, Device},
+    model::Size,
+    opts::Device,
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
 
+use cmd::Command;
+use view::Segment;
+use worker::{Reply, Request, Worker};
+
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
-
-/// Longest the shell waits, on quitting, for the model's thread to stop
-/// the turn in progress and end the transcript.
-const FINISH: Duration = Duration::from_secs(2);
 
 /// Runs the shell until the user quits, showing the model's thinking and
 /// what it reads if `verbose` is set, or once ctrl+o is pressed, and
 /// keeping a transcript of the session in `log`.
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
-    let (requests, requests_rx) = mpsc::channel();
-    let (replies_tx, replies) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    // Disconnected once the model's thread is done.
-    let (done, finished) = mpsc::channel::<()>();
     let model = settings.model.clone();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
-    {
-        let stop = stop.clone();
-        thread::spawn(move || {
-            let _done = done;
-            if let Err(e) = work(&settings, log, requests_rx, &replies_tx, &stop) {
-                let _ = replies_tx.send(Reply::Failed(e.to_string()));
-            }
-        });
-    }
+    let worker = Worker::spawn(settings, log);
 
     let mut app = App {
         screen: Screen::new()?,
@@ -90,9 +71,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         auto: false,
         lines: Vec::new(),
         blank: false,
-        requests,
-        replies,
-        stop,
+        worker,
     };
     let result = app.run();
     // Leave the conversation on screen, but not the input box, with where
@@ -100,7 +79,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     // whatever the shell prints next.
     if let Some(path) = &app.transcript {
         app.lines.push(vec![
-            span(format!("  Transcript in {}", tilde(path))).dark_grey(),
+            span(format!("  Transcript in {}", view::tilde(path))).dark_grey(),
         ]);
     }
     app.lines.push(Line::new());
@@ -116,308 +95,8 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
             | Status::Starting { .. }
             | Status::Opening(_)
     );
-    app.stop.store(true, Ordering::Relaxed);
-    drop(app);
-    if loaded {
-        let _ = finished.recv_timeout(FINISH);
-    }
+    app.into_worker().finish(loaded);
     result
-}
-
-/// How the thinking budget reads when asked.
-fn budget_notice(tokens: Option<usize>) -> String {
-    match tokens {
-        Some(tokens) => format!("Thinking budget: {tokens} tokens"),
-        None => "No thinking budget".to_string(),
-    }
-}
-
-/// How setting the thinking budget is acknowledged.
-fn budget_set(tokens: Option<usize>) -> String {
-    match tokens {
-        Some(tokens) => format!("Thinking budget set to {tokens} tokens"),
-        None => "Thinking budget lifted".to_string(),
-    }
-}
-
-/// What the `/auto` command says of auto mode, and how setting it is
-/// acknowledged.
-fn auto_notice(auto: bool) -> String {
-    if auto {
-        "Auto mode on: the model goes on by itself until it says it is done".to_string()
-    } else {
-        "Auto mode off: the model asks when it has something to ask".to_string()
-    }
-}
-
-/// The slash commands, each with the line `/help` says of it.
-const COMMANDS: [(&str, &str); 8] = [
-    (
-        "/model",
-        "the model, the device it runs on, and its context window",
-    ),
-    ("/stats", "where this session's time has gone"),
-    ("/transcript", "where this session's transcript is"),
-    ("/compact", "compact the conversation now"),
-    (
-        "/thinking-budget N",
-        "cap the model's thinking at N tokens, 0 for no cap",
-    ),
-    (
-        "/auto on|off",
-        "go on by itself until it says it is done, or ask",
-    ),
-    (
-        "/server stop|start|restart",
-        "the dwim server the model runs in; stop, start or restart it",
-    ),
-    ("/help", "this list"),
-];
-
-/// What the `/server` command asks of the server.
-#[derive(Clone, Copy)]
-enum ServerAction {
-    /// Show the server: who it is and how many sessions it has.
-    Show,
-    Stop,
-    Start,
-    Restart,
-}
-
-/// A slash command, as the user types it after the slash.
-enum Command {
-    Model,
-    Stats,
-    Transcript,
-    Compact,
-    /// Ask what the thinking budget is, or set it.
-    ThinkingBudget,
-    SetThinkingBudget(Option<usize>),
-    /// Ask whether auto mode is on, or set it.
-    Auto,
-    SetAuto(bool),
-    Server(ServerAction),
-    Help,
-}
-
-impl Command {
-    /// The command `text` names, or what is wrong with it.
-    fn parse(text: &str) -> Result<Self, String> {
-        let (name, argument) = text
-            .trim()
-            .split_once(char::is_whitespace)
-            .map_or((text.trim(), None), |(name, rest)| {
-                (name, Some(rest.trim()))
-            });
-        match (name, argument) {
-            ("model", None) => Ok(Command::Model),
-            ("stats", None) => Ok(Command::Stats),
-            ("transcript", None) => Ok(Command::Transcript),
-            ("compact", None) => Ok(Command::Compact),
-            ("help", None) => Ok(Command::Help),
-            ("thinking-budget", None) => Ok(Command::ThinkingBudget),
-            ("thinking-budget", Some(tokens)) => tokens
-                .parse()
-                .map(|tokens| Command::SetThinkingBudget(opts::budget(tokens)))
-                .map_err(|_| {
-                    "/thinking-budget takes a number of tokens, or 0 for no cap".to_string()
-                }),
-            ("auto", None) => Ok(Command::Auto),
-            ("auto", Some("on")) => Ok(Command::SetAuto(true)),
-            ("auto", Some("off")) => Ok(Command::SetAuto(false)),
-            ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
-            ("server", None) => Ok(Command::Server(ServerAction::Show)),
-            ("server", Some("stop")) => Ok(Command::Server(ServerAction::Stop)),
-            ("server", Some("start")) => Ok(Command::Server(ServerAction::Start)),
-            ("server", Some("restart")) => Ok(Command::Server(ServerAction::Restart)),
-            ("server", Some(_)) => Err("/server takes stop, start or restart".to_string()),
-            _ => Err(format!("Unknown command /{text} · /help lists them")),
-        }
-    }
-}
-
-/// What the shell asks of the model thread.
-enum Request {
-    /// A message from the user.
-    Message(String),
-    /// Compact the conversation now, as the `/compact` command asks.
-    Compact,
-    /// Limit a thought to this many tokens, or lift the limit, as the
-    /// `/thinking-budget` command asks.
-    ThinkingBudget(Option<usize>),
-    /// Turn auto mode on or off, as the `/auto` command asks.
-    Auto(bool),
-    /// Show, stop, start or restart the server, as the `/server` command
-    /// asks.
-    Server(ServerAction),
-}
-
-/// What the model thread reports back.
-enum Reply {
-    /// What the server is doing while the session waits on it.
-    Status(session::Status),
-    /// The model is ready for a message, and how long loading it took.
-    Ready(Duration),
-    /// The session is open on the server again, and goes on with what was
-    /// asked of it.
-    Reopened,
-    /// Something that happened in the turn.
-    Event(Event),
-    /// Something to tell the user, in place of a reply.
-    Notice(String),
-    /// The thinking budget, as now set.
-    ThinkingBudget(Option<usize>),
-    /// Auto mode, as now set.
-    Auto(bool),
-    /// The reply is over, and where the conversation's time has gone.
-    Done(harness::Stats),
-    /// The turn failed, though the model is still there for the next one.
-    Error(String),
-    /// The model is gone: it could not be fetched or loaded.
-    Failed(String),
-}
-
-/// Loads the model and answers messages until the UI hangs up, keeping a
-/// transcript in `log`.
-fn work(
-    settings: &Settings,
-    log: Log,
-    requests: Receiver<Request>,
-    replies: &Sender<Reply>,
-    stop: &AtomicBool,
-) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(settings, log, {
-        let replies = replies.clone();
-        move |status| {
-            let _ = replies.send(Reply::Status(status));
-        }
-    })?;
-    let mut harness = loaded.harness;
-    let _ = replies.send(Reply::Ready(loaded.loading));
-    // Whether the session's server was stopped, so the next request that
-    // needs the model opens it on another.
-    let mut stopped = false;
-    let on_status = || {
-        let replies = replies.clone();
-        move |status| {
-            let _ = replies.send(Reply::Status(status));
-        }
-    };
-
-    for request in requests {
-        let on_event = |event: Event| {
-            let _ = replies.send(Reply::Event(event));
-            if stop.load(Ordering::Relaxed) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        };
-        if stopped && matches!(request, Request::Message(_) | Request::Compact) {
-            if let Err(e) = session::reopen(settings, &mut harness, on_status()) {
-                let _ = replies.send(Reply::Error(e.to_string()));
-                let _ = replies.send(Reply::Done(harness.stats()));
-                continue;
-            }
-            stopped = false;
-            let _ = replies.send(Reply::Reopened);
-        }
-        let result = match request {
-            Request::Message(message) => harness.send(&message, on_event),
-            Request::Server(action) => {
-                server(settings, &mut harness, &mut stopped, action, on_status).map(|notice| {
-                    let _ = replies.send(Reply::Notice(notice));
-                })
-            }
-            Request::Compact => harness.compact(on_event).map(|compacted| {
-                if !compacted && !stop.load(Ordering::Relaxed) {
-                    let _ = replies.send(Reply::Notice("Nothing to compact yet".to_string()));
-                }
-            }),
-            Request::ThinkingBudget(tokens) => {
-                harness.set_thinking_budget(tokens);
-                let _ = replies.send(Reply::ThinkingBudget(tokens));
-                Ok(())
-            }
-            Request::Auto(auto) => {
-                harness.set_auto(auto);
-                let _ = replies.send(Reply::Auto(auto));
-                Ok(())
-            }
-        };
-        if let Err(e) = result {
-            let _ = replies.send(Reply::Error(e.to_string()));
-        }
-        let _ = replies.send(Reply::Done(harness.stats()));
-    }
-    Ok(())
-}
-
-/// Does what `/server` asks, `action`, for the session `harness` runs,
-/// which `stopped` says is not on a server: returns what to tell of it.
-/// `on_status` makes what is told what the server does as it starts.
-fn server<F: FnMut(session::Status) + 'static>(
-    settings: &Settings,
-    harness: &mut Harness<Client>,
-    stopped: &mut bool,
-    action: ServerAction,
-    on_status: impl Fn() -> F,
-) -> Result<String, Box<dyn Error>> {
-    match action {
-        ServerAction::Show => Ok(match session::running() {
-            None => "No dwim server is running · the next message starts it".to_string(),
-            Some(welcome) => {
-                let device = if *stopped {
-                    welcome.device.to_uppercase()
-                } else {
-                    harness.conversation().device().to_string()
-                };
-                let mut notice = format!(
-                    "dwim server {} · {} on {device} · {} of {} {} open",
-                    welcome.pid,
-                    welcome.model,
-                    welcome.sessions,
-                    welcome.room,
-                    if welcome.room == 1 {
-                        "session"
-                    } else {
-                        "sessions"
-                    },
-                );
-                if !session::same_build(&welcome) {
-                    notice.push_str(" · from another build of dwim");
-                }
-                if let Some(path) = session::log_path() {
-                    notice.push_str(&format!(" · log {}", tilde(&path)));
-                }
-                notice
-            }
-        }),
-        ServerAction::Stop if *stopped => {
-            Ok("The dwim server is stopped · the next message starts it".to_string())
-        }
-        ServerAction::Stop => {
-            session::stop(harness.conversation())?;
-            *stopped = true;
-            Ok("Stopped the dwim server · the next message starts it again".to_string())
-        }
-        ServerAction::Start if !*stopped => {
-            Ok("The dwim server is running · /server restart restarts it".to_string())
-        }
-        ServerAction::Start | ServerAction::Restart => {
-            if !*stopped {
-                session::stop(harness.conversation())?;
-                *stopped = true;
-            }
-            session::reopen(settings, harness, on_status())?;
-            *stopped = false;
-            Ok(match action {
-                ServerAction::Start => "Started the dwim server",
-                _ => "Restarted the dwim server",
-            }
-            .to_string())
-        }
-    }
 }
 
 /// What the model is doing.
@@ -459,17 +138,6 @@ enum Status {
         start: Instant,
         tokens: usize,
     },
-}
-
-/// What part of the reply is being generated.
-#[derive(Clone, Copy, PartialEq)]
-enum Segment {
-    /// The model's thought, before it replies.
-    Thought,
-    /// The reply itself.
-    Text,
-    /// The note the model goes on from after the conversation is compacted.
-    Note,
 }
 
 struct App {
@@ -516,12 +184,15 @@ struct App {
     /// last line printed there was blank.
     lines: Vec<Line>,
     blank: bool,
-    requests: Sender<Request>,
-    replies: Receiver<Reply>,
-    stop: Arc<AtomicBool>,
+    worker: Worker,
 }
 
 impl App {
+    /// Closes the screen, leaving the model's thread.
+    fn into_worker(self) -> Worker {
+        self.worker
+    }
+
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let mut dirty = true;
         loop {
@@ -542,7 +213,7 @@ impl App {
                 dirty = true;
             }
             loop {
-                match self.replies.try_recv() {
+                match self.worker.try_recv() {
                     Ok(reply) => self.reply(reply)?,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -620,7 +291,7 @@ impl App {
             self.status,
             Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
         ) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.worker.interrupt();
             self.interrupted = true;
         }
     }
@@ -682,7 +353,7 @@ impl App {
                 return;
             }
             Some(Err(what)) => {
-                self.say(&notice(what));
+                self.say(&view::notice(what));
                 return;
             }
         };
@@ -692,9 +363,8 @@ impl App {
         self.reply_width = columns.saturating_sub(2);
         self.committed = 0;
         self.interrupted = false;
-        self.stop.store(false, Ordering::Relaxed);
         self.status = Status::Reading(Instant::now());
-        let _ = self.requests.send(request);
+        self.worker.send(request);
     }
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
@@ -723,15 +393,17 @@ impl App {
             Reply::ThinkingBudget(tokens) => {
                 self.thinking_budget = tokens;
                 self.finish();
-                self.lines
-                    .push(vec![span(format!("● {}", budget_set(tokens))).dark_grey()]);
+                self.lines.push(vec![
+                    span(format!("● {}", view::budget_set(tokens))).dark_grey(),
+                ]);
                 self.lines.push(Line::new());
             }
             Reply::Auto(auto) => {
                 self.auto = auto;
                 self.finish();
-                self.lines
-                    .push(vec![span(format!("● {}", auto_notice(auto))).dark_grey()]);
+                self.lines.push(vec![
+                    span(format!("● {}", view::auto_notice(auto))).dark_grey(),
+                ]);
                 self.lines.push(Line::new());
             }
             Reply::Error(e) => {
@@ -936,7 +608,7 @@ impl App {
                     .enumerate()
                     .take(end)
                     .skip(committed)
-                    .map(|line| reply_line(segment, line)),
+                    .map(|line| view::reply_line(segment, line)),
             );
             self.committed = end;
         }
@@ -948,7 +620,7 @@ impl App {
     fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
         let lines = match command {
-            Command::Model => model_listing(
+            Command::Model => view::model_listing(
                 &self.model,
                 self.device,
                 self.device_name.as_deref(),
@@ -957,19 +629,19 @@ impl App {
             ),
             Command::Stats => {
                 let details = self.stats.report(self.loading, self.started.elapsed());
-                report(
+                view::report(
                     vec![span("● "), span("This session").bold()],
                     details,
                     columns,
                 )
             }
-            Command::Transcript => notice(match &self.transcript {
-                Some(path) => format!("Transcript in {}", tilde(path)),
+            Command::Transcript => view::notice(match &self.transcript {
+                Some(path) => format!("Transcript in {}", view::tilde(path)),
                 None => "No transcript is kept".to_string(),
             }),
-            Command::Help => help(columns),
-            Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
-            Command::Auto => notice(auto_notice(self.auto)),
+            Command::Help => view::help(columns),
+            Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
+            Command::Auto => view::notice(view::auto_notice(self.auto)),
             Command::Compact
             | Command::SetThinkingBudget(_)
             | Command::SetAuto(_)
@@ -1008,7 +680,7 @@ impl App {
                     .into_iter()
                     .enumerate()
                     .skip(self.committed)
-                    .map(|line| reply_line(segment, line)),
+                    .map(|line| view::reply_line(segment, line)),
             );
         }
         // A blank line between the conversation and the input box, unless
@@ -1077,7 +749,7 @@ impl App {
             } => (
                 "Downloading model…",
                 since,
-                download_details(done, total, since.elapsed()),
+                view::download_details(done, total, since.elapsed()),
             ),
             Status::Connecting(since) => ("Connecting to dwim server…", since, seconds(since)),
             Status::Restarting(since) => ("Restarting dwim server…", since, seconds(since)),
@@ -1118,7 +790,7 @@ impl App {
                 {
                     // No rate before a second has passed or a token arrived,
                     // and the word `tok/s` is left out with it.
-                    let mut details = rate(tokens as f64, start.elapsed())
+                    let mut details = view::rate(tokens as f64, start.elapsed())
                         .map_or(String::new(), |rate| format!("{rate:>5.1} tok/s · "));
                     details.push_str(match (self.segment, self.verbose) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
@@ -1140,213 +812,6 @@ impl App {
     /// The line under the input box: the directory the agent works in, at
     /// the left.
     fn footer(&self) -> Line {
-        vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()]
-    }
-}
-
-/// How fast `done` of something went in `elapsed`, per second; nothing
-/// before a second has passed, or before anything was done, since it is
-/// too early to tell.
-fn rate(done: f64, elapsed: Duration) -> Option<f64> {
-    (elapsed >= Duration::from_secs(1) && done > 0.0).then(|| done / elapsed.as_secs_f64())
-}
-
-/// How a download is going: how much of the file has arrived, out of how
-/// much, at what speed, and the time left once the file's size is known.
-/// The fields are padded to fixed widths, as the status line's are.
-fn download_details(done: u64, total: Option<u64>, elapsed: Duration) -> String {
-    let mut details = format!("{:>8}", model::bytes(done));
-    if let Some(total) = total {
-        details.push_str(&format!(
-            " / {:>8} ({:>3}%)",
-            model::bytes(total),
-            done * 100 / total.max(1)
-        ));
-    }
-    let rate = rate(done as f64, elapsed);
-    let speed = rate.map_or(String::new(), |rate| {
-        format!("{}/s", model::bytes(rate as u64))
-    });
-    write!(details, " · {speed:>10}").expect("a String takes any write");
-    if let Some(total) = total {
-        let left = match rate {
-            Some(rate) if done < total => {
-                let left = ((total - done) as f64 / rate).round() as u64;
-                match left {
-                    0..60 => format!("{left}s"),
-                    60..3600 => format!("{}m {:02}s", left / 60, left % 60),
-                    _ => format!("{}h {:02}m", left / 3600, left % 3600 / 60),
-                }
-            }
-            _ => String::new(),
-        };
-        write!(details, " · {left:>7} left").expect("a String takes any write");
-    }
-    details
-}
-
-/// A path, with the home directory as `~`.
-fn tilde(path: &Path) -> String {
-    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
-/// The model, for the `/model` command: its source and its weights on
-/// disk, the device it runs on and the memory the model takes there, and
-/// how much conversation it has room for and the memory that takes, as a
-/// table of labels and values.
-fn model_listing(
-    name: &str,
-    device: Device,
-    device_name: Option<&str>,
-    size: Option<&Size>,
-    columns: usize,
-) -> Vec<Line> {
-    let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match model::locate(name) {
-        Ok(dir) => {
-            let (files, bytes) = model::on_disk(&dir);
-            match files {
-                0 => "not fetched".to_string(),
-                n if n == qwen35::FILES.len() => {
-                    format!("{} in {}", model::bytes(bytes), tilde(&dir))
-                }
-                n => format!(
-                    "{n}/{} files, {} in {}",
-                    qwen35::FILES.len(),
-                    model::bytes(bytes),
-                    tilde(&dir)
-                ),
-            }
-        }
-        Err(e) => e.to_string(),
-    };
-    let mut on = match (device, device_name) {
-        (Device::Cpu, _) => "CPU".to_string(),
-        (Device::Gpu, None) => "GPU".to_string(),
-        (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
-    };
-    if let Some(size) = size {
-        on.push_str(&format!(" · {}", model::bytes(size.model)));
-    }
-    let mut rows = vec![
-        (
-            "source",
-            format!("{} at {}", qwen35::REPO, &qwen35::REVISION[..7]),
-        ),
-        ("weights", weights),
-        ("device", on),
-    ];
-    if let Some(size) = size {
-        rows.push((
-            "context",
-            format!(
-                "{} tokens ({})",
-                size.context,
-                model::bytes(size.conversation)
-            ),
-        ));
-        rows.push((
-            "sessions",
-            format!("room for {} at once, sharing the model", size.sessions),
-        ));
-    }
-    report(header, table(rows), columns)
-}
-
-/// Rows of a label and a value as lines, with the values aligned.
-fn table(rows: Vec<(&str, String)>) -> Vec<String> {
-    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0) + 2;
-    rows.into_iter()
-        .map(|(label, value)| format!("{label:<width$}{value}"))
-        .collect()
-}
-
-/// What the `/help` command says: the commands, and the keys.
-fn help(columns: usize) -> Vec<Line> {
-    let width = COMMANDS
-        .iter()
-        .map(|(name, _)| name.len())
-        .max()
-        .unwrap_or(0)
-        + 2;
-    let mut lines: Vec<String> = COMMANDS
-        .iter()
-        .map(|(name, what)| format!("{name:<width$}{what}"))
-        .collect();
-    lines.push("ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits".to_string());
-    report(vec![span("● "), span("Commands").bold()], lines, columns)
-}
-
-/// A report: its header, then its details under `⎿`, dimmed and wrapped to
-/// the terminal's `columns`, the way a tool's output follows its call.
-fn report(header: Line, details: impl IntoIterator<Item = String>, columns: usize) -> Vec<Line> {
-    let mut lines = vec![header];
-    let mut first = true;
-    for detail in details {
-        for text in tui::wrap(&detail, columns.saturating_sub(4)) {
-            let prefix = if first { "  ⎿ " } else { "    " };
-            first = false;
-            lines.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
-        }
-    }
-    lines
-}
-
-/// One line said in place of a reply.
-fn notice(text: impl Into<String>) -> Vec<Line> {
-    vec![vec![span(format!("● {}", text.into()))]]
-}
-
-/// A line of a part of the reply, the first one marked with a bullet. A
-/// thought is dimmed, so the reply stands out from it, and so is the note
-/// the model goes on from after a compaction.
-fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
-    match segment {
-        Segment::Thought | Segment::Note => {
-            let bullet = if i == 0 { span("✻ ") } else { span("  ") };
-            vec![bullet.dark_grey(), span(text).dark_grey().italic()]
-        }
-        Segment::Text => {
-            let bullet = if i == 0 { span("● ") } else { span("  ") };
-            vec![bullet, span(text)]
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_the_commands() {
-        assert!(matches!(Command::parse("compact"), Ok(Command::Compact)));
-        assert!(matches!(Command::parse("help "), Ok(Command::Help)));
-        assert!(matches!(
-            Command::parse("thinking-budget"),
-            Ok(Command::ThinkingBudget)
-        ));
-        assert!(matches!(
-            Command::parse("thinking-budget 100"),
-            Ok(Command::SetThinkingBudget(Some(100)))
-        ));
-        assert!(matches!(
-            Command::parse("thinking-budget 0"),
-            Ok(Command::SetThinkingBudget(None))
-        ));
-        assert!(Command::parse("thinking-budget lots").is_err());
-        assert!(matches!(
-            Command::parse("auto on"),
-            Ok(Command::SetAuto(true))
-        ));
-        assert!(matches!(Command::parse("auto"), Ok(Command::Auto)));
-        assert!(Command::parse("auto maybe").is_err());
-        assert!(Command::parse("model now").is_err());
-        assert!(
-            Command::parse("nothing").is_err_and(|e| e.starts_with("Unknown command /nothing"))
-        );
+        vec![span(format!("  {}", view::tilde(&self.cwd))).dark_grey()]
     }
 }
