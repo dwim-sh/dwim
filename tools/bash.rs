@@ -34,10 +34,7 @@ use std::{
     env,
     fs::{self, DirBuilder, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{
-        fs::DirBuilderExt,
-        process::{CommandExt, ExitStatusExt},
-    },
+    os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -224,14 +221,7 @@ impl Bash {
         // with the command's ID, so that the timeout ends what the
         // command started along with it, and with no controlling
         // terminal, so that nothing it runs can open the user's.
-        unsafe {
-            shell.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        sys::process::own_session(&mut shell);
         let mut child = shell
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.shell.display()))?;
@@ -252,7 +242,7 @@ impl Bash {
                 s.spawn(move || {
                     if finished.recv_timeout(timeout).is_err() {
                         timed_out.store(true, Ordering::Relaxed);
-                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                        sys::process::kill_group(pid);
                     }
                 });
             }
