@@ -42,11 +42,8 @@ pub fn once(
     })?;
     drop(printer);
     if stats {
-        for line in loaded
-            .harness
-            .stats()
-            .report(loaded.loading, started.elapsed())
-        {
+        let stats = loaded.harness.stats();
+        for line in session::accounting(&stats, loaded.loading, started.elapsed()) {
             eprintln!("{line}");
         }
     }

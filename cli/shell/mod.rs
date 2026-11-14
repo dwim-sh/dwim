@@ -627,7 +627,8 @@ impl App {
                 columns,
             ),
             Command::Stats => {
-                let details = self.stats.report(self.loading, self.started.elapsed());
+                let details =
+                    session::accounting(&self.stats, self.loading, self.started.elapsed());
                 view::report(
                     vec![span("● "), span("This session").bold()],
                     details,

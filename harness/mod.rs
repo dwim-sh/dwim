@@ -38,7 +38,7 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::inference::{Chunk, Conversation, Turn};
@@ -478,79 +478,6 @@ pub struct Stats {
     /// Tool calls run, and the time they took.
     pub calls: usize,
     pub tool_seconds: f64,
-}
-
-impl Stats {
-    /// The accounting as lines, given how long loading the model took and
-    /// how long everything took: what is left over is the time outside the
-    /// model and the tools.
-    pub fn report(&self, loading: Duration, total: Duration) -> Vec<String> {
-        let m = &self.model;
-        let row = |name: &str, count: String, seconds: f64, rate: String| {
-            format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}")
-        };
-        let tokens = |name: &str, tally: &crate::inference::Tally| {
-            row(
-                name,
-                format!("{} tokens", tally.tokens),
-                tally.seconds,
-                format!("{:.0} tok/s", tally.rate()),
-            )
-        };
-        let accounted = loading.as_secs_f64()
-            + m.cached.seconds
-            + m.prompt.seconds
-            + m.thought.seconds
-            + m.answer.seconds
-            + self.tool_seconds;
-        let mut lines = vec![
-            row(
-                "loading",
-                String::new(),
-                loading.as_secs_f64(),
-                String::new(),
-            ),
-            row(
-                "cached",
-                format!("{} tokens", m.cached.tokens),
-                m.cached.seconds,
-                String::new(),
-            ),
-            tokens("prompt", &m.prompt),
-            tokens("thought", &m.thought),
-            tokens("answer", &m.answer),
-            row(
-                "tools",
-                format!("{} calls", self.calls),
-                self.tool_seconds,
-                String::new(),
-            ),
-            row(
-                "other",
-                String::new(),
-                (total.as_secs_f64() - accounted).max(0.0),
-                String::new(),
-            ),
-            row("total", String::new(), total.as_secs_f64(), String::new()),
-        ];
-        // Drafting, after the tokens generated, where the model drafted.
-        if m.drafted > 0 {
-            lines.insert(
-                5,
-                format!(
-                    "{:<8}{:>13}{:>10}{:>11}",
-                    "drafts",
-                    format!("{} tokens", m.drafted),
-                    "",
-                    format!("{:.0}% kept", 100.0 * m.accepted as f64 / m.drafted as f64)
-                ),
-            );
-        }
-        lines
-            .into_iter()
-            .map(|line| line.trim_end().to_string())
-            .collect()
-    }
 }
 
 impl<C: Conversation> Harness<C> {
