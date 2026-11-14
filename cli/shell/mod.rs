@@ -3,11 +3,11 @@
 //! stays responsive while it downloads, loads, and generates.
 
 mod cmd;
+mod view;
 
 use std::{
     env,
     error::Error,
-    fmt::Write,
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
@@ -23,19 +23,18 @@ use crossterm::{
     event::{self, Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim::gpu::BACKEND;
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::models::qwen35;
 use dwim::server::Client;
 
 use crate::{
-    model::{self, Size},
+    model::Size,
     opts::Device,
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
 
-use cmd::{COMMANDS, Command, ServerAction};
+use cmd::{Command, ServerAction};
+use view::Segment;
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
@@ -104,7 +103,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     // whatever the shell prints next.
     if let Some(path) = &app.transcript {
         app.lines.push(vec![
-            span(format!("  Transcript in {}", tilde(path))).dark_grey(),
+            span(format!("  Transcript in {}", view::tilde(path))).dark_grey(),
         ]);
     }
     app.lines.push(Line::new());
@@ -126,32 +125,6 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         let _ = finished.recv_timeout(FINISH);
     }
     result
-}
-
-/// How the thinking budget reads when asked.
-fn budget_notice(tokens: Option<usize>) -> String {
-    match tokens {
-        Some(tokens) => format!("Thinking budget: {tokens} tokens"),
-        None => "No thinking budget".to_string(),
-    }
-}
-
-/// How setting the thinking budget is acknowledged.
-fn budget_set(tokens: Option<usize>) -> String {
-    match tokens {
-        Some(tokens) => format!("Thinking budget set to {tokens} tokens"),
-        None => "Thinking budget lifted".to_string(),
-    }
-}
-
-/// What the `/auto` command says of auto mode, and how setting it is
-/// acknowledged.
-fn auto_notice(auto: bool) -> String {
-    if auto {
-        "Auto mode on: the model goes on by itself until it says it is done".to_string()
-    } else {
-        "Auto mode off: the model asks when it has something to ask".to_string()
-    }
 }
 
 /// What the shell asks of the model thread.
@@ -306,7 +279,7 @@ fn server<F: FnMut(session::Status) + 'static>(
                     notice.push_str(" · from another build of dwim");
                 }
                 if let Some(path) = session::log_path() {
-                    notice.push_str(&format!(" · log {}", tilde(&path)));
+                    notice.push_str(&format!(" · log {}", view::tilde(&path)));
                 }
                 notice
             }
@@ -377,17 +350,6 @@ enum Status {
         start: Instant,
         tokens: usize,
     },
-}
-
-/// What part of the reply is being generated.
-#[derive(Clone, Copy, PartialEq)]
-enum Segment {
-    /// The model's thought, before it replies.
-    Thought,
-    /// The reply itself.
-    Text,
-    /// The note the model goes on from after the conversation is compacted.
-    Note,
 }
 
 struct App {
@@ -600,7 +562,7 @@ impl App {
                 return;
             }
             Some(Err(what)) => {
-                self.say(&notice(what));
+                self.say(&view::notice(what));
                 return;
             }
         };
@@ -641,15 +603,17 @@ impl App {
             Reply::ThinkingBudget(tokens) => {
                 self.thinking_budget = tokens;
                 self.finish();
-                self.lines
-                    .push(vec![span(format!("● {}", budget_set(tokens))).dark_grey()]);
+                self.lines.push(vec![
+                    span(format!("● {}", view::budget_set(tokens))).dark_grey(),
+                ]);
                 self.lines.push(Line::new());
             }
             Reply::Auto(auto) => {
                 self.auto = auto;
                 self.finish();
-                self.lines
-                    .push(vec![span(format!("● {}", auto_notice(auto))).dark_grey()]);
+                self.lines.push(vec![
+                    span(format!("● {}", view::auto_notice(auto))).dark_grey(),
+                ]);
                 self.lines.push(Line::new());
             }
             Reply::Error(e) => {
@@ -854,7 +818,7 @@ impl App {
                     .enumerate()
                     .take(end)
                     .skip(committed)
-                    .map(|line| reply_line(segment, line)),
+                    .map(|line| view::reply_line(segment, line)),
             );
             self.committed = end;
         }
@@ -866,7 +830,7 @@ impl App {
     fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
         let lines = match command {
-            Command::Model => model_listing(
+            Command::Model => view::model_listing(
                 &self.model,
                 self.device,
                 self.device_name.as_deref(),
@@ -875,19 +839,19 @@ impl App {
             ),
             Command::Stats => {
                 let details = self.stats.report(self.loading, self.started.elapsed());
-                report(
+                view::report(
                     vec![span("● "), span("This session").bold()],
                     details,
                     columns,
                 )
             }
-            Command::Transcript => notice(match &self.transcript {
-                Some(path) => format!("Transcript in {}", tilde(path)),
+            Command::Transcript => view::notice(match &self.transcript {
+                Some(path) => format!("Transcript in {}", view::tilde(path)),
                 None => "No transcript is kept".to_string(),
             }),
-            Command::Help => help(columns),
-            Command::ThinkingBudget => notice(budget_notice(self.thinking_budget)),
-            Command::Auto => notice(auto_notice(self.auto)),
+            Command::Help => view::help(columns),
+            Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
+            Command::Auto => view::notice(view::auto_notice(self.auto)),
             Command::Compact
             | Command::SetThinkingBudget(_)
             | Command::SetAuto(_)
@@ -926,7 +890,7 @@ impl App {
                     .into_iter()
                     .enumerate()
                     .skip(self.committed)
-                    .map(|line| reply_line(segment, line)),
+                    .map(|line| view::reply_line(segment, line)),
             );
         }
         // A blank line between the conversation and the input box, unless
@@ -995,7 +959,7 @@ impl App {
             } => (
                 "Downloading model…",
                 since,
-                download_details(done, total, since.elapsed()),
+                view::download_details(done, total, since.elapsed()),
             ),
             Status::Connecting(since) => ("Connecting to dwim server…", since, seconds(since)),
             Status::Restarting(since) => ("Restarting dwim server…", since, seconds(since)),
@@ -1036,7 +1000,7 @@ impl App {
                 {
                     // No rate before a second has passed or a token arrived,
                     // and the word `tok/s` is left out with it.
-                    let mut details = rate(tokens as f64, start.elapsed())
+                    let mut details = view::rate(tokens as f64, start.elapsed())
                         .map_or(String::new(), |rate| format!("{rate:>5.1} tok/s · "));
                     details.push_str(match (self.segment, self.verbose) {
                         (Segment::Thought, false) => "ctrl+o to show · ",
@@ -1058,179 +1022,6 @@ impl App {
     /// The line under the input box: the directory the agent works in, at
     /// the left.
     fn footer(&self) -> Line {
-        vec![span(format!("  {}", tilde(&self.cwd))).dark_grey()]
-    }
-}
-
-/// How fast `done` of something went in `elapsed`, per second; nothing
-/// before a second has passed, or before anything was done, since it is
-/// too early to tell.
-fn rate(done: f64, elapsed: Duration) -> Option<f64> {
-    (elapsed >= Duration::from_secs(1) && done > 0.0).then(|| done / elapsed.as_secs_f64())
-}
-
-/// How a download is going: how much of the file has arrived, out of how
-/// much, at what speed, and the time left once the file's size is known.
-/// The fields are padded to fixed widths, as the status line's are.
-fn download_details(done: u64, total: Option<u64>, elapsed: Duration) -> String {
-    let mut details = format!("{:>8}", model::bytes(done));
-    if let Some(total) = total {
-        details.push_str(&format!(
-            " / {:>8} ({:>3}%)",
-            model::bytes(total),
-            done * 100 / total.max(1)
-        ));
-    }
-    let rate = rate(done as f64, elapsed);
-    let speed = rate.map_or(String::new(), |rate| {
-        format!("{}/s", model::bytes(rate as u64))
-    });
-    write!(details, " · {speed:>10}").expect("a String takes any write");
-    if let Some(total) = total {
-        let left = match rate {
-            Some(rate) if done < total => {
-                let left = ((total - done) as f64 / rate).round() as u64;
-                match left {
-                    0..60 => format!("{left}s"),
-                    60..3600 => format!("{}m {:02}s", left / 60, left % 60),
-                    _ => format!("{}h {:02}m", left / 3600, left % 3600 / 60),
-                }
-            }
-            _ => String::new(),
-        };
-        write!(details, " · {left:>7} left").expect("a String takes any write");
-    }
-    details
-}
-
-/// A path, with the home directory as `~`.
-fn tilde(path: &Path) -> String {
-    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
-/// The model, for the `/model` command: its source and its weights on
-/// disk, the device it runs on and the memory the model takes there, and
-/// how much conversation it has room for and the memory that takes, as a
-/// table of labels and values.
-fn model_listing(
-    name: &str,
-    device: Device,
-    device_name: Option<&str>,
-    size: Option<&Size>,
-    columns: usize,
-) -> Vec<Line> {
-    let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match model::locate(name) {
-        Ok(dir) => {
-            let (files, bytes) = model::on_disk(&dir);
-            match files {
-                0 => "not fetched".to_string(),
-                n if n == qwen35::FILES.len() => {
-                    format!("{} in {}", model::bytes(bytes), tilde(&dir))
-                }
-                n => format!(
-                    "{n}/{} files, {} in {}",
-                    qwen35::FILES.len(),
-                    model::bytes(bytes),
-                    tilde(&dir)
-                ),
-            }
-        }
-        Err(e) => e.to_string(),
-    };
-    let mut on = match (device, device_name) {
-        (Device::Cpu, _) => "CPU".to_string(),
-        (Device::Gpu, None) => "GPU".to_string(),
-        (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
-    };
-    if let Some(size) = size {
-        on.push_str(&format!(" · {}", model::bytes(size.model)));
-    }
-    let mut rows = vec![
-        (
-            "source",
-            format!("{} at {}", qwen35::REPO, &qwen35::REVISION[..7]),
-        ),
-        ("weights", weights),
-        ("device", on),
-    ];
-    if let Some(size) = size {
-        rows.push((
-            "context",
-            format!(
-                "{} tokens ({})",
-                size.context,
-                model::bytes(size.conversation)
-            ),
-        ));
-        rows.push((
-            "sessions",
-            format!("room for {} at once, sharing the model", size.sessions),
-        ));
-    }
-    report(header, table(rows), columns)
-}
-
-/// Rows of a label and a value as lines, with the values aligned.
-fn table(rows: Vec<(&str, String)>) -> Vec<String> {
-    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0) + 2;
-    rows.into_iter()
-        .map(|(label, value)| format!("{label:<width$}{value}"))
-        .collect()
-}
-
-/// What the `/help` command says: the commands, and the keys.
-fn help(columns: usize) -> Vec<Line> {
-    let width = COMMANDS
-        .iter()
-        .map(|(name, _)| name.len())
-        .max()
-        .unwrap_or(0)
-        + 2;
-    let mut lines: Vec<String> = COMMANDS
-        .iter()
-        .map(|(name, what)| format!("{name:<width$}{what}"))
-        .collect();
-    lines.push("ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits".to_string());
-    report(vec![span("● "), span("Commands").bold()], lines, columns)
-}
-
-/// A report: its header, then its details under `⎿`, dimmed and wrapped to
-/// the terminal's `columns`, the way a tool's output follows its call.
-fn report(header: Line, details: impl IntoIterator<Item = String>, columns: usize) -> Vec<Line> {
-    let mut lines = vec![header];
-    let mut first = true;
-    for detail in details {
-        for text in tui::wrap(&detail, columns.saturating_sub(4)) {
-            let prefix = if first { "  ⎿ " } else { "    " };
-            first = false;
-            lines.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
-        }
-    }
-    lines
-}
-
-/// One line said in place of a reply.
-fn notice(text: impl Into<String>) -> Vec<Line> {
-    vec![vec![span(format!("● {}", text.into()))]]
-}
-
-/// A line of a part of the reply, the first one marked with a bullet. A
-/// thought is dimmed, so the reply stands out from it, and so is the note
-/// the model goes on from after a compaction.
-fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
-    match segment {
-        Segment::Thought | Segment::Note => {
-            let bullet = if i == 0 { span("✻ ") } else { span("  ") };
-            vec![bullet.dark_grey(), span(text).dark_grey().italic()]
-        }
-        Segment::Text => {
-            let bullet = if i == 0 { span("● ") } else { span("  ") };
-            vec![bullet, span(text)]
-        }
+        vec![span(format!("  {}", view::tilde(&self.cwd))).dark_grey()]
     }
 }
