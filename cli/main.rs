@@ -1,5 +1,4 @@
 mod bench;
-mod fetch;
 mod model;
 mod once;
 mod opts;

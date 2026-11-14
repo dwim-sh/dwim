@@ -2,7 +2,6 @@
 //! an interrupted run left.
 
 use std::{
-    error::Error,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::symlink,
@@ -11,8 +10,8 @@ use std::{
     time::Duration,
 };
 
-use dwim::inference::{
-    hub,
+use crate::inference::{
+    Result, hub,
     qwen35::{self, File},
 };
 
@@ -23,7 +22,7 @@ const STALE: Duration = Duration::from_secs(60);
 
 /// How far along the download of one of a model's files is.
 #[derive(Clone, Copy, Debug)]
-pub struct Progress {
+pub struct Download {
     pub file: &'static str,
     /// Bytes downloaded so far.
     pub done: u64,
@@ -38,7 +37,7 @@ pub struct Progress {
 /// named by its digest, and the file in the snapshot is a link to it, as
 /// the cache's other users lay them out; a blob one of them downloaded is
 /// linked to without downloading it again.
-pub fn fetch(dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<dyn Error>> {
+pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
     let blobs = hub::blobs_dir(qwen35::REPO).ok_or("cannot determine the home directory")?;
     for file in &qwen35::FILES {
         let path = dir.join(file.name);
@@ -73,16 +72,12 @@ pub fn fetch(dir: &Path, mut progress: impl FnMut(Progress)) -> Result<(), Box<d
 /// another run is still writing is waited for; one nobody is writing is
 /// picked up where it left off, which matters for a model of several
 /// gigabytes on a slow link.
-fn download(
-    file: &File,
-    blob: &Path,
-    progress: &mut impl FnMut(Progress),
-) -> Result<(), Box<dyn Error>> {
+fn download(file: &File, blob: &Path, progress: &mut impl FnMut(Download)) -> Result<()> {
     let partial = blob.with_file_name(format!("{}.incomplete", file.digest));
     let mut done = loop {
         match fs::metadata(&partial) {
             Ok(meta) if meta.modified()?.elapsed().is_ok_and(|age| age < STALE) => {
-                progress(Progress {
+                progress(Download {
                     file: file.name,
                     done: meta.len(),
                     total: None,
@@ -96,7 +91,7 @@ fn download(
             Err(_) => break 0,
         }
     };
-    progress(Progress {
+    progress(Download {
         file: file.name,
         done,
         total: None,
@@ -129,8 +124,8 @@ fn save(
     partial: &Path,
     mut done: u64,
     file: &'static str,
-    progress: &mut impl FnMut(Progress),
-) -> Result<(), Box<dyn Error>> {
+    progress: &mut impl FnMut(Download),
+) -> Result<()> {
     let total = response
         .headers()
         .get("content-length")
@@ -154,7 +149,7 @@ fn save(
         writer.write_all(&buf[..n])?;
         done += n as u64;
         if Some(done) != total {
-            progress(Progress { file, done, total });
+            progress(Download { file, done, total });
         }
     }
     if let Some(total) = total
@@ -162,7 +157,7 @@ fn save(
     {
         return Err(format!("{file}: got {done} of {total} bytes").into());
     }
-    progress(Progress {
+    progress(Download {
         file,
         done,
         total: Some(done),

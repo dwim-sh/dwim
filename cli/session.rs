@@ -19,7 +19,7 @@ use dwim::inference::{Device, Model, Progress, Tally};
 use dwim::server::{self, Client, Connection, protocol::Welcome};
 use dwim::sys;
 
-use crate::{fetch, model};
+use crate::model;
 
 pub use dwim::server::protocol::Status;
 
@@ -71,7 +71,7 @@ pub fn fetch_model(
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
     let dir = Model::dir(&settings.model)?;
-    fetch::fetch(&dir, |progress| {
+    Model::fetch(&dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
             done: progress.done,

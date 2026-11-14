@@ -4,7 +4,7 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::inference::{Device, Model, Size, qwen35};
+use dwim::inference::{Device, Model, OnDisk, Size};
 use dwim::sys;
 
 use crate::{
@@ -43,18 +43,13 @@ pub fn model_listing(
     let header = vec![span("● "), span(name.to_string()).bold()];
     let weights = match Model::dir(name) {
         Ok(dir) => {
-            let (files, bytes) = model::on_disk(&dir);
+            let OnDisk { files, of, bytes } = Model::on_disk(&dir);
             match files {
                 0 => "not fetched".to_string(),
-                n if n == qwen35::FILES.len() => {
+                n if n == of => {
                     format!("{} in {}", model::bytes(bytes), tilde(&dir))
                 }
-                n => format!(
-                    "{n}/{} files, {} in {}",
-                    qwen35::FILES.len(),
-                    model::bytes(bytes),
-                    tilde(&dir)
-                ),
+                n => format!("{n}/{of} files, {} in {}", model::bytes(bytes), tilde(&dir)),
             }
         }
         Err(e) => e.to_string(),
@@ -70,7 +65,7 @@ pub fn model_listing(
     let mut rows = vec![
         (
             "source",
-            format!("{} at {}", qwen35::REPO, &qwen35::REVISION[..7]),
+            format!("{} at {}", Model::REPO, &Model::REVISION[..7]),
         ),
         ("weights", weights),
         ("device", on),

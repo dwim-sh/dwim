@@ -3,7 +3,7 @@
 //! it samples.
 
 use std::{
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     gpu::{self, Cpu, Device as _, Gpu},
-    inference::{Format, Gguf, LanguageModel, Result, Sampler, Tokenizer, qwen35},
+    inference::{Download, Format, Gguf, LanguageModel, Result, Sampler, Tokenizer, fetch, qwen35},
 };
 
 /// Tokens of conversation the model has room for when the device cannot
@@ -67,6 +67,15 @@ pub struct Size {
     pub conversation: u64,
 }
 
+/// How much of the model is in a directory: how many of its files, out
+/// of how many, and their size in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OnDisk {
+    pub files: usize,
+    pub of: usize,
+    pub bytes: u64,
+}
+
 /// How far loading the model has got.
 pub enum Progress {
     /// The device is open: its name.
@@ -97,6 +106,11 @@ impl Model {
     /// would each have less than the fewest a session is given.
     pub const SESSIONS: usize = 2;
 
+    /// The repository the model's files come from, and the commit of it
+    /// they are fetched at.
+    pub const REPO: &str = qwen35::REPO;
+    pub const REVISION: &str = qwen35::REVISION;
+
     /// The directory the files of the model called `name` are kept in,
     /// which is the one model's.
     pub fn dir(name: &str) -> Result<PathBuf> {
@@ -109,6 +123,24 @@ impl Model {
     /// The file in `dir` that holds the model's weights.
     pub fn weights(dir: &Path) -> PathBuf {
         dir.join(qwen35::WEIGHTS)
+    }
+
+    /// How much of the model is in `dir`.
+    pub fn on_disk(dir: &Path) -> OnDisk {
+        let found = qwen35::FILES
+            .iter()
+            .filter_map(|file| fs::metadata(dir.join(file.name)).ok());
+        OnDisk {
+            files: found.clone().count(),
+            of: qwen35::FILES.len(),
+            bytes: found.map(|metadata| metadata.len()).sum(),
+        }
+    }
+
+    /// Downloads the model's files into `dir` unless they are there,
+    /// telling `on_download` how each is coming in.
+    pub fn fetch(dir: &Path, on_download: impl FnMut(Download)) -> Result<()> {
+        fetch::fetch(dir, on_download)
     }
 
     /// The size of the model on `device` with the context it gets by
