@@ -11,7 +11,10 @@
 //! that stands for 8 less; a `Q8_0` block's 32 bytes hold its elements in
 //! order as signed integers.
 
-use crate::gpu::{from_f16, quantize, to_f16};
+use crate::gpu::{
+    CACHE_BLOCK,
+    float::{from_f16, to_f16},
+};
 
 /// Weights per block.
 pub const BLOCK: usize = 32;
@@ -146,6 +149,34 @@ pub fn dot_q4_0(scales: &[u16], quants: &[u8], x: &[f32]) -> f32 {
         acc += from_f16(scale) * sum.iter().sum::<f32>();
     }
     acc
+}
+
+/// Quantizes a block of [`CACHE_BLOCK`] activations as caches hold them: the
+/// scale is the largest magnitude over 127 rounded to f16, and each
+/// activation the nearest multiple of it, ties away from zero. Returns the
+/// scale's bits and the multiples. Every device gets the same bits: the
+/// multiples are settled by comparing with the midpoints between them,
+/// which are exact in f32, so a division that is not correctly rounded, as
+/// on a GPU, does not change them.
+pub fn quantize(block: &[f32]) -> (u16, [i8; CACHE_BLOCK]) {
+    assert_eq!(block.len(), CACHE_BLOCK);
+    let amax = block.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let bits = to_f16(amax * (1.0 / 127.0));
+    let d = from_f16(bits);
+    let mut q = [0; CACHE_BLOCK];
+    if d > 0.0 {
+        for (q, &x) in q.iter_mut().zip(block) {
+            let a = x.abs();
+            let mut n = (a / d).round().min(128.0);
+            if a >= (n + 0.5) * d {
+                n += 1.0;
+            } else if n > 0.0 && a < (n - 0.5) * d {
+                n -= 1.0;
+            }
+            *q = (n.min(127.0) as i8) * if x < 0.0 { -1 } else { 1 };
+        }
+    }
+    (bits, q)
 }
 
 #[cfg(test)]

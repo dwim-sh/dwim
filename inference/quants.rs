@@ -10,7 +10,7 @@
 //! which keeps them to within a 254th of each block's largest magnitude,
 //! finer than either format's own steps.
 
-use crate::gpu::{Tensor, from_f16, quant};
+use crate::gpu::{Tensor, float::from_f16, quant};
 
 /// Bytes of a file block of each format.
 pub const Q4_0_BYTES: usize = 18;
@@ -189,7 +189,7 @@ pub fn pack_q8_0(x: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::to_f16;
+    use crate::gpu::float::to_f16;
 
     fn row(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed;

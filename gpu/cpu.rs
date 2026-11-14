@@ -4,7 +4,9 @@
 use rayon::prelude::*;
 
 use crate::gpu::{
-    CACHE_BLOCK, CONV_KERNEL, Device, Tensor, bf16, from_f16, quant, quantize, sigmoid, softplus,
+    CACHE_BLOCK, CONV_KERNEL, Device, Tensor,
+    float::{bf16, from_f16},
+    quant::{self, quantize},
 };
 
 pub struct Cpu;
@@ -420,9 +422,22 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `ln(1 + e^x)`, without overflowing for large `x`.
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::gpu::{CACHE_BLOCK, F16_MAX, Tensor, from_f16, quant, quantize, to_f16};
+    use crate::gpu::{
+        CACHE_BLOCK, Tensor,
+        float::{F16_MAX, from_f16, to_f16},
+        quant::{self, quantize},
+    };
 
     /// Values in [-1, 1) from a seed.
     fn values(n: usize, seed: u64) -> Vec<f32> {
