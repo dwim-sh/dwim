@@ -10,7 +10,7 @@ use std::{
 };
 
 use dwim::gpu::{Cpu, Device as _, Gpu};
-use dwim::models::{Gguf, LanguageModel, Sampler, qwen35};
+use dwim::inference::{Gguf, LanguageModel, Sampler, qwen35};
 
 pub use dwim::server::protocol::Size;
 

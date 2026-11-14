@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::models::{Chunk, Conversation, Turn};
+use crate::inference::{Chunk, Conversation, Turn};
 use crate::tools::{ToolCall, Tools, bash, read};
 
 pub use crate::harness::log::Log;
@@ -474,7 +474,7 @@ pub struct Harness<C: Conversation> {
 /// doing, and the tools'.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
-    pub model: crate::models::Stats,
+    pub model: crate::inference::Stats,
     /// Tool calls run, and the time they took.
     pub calls: usize,
     pub tool_seconds: f64,
@@ -489,7 +489,7 @@ impl Stats {
         let row = |name: &str, count: String, seconds: f64, rate: String| {
             format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}")
         };
-        let tokens = |name: &str, tally: &crate::models::Tally| {
+        let tokens = |name: &str, tally: &crate::inference::Tally| {
             row(
                 name,
                 format!("{} tokens", tally.tokens),
@@ -1078,7 +1078,7 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{Chat, Format, Sampler, Tokenizer, testing::Scripted};
+    use crate::inference::{Chat, Format, Sampler, Tokenizer, testing::Scripted};
 
     use super::*;
 

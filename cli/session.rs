@@ -17,7 +17,7 @@ use std::{
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::models::{Gguf, LanguageModel, Tokenizer};
+use dwim::inference::{Gguf, LanguageModel, Tokenizer};
 use dwim::server::{self, Client, Connection, protocol::Welcome};
 use dwim::sys;
 

@@ -5,7 +5,7 @@ use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
 use dwim::gpu::BACKEND;
-use dwim::models::qwen35;
+use dwim::inference::qwen35;
 use dwim::sys;
 
 use crate::{

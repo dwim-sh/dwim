@@ -16,7 +16,7 @@ use std::{
 
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
-use dwim::models::qwen35;
+use dwim::inference::qwen35;
 use dwim::sys::{self, memory};
 
 use opts::Opts;

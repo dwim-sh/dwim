@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Conversation, LanguageModel, Result, Sampler, Tokenizer};
+use crate::inference::{Conversation, LanguageModel, Result, Sampler, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -984,7 +984,7 @@ impl Utf8Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::testing::Scripted;
+    use crate::inference::testing::Scripted;
 
     /// A chat with a scripted model over the tiny vocabulary, its scripts
     /// given as text with special tokens in it.

@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use crate::models::{Answer, Chunk, Conversation, Reply, Result, Sampler, Stats, Turn};
+use crate::inference::{Answer, Chunk, Conversation, Reply, Result, Sampler, Stats, Turn};
 use crate::server::{
     build,
     protocol::{Generation, Opened, Piece, Request, Response, Size, State, Status, Welcome},

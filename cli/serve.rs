@@ -9,7 +9,7 @@
 
 use std::error::Error;
 
-use dwim::models::Format;
+use dwim::inference::Format;
 use dwim::server::{self, Hello, Server};
 
 use crate::{

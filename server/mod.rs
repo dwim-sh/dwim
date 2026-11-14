@@ -45,7 +45,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::models::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, qwen35};
+use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, qwen35};
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, Size, State, Status, Welcome,
 };
@@ -501,7 +501,7 @@ fn read(
     }
 }
 
-fn count(result: crate::models::Result<usize>) -> Response {
+fn count(result: crate::inference::Result<usize>) -> Response {
     match result {
         Ok(count) => Response::Count(count),
         Err(e) => Response::Error {
@@ -719,7 +719,7 @@ impl LanguageModel for Shared {
         self.model().save(len)
     }
 
-    fn restore(&mut self, state: &[u8]) -> crate::models::Result<usize> {
+    fn restore(&mut self, state: &[u8]) -> crate::inference::Result<usize> {
         self.model().restore(state)
     }
 
@@ -743,7 +743,7 @@ impl LanguageModel for Shared {
         self.model().mark()
     }
 
-    fn rewind_to_mark(&mut self) -> crate::models::Result<()> {
+    fn rewind_to_mark(&mut self) -> crate::inference::Result<()> {
         self.model().rewind_to_mark()
     }
 
@@ -756,11 +756,11 @@ impl LanguageModel for Shared {
     }
 
     /// A session runs the one sequence it took.
-    fn add_sequence(&mut self) -> crate::models::Result<usize> {
+    fn add_sequence(&mut self) -> crate::inference::Result<usize> {
         Err("a session runs one sequence".into())
     }
 
-    fn select_sequence(&mut self, id: usize) -> crate::models::Result<()> {
+    fn select_sequence(&mut self, id: usize) -> crate::inference::Result<()> {
         if id == 0 {
             Ok(())
         } else {
@@ -773,7 +773,7 @@ impl LanguageModel for Shared {
 mod tests {
     use std::time::Instant;
 
-    use crate::models::{Conversation, Tokenizer, Turn, testing::Scripted};
+    use crate::inference::{Conversation, Tokenizer, Turn, testing::Scripted};
 
     use super::*;
 
@@ -841,7 +841,7 @@ mod tests {
     }
 
     /// The text of a reply to `message`.
-    fn ask(client: &mut Client, message: &str) -> (String, crate::models::Reply) {
+    fn ask(client: &mut Client, message: &str) -> (String, crate::inference::Reply) {
         let mut text = String::new();
         let reply = client
             .send(message, |chunk| {

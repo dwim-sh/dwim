@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Answer, Reply, Stats, Turn};
+use crate::inference::{Answer, Reply, Stats, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -172,7 +172,7 @@ pub struct Sampling {
     pub seed: u64,
 }
 
-/// A piece of a reply, as [`crate::models::Chunk`] has it, owned.
+/// A piece of a reply, as [`crate::inference::Chunk`] has it, owned.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Piece {
     Thought(String),

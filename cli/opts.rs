@@ -78,7 +78,7 @@ pub struct Opts {
 
     /// tokens the model drafts ahead and verifies in one pass, or 0 to
     /// decode a token at a time (default: 4)
-    #[argh(option, arg_name = "n", default = "dwim::models::DRAFTS")]
+    #[argh(option, arg_name = "n", default = "dwim::inference::DRAFTS")]
     pub speculate: usize,
 
     /// program to run the model's shell commands through, as `shell -c

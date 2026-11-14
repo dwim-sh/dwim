@@ -1,4 +1,4 @@
-//! Language models: Qwen3.8-27B, its tokenizer and weights, and a chat
+//! Inference: Qwen3.8-27B, its tokenizer and weights, and a chat
 //! around it.
 
 mod chat;
