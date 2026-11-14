@@ -5,9 +5,11 @@ use std::{
     error::Error,
     ops::ControlFlow,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
+    thread,
     time::Duration,
 };
 
@@ -18,6 +20,81 @@ use crate::{
     session::{self, Settings},
     shell::{cmd::ServerAction, view},
 };
+
+/// Longest the shell waits, on quitting, for the model's thread to stop
+/// the turn in progress and end the transcript.
+const FINISH: Duration = Duration::from_secs(2);
+
+/// The model's thread, as the shell has it: where to send requests, and
+/// where the replies come back.
+pub struct Worker {
+    requests: Sender<Request>,
+    replies: Receiver<Reply>,
+    /// Set to stop the turn in progress.
+    stop: Arc<AtomicBool>,
+    /// Disconnected once the thread is done.
+    finished: Receiver<()>,
+}
+
+impl Worker {
+    /// Starts the thread, which loads the model as `settings` have it and
+    /// keeps a transcript in `log`.
+    pub fn spawn(settings: Settings, log: Log) -> Self {
+        let (requests, requests_rx) = mpsc::channel();
+        let (replies_tx, replies) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done, finished) = mpsc::channel::<()>();
+        thread::spawn({
+            let stop = stop.clone();
+            move || {
+                let _done = done;
+                if let Err(e) = work(&settings, log, requests_rx, &replies_tx, &stop) {
+                    let _ = replies_tx.send(Reply::Failed(e.to_string()));
+                }
+            }
+        });
+        Self {
+            requests,
+            replies,
+            stop,
+            finished,
+        }
+    }
+
+    /// Asks the thread for something, which it gets to after what it was
+    /// asked before.
+    pub fn send(&self, request: Request) {
+        self.stop.store(false, Ordering::Relaxed);
+        let _ = self.requests.send(request);
+    }
+
+    /// The next thing the thread has reported, if it has reported anything.
+    pub fn try_recv(&self) -> Result<Reply, TryRecvError> {
+        self.replies.try_recv()
+    }
+
+    /// Stops the turn in progress.
+    pub fn interrupt(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Hangs up on the thread, which stops the turn in progress and, with
+    /// no more requests to answer, ends the transcript: waits a while for
+    /// that if `wait` is set.
+    pub fn finish(self, wait: bool) {
+        let Self {
+            requests,
+            replies,
+            stop,
+            finished,
+        } = self;
+        stop.store(true, Ordering::Relaxed);
+        drop((requests, replies));
+        if wait {
+            let _ = finished.recv_timeout(FINISH);
+        }
+    }
+}
 
 /// What the shell asks of the model thread.
 pub enum Request {
@@ -62,7 +139,7 @@ pub enum Reply {
 
 /// Loads the model and answers messages until the UI hangs up, keeping a
 /// transcript in `log`.
-pub fn work(
+fn work(
     settings: &Settings,
     log: Log,
     requests: Receiver<Request>,

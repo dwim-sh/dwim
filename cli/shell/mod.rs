@@ -10,12 +10,7 @@ use std::{
     env,
     error::Error,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
-    },
-    thread,
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 
@@ -34,38 +29,21 @@ use crate::{
 
 use cmd::Command;
 use view::Segment;
-use worker::{Reply, Request};
+use worker::{Reply, Request, Worker};
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
 const TICK: Duration = Duration::from_millis(80);
-
-/// Longest the shell waits, on quitting, for the model's thread to stop
-/// the turn in progress and end the transcript.
-const FINISH: Duration = Duration::from_secs(2);
 
 /// Runs the shell until the user quits, showing the model's thinking and
 /// what it reads if `verbose` is set, or once ctrl+o is pressed, and
 /// keeping a transcript of the session in `log`.
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
-    let (requests, requests_rx) = mpsc::channel();
-    let (replies_tx, replies) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    // Disconnected once the model's thread is done.
-    let (done, finished) = mpsc::channel::<()>();
     let model = settings.model.clone();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
-    {
-        let stop = stop.clone();
-        thread::spawn(move || {
-            let _done = done;
-            if let Err(e) = worker::work(&settings, log, requests_rx, &replies_tx, &stop) {
-                let _ = replies_tx.send(Reply::Failed(e.to_string()));
-            }
-        });
-    }
+    let worker = Worker::spawn(settings, log);
 
     let mut app = App {
         screen: Screen::new()?,
@@ -93,9 +71,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         auto: false,
         lines: Vec::new(),
         blank: false,
-        requests,
-        replies,
-        stop,
+        worker,
     };
     let result = app.run();
     // Leave the conversation on screen, but not the input box, with where
@@ -119,11 +95,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
             | Status::Starting { .. }
             | Status::Opening(_)
     );
-    app.stop.store(true, Ordering::Relaxed);
-    drop(app);
-    if loaded {
-        let _ = finished.recv_timeout(FINISH);
-    }
+    app.into_worker().finish(loaded);
     result
 }
 
@@ -212,12 +184,15 @@ struct App {
     /// last line printed there was blank.
     lines: Vec<Line>,
     blank: bool,
-    requests: Sender<Request>,
-    replies: Receiver<Reply>,
-    stop: Arc<AtomicBool>,
+    worker: Worker,
 }
 
 impl App {
+    /// Closes the screen, leaving the model's thread.
+    fn into_worker(self) -> Worker {
+        self.worker
+    }
+
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let mut dirty = true;
         loop {
@@ -238,7 +213,7 @@ impl App {
                 dirty = true;
             }
             loop {
-                match self.replies.try_recv() {
+                match self.worker.try_recv() {
                     Ok(reply) => self.reply(reply)?,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -316,7 +291,7 @@ impl App {
             self.status,
             Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
         ) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.worker.interrupt();
             self.interrupted = true;
         }
     }
@@ -388,9 +363,8 @@ impl App {
         self.reply_width = columns.saturating_sub(2);
         self.committed = 0;
         self.interrupted = false;
-        self.stop.store(false, Ordering::Relaxed);
         self.status = Status::Reading(Instant::now());
-        let _ = self.requests.send(request);
+        self.worker.send(request);
     }
 
     fn reply(&mut self, reply: Reply) -> Result<(), Box<dyn Error>> {
