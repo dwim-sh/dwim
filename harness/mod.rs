@@ -8,7 +8,7 @@
 //! to say what it has done and what remains. The harness refuses a call
 //! that repeats the one before it, whose output is already there.
 //!
-//! A [`Harness`] wraps a [`Conversation`] and reports each turn's thoughts, text,
+//! A [`Harness`] wraps a [`Session`] and reports each turn's thoughts, text,
 //! tool calls, and tool output as [`Event`]s, so a user interface can show
 //! them as they happen. The tools live in `crate::tools`. The system prompt
 //! pushes the model to use them rather than answer from memory or ask the
@@ -41,7 +41,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::inference::{Chunk, Conversation, Turn};
+use crate::inference::{Chunk, Session, Turn};
 use crate::tools::{ToolCall, Tools, bash, read};
 
 pub use crate::harness::log::Log;
@@ -432,9 +432,9 @@ struct Entry {
     prompt: bool,
 }
 
-/// The loop around a [`Conversation`] that runs the tools the model calls
+/// The loop around a [`Session`] that runs the tools the model calls
 /// and feeds the results back, until the model replies with text alone.
-pub struct Harness<C: Conversation> {
+pub struct Harness<C: Session> {
     chat: C,
     tools: Tools,
     /// Where the agent is, until the first message carries it.
@@ -483,7 +483,7 @@ pub struct Stats {
     pub tool_seconds: f64,
 }
 
-impl<C: Conversation> Harness<C> {
+impl<C: Session> Harness<C> {
     /// An agent on `chat`, which has read the system prompt, working in
     /// `dir`, with `restart` to open the conversation over with the same
     /// prompt once the chat is cleared, when the conversation is compacted.
@@ -966,7 +966,7 @@ impl<C: Conversation> Harness<C> {
     }
 }
 
-impl<C: Conversation> Drop for Harness<C> {
+impl<C: Session> Drop for Harness<C> {
     /// Ends the transcript: the session finished.
     fn drop(&mut self) {
         let stats = self.stats();
@@ -1010,7 +1010,7 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use crate::inference::{Chat, Format, Sampler, Tokenizer, testing::Scripted};
+    use crate::inference::{Format, Local, Sampler, Tokenizer, testing::Scripted};
 
     use super::*;
 
@@ -1049,7 +1049,7 @@ mod tests {
 
     /// A harness around a scripted model with room for `max_len` tokens,
     /// which says `scripts` in turn and `note` when asked for a note.
-    pub fn harness(scripts: &[String], max_len: usize, note: &str) -> Harness<Chat<Scripted>> {
+    pub fn harness(scripts: &[String], max_len: usize, note: &str) -> Harness<Local<Scripted>> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         Harness::new(chat(scripts, max_len, note), dir, |chat| {
             chat.system("Be brief.", |_, _| {})
@@ -1058,11 +1058,11 @@ mod tests {
     }
 
     /// A conversation as `harness` has it, opened with its system prompt.
-    fn chat(scripts: &[String], max_len: usize, note: &str) -> Chat<Scripted> {
+    fn chat(scripts: &[String], max_len: usize, note: &str) -> Local<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
-        let mut chat = Chat::new(
+        let mut chat = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
@@ -1123,7 +1123,7 @@ mod tests {
 
     /// The names of the events of a turn, and the note it wrote.
     pub fn send(
-        harness: &mut Harness<Chat<Scripted>>,
+        harness: &mut Harness<Local<Scripted>>,
         message: &str,
     ) -> (Vec<&'static str>, String) {
         let mut events = Vec::new();
@@ -1259,7 +1259,7 @@ mod tests {
     /// A harness around a scripted model working in `dir`, under a budget
     /// of 100, keeping a log at `path`. `DIR` in a script stands for the
     /// directory.
-    fn harness_in(dir: &Path, scripts: &[String], path: &Path) -> Harness<Chat<Scripted>> {
+    fn harness_in(dir: &Path, scripts: &[String], path: &Path) -> Harness<Local<Scripted>> {
         harness_within(dir, scripts, path, 100_000)
     }
 
@@ -1270,13 +1270,13 @@ mod tests {
         scripts: &[String],
         path: &Path,
         max_len: usize,
-    ) -> Harness<Chat<Scripted>> {
+    ) -> Harness<Local<Scripted>> {
         let at = dir.display().to_string();
         let scripts: Vec<String> = scripts.iter().map(|s| s.replace("DIR", &at)).collect();
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len);
-        let mut chat = Chat::new(
+        let mut chat = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(1.0, 1, 0.95, 0.0, 1),
@@ -1357,7 +1357,7 @@ mod tests {
 
     /// Sends `message`, breaking at the first event that `stop` is true of.
     fn send_until(
-        harness: &mut Harness<Chat<Scripted>>,
+        harness: &mut Harness<Local<Scripted>>,
         message: &str,
         stop: impl Fn(&Event) -> bool,
     ) {
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     /// The transcript's turns as a letter each: a user's, a reply, results.
-    fn shape(harness: &Harness<Chat<Scripted>>) -> String {
+    fn shape(harness: &Harness<Local<Scripted>>) -> String {
         harness
             .transcript()
             .map(|turn| match turn {

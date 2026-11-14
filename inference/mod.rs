@@ -14,7 +14,7 @@ mod states;
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Answer, Chat, Chunk, DRAFTS, Format, Reply, Stats, Tally, Turn};
+pub use chat::{Answer, Chunk, DRAFTS, Format, Local, Reply, Stats, Tally, Turn};
 pub use fetch::Download;
 pub use gguf::Gguf;
 pub use model::{Device, Model, OnDisk, Progress, Size};
@@ -138,10 +138,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
     }
 }
 
-/// A conversation with the model, as the harness holds one: a [`Chat`] on
-/// a model in this process, or one kept with the server that has the
-/// model, and reached over its socket.
-pub trait Conversation {
+/// A session with the model, a conversation with it, as the harness holds
+/// one: a [`Local`] on a model in this process, or a `server::Remote`,
+/// kept with the server that has the model and reached over its socket.
+pub trait Session {
     /// Forgets the conversation, so that a system prompt can open another.
     fn clear(&mut self) -> Result<()>;
 

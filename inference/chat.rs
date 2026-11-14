@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::inference::{Conversation, LanguageModel, Result, Sampler, Tokenizer};
+use crate::inference::{LanguageModel, Result, Sampler, Session, Tokenizer};
 
 /// Most tokens fed to the model at once while it reads a prompt, between
 /// progress reports.
@@ -72,10 +72,10 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 /// template opens the tag for it, and the thought is streamed apart from
 /// the reply. It may also call tools, if the system prompt describes them,
 /// by replying with `<tool_call>` blocks. Their results go back to it in a
-/// user turn of `<tool_response>` blocks. `Chat` only speaks the format:
+/// user turn of `<tool_response>` blocks. `Local` only speaks the format:
 /// what the tools are and running them is up to the caller.
 ///
-/// The tags of the format are special tokens, which `Chat` puts in by id.
+/// The tags of the format are special tokens, which `Local` puts in by id.
 /// What the user and the tools say is encoded as text, so that a message
 /// which spells out a tag stays text: a command that prints `<|im_end|>`
 /// cannot end the turn or start another.
@@ -84,7 +84,7 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 /// the chat template leaves earlier thoughts out: the model is rewound to
 /// where the reply began and reads the reply back with an empty thought,
 /// as the template writes a reply already made, which is also how
-/// [`Chat::replay`] writes one. A reply stopped short for room keeps its
+/// [`Local::replay`] writes one. A reply stopped short for room keeps its
 /// thought, for the note that compacts the conversation to be written
 /// from it. Everything else stays, and each turn runs the model over only
 /// its new tokens.
@@ -96,7 +96,7 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 /// only mentions, is part of the thought. Left in the thought, a call the
 /// model meant gets no result, and the model goes on thinking about what
 /// it has asked for: a thought that never ends.
-pub struct Chat<M: LanguageModel> {
+pub struct Local<M: LanguageModel> {
     model: M,
     format: Format,
     sampler: Sampler,
@@ -197,7 +197,7 @@ pub enum Chunk<'a> {
 /// What a reply came to: the tool calls it made, as the model wrote them,
 /// whether it was stopped short because the context was full, but for the
 /// reserve, and whether its thought was ended at the limit
-/// [`Chat::limit_thoughts`] sets, rather than by the model.
+/// [`Local::limit_thoughts`] sets, rather than by the model.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Reply {
     pub calls: Vec<String>,
@@ -278,7 +278,7 @@ impl Format {
     }
 
     /// Most tokens a plain answer to `message` takes with its framing, if
-    /// it is limited to `limit` tokens: what [`Chat::answer`] needs room
+    /// it is limited to `limit` tokens: what [`Local::answer`] needs room
     /// for. Fails only if the message cannot be encoded.
     pub fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
         Ok(self.user(message)?.len()
@@ -360,7 +360,7 @@ impl Format {
     }
 }
 
-impl<M: LanguageModel> Chat<M> {
+impl<M: LanguageModel> Local<M> {
     /// A conversation with `model`, in `format`, picking tokens with
     /// `sampler`.
     pub fn new(model: M, format: Format, sampler: Sampler) -> Result<Self> {
@@ -769,7 +769,7 @@ impl<M: LanguageModel> Chat<M> {
     }
 }
 
-impl<M: LanguageModel> Conversation for Chat<M> {
+impl<M: LanguageModel> Session for Local<M> {
     fn clear(&mut self) -> Result<()> {
         self.speculation = None;
         self.model.reset();
@@ -986,10 +986,10 @@ mod tests {
 
     /// A chat with a scripted model over the tiny vocabulary, its scripts
     /// given as text with special tokens in it.
-    fn chat(scripts: &[&str]) -> Chat<Scripted> {
+    fn chat(scripts: &[&str]) -> Local<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let model = Scripted::new(&tokenizer, scripts, 1 << 16);
-        let mut chat = Chat::new(
+        let mut chat = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
@@ -1263,7 +1263,7 @@ mod tests {
             ],
             max_len,
         );
-        let mut chat = Chat::new(
+        let mut chat = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
@@ -1453,7 +1453,7 @@ mod tests {
         // under it.
         let tokenizer = Tokenizer::tiny();
         let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
-        let mut measure = Chat::new(
+        let mut measure = Local::new(
             Scripted::new(&tokenizer, &[], 1 << 16),
             Format::new(Tokenizer::tiny()).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
@@ -1476,7 +1476,7 @@ mod tests {
             .len();
         let max_len = system + framing + heads_len + 3;
         let model = Scripted::new(&tokenizer, &[], max_len).answers(&tokenizer, " fix it.");
-        let mut chat = Chat::new(
+        let mut chat = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
