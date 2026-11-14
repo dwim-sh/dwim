@@ -18,4 +18,4 @@ pub use darwin::memory;
 #[cfg(not(target_vendor = "apple"))]
 pub use linux::memory;
 
-pub use unix::fs;
+pub use unix::{fs, process};

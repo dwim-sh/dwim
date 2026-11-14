@@ -50,7 +50,10 @@ use std::{
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string};
+use crate::{
+    sys,
+    tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string},
+};
 
 const NAME: &str = "bash";
 
@@ -346,19 +349,11 @@ fn sweep(tmp: &Path) {
             .and_then(|pid| pid.parse::<u32>().ok());
         if let Some(pid) = pid
             && pid != process::id()
-            && !alive(pid)
+            && !sys::process::alive(pid)
         {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
-}
-
-/// Whether a process with `pid` is running. Signal 0 checks without
-/// sending anything, and is refused for another user's process, which is
-/// running all the same.
-fn alive(pid: u32) -> bool {
-    let refused = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
-    !refused || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// One stream of a command's output as it is read: its first [`PREVIEW`]

@@ -19,6 +19,7 @@ use std::{
 use dwim::harness::{self, Harness, Log};
 use dwim::models::{Gguf, LanguageModel, Tokenizer};
 use dwim::server::{self, Client, Connection, protocol::Welcome};
+use dwim::sys;
 
 use crate::{
     fetch,
@@ -345,9 +346,7 @@ fn plural(n: usize, word: &str) -> String {
 /// Waits for the process `pid` to exit, up to a while.
 fn wait_for_exit(pid: u32) {
     let deadline = Instant::now() + RETIRING;
-    // SAFETY: a signal of 0 sends nothing, and only asks whether the
-    // process is there.
-    while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < deadline {
+    while sys::process::alive(pid) && Instant::now() < deadline {
         thread::sleep(POLL);
     }
 }
