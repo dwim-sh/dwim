@@ -3,5 +3,6 @@
 
 pub mod dirs;
 pub mod fs;
+pub mod mmap;
 pub mod process;
 pub mod user;
