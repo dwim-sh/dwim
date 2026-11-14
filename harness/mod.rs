@@ -57,6 +57,15 @@ const MAX_FILES: usize = 50;
 /// and small models otherwise tend to repeat a call over and over.
 const REPEATED: &str = "error: you just ran this, and its output is above. Don't run it again: use that output, run something else, or reply to the user.";
 
+/// What the model gets back for a call that was not run because the turn
+/// was interrupted before it.
+const NOT_RUN: &str = "not run: the turn was interrupted";
+
+/// What the model gets back for a call that ran before the turn was
+/// interrupted, when there is no room left for what it returned.
+const DROPPED: &str =
+    "interrupted: this ran, but there was no room in the context window for its output";
+
 /// Most tokens the model may think at a time before it is made to act, if
 /// they are limited: the thinking budget. The figures here are from
 /// Bonsai, PrismML's ternary build of the model, which dwim ran before,
@@ -797,6 +806,11 @@ impl<C: Conversation> Harness<C> {
             let capped = self.steps >= self.max_calls;
             let more = if capped { self.account_tokens()? } else { 0 };
             if !compaction::make_room(self, &fed, more, on_event)? {
+                // Results that a compaction was to make room for still
+                // answer the reply before them.
+                if let Turn::Results(outputs) = input {
+                    self.close(outputs)?;
+                }
                 return Ok(Outcome::Done);
             }
             if capped {
@@ -863,7 +877,11 @@ impl<C: Conversation> Harness<C> {
                 prompt = true;
                 continue;
             }
+            // Every call of the reply gets a result, as the model expects
+            // of a reply that calls: once the turn is interrupted, the
+            // calls that remain get word that they were not run.
             let mut outputs = Vec::new();
+            let mut interrupted = false;
             for call in &reply.calls {
                 let mut seconds = None;
                 let mut changed = false;
@@ -872,16 +890,16 @@ impl<C: Conversation> Harness<C> {
                     Ok(call) => {
                         let detail = crate::tools::describe(&call);
                         self.log.call(&call.name, &detail);
-                        if on_event(Event::Call {
-                            name: call.name.clone(),
-                            detail: detail.clone(),
-                        })
-                        .is_break()
-                        {
-                            return Ok(Outcome::Done);
-                        }
+                        interrupted = interrupted
+                            || on_event(Event::Call {
+                                name: call.name.clone(),
+                                detail: detail.clone(),
+                            })
+                            .is_break();
                         let this = Some((call.name.clone(), call.arguments.to_string()));
-                        if this == last {
+                        if interrupted {
+                            NOT_RUN.to_string()
+                        } else if this == last {
                             REPEATED.to_string()
                         } else {
                             last = this;
@@ -895,18 +913,21 @@ impl<C: Conversation> Harness<C> {
                             output.text
                         }
                     }
+                    Err(_) if interrupted => NOT_RUN.to_string(),
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
                 self.log.output(&output, seconds);
-                if on_event(Event::Output(output.clone())).is_break() {
-                    return Ok(Outcome::Done);
-                }
+                interrupted = interrupted || on_event(Event::Output(output.clone())).is_break();
                 if changed {
                     self.unchanged = 0;
                 } else {
                     self.unchanged += 1;
                 }
                 outputs.push(output);
+            }
+            if interrupted {
+                self.close(outputs)?;
+                return Ok(Outcome::Done);
             }
             if self.unchanged >= self.nudge_after
                 && let Some(last) = outputs.last_mut()
@@ -919,6 +940,24 @@ impl<C: Conversation> Harness<C> {
             input = Turn::Results(outputs);
             prompt = false;
         }
+    }
+
+    /// Feeds `outputs` as the results of the calls the last reply made,
+    /// with no reply to them, and records them: how a turn interrupted at
+    /// its calls ends, so that the next message follows a whole exchange.
+    /// No conversation is compacted to make room for them, since that is
+    /// the model's work too: if they do not fit, the calls that ran get
+    /// word that their output was dropped instead.
+    fn close(&mut self, mut outputs: Vec<String>) -> Result<(), Box<dyn Error>> {
+        let mut turn = Turn::Results(outputs.clone());
+        if self.chat.measure(&turn)? > self.chat.free() {
+            for output in outputs.iter_mut().filter(|output| *output != NOT_RUN) {
+                *output = DROPPED.to_string();
+            }
+            turn = Turn::Results(outputs.clone());
+        }
+        self.chat.feed_results(&outputs)?;
+        self.record(turn, false)
     }
 
     /// Whether the model, in auto mode, is to be told to go on after the
@@ -1343,6 +1382,108 @@ mod tests {
                 .all(|&(thought, ended)| thought > 0 && !ended),
             "{replies:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reply that calls `bash` twice, to make a file in `dir` and then
+    /// another.
+    fn reply_making_two(dir: &Path) -> String {
+        let call = |file: &str| {
+            format!(
+                "<tool_call>\n<function=bash>\n<parameter=command>\ntouch {}\n</parameter>\n</function>\n</tool_call>",
+                dir.join(file).display()
+            )
+        };
+        format!("{}\n</think>\n\n{}\n{}", filler(10), call("a"), call("b"))
+    }
+
+    /// Sends `message`, breaking at the first event that `stop` is true of.
+    fn send_until(
+        harness: &mut Harness<Chat<Scripted>>,
+        message: &str,
+        stop: impl Fn(&Event) -> bool,
+    ) {
+        harness
+            .send(message, |event| {
+                if stop(&event) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+    }
+
+    /// The transcript's turns as a letter each: a user's, a reply, results.
+    fn shape(harness: &Harness<Chat<Scripted>>) -> String {
+        harness
+            .transcript()
+            .map(|turn| match turn {
+                Turn::User(_) => 'u',
+                Turn::Reply { .. } => 'r',
+                Turn::Results(_) => 't',
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answers_the_calls_of_a_turn_interrupted_before_they_run() {
+        let dir = scratch();
+        let scripts = [reply_making_two(&dir), reply(10, false)];
+        let mut harness = harness(&scripts, 100_000, "");
+        send_until(&mut harness, "go", |event| {
+            matches!(event, Event::Call { .. })
+        });
+        assert!(!dir.join("a").exists() && !dir.join("b").exists());
+        send(&mut harness, "what happened?");
+
+        // The reply's two calls are answered before the next message, and
+        // the model was fed what the transcript has.
+        assert_eq!(shape(&harness), "urtur");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::Results(outputs) = turns[2] else {
+            panic!("{:?}", turns[2])
+        };
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert!(
+            outputs.iter().all(|output| output == NOT_RUN),
+            "{outputs:?}"
+        );
+        let tokenizer = Tokenizer::tiny();
+        let fed: Vec<u8> = harness
+            .chat
+            .model()
+            .fed
+            .iter()
+            .flat_map(|&token| tokenizer.decode(token).to_vec())
+            .collect();
+        let fed = String::from_utf8(fed).unwrap();
+        let results = fed.find("<tool_response>").expect("no results were fed");
+        assert_eq!(fed.matches("<tool_response>").count(), 2, "{fed}");
+        assert!(results < fed.find("what happened?").unwrap(), "{fed}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn answers_the_calls_of_a_turn_interrupted_after_one_ran() {
+        let dir = scratch();
+        let scripts = [reply_making_two(&dir), reply(10, false)];
+        let mut harness = harness(&scripts, 100_000, "");
+        send_until(&mut harness, "go", |event| {
+            matches!(event, Event::Output(_))
+        });
+        assert!(dir.join("a").exists() && !dir.join("b").exists());
+        send(&mut harness, "what happened?");
+
+        // The call that ran keeps its output, and the other was not run.
+        assert_eq!(shape(&harness), "urtur");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::Results(outputs) = turns[2] else {
+            panic!("{:?}", turns[2])
+        };
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert_ne!(outputs[0], NOT_RUN);
+        assert_eq!(outputs[1], NOT_RUN);
         fs::remove_dir_all(dir).unwrap();
     }
 
