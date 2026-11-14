@@ -4,7 +4,6 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::gpu::BACKEND;
 use dwim::inference::{Device, Model, Size, qwen35};
 use dwim::sys;
 
@@ -63,7 +62,7 @@ pub fn model_listing(
     let mut on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
         (Device::Gpu, None) => "GPU".to_string(),
-        (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {BACKEND}"),
+        (Device::Gpu, Some(gpu)) => format!("GPU · {gpu} via {}", Device::BACKEND),
     };
     if let Some(size) = size {
         on.push_str(&format!(" · {}", model::bytes(size.model)));

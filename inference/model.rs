@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    gpu::{Cpu, Device as _, Gpu},
+    gpu::{self, Cpu, Device as _, Gpu},
     inference::{Format, Gguf, LanguageModel, Result, Sampler, Tokenizer, qwen35},
 };
 
@@ -38,6 +38,11 @@ const HEADROOM: u64 = 256 << 20;
 pub enum Device {
     Cpu,
     Gpu,
+}
+
+impl Device {
+    /// The API the GPU is driven through on this system.
+    pub const BACKEND: &str = gpu::BACKEND;
 }
 
 impl fmt::Display for Device {
