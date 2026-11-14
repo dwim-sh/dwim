@@ -409,6 +409,17 @@ impl<M: LanguageModel> Chat<M> {
         self.len + 1 + ending <= self.model.max_len().saturating_sub(reserve)
     }
 
+    /// Opens the conversation with a system prompt, reporting how many of
+    /// its tokens the model has read so far, out of how many, as it goes.
+    pub fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        if self.len != 0 {
+            return Err("the conversation has already started".into());
+        }
+        let content = self.format.tokenizer.encode_with_special(text)?;
+        let turn = self.format.turn("system", content)?;
+        self.read(&turn, on_progress)
+    }
+
     /// The conversation so far as the model's state, for `restore` to take
     /// up from, if the model can give it.
     pub fn save(&self) -> Option<Vec<u8>> {
@@ -759,15 +770,6 @@ impl<M: LanguageModel> Chat<M> {
 }
 
 impl<M: LanguageModel> Conversation for Chat<M> {
-    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        if self.len != 0 {
-            return Err("the conversation has already started".into());
-        }
-        let content = self.format.tokenizer.encode_with_special(text)?;
-        let turn = self.format.turn("system", content)?;
-        self.read(&turn, on_progress)
-    }
-
     fn clear(&mut self) -> Result<()> {
         self.speculation = None;
         self.model.reset();
@@ -797,10 +799,6 @@ impl<M: LanguageModel> Conversation for Chat<M> {
 
     fn sampler(&self) -> &Sampler {
         &self.sampler
-    }
-
-    fn thought_limit(&self) -> Option<usize> {
-        self.thought_limit
     }
 
     fn capacity(&self) -> usize {

@@ -452,6 +452,9 @@ pub struct Harness<C: Conversation> {
     restart: Restart<C>,
     /// Most tokens of a note.
     note_tokens: usize,
+    /// The thinking budget: most tokens a thought may run to, if they
+    /// are limited.
+    thinking_budget: Option<usize>,
     /// Tool calls made in the turn so far, and the most there may be
     /// before the model is asked to reply.
     steps: usize,
@@ -500,6 +503,7 @@ impl<C: Conversation> Harness<C> {
             transcript: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
+            thinking_budget: None,
             steps: 0,
             max_calls: MAX_CALLS,
             unchanged: 0,
@@ -530,6 +534,7 @@ impl<C: Conversation> Harness<C> {
         } else {
             DECIDE_CLOSING
         };
+        self.thinking_budget = tokens;
         self.chat.limit_thoughts(tokens, closing);
     }
 
@@ -576,7 +581,7 @@ impl<C: Conversation> Harness<C> {
             &self.dir,
             self.chat.capacity(),
             self.chat.sampler(),
-            self.chat.thought_limit(),
+            self.thinking_budget,
             system,
         );
         self.log = log;
@@ -755,8 +760,7 @@ impl<C: Conversation> Harness<C> {
                 prompt = true;
                 continue;
             }
-            let budget = self.chat.thought_limit();
-            self.limit_thoughts(budget);
+            self.limit_thoughts(self.thinking_budget);
             let mut text = String::new();
             let before = self.chat.stats();
             let reply = {
@@ -1127,7 +1131,7 @@ mod tests {
         // with the closing, and the reply goes on to its call and its text.
         let scripts = [reply(1000, true), reply(1000, false)];
         let mut limited = harness(&scripts, 8000, "");
-        assert_eq!(limited.chat.thought_limit(), THINKING_BUDGET);
+        assert_eq!(limited.thinking_budget, THINKING_BUDGET);
         assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
         limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
@@ -1186,7 +1190,7 @@ mod tests {
         let scripts = [reply(1000, false)];
         let mut free = harness(&scripts, 8000, "");
         free.set_thinking_budget(None);
-        assert_eq!(free.chat.thought_limit(), None);
+        assert_eq!(free.thinking_budget, None);
         let mut thought = String::new();
         free.send("go", |event| {
             if let Event::Thought(text) = event {

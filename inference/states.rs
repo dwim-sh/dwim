@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    inference::{Chat, Conversation, LanguageModel, Result, qwen35},
+    inference::{Chat, LanguageModel, Result, qwen35},
     sys,
 };
 
@@ -19,7 +19,7 @@ impl<M: LanguageModel> Chat<M> {
     /// Opens the conversation with the system prompt: from the state saved
     /// by an earlier reading of the same prompt, if there is one and it
     /// fits, and otherwise by reading the prompt, reporting progress as
-    /// [`Conversation::system`] does, and saving the state for the next
+    /// [`Chat::system`] does, and saving the state for the next
     /// time. Returns whether the state was restored.
     pub fn start(&mut self, prompt: &str, on_progress: impl FnMut(usize, usize)) -> Result<bool> {
         let path = state_path(prompt);
