@@ -181,7 +181,7 @@ impl Client {
 
     /// Opens the conversation with the system prompt, from the state the
     /// server saved after an earlier reading of the same prompt if there
-    /// is one, reporting the reading as `Conversation::system` does, and
+    /// is one, reporting the reading as [`Client::system`] does, and
     /// returns whether the state was restored.
     pub fn start(&mut self, prompt: &str, on_progress: impl FnMut(usize, usize)) -> Result<bool> {
         let request = Request::Start {
@@ -194,6 +194,16 @@ impl Client {
             }
             other => Err(unexpected(&other)),
         }
+    }
+
+    /// Opens the conversation with a system prompt, reading it whether or
+    /// not the server has the state of an earlier reading, reporting how
+    /// many of its tokens the model has read so far, out of how many.
+    pub fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
+        let request = Request::System {
+            text: text.to_string(),
+        };
+        self.done(&request, prompting(on_progress))
     }
 
     /// Makes a request, as [`Connection::call`] does, telling `on_status`
@@ -284,13 +294,6 @@ impl Piece {
 }
 
 impl Conversation for Client {
-    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        let request = Request::System {
-            text: text.to_string(),
-        };
-        self.done(&request, prompting(on_progress))
-    }
-
     fn clear(&mut self) -> Result<()> {
         self.done(&Request::Clear, |_| ControlFlow::Continue(()))
     }
@@ -328,10 +331,6 @@ impl Conversation for Client {
 
     fn reserve(&mut self, tokens: usize) {
         self.generation.reserve = tokens;
-    }
-
-    fn thought_limit(&self) -> Option<usize> {
-        self.generation.thought_limit
     }
 
     fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {

@@ -142,10 +142,6 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 /// a model in this process, or one kept with the server that has the
 /// model, and reached over its socket.
 pub trait Conversation {
-    /// Opens the conversation with a system prompt, reporting how many of
-    /// its tokens the model has read so far, out of how many, as it goes.
-    fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()>;
-
     /// Forgets the conversation, so that a system prompt can open another.
     fn clear(&mut self) -> Result<()>;
 
@@ -170,9 +166,6 @@ pub trait Conversation {
 
     /// Keeps `tokens` of the context free: a reply stops short of them.
     fn reserve(&mut self, tokens: usize);
-
-    /// Most tokens a thought may run to, if they are limited.
-    fn thought_limit(&self) -> Option<usize>;
 
     /// Ends a thought that runs to `tokens`, if they are limited, or that
     /// repeats itself, with `closing` written into it as the model's own.
