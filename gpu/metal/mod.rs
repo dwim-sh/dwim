@@ -27,7 +27,10 @@ use objc2_metal::{
     MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, host, quant};
+use crate::{
+    gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, quant},
+    sys::memory,
+};
 
 /// Positions one threadgroup of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -722,10 +725,10 @@ impl Device for Metal {
             .device
             .recommendedMaxWorkingSetSize()
             .saturating_sub(allocated);
-        if let Some(available) = host::available() {
+        if let Some(available) = memory::available() {
             free = free.min(available);
         }
-        if let Some(total) = host::total() {
+        if let Some(total) = memory::total() {
             free = free.min((total / SHARE.1 * SHARE.0).saturating_sub(allocated));
         }
         Some(free)
