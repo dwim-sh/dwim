@@ -74,25 +74,3 @@ pub fn offline() -> bool {
 fn var(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_the_repo_dir_as_the_library_does() {
-        let dir = repo_dir("prism-ml/Ternary-Bonsai-2-27B-gguf").unwrap();
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "models--prism-ml--Ternary-Bonsai-2-27B-gguf"
-        );
-    }
-
-    #[test]
-    fn links_a_snapshot_file_to_its_blob() {
-        assert_eq!(
-            blob_link("abc"),
-            Path::new("..").join("..").join("blobs").join("abc")
-        );
-    }
-}

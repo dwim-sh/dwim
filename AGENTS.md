@@ -70,6 +70,23 @@ are fetched into the user's Hugging Face cache on first use, or by
   before calling a change done.
 * `CONTRIBUTING.md` has the longer version, and how to run SWE-bench Lite.
 
+## Tests
+
+A test checks something `dwim` does: behavior a user or the model would
+find broken, such as what `man/dwim.1` says an option or a tool does. Never
+add a test that only pins how the source is written:
+
+* The wording, order, grouping, or width of help text, a usage line, a
+  status line, or any other text for a person to read. Run `dwim` and read
+  it instead.
+* A constant or a table checked against itself or another table: that a
+  list is sorted, has no duplicates, or names every entry of another.
+* A string or a value copied from the source into the test, or a one-line
+  function restated as its own expected value.
+
+If the only way a test can fail is someone editing text or a table on
+purpose, and the fix is to edit the test to match, do not write it.
+
 ## Coding Style
 
 * Never use `pub(crate)`. A definition is either `pub` or not.

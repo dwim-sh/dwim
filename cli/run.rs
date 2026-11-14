@@ -1348,21 +1348,5 @@ mod tests {
         assert!(
             Command::parse("nothing").is_err_and(|e| e.starts_with("Unknown command /nothing"))
         );
-        // Every command has its line in the help.
-        for name in ["model", "stats", "transcript", "compact", "help"] {
-            assert!(Command::parse(name).is_ok(), "{name}");
-            assert!(
-                COMMANDS
-                    .iter()
-                    .any(|(command, _)| command == &format!("/{name}"))
-            );
-        }
-    }
-
-    #[test]
-    fn tells_the_rate_once_it_can() {
-        assert_eq!(rate(10.0, Duration::from_millis(500)), None);
-        assert_eq!(rate(0.0, Duration::from_secs(2)), None);
-        assert_eq!(rate(10.0, Duration::from_secs(2)), Some(5.0));
     }
 }
