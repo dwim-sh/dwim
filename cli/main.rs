@@ -18,6 +18,7 @@ use std::{
 use argh::{EarlyExit, FromArgValue, FromArgs};
 use dwim::harness::Log;
 use dwim::models::qwen35;
+use dwim::sys::memory;
 
 use opts::{Device, Opts};
 use session::Stderr;
@@ -42,7 +43,7 @@ fn main() {
     }
     let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
-    let result = check_memory().and_then(|()| {
+    let result = memory::check().and_then(|()| {
         if opts.download {
             let mut stderr = Stderr::new();
             let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
@@ -248,30 +249,4 @@ fn options(output: &str) -> BTreeMap<&str, (String, String)> {
             (name, (usage, description))
         })
         .collect()
-}
-
-/// Memory a Mac needs to run the model: its CPU and GPU share it, and the
-/// weights alone take 16 GB of it.
-#[cfg(target_vendor = "apple")]
-const MIN_MEMORY: u64 = 32 << 30;
-
-/// Refuses to go on, before any weights are downloaded, on a Mac with too
-/// little memory to run the model.
-#[cfg(target_vendor = "apple")]
-fn check_memory() -> Result<(), Box<dyn Error>> {
-    let memory = dwim::gpu::host::total().ok_or("cannot determine the memory size")?;
-    if memory < MIN_MEMORY {
-        return Err(format!(
-            "dwim requires {} GiB or more DRAM on a Mac, and this one has {} GiB",
-            MIN_MEMORY >> 30,
-            memory >> 30
-        )
-        .into());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn check_memory() -> Result<(), Box<dyn Error>> {
-    Ok(())
 }

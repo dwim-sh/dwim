@@ -26,7 +26,7 @@ impl Device for Cpu {
     }
 
     fn memory(&self) -> Option<u64> {
-        crate::gpu::host::available()
+        crate::sys::memory::available()
     }
 
     fn upload(&self, tensor: Tensor) -> Tensor {

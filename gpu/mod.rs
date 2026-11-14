@@ -8,7 +8,6 @@
 mod tests;
 
 pub mod cpu;
-pub mod host;
 #[cfg(target_vendor = "apple")]
 pub mod metal;
 pub mod quant;

@@ -34,6 +34,10 @@ compiles the Vulkan kernels.
   `vulkan` (WGSL kernels compiled to SPIR-V at build time), and `metal`
   (MSL kernels compiled when the device opens). `quant` is the 4- and 8-bit
   block weight formats.
+* `sys/`: what is asked of the operating system, a directory for each
+  (`darwin`, `linux`) with the same modules, re-exported as `sys::memory`
+  and so on for the one being built for. Code that differs by system goes
+  here, not behind a `cfg` where it is used.
 * `scripts/`: `swebench.py` runs SWE-bench Lite; `release` cuts a release.
 * `testing/`: `difftest`, differential testing of the GPU against the CPU
   with the real weights.
