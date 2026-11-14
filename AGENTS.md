@@ -9,16 +9,15 @@ One package: `lib.rs` is the library, with the directories below as its
 modules, `cli/` and `testing/difftest/` are its two binaries, and `build.rs`
 compiles the Vulkan kernels.
 
-* `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI,
-  `serve`, which runs the server, and `bench`, which times the model at
-  depths of context.
+* `cli/`: the `dwim` command: arguments, the terminal UI, `serve`, which
+  runs the server, and `bench`, which times the model at depths of context.
 * `inference/`: running the language model: `gguf` reads the weights file,
   `quants` unpacks the block formats llama.cpp quantizes to, `tokenizer`
   builds the BPE tokenizer from it, `qwen35` is the transformer as
   operations on a device, `model` loads it onto one and sizes its context,
   `chat` is the conversation around it, `states` keeps the states of system
-  prompts read before, and `hub` is the Hugging Face cache the weights are
-  kept in.
+  prompts read before, `hub` is the Hugging Face cache the weights are kept
+  in, and `fetch` downloads them into it.
 * `harness/`: the agent around the model: the system prompt (which includes
   this file), the tool loop, compaction near the end of the context, the
   thinking budget if one is set and the cap on a turn's calls, and the

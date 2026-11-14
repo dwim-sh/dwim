@@ -2,8 +2,9 @@
 //! around it.
 
 mod chat;
+mod fetch;
 pub mod gguf;
-pub mod hub;
+mod hub;
 mod model;
 pub mod quants;
 pub mod qwen35;
@@ -14,8 +15,9 @@ pub mod testing;
 mod tokenizer;
 
 pub use chat::{Answer, Chat, Chunk, DRAFTS, Format, Reply, Stats, Tally, Turn};
+pub use fetch::Download;
 pub use gguf::Gguf;
-pub use model::{Device, Model, Progress, Size};
+pub use model::{Device, Model, OnDisk, Progress, Size};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 
