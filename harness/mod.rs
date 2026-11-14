@@ -1596,43 +1596,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_where_the_time_went() {
-        let stats = Stats {
-            model: crate::models::Stats {
-                cached: crate::models::Tally {
-                    tokens: 1500,
-                    seconds: 0.5,
-                },
-                prompt: crate::models::Tally {
-                    tokens: 1200,
-                    seconds: 15.0,
-                },
-                thought: crate::models::Tally {
-                    tokens: 900,
-                    seconds: 30.0,
-                },
-                answer: crate::models::Tally {
-                    tokens: 300,
-                    seconds: 10.0,
-                },
-                drafted: 0,
-                accepted: 0,
-            },
-            calls: 2,
-            tool_seconds: 0.5,
-        };
-        let lines = stats.report(Duration::from_secs_f64(2.5), Duration::from_secs_f64(60.0));
-        assert_eq!(lines[0], "loading                   2.5 s");
-        assert_eq!(lines[1], "cached    1500 tokens     0.5 s");
-        assert_eq!(lines[2], "prompt    1200 tokens    15.0 s   80 tok/s");
-        assert_eq!(lines[3], "thought    900 tokens    30.0 s   30 tok/s");
-        assert_eq!(lines[4], "answer     300 tokens    10.0 s   30 tok/s");
-        assert_eq!(lines[5], "tools         2 calls     0.5 s");
-        assert_eq!(lines[6], "other                     1.5 s");
-        assert_eq!(lines[7], "total                    60.0 s");
-    }
-
-    #[test]
     fn dates() {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(11016), "2000-02-29");

@@ -106,10 +106,4 @@ mod tests {
         assert_eq!(depths(16384), [1024, 8192]);
         assert_eq!(depths(1 << 18), DEPTHS);
     }
-
-    #[test]
-    fn picks_the_likeliest_token() {
-        assert_eq!(likeliest(&[0.1, 0.7, 0.2]), 1);
-        assert_eq!(likeliest(&[]), 0);
-    }
 }

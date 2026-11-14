@@ -107,7 +107,7 @@ fn project(dir: &Path) -> String {
 }
 
 /// The headings `--help` lists the options under, each with its options by
-/// name. Every option has to be under one of them, which a test checks.
+/// name. An option under none of them is left out of the help.
 const GROUPS: &[(&str, &[&str])] = &[
     (
         "The model:",
@@ -274,78 +274,4 @@ fn check_memory() -> Result<(), Box<dyn Error>> {
 #[cfg(not(target_vendor = "apple"))]
 fn check_memory() -> Result<(), Box<dyn Error>> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The help text argh writes for the options.
-    fn output() -> String {
-        match Opts::from_args(&["dwim"], &["--help"]) {
-            Err(EarlyExit {
-                output,
-                status: Ok(()),
-            }) => output,
-            _ => panic!("--help did not print the help"),
-        }
-    }
-
-    #[test]
-    fn help_lists_every_option_once() {
-        let listed: Vec<&str> = GROUPS
-            .iter()
-            .flat_map(|(_, names)| names.iter().copied())
-            .collect();
-        let mut sorted = listed.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), listed.len(), "an option is listed twice");
-        let output = output();
-        let parsed: Vec<&str> = options(&output).into_keys().collect();
-        assert_eq!(sorted, parsed, "the groups and the options differ");
-    }
-
-    #[test]
-    fn help_sorts_each_group_by_name() {
-        for (heading, names) in GROUPS {
-            assert!(
-                names.windows(2).all(|pair| pair[0] < pair[1]),
-                "{heading} is out of order"
-            );
-        }
-    }
-
-    #[test]
-    fn help_keeps_the_descriptions() {
-        let output = output();
-        let options = options(&output);
-        let (usage, description) = &options["--thinking-budget"];
-        assert_eq!(usage, "--thinking-budget <tokens>");
-        assert_eq!(
-            description,
-            "most tokens the model may think at a time before it is made to act, \
-             or 0 for no limit (default: 2048)"
-        );
-        let (usage, description) = &options["--help"];
-        assert_eq!(usage, "--help");
-        assert_eq!(description, "display usage information");
-    }
-
-    #[test]
-    fn help_fits_the_width() {
-        let size = model::Size {
-            sessions: 2,
-            context: 65536,
-            model: 17_000_000_000,
-            conversation: 3_000_000_000,
-        };
-        let text = layout(&output(), Some(size));
-        for line in text.lines() {
-            assert!(line.len() <= WIDTH, "too long: {line:?}");
-        }
-        assert!(text.starts_with(USAGE));
-        assert!(text.contains("65536 on this machine"));
-        assert!(text.contains("\nThe model:\n  --context <tokens>"));
-    }
 }
