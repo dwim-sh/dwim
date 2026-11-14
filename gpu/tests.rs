@@ -714,7 +714,7 @@ pub fn cache_round_trips<D: Device>(gpu: &D) {
     let mut c = cache(gpu, &data, 7 * CACHE_BLOCK);
     let blocks: Vec<_> = data
         .chunks_exact(CACHE_BLOCK)
-        .map(crate::gpu::quantize)
+        .map(quant::quantize)
         .collect();
     let bytes = |blocks: &[(u16, [i8; CACHE_BLOCK])]| -> Vec<u8> {
         let quants = blocks.iter().flat_map(|(_, q)| q.map(|q| q as u8));

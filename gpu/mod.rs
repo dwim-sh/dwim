@@ -8,6 +8,7 @@
 mod tests;
 
 pub mod cpu;
+pub mod float;
 pub mod quant;
 pub mod vulkan;
 
@@ -41,7 +42,7 @@ cfg_select! {
 pub const CONV_KERNEL: usize = 4;
 
 /// Activations a block of a key or value cache holds: 8-bit integers
-/// sharing an f16 scale, as [`quantize`] makes them.
+/// sharing an f16 scale, as [`quant::quantize`] makes them.
 pub const CACHE_BLOCK: usize = 32;
 
 /// A weight matrix on the host, of shape `[rows, cols]`: raw bf16 bits, or
@@ -147,7 +148,7 @@ impl Tensor {
             match self {
                 Tensor::Bf16 { data, .. } => {
                     for (o, &w) in out.iter_mut().zip(&data[r * cols..][..cols]) {
-                        *o = bf16(w);
+                        *o = float::bf16(w);
                     }
                 }
                 Tensor::Q4_0 { scales, quants, .. } => {
@@ -346,82 +347,8 @@ pub trait Device {
     );
 }
 
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// `ln(1 + e^x)`, without overflowing for large `x`.
-pub fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
-
-/// Converts bf16 bits to f32: bf16 is the top half of an f32.
-pub fn bf16(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-/// The largest finite half-precision float.
-pub const F16_MAX: f32 = 65504.0;
-
-/// Converts an f32 to the bits of the nearest IEEE half-precision float,
-/// ties to even, clamped to the largest finite one.
-pub fn to_f16(x: f32) -> u16 {
-    let sign = ((x.to_bits() >> 16) & 0x8000) as u16;
-    let a = x.abs().min(F16_MAX);
-    if a < f32::from_bits((127 - 14) << 23) {
-        // Subnormal: multiples of 2^-24, which may round up to the smallest
-        // normal, whose bits follow on from the largest subnormal's.
-        return sign | (a * (1u32 << 24) as f32).round_ties_even() as u16;
-    }
-    let e = ((a.to_bits() >> 23) & 0xff) as i32 - 127;
-    // The mantissa scaled to [1024, 2048), which rounding may carry to 2048.
-    let m = (a * f32::from_bits(((127 + 10 - e) as u32) << 23)).round_ties_even() as u32;
-    let (e, m) = if m == 2048 { (e + 1, 1024) } else { (e, m) };
-    sign | (((e + 15) as u16) << 10) | (m - 1024) as u16
-}
-
-/// Quantizes a block of [`CACHE_BLOCK`] activations as caches hold them: the
-/// scale is the largest magnitude over 127 rounded to f16, and each
-/// activation the nearest multiple of it, ties away from zero. Returns the
-/// scale's bits and the multiples. Every device gets the same bits: the
-/// multiples are settled by comparing with the midpoints between them,
-/// which are exact in f32, so a division that is not correctly rounded, as
-/// on a GPU, does not change them.
-pub fn quantize(block: &[f32]) -> (u16, [i8; CACHE_BLOCK]) {
-    assert_eq!(block.len(), CACHE_BLOCK);
-    let amax = block.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-    let bits = to_f16(amax * (1.0 / 127.0));
-    let d = from_f16(bits);
-    let mut q = [0; CACHE_BLOCK];
-    if d > 0.0 {
-        for (q, &x) in q.iter_mut().zip(block) {
-            let a = x.abs();
-            let mut n = (a / d).round().min(128.0);
-            if a >= (n + 0.5) * d {
-                n += 1.0;
-            } else if n > 0.0 && a < (n - 0.5) * d {
-                n -= 1.0;
-            }
-            *q = (n.min(127.0) as i8) * if x < 0.0 { -1 } else { 1 };
-        }
-    }
-    (bits, q)
-}
-
 /// The bytes a cache holds for `len` activations, a whole number of blocks.
 pub fn cache_bytes(len: usize) -> usize {
     assert!(len.is_multiple_of(CACHE_BLOCK));
     len + len / CACHE_BLOCK * 2
-}
-
-/// Converts the bits of a finite IEEE half-precision float to f32.
-pub fn from_f16(bits: u16) -> f32 {
-    let (bits, sign) = (bits as u32, bits as u32 & 0x8000);
-    let exp = (bits >> 10) & 0x1f;
-    // A normal float has an implicit leading one; a subnormal float scales
-    // like the smallest normal one.
-    let mantissa = (bits & 0x3ff) | (((exp != 0) as u32) << 10);
-    let scale = f32::from_bits((exp.max(1) + 127 - 25) << 23);
-    let magnitude = mantissa as f32 * scale;
-    f32::from_bits(magnitude.to_bits() | (sign << 16))
 }
