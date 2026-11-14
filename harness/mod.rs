@@ -598,6 +598,7 @@ impl<C: Conversation> Harness<C> {
     /// of the first message if that went ahead of it when it was sent.
     pub fn reopen(&mut self, chat: C) -> Result<(), Box<dyn Error>> {
         self.chat = chat;
+        self.note_tokens = compaction::reserve(&mut self.chat)?;
         let mut turns: Vec<Turn> = self
             .transcript
             .iter()
@@ -1083,6 +1084,32 @@ mod tests {
         let tokens = harness.chat.tokens();
         harness.reopen(chat(&[], 8000, "")).unwrap();
         assert_eq!(harness.chat.tokens(), tokens);
+    }
+
+    #[test]
+    fn a_reopened_conversation_keeps_its_budget_and_its_reserve() {
+        // The conversation it is reopened on is new, and knows neither the
+        // thinking budget nor the room kept for a compaction's note: a
+        // thought of 1000 tokens is ended at the budget of 100 all the
+        // same, and as much room is free as was.
+        let mut harness = harness(&[], 8000, "");
+        harness.set_thinking_budget(Some(100));
+        let free = harness.chat.free();
+        harness
+            .reopen(chat(&[reply(1000, false)], 8000, ""))
+            .unwrap();
+        assert_eq!(harness.chat.free(), free);
+        let mut thought = String::new();
+        harness
+            .send("go", |event| {
+                if let Event::Thought(text) = event {
+                    thought.push_str(&text);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(thought.contains(RECALL_CLOSING), "{thought}");
+        assert!(thought.len() < 1000, "{}", thought.len());
     }
 
     /// The records of the log at `path`, which is removed.
