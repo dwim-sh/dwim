@@ -101,3 +101,17 @@ purpose, and the fix is to edit the test to match, do not write it.
 * A file reads from top to bottom: a function comes before the ones it
   calls, so the public and high-level ones are first and the helpers and
   foreign declarations last.
+
+## Commits and Pull Requests
+
+* A subject is `area: What changes`, as in `tools: Read only regular files`.
+  The area is the directory or the module the change is in (`sys`,
+  `gpu/vulkan`, `tools/bash`, `ci`), the rest is in the imperative, and all
+  of it fits in 72 characters.
+* The subject names the things that change, not the intent behind them:
+  `sys: Move libc, mmap and dirs callers behind sys/unix`, not `Move what
+  dwim asks of the operating system into sys/`. Someone reading one line
+  of `git log` should know what was touched.
+* The body says why, and what was and was not verified.
+* A pull request's title is a subject too, written the same way, since it
+  becomes the subject of the commit that merges it.
