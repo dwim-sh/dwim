@@ -45,9 +45,9 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, qwen35};
+use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, Size, qwen35};
 use crate::server::protocol::{
-    Generation, Opened, Piece, Request, Response, Sampling, Size, State, Status, Welcome,
+    Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
 };
 use crate::sys;
 

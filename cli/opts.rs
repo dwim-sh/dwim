@@ -1,22 +1,19 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use argh::{FromArgValue, FromArgs};
+use argh::FromArgs;
+use dwim::inference::{Device, Model, Size};
 
-use crate::{
-    model::{self, Size},
-    session::Settings,
-    tui,
-};
+use crate::{model, session::Settings, tui};
 
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
     /// model to run (default: qwen3.8-27b)
-    #[argh(option, default = "model::NAME.to_string()")]
+    #[argh(option, default = "Model::NAME.to_string()")]
     pub model: String,
 
     /// device to run the model on: gpu (default), or cpu
-    #[argh(option, default = "Device::Gpu")]
+    #[argh(option, default = "Device::Gpu", from_str_fn(device))]
     pub device: Device,
 
     /// tokens of conversation each session has room for (default: as
@@ -119,6 +116,15 @@ pub fn budget(tokens: usize) -> Option<usize> {
     (tokens > 0).then_some(tokens)
 }
 
+/// A device as `--device` takes it.
+fn device(value: &str) -> Result<Device, String> {
+    match value {
+        "cpu" => Ok(Device::Cpu),
+        "gpu" => Ok(Device::Gpu),
+        _ => Err(format!("unknown device '{value}' (expected gpu or cpu)")),
+    }
+}
+
 /// A number of sessions as `--sessions` takes it: 1 or more.
 fn sessions(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
@@ -133,23 +139,6 @@ fn temperature(value: &str) -> Result<f32, String> {
     match value.parse::<f32>() {
         Ok(t) if t.is_finite() && t >= 0.0 => Ok(t),
         _ => Err("expected a temperature, a number 0 or more".to_string()),
-    }
-}
-
-/// Where to run the model.
-#[derive(Clone, Copy)]
-pub enum Device {
-    Cpu,
-    Gpu,
-}
-
-impl FromArgValue for Device {
-    fn from_arg_value(value: &str) -> Result<Self, String> {
-        match value {
-            "cpu" => Ok(Device::Cpu),
-            "gpu" => Ok(Device::Gpu),
-            _ => Err(format!("unknown device '{value}' (expected gpu or cpu)")),
-        }
     }
 }
 
@@ -207,9 +196,9 @@ pub fn help(output: &str, args: &[&str]) -> String {
         .iter()
         .position(|&arg| arg == "--device")
         .and_then(|i| args.get(i + 1))
-        .and_then(|value| Device::from_arg_value(value).ok())
+        .and_then(|value| device(value).ok())
         .unwrap_or(Device::Gpu);
-    layout(output, model::default_size(device))
+    layout(output, Model::default_size(device))
 }
 
 /// The help text laid out from argh's `output`, saying the default context

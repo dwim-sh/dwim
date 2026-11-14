@@ -9,18 +9,15 @@
 
 use std::error::Error;
 
-use dwim::inference::Format;
+use dwim::inference::Model;
 use dwim::server::{self, Hello, Server};
 
-use crate::{
-    model,
-    session::{self, Settings, Stderr},
-};
+use crate::session::{self, Settings, Stderr};
 
 /// Runs the server with the model as `settings` have it, until it exits.
 pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let path = server::socket_path();
-    let sessions = settings.sessions.unwrap_or(model::SESSIONS);
+    let sessions = settings.sessions.unwrap_or(Model::SESSIONS);
     if sessions == 0 {
         return Err("a server needs room for one session at least".into());
     }
@@ -33,19 +30,21 @@ pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let server = Server::bind(&path, hello)?;
     eprintln!("listening on {}", path.display());
     let mut stderr = Stderr::new();
-    let loaded = match session::load_model(settings, sessions, |status| {
+    let model = match session::load_model(settings, sessions, |status| {
         stderr.report(&status);
         server.status(&status);
     }) {
-        Ok(loaded) => loaded,
+        Ok(model) => model,
         Err(e) => {
             server.fail(&e.to_string());
             return Err(e);
         }
     };
-    let format = Format::new(loaded.tokenizer)?;
-    let gguf = loaded.gguf;
+    let format = model.format().clone();
+    let (device, size) = (model.device().to_string(), model.size());
     let temperature = settings.temperature;
-    let sampler = move |asked: Option<f32>| model::sampler(&gguf, asked.or(temperature));
-    server.run(loaded.model, format, loaded.device, loaded.size, sampler)
+    let sampler = model.sampler();
+    server.run(Box::new(model), format, device, size, move |asked| {
+        sampler(asked.or(temperature))
+    })
 }

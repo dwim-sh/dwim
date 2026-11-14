@@ -4,6 +4,7 @@
 mod chat;
 pub mod gguf;
 pub mod hub;
+mod model;
 pub mod quants;
 pub mod qwen35;
 mod sampler;
@@ -13,6 +14,7 @@ mod tokenizer;
 
 pub use chat::{Answer, Chat, Chunk, DRAFTS, Format, Reply, Stats, Tally, Turn};
 pub use gguf::Gguf;
+pub use model::{Device, Model, Progress, Size};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 
@@ -134,7 +136,7 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 }
 
 /// The cosines and sines of the angles rotary position embeddings rotate
-/// by, laid out as [`Device::rope`] expects, for positions up to `max_len`
+/// by, laid out as [`crate::gpu::Device::rope`] expects, for positions up to `max_len`
 /// and `rot_dim` rotated elements per head. Each pair of elements rotates at
 /// its own frequency.
 pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {

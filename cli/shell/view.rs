@@ -5,12 +5,11 @@ use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
 use dwim::gpu::BACKEND;
-use dwim::inference::qwen35;
+use dwim::inference::{Device, Model, Size, qwen35};
 use dwim::sys;
 
 use crate::{
-    model::{self, Size},
-    opts::Device,
+    model,
     shell::cmd::COMMANDS,
     tui::{self, Line, span},
 };
@@ -43,7 +42,7 @@ pub fn model_listing(
     columns: usize,
 ) -> Vec<Line> {
     let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match model::locate(name) {
+    let weights = match Model::dir(name) {
         Ok(dir) => {
             let (files, bytes) = model::on_disk(&dir);
             match files {

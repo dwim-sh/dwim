@@ -19,10 +19,9 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::harness::{self, Event, Log};
+use dwim::inference::{Device, Size};
 
 use crate::{
-    model::Size,
-    opts::Device,
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };

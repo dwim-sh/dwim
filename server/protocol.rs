@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::inference::{Answer, Reply, Stats, Turn};
+use crate::inference::{Answer, Reply, Size, Stats, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -214,17 +214,4 @@ pub enum Status {
     /// The session reached a server, and opens a conversation on it. The
     /// session tells itself this; a server never sends it.
     Opening,
-}
-
-/// How many sessions the model has room for at once, the tokens of
-/// conversation each has room for, and the device memory they take:
-/// `model` bytes for the weights and the activations, which the sessions
-/// share, and `conversation` bytes more for each session, for its recurrent
-/// states and its tokens of context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Size {
-    pub sessions: usize,
-    pub context: usize,
-    pub model: u64,
-    pub conversation: u64,
 }
