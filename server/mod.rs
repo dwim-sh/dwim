@@ -125,7 +125,7 @@ fn state_path(prompt: &str) -> Option<PathBuf> {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     Some(
-        dirs::cache_dir()?
+        sys::dirs::cache()?
             .join("dwim")
             .join("states")
             .join(format!("{hash:016x}.bin")),

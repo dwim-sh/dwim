@@ -406,12 +406,7 @@ fn spawn(settings: &Settings) -> Result<(), Box<dyn Error>> {
 /// (`~/.local/state`, or on macOS, where there is none, `~/Library/Application
 /// Support`).
 pub fn log_path() -> Option<PathBuf> {
-    Some(
-        dirs::state_dir()
-            .or_else(dirs::data_local_dir)?
-            .join("dwim")
-            .join("server.log"),
-    )
+    Some(sys::dirs::state()?.join("dwim").join("server.log"))
 }
 
 /// What the server is doing, as it is told on standard error: a line

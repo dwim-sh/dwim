@@ -12,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::sys;
+
 /// The server the files come from unless `HF_ENDPOINT` names another.
 const ENDPOINT: &str = "https://huggingface.co";
 
@@ -25,7 +27,7 @@ pub fn cache_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(home).join("hub"));
     }
     Some(
-        dirs::home_dir()?
+        sys::dirs::home()?
             .join(".cache")
             .join("huggingface")
             .join("hub"),
