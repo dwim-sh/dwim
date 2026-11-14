@@ -136,23 +136,6 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
     }
 }
 
-/// The cosines and sines of the angles rotary position embeddings rotate
-/// by, laid out as [`crate::gpu::Device::rope`] expects, for positions up to `max_len`
-/// and `rot_dim` rotated elements per head. Each pair of elements rotates at
-/// its own frequency.
-pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
-    let half = rot_dim / 2;
-    let mut table = Vec::with_capacity(max_len * rot_dim);
-    for pos in 0..max_len {
-        for i in 0..half {
-            let freq = 1.0 / theta.powf((2 * i) as f32 / rot_dim as f32);
-            let (sin, cos) = (pos as f32 * freq).sin_cos();
-            table.extend([cos, sin]);
-        }
-    }
-    table
-}
-
 /// A conversation with the model, as the harness holds one: a [`Chat`] on
 /// a model in this process, or one kept with the server that has the
 /// model, and reached over its socket.

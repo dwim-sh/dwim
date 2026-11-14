@@ -15,7 +15,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
-    inference::{Gguf, LanguageModel, Result, gguf, hub, quants, rope_table},
+    inference::{Gguf, LanguageModel, Result, gguf, hub, quants},
 };
 
 /// The model as `dwim` names it.
@@ -305,8 +305,8 @@ impl Memory {
 
 /// The model, with its weights on a device, and the state of a sequence.
 pub struct Model<D: Device> {
-    pub config: Config,
-    pub device: D,
+    config: Config,
+    device: D,
     /// The file, kept mapped for the embedding table, which is looked up
     /// on the CPU: it is most of a third of a gigabyte, and a token needs
     /// one row of it.
@@ -1504,6 +1504,23 @@ impl<D: Device> State<D> {
         device.resize(&mut self.up, n * self.intermediate);
         device.resize(&mut self.gate_ffn, n * self.intermediate);
     }
+}
+
+/// The cosines and sines of the angles rotary position embeddings rotate
+/// by, laid out as [`Device::rope`] expects, for positions up to `max_len`
+/// and `rot_dim` rotated elements per head. Each pair of elements rotates at
+/// its own frequency.
+fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
+    let half = rot_dim / 2;
+    let mut table = Vec::with_capacity(max_len * rot_dim);
+    for pos in 0..max_len {
+        for i in 0..half {
+            let freq = 1.0 / theta.powf((2 * i) as f32 / rot_dim as f32);
+            let (sin, cos) = (pos as f32 * freq).sin_cos();
+            table.extend([cos, sin]);
+        }
+    }
+    table
 }
 
 #[cfg(test)]
