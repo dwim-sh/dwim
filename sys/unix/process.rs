@@ -17,6 +17,7 @@ mod tests {
     use std::process::{self, Command};
 
     use super::*;
+    use crate::sys::user;
 
     #[test]
     fn a_process_is_alive_until_it_is_reaped() {
@@ -30,7 +31,7 @@ mod tests {
     #[test]
     fn another_users_process_is_alive() {
         // Process 1 is root's, and is always there.
-        if unsafe { libc::getuid() } != 0 {
+        if user::id() != 0 {
             assert!(alive(1));
         }
     }
