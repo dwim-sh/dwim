@@ -15,8 +15,10 @@ compiles the Vulkan kernels.
 * `inference/`: running the language model: `gguf` reads the weights file,
   `quants` unpacks the block formats llama.cpp quantizes to, `tokenizer`
   builds the BPE tokenizer from it, `qwen35` is the transformer as
-  operations on a device, `chat` is the conversation around it, and `hub`
-  is the Hugging Face cache the weights are kept in.
+  operations on a device, `model` loads it onto one and sizes its context,
+  `chat` is the conversation around it, `states` keeps the states of system
+  prompts read before, and `hub` is the Hugging Face cache the weights are
+  kept in.
 * `harness/`: the agent around the model: the system prompt (which includes
   this file), the tool loop, compaction near the end of the context, the
   thinking budget if one is set and the cap on a turn's calls, and the
