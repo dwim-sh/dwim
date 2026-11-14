@@ -18,7 +18,7 @@ usually a link and a title, and the comment you draft is the write-up.
    abstract, the body, and the appendices that give prompts, harnesses, or
    results on open-weight models. Don't write from the abstract alone.
 3. Check every claim you make about dwim against the code: the harness
-   under `harness/`, the tools under `tools/`, the model under `models/`,
+   under `harness/`, the tools under `tools/`, the model under `inference/`,
    and the manual page. A number about dwim says whether it was measured
    or worked out from the code.
 

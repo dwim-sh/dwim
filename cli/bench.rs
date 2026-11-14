@@ -9,6 +9,8 @@
 
 use std::{error::Error, time::Instant};
 
+use dwim::inference::LanguageModel as _;
+
 use crate::session::{self, Settings, Stderr};
 
 /// The depths of context, in tokens, at which the model is timed: those
@@ -34,8 +36,7 @@ const FILLER: &str = include_str!("bench.rs");
 /// a second, reading and generating, on standard output.
 pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let mut stderr = Stderr::new();
-    let loaded = session::load_model(settings, 1, |status| stderr.report(&status))?;
-    let mut model = loaded.model;
+    let mut model = session::load_model(settings, 1, |status| stderr.report(&status))?;
     let depths = depths(model.max_len());
     if depths.is_empty() {
         return Err(format!(
@@ -45,7 +46,7 @@ pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let filler = loaded.tokenizer.encode(FILLER)?;
+    let filler = model.format().tokenizer.encode(FILLER)?;
     let token = |i: usize| filler[i % filler.len()];
     println!("{:>8}  {:>12}  {:>12}", "context", "read", "generate");
     let mut pos = 0;

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use dwim::models::{
+use dwim::inference::{
     hub,
     qwen35::{self, File},
 };

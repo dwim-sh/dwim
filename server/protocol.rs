@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Answer, Reply, Stats, Turn};
+use crate::inference::{Answer, Chunk, Reply, Sampler, Size, Stats, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -172,12 +172,47 @@ pub struct Sampling {
     pub seed: u64,
 }
 
-/// A piece of a reply, as [`crate::models::Chunk`] has it, owned.
+impl Sampling {
+    /// The settings of `sampler`.
+    pub fn of(sampler: &Sampler) -> Self {
+        Self {
+            temperature: sampler.temperature,
+            top_k: sampler.top_k,
+            top_p: sampler.top_p,
+            min_p: sampler.min_p,
+            seed: sampler.seed,
+        }
+    }
+
+    /// A sampler with the settings.
+    pub fn sampler(&self) -> Sampler {
+        Sampler::new(
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.min_p,
+            self.seed,
+        )
+    }
+}
+
+/// A piece of a reply, as [`crate::inference::Chunk`] has it, owned.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Piece {
     Thought(String),
     Text(String),
     Token,
+}
+
+impl Piece {
+    /// `chunk`, owned.
+    pub fn of(chunk: Chunk) -> Self {
+        match chunk {
+            Chunk::Thought(text) => Piece::Thought(text.to_string()),
+            Chunk::Text(text) => Piece::Text(text.to_string()),
+            Chunk::Token => Piece::Token,
+        }
+    }
 }
 
 /// What the server is doing while a request waits.
@@ -214,17 +249,4 @@ pub enum Status {
     /// The session reached a server, and opens a conversation on it. The
     /// session tells itself this; a server never sends it.
     Opening,
-}
-
-/// How many sessions the model has room for at once, the tokens of
-/// conversation each has room for, and the device memory they take:
-/// `model` bytes for the weights and the activations, which the sessions
-/// share, and `conversation` bytes more for each session, for its recurrent
-/// states and its tokens of context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Size {
-    pub sessions: usize,
-    pub context: usize,
-    pub model: u64,
-    pub conversation: u64,
 }

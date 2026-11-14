@@ -25,7 +25,7 @@ use std::{
 };
 
 use dwim::gpu::{Cpu, Device, Gpu};
-use dwim::models::{
+use dwim::inference::{
     Gguf, LanguageModel,
     qwen35::{self, Model},
 };
@@ -254,7 +254,7 @@ impl Run {
     /// Has the CPU run `prompt` in the pieces the GPU will, and then write
     /// the continuation a token at a time.
     fn record(cpu: &mut Model<Cpu>, gguf: &Gguf, prompt: &str) -> Result<Self> {
-        let tokenizer = dwim::models::Tokenizer::from_gguf(gguf)?;
+        let tokenizer = dwim::inference::Tokenizer::from_gguf(gguf)?;
         let mut run = Self {
             tokens: tokenizer.encode(prompt)?,
             prompt: 0,
@@ -381,7 +381,7 @@ fn key(root: &Path, model: &Path) -> Result<u64> {
         .iter()
         .map(|f| root.join("gpu").join(f))
         .collect();
-    for entry in std::fs::read_dir(root.join("models"))? {
+    for entry in std::fs::read_dir(root.join("inference"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "rs") {
             files.push(path);

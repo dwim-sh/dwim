@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     gpu::{Tensor, bf16, quant},
-    models::{Result, quants},
+    inference::{Result, quants},
     sys::mmap::Map,
 };
 

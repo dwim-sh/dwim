@@ -5,27 +5,21 @@
 use std::{
     env,
     error::Error,
-    fmt,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::models::{Gguf, LanguageModel, Tokenizer};
+use dwim::inference::{Device, Model, Progress, Tally};
 use dwim::server::{self, Client, Connection, protocol::Welcome};
 use dwim::sys;
 
-use crate::{
-    fetch,
-    model::{self, Opened, Size},
-    opts::Device,
-};
+use crate::{fetch, model};
 
 pub use dwim::server::protocol::Status;
 
@@ -62,25 +56,6 @@ pub struct Settings {
     pub shell: Option<PathBuf>,
 }
 
-impl fmt::Display for Device {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Device::Cpu => "cpu",
-            Device::Gpu => "gpu",
-        })
-    }
-}
-
-/// The model loaded onto its device, with the file it came from.
-pub struct LoadedModel {
-    pub model: Box<dyn LanguageModel>,
-    pub tokenizer: Tokenizer,
-    pub gguf: Arc<Gguf>,
-    /// The name of the device it runs on.
-    pub device: String,
-    pub size: Size,
-}
-
 /// The harness around the model, ready for a message.
 pub struct Loaded {
     pub harness: Harness<Client>,
@@ -95,7 +70,7 @@ pub fn fetch_model(
     settings: &Settings,
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = model::locate(&settings.model)?;
+    let dir = Model::dir(&settings.model)?;
     fetch::fetch(&dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
@@ -113,25 +88,21 @@ pub fn load_model(
     settings: &Settings,
     sessions: usize,
     mut on_status: impl FnMut(Status),
-) -> Result<LoadedModel, Box<dyn Error>> {
+) -> Result<Model, Box<dyn Error>> {
     let dir = fetch_model(settings, &mut on_status)?;
-    let gguf = model::open(&dir)?;
-    let device = Opened::open(settings.device)?;
-    let name = device.name();
-    on_status(Status::Device(name.clone()));
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let size = model::size(&gguf, &device, settings.context, sessions)?;
-    on_status(Status::Sized(size));
-    let model = device.load(gguf.clone(), size.context, |done, total| {
-        on_status(Status::Weights { done, total })
-    })?;
-    Ok(LoadedModel {
-        model,
-        tokenizer,
-        gguf,
-        device: name,
-        size,
-    })
+    Model::load(
+        &dir,
+        settings.device,
+        settings.context,
+        sessions,
+        |progress| {
+            on_status(match progress {
+                Progress::Device(name) => Status::Device(name),
+                Progress::Sized(size) => Status::Sized(size),
+                Progress::Weights { done, total } => Status::Weights { done, total },
+            })
+        },
+    )
 }
 
 /// Reaches the server, starting one if none is running, opens a session
@@ -210,6 +181,77 @@ fn open(
     })?;
     client.on_status(on_status);
     Ok((client, system))
+}
+
+/// Where `stats` say a session's time has gone, as lines, given how long loading the model took and
+/// how long everything took: what is left over is the time outside the
+/// model and the tools.
+pub fn accounting(stats: &harness::Stats, loading: Duration, total: Duration) -> Vec<String> {
+    let m = &stats.model;
+    let row = |name: &str, count: String, seconds: f64, rate: String| {
+        format!("{name:<8}{count:>13}{seconds:>8.1} s{rate:>11}")
+    };
+    let tokens = |name: &str, tally: &Tally| {
+        row(
+            name,
+            format!("{} tokens", tally.tokens),
+            tally.seconds,
+            format!("{:.0} tok/s", tally.rate()),
+        )
+    };
+    let accounted = loading.as_secs_f64()
+        + m.cached.seconds
+        + m.prompt.seconds
+        + m.thought.seconds
+        + m.answer.seconds
+        + stats.tool_seconds;
+    let mut lines = vec![
+        row(
+            "loading",
+            String::new(),
+            loading.as_secs_f64(),
+            String::new(),
+        ),
+        row(
+            "cached",
+            format!("{} tokens", m.cached.tokens),
+            m.cached.seconds,
+            String::new(),
+        ),
+        tokens("prompt", &m.prompt),
+        tokens("thought", &m.thought),
+        tokens("answer", &m.answer),
+        row(
+            "tools",
+            format!("{} calls", stats.calls),
+            stats.tool_seconds,
+            String::new(),
+        ),
+        row(
+            "other",
+            String::new(),
+            (total.as_secs_f64() - accounted).max(0.0),
+            String::new(),
+        ),
+        row("total", String::new(), total.as_secs_f64(), String::new()),
+    ];
+    // Drafting, after the tokens generated, where the model drafted.
+    if m.drafted > 0 {
+        lines.insert(
+            5,
+            format!(
+                "{:<8}{:>13}{:>10}{:>11}",
+                "drafts",
+                format!("{} tokens", m.drafted),
+                "",
+                format!("{:.0}% kept", 100.0 * m.accepted as f64 / m.drafted as f64)
+            ),
+        );
+    }
+    lines
+        .into_iter()
+        .map(|line| line.trim_end().to_string())
+        .collect()
 }
 
 /// The server listening, as it says who it is, if one is.

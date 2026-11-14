@@ -16,7 +16,7 @@ use std::{
 
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
-use dwim::models::qwen35;
+use dwim::inference::Model;
 use dwim::sys::{self, memory};
 
 use opts::Opts;
@@ -46,7 +46,7 @@ fn main() {
         if opts.download {
             let mut stderr = Stderr::new();
             let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
-            println!("{}", dir.join(qwen35::WEIGHTS).display());
+            println!("{}", Model::weights(&dir).display());
             return Ok(());
         }
         if opts.bench {

@@ -1,18 +1,21 @@
-//! Language models: Qwen3.8-27B, its tokenizer and weights, and a chat
+//! Inference: Qwen3.8-27B, its tokenizer and weights, and a chat
 //! around it.
 
 mod chat;
 pub mod gguf;
 pub mod hub;
+mod model;
 pub mod quants;
 pub mod qwen35;
 mod sampler;
+mod states;
 #[cfg(test)]
 pub mod testing;
 mod tokenizer;
 
 pub use chat::{Answer, Chat, Chunk, DRAFTS, Format, Reply, Stats, Tally, Turn};
 pub use gguf::Gguf;
+pub use model::{Device, Model, Progress, Size};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 
@@ -131,23 +134,6 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
     fn select_sequence(&mut self, id: usize) -> Result<()> {
         (**self).select_sequence(id)
     }
-}
-
-/// The cosines and sines of the angles rotary position embeddings rotate
-/// by, laid out as [`Device::rope`] expects, for positions up to `max_len`
-/// and `rot_dim` rotated elements per head. Each pair of elements rotates at
-/// its own frequency.
-pub fn rope_table(max_len: usize, rot_dim: usize, theta: f32) -> Vec<f32> {
-    let half = rot_dim / 2;
-    let mut table = Vec::with_capacity(max_len * rot_dim);
-    for pos in 0..max_len {
-        for i in 0..half {
-            let freq = 1.0 / theta.powf((2 * i) as f32 / rot_dim as f32);
-            let (sin, cos) = (pos as f32 * freq).sin_cos();
-            table.extend([cos, sin]);
-        }
-    }
-    table
 }
 
 /// A conversation with the model, as the harness holds one: a [`Chat`] on
