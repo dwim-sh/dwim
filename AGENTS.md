@@ -1,119 +1,81 @@
-# `dwim`
+This is `dwim`, a coding agent harness in Rust: the agent, the model
+(`qwen3.8-27b`, a 16 GB Q4_0 GGUF), and the engine that runs it, in one
+program. One package: `lib.rs` is the library, `cli/` and
+`testing/difftest/` are the binaries.
 
-A coding agent harness in Rust: the agent, the model, and the engine that
-runs it, in one program.
+## Building and Verifying
+
+- **Build**: `cargo build`
+- **Test**: `cargo test`
+- **Lint**: `cargo clippy --all-targets -- -D warnings`
+- **Format**: `cargo fmt --check`
+- **Real model**, if the weights are in the cache:
+  `cargo test real_model -- --ignored --nocapture` and
+  `cargo run --bin difftest`
+- **Fetch the weights** (16 GB, into the Hugging Face cache):
+  `dwim --download`
+- Before calling a change done, run `./target/debug/dwim` in a terminal
+  and ask the model something.
+- GPU tests skip a backend whose GPU is not there. The GPU is Metal on
+  macOS, Vulkan 1.1 with `VK_KHR_push_descriptor` elsewhere.
 
 ## Layout
 
-One package: `lib.rs` is the library, with the directories below as its
-modules, `cli/` and `testing/difftest/` are its two binaries, and `build.rs`
-compiles the Vulkan kernels.
-
-* `cli/`: the `dwim` command: arguments, fetching the model, the terminal UI,
-  `serve`, which runs the server, and `bench`, which times the model at
-  depths of context.
-* `inference/`: running the language model: `gguf` reads the weights file,
-  `quants` unpacks the block formats llama.cpp quantizes to, `tokenizer`
-  builds the BPE tokenizer from it, `qwen35` is the transformer as
-  operations on a device, `model` loads it onto one and sizes its context,
-  `chat` is the conversation around it, `states` keeps the states of system
-  prompts read before, and `hub` is the Hugging Face cache the weights are
-  kept in.
-* `harness/`: the agent around the model: the system prompt (which includes
-  this file), the tool loop, compaction near the end of the context, the
-  thinking budget if one is set and the cap on a turn's calls, and the
-  session transcript. It runs on a `Conversation`: a `Chat` in the same
-  process, or a `server::Client`.
-* `server/`: the server that has the model, which every session is a client
-  of over a Unix socket, since the model fits in memory once: `protocol` is
-  what they say to each other, `client` the session's end of it. The
-  weights are shared and each session has a sequence of its own on the
-  device, its key/value caches and recurrent states; sessions take turns
-  with the model a reply at a time.
-* `tools/`: the tools, one file each, and `call`, which parses a call as the
-  model writes it.
-* `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,
-  `vulkan` (WGSL kernels compiled to SPIR-V at build time), and `metal`
-  (MSL kernels compiled when the device opens). `quant` is the 4- and 8-bit
-  block weight formats.
-* `sys/`: what is asked of the operating system, a directory for each
-  (`darwin`, `linux`) with the same modules, re-exported as `sys::memory`
-  and so on for the one being built for, and `unix` for what both do the
-  same way, re-exported whichever is being built for. Code that differs by
-  system goes here, not behind a `cfg` where it is used.
-* `scripts/`: `swebench.py` runs SWE-bench Lite; `release` cuts a release.
-* `testing/`: `difftest`, differential testing of the GPU against the CPU
-  with the real weights.
-* `man/`: `dwim.1`, the manual page.
-* `third_party/`: reference implementations studied for design, not built.
-
-## Model
-
-The one model is `qwen3.8-27b`, Qwen3.8-27B as Qwen released it, in
-bartowski's Q4_0 GGUF conversion (16 GB): a hybrid of full attention every
-fourth layer and Gated DeltaNet linear attention elsewhere, which
-`inference/qwen35.rs` runs and documents in detail. Q4_0 and Q8_0 matrices
-run as they are, and Q4_1 and Q6_K are quantized again as Q8_0 on loading.
-It needs a 32 GiB Mac. It thinks by default and calls tools as
-`<tool_call><function=bash>…`. Its 65th block predicts the token after the
-next, and the model drafts with it: the chat drafts `--speculate` tokens
-after each it picks and the model verifies them in one pass, keeping the
-ones the sampler accepts.
-
-## Building
-
-`cargo build` needs nothing beyond Rust. The GPU needs Metal on macOS or a
-Vulkan 1.1 driver with `VK_KHR_push_descriptor` elsewhere. The weights (16 GB)
-are fetched into the user's Hugging Face cache on first use, or by
-`dwim --download`.
-
-## Verifying
-
-* `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`,
-  as CI runs them. GPU tests skip a backend whose GPU is not available.
-* `cargo test real_model -- --ignored --nocapture` and
-  `cargo run --bin difftest` check the real model if it is in the cache.
-* Exercise `./target/debug/dwim` in a terminal and ask the model something
-  before calling a change done.
-* `CONTRIBUTING.md` has the longer version, and how to run SWE-bench Lite.
+- `cli/` - the `dwim` command: options, fetching the model, the shell,
+  `serve`, `bench`
+- `inference/` - running the model: `gguf`, `quants`, `tokenizer`,
+  `qwen35` (the transformer, documented there), `model` (loading and
+  sizing), `chat`, `states` (saved system prompts), `hub` (the Hugging
+  Face cache)
+- `harness/` - the agent: system prompt (includes this file), tool loop,
+  compaction, thinking budget, transcript
+- `server/` - the process that has the model; every session is a client
+  over a Unix socket (`protocol`, `client`)
+- `tools/` - the tools, one file each; `call` parses a call
+- `gpu/` - the `Device` trait; `cpu` is the reference, `vulkan` (WGSL
+  kernels, compiled by `build.rs`), `metal` (MSL kernels), `quant`
+- `sys/` - what is asked of the operating system: `darwin/` and `linux/`
+  with the same modules, `unix/` for what both do the same way, all
+  re-exported as `sys::memory` and so on
+- `scripts/` - `swebench.py`, `release`
+- `man/dwim.1` - the manual page
+- `third_party/` - references to read, not built
 
 ## Tests
 
-A test checks something `dwim` does: behavior a user or the model would
-find broken, such as what `man/dwim.1` says an option or a tool does. Never
+A test checks behavior a user or the model would find broken. **Never**
 add a test that only pins how the source is written:
 
-* The wording, order, grouping, or width of help text, a usage line, a
-  status line, or any other text for a person to read. Run `dwim` and read
-  it instead.
-* A constant or a table checked against itself or another table: that a
-  list is sorted, has no duplicates, or names every entry of another.
-* A string or a value copied from the source into the test, or a one-line
-  function restated as its own expected value.
+- The wording, order, or width of help text, a status line, or any text
+  for a person to read. Run `dwim` and read it.
+- A table checked against itself or another table: sorted, no duplicates,
+  names every entry.
+- A value copied from the source, or a one-line function restated as its
+  expected value.
 
-If the only way a test can fail is someone editing text or a table on
-purpose, and the fix is to edit the test to match, do not write it.
+If a test can only fail when someone edits text or a table on purpose,
+do not write it.
 
 ## Coding Style
 
-* Never use `pub(crate)`. A definition is either `pub` or not.
-* One `use` per crate with nested paths, grouped as `std`, external crates,
-  then `crate`, separated by blank lines.
-* Doc comments say what a thing is or does, in plain sentences.
-* A file reads from top to bottom: a function comes before the ones it
-  calls, so the public and high-level ones are first and the helpers and
-  foreign declarations last.
+- **Never `pub(crate)`.** A definition is `pub` or not.
+- One `use` per crate with nested paths, grouped `std`, external crates,
+  `crate`, separated by blank lines.
+- Doc comments say what a thing is or does, in plain sentences.
+- A file reads top to bottom: a function comes before the ones it calls,
+  helpers and foreign declarations last.
+- Code that differs by system goes in `sys/`, not behind a `cfg` where it
+  is used.
 
 ## Commits and Pull Requests
 
-* A subject is `area: What changes`, as in `tools: Read only regular files`.
-  The area is the directory or the module the change is in (`sys`,
-  `gpu/vulkan`, `tools/bash`, `ci`), the rest is in the imperative, and all
-  of it fits in 72 characters.
-* The subject names the things that change, not the intent behind them:
-  `sys: Move libc, mmap and dirs callers behind sys/unix`, not `Move what
-  dwim asks of the operating system into sys/`. Someone reading one line
-  of `git log` should know what was touched.
-* The body says why, and what was and was not verified.
-* A pull request's title is a subject too, written the same way, since it
-  becomes the subject of the commit that merges it.
+- A subject is `area: What changes`, as in `tools: Read only regular
+  files`: the area is the directory or module (`sys`, `gpu/vulkan`, `ci`),
+  the rest imperative, all within 72 characters.
+- It names the things that change, not the intent: `sys: Move libc, mmap
+  and dirs callers behind sys/unix`, not `Move what dwim asks of the
+  operating system into sys/`.
+- The body says why, and what was and was not verified.
+- A pull request's title is a subject too, written the same way.
+
+`CONTRIBUTING.md` has the longer version, and how to run SWE-bench Lite.
