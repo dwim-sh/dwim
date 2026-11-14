@@ -93,3 +93,6 @@ purpose, and the fix is to edit the test to match, do not write it.
 * One `use` per crate with nested paths, grouped as `std`, external crates,
   then `crate`, separated by blank lines.
 * Doc comments say what a thing is or does, in plain sentences.
+* A file reads from top to bottom: a function comes before the ones it
+  calls, so the public and high-level ones are first and the helpers and
+  foreign declarations last.
