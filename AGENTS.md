@@ -35,7 +35,8 @@ compiles the Vulkan kernels.
 * `gpu/`: devices a model runs on: the `Device` trait, `cpu` as the reference,
   `vulkan` (WGSL kernels compiled to SPIR-V at build time), and `metal`
   (MSL kernels compiled when the device opens). `quant` is the 4- and 8-bit
-  block weight formats.
+  block formats of weights and caches, and `float` the half-width floats
+  their scales and the other weights are kept as.
 * `sys/`: what is asked of the operating system, a directory for each
   (`darwin`, `linux`) with the same modules, re-exported as `sys::memory`
   and so on for the one being built for, and `unix` for what both do the

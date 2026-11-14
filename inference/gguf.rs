@@ -19,7 +19,11 @@ use std::{
 };
 
 use crate::{
-    gpu::{Tensor, bf16, quant},
+    gpu::{
+        Tensor,
+        float::{bf16, to_bf16},
+        quant,
+    },
     inference::{Result, quants},
     sys::mmap::Map,
 };
@@ -107,14 +111,6 @@ pub fn row_bytes(dtype: u32, cols: usize) -> Result<usize> {
         Q6_K => blocks(quants::Q6_K_BLOCK, quants::Q6_K_BYTES),
         other => Err(format!("tensor type {other} is not supported").into()),
     }
-}
-
-/// Rounds an f32 to the nearest bf16, ties to even: bf16 is the top half
-/// of an f32.
-fn to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let round = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(round)) >> 16) as u16
 }
 
 /// Reconstructs a row of weights of a tensor type from its bytes.
