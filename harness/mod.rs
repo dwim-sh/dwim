@@ -1703,7 +1703,8 @@ mod tests {
         // The tools' limits as the tools have them.
         assert!(prompt.contains(&format!("a page of up to {} numbered lines", read::PAGE)));
         assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
-        assert!(prompt.contains("From AGENTS.md:\n\n# `dwim`"));
+        let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(prompt.contains(&format!("From AGENTS.md:\n\n{}", agents.trim())));
         // What changes between runs is not in the prompt, so that the state
         // saved after it is good for the next run.
         assert!(!prompt.contains("# Environment"));
