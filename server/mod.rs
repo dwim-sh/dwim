@@ -45,7 +45,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, Size, qwen35};
+use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, Size};
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
 };
@@ -57,9 +57,6 @@ pub use crate::server::client::{Client, Connection};
 /// default: long enough that a session started soon after the last ended
 /// finds the model loaded.
 pub const IDLE: Duration = Duration::from_secs(10 * 60);
-
-/// How many saved states of system prompts are kept.
-const STATES_KEPT: usize = 4;
 
 /// Where the server listens: in the user's runtime directory, or the
 /// temporary directory where there is none, named for the user.
@@ -83,68 +80,6 @@ pub fn build() -> String {
             format!("{version}-{}-{modified}", metadata.len())
         }
         Err(_) => version.to_string(),
-    }
-}
-
-/// Opens the conversation with the system prompt: from the state saved by
-/// an earlier reading of the same prompt, if there is one and it fits, and
-/// otherwise by reading the prompt, reporting progress as `Chat::system`
-/// does, and saving the state for the next time. Returns whether the state
-/// was restored.
-pub fn start<M: LanguageModel>(
-    chat: &mut Chat<M>,
-    prompt: &str,
-    on_progress: impl FnMut(usize, usize),
-) -> Result<bool, Box<dyn Error>> {
-    let path = state_path(prompt);
-    if let Some(path) = &path
-        && let Ok(state) = fs::read(path)
-        && chat.restore(&state).is_ok()
-    {
-        return Ok(true);
-    }
-    chat.system(prompt, on_progress)?;
-    if let Some(path) = path
-        && let Some(state) = chat.save()
-        && let Some(dir) = path.parent()
-        && fs::create_dir_all(dir).is_ok()
-        && fs::write(&path, state).is_ok()
-    {
-        prune(dir);
-    }
-    Ok(false)
-}
-
-/// Where the state after `prompt` is kept: named by a hash of the model's
-/// name and the prompt, in the cache directory.
-fn state_path(prompt: &str) -> Option<PathBuf> {
-    // FNV-1a, so that the name is the same from one build to the next.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in qwen35::NAME.bytes().chain([0]).chain(prompt.bytes()) {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    Some(
-        sys::dirs::cache()?
-            .join("dwim")
-            .join("states")
-            .join(format!("{hash:016x}.bin")),
-    )
-}
-
-/// Removes all but the newest saved states.
-fn prune(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut states: Vec<_> = entries
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
-        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-        .collect();
-    states.sort();
-    for (_, path) in states.iter().rev().skip(STATES_KEPT) {
-        let _ = fs::remove_file(path);
     }
 }
 
@@ -547,7 +482,7 @@ fn serve(
     let on_chunk = |chunk: Chunk| stream(Piece::of(chunk));
     Ok(match request {
         Request::Start { prompt } => {
-            let restored = start(chat, &prompt, progress)?;
+            let restored = chat.start(&prompt, progress)?;
             Response::Started {
                 restored,
                 state: state(chat),
@@ -623,38 +558,6 @@ impl Generation {
         if let Some(closing) = &self.closing {
             chat.limit_thoughts(self.thought_limit, closing);
         }
-    }
-}
-
-impl Piece {
-    fn of(chunk: Chunk) -> Self {
-        match chunk {
-            Chunk::Thought(text) => Piece::Thought(text.to_string()),
-            Chunk::Text(text) => Piece::Text(text.to_string()),
-            Chunk::Token => Piece::Token,
-        }
-    }
-}
-
-impl Sampling {
-    pub fn of(sampler: &Sampler) -> Self {
-        Self {
-            temperature: sampler.temperature,
-            top_k: sampler.top_k,
-            top_p: sampler.top_p,
-            min_p: sampler.min_p,
-            seed: sampler.seed,
-        }
-    }
-
-    pub fn sampler(&self) -> Sampler {
-        Sampler::new(
-            self.temperature,
-            self.top_k,
-            self.top_p,
-            self.min_p,
-            self.seed,
-        )
     }
 }
 

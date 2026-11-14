@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::inference::{Answer, Reply, Size, Stats, Turn};
+use crate::inference::{Answer, Chunk, Reply, Sampler, Size, Stats, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -172,12 +172,47 @@ pub struct Sampling {
     pub seed: u64,
 }
 
+impl Sampling {
+    /// The settings of `sampler`.
+    pub fn of(sampler: &Sampler) -> Self {
+        Self {
+            temperature: sampler.temperature,
+            top_k: sampler.top_k,
+            top_p: sampler.top_p,
+            min_p: sampler.min_p,
+            seed: sampler.seed,
+        }
+    }
+
+    /// A sampler with the settings.
+    pub fn sampler(&self) -> Sampler {
+        Sampler::new(
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.min_p,
+            self.seed,
+        )
+    }
+}
+
 /// A piece of a reply, as [`crate::inference::Chunk`] has it, owned.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Piece {
     Thought(String),
     Text(String),
     Token,
+}
+
+impl Piece {
+    /// `chunk`, owned.
+    pub fn of(chunk: Chunk) -> Self {
+        match chunk {
+            Chunk::Thought(text) => Piece::Thought(text.to_string()),
+            Chunk::Text(text) => Piece::Text(text.to_string()),
+            Chunk::Token => Piece::Token,
+        }
+    }
 }
 
 /// What the server is doing while a request waits.
