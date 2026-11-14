@@ -34,7 +34,7 @@ use std::{
     env,
     fs::{self, DirBuilder, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -558,24 +558,12 @@ fn char_start(bytes: &[u8]) -> usize {
 
 /// How a command ended, as the last line of its result.
 fn ended(status: ExitStatus) -> String {
-    match (status.code(), status.signal()) {
+    match (status.code(), sys::process::signal(status)) {
         (Some(code), _) => format!("[exit code {code}]"),
         (None, Some(signal)) => {
-            let name = match signal {
-                libc::SIGHUP => " (SIGHUP)",
-                libc::SIGINT => " (SIGINT)",
-                libc::SIGQUIT => " (SIGQUIT)",
-                libc::SIGILL => " (SIGILL)",
-                libc::SIGABRT => " (SIGABRT)",
-                libc::SIGFPE => " (SIGFPE)",
-                libc::SIGKILL => " (SIGKILL)",
-                libc::SIGBUS => " (SIGBUS)",
-                libc::SIGSEGV => " (SIGSEGV)",
-                libc::SIGPIPE => " (SIGPIPE)",
-                libc::SIGALRM => " (SIGALRM)",
-                libc::SIGTERM => " (SIGTERM)",
-                _ => "",
-            };
+            let name = sys::process::signal_name(signal)
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
             format!("[killed by signal {signal}{name}]")
         }
         (None, None) => format!("[{status}]"),

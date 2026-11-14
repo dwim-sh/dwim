@@ -1,6 +1,10 @@
 //! Processes other than this one.
 
-use std::{io, os::unix::process::CommandExt, process::Command};
+use std::{
+    io,
+    os::unix::process::{CommandExt, ExitStatusExt},
+    process::{Command, ExitStatus},
+};
 
 /// Has `command` run in a session of its own, which is a process group of
 /// its own with the command's ID, and has no controlling terminal.
@@ -31,6 +35,30 @@ pub fn alive(pid: u32) -> bool {
     // process is there.
     let refused = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
     !refused || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The signal that killed the process `status` is of, if one did.
+pub fn signal(status: ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+/// The name of `signal`, for the ones a command is likely to be killed by.
+pub fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
