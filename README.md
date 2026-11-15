@@ -5,10 +5,11 @@
 
 *Do what I mean.*
 
-**A coding agent that runs on your own GPU.**
+**A coding agent that you control.**
 
-The agent, the model, and the engine that runs it, in one Rust program:
-no API key, no cloud, and nothing leaves your machine.
+The agent, the model, and the engine that runs it, in one Rust program.
+Local by default: no API key, no cloud, and nothing leaves your machine
+unless you send a session to a bigger model.
 
 [![Model: Qwen3.8-27B](https://img.shields.io/badge/Model-Qwen3.8--27B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-27B)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
@@ -49,8 +50,11 @@ ahead of time.
 
 ## Features
 
-- **Fully local coding agent.** Runs commands, reads their output, and keeps
-  going.
+- **Local by default.** Runs commands, reads their output, and keeps
+  going, all on your machine.
+- **A bigger model when you need it.** With `OPENROUTER_API_KEY` set,
+  `/model` moves the session to Qwen3.8 Max at OpenRouter, and back. The
+  conversation goes with it.
 - **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
   or more, decoding several tokens at a time with the drafter its file
   ships.
@@ -77,6 +81,9 @@ Run `dwim` in another terminal and it connects to the same server, ready in
 a moment instead of loading the model again. Two sessions fit at once by
 default, each with its own context; `--sessions` sets how many, and
 `/server` in the shell shows, stops, or restarts the server.
+
+`/model` picks the model and where it runs; `--model large` starts a
+session on the large one.
 
 To ask one thing and exit, give the prompt on the command line:
 
