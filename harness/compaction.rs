@@ -11,7 +11,7 @@
 use std::{error::Error, fmt::Write};
 
 use crate::harness::{Entry, Event, Harness, OnEvent, environment};
-use crate::inference::{Session, Turn};
+use crate::model::{Session, Turn};
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -229,7 +229,7 @@ mod tests {
         STEPS_PROMPT,
         tests::{harness, reply, reply_saying, send},
     };
-    use crate::inference::Tokenizer;
+    use crate::model::Tokenizer;
 
     use super::*;
 

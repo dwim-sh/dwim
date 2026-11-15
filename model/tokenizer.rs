@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use fancy_regex::Regex;
 
-use crate::inference::{Result, gguf::Gguf};
+use crate::model::{Result, gguf::Metadata};
 
 /// The regular expression Qwen's tokenizers split text into words with.
 const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -13,7 +13,8 @@ const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{
 const CONTROL: i64 = 3;
 const USER_DEFINED: i64 = 4;
 
-/// A byte-level BPE tokenizer, loaded from the vocabulary in a GGUF file.
+/// A byte-level BPE tokenizer, loaded from the vocabulary a GGUF file
+/// carries in its metadata.
 ///
 /// Text is first split into words by a regular expression. Each word starts
 /// out as one token per UTF-8 byte, and adjacent tokens are then merged
@@ -35,7 +36,7 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Loads the vocabulary a GGUF file carries: its tokens, their types,
     /// and the merges.
-    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+    pub fn from_gguf(gguf: &Metadata) -> Result<Self> {
         let pre = gguf.str("tokenizer.ggml.pre")?;
         if !matches!(pre, "qwen2" | "qwen35") {
             return Err(format!("the '{pre}' pre-tokenizer is not supported").into());
@@ -171,7 +172,7 @@ impl Tokenizer {
     /// merge, and the special tokens of the chat format.
     #[cfg(test)]
     pub fn tiny() -> Self {
-        use crate::inference::gguf::{self, Value};
+        use crate::model::gguf::Value;
 
         let mut tokens: Vec<Value> = byte_chars()
             .iter()
@@ -180,7 +181,7 @@ impl Tokenizer {
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
-        for special in crate::inference::local::SPECIAL_TOKENS {
+        for special in crate::model::format::SPECIAL_TOKENS {
             tokens.push(Value::Str(special.to_string()));
             types.push(Value::I32(if special.starts_with("<|") {
                 CONTROL as i32
@@ -188,11 +189,6 @@ impl Tokenizer {
                 USER_DEFINED as i32
             }));
         }
-        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dwim-tokenizer-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tiny.gguf");
         let meta = [
             ("tokenizer.ggml.pre", Value::Str("qwen2".to_string())),
             ("tokenizer.ggml.tokens", Value::Array(tokens)),
@@ -202,10 +198,8 @@ impl Tokenizer {
                 Value::Array(vec![Value::Str("h i".to_string())]),
             ),
         ];
-        gguf::write(&path, &meta, &[]).unwrap();
-        let tokenizer = Self::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        tokenizer
+        let meta = meta.map(|(key, value)| (key.to_string(), value));
+        Self::from_gguf(&Metadata::new(meta)).unwrap()
     }
 
     fn merge(&self, word: &[u8], out: &mut Vec<u32>) {

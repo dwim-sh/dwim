@@ -4,7 +4,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::inference::{LanguageModel, Result, Tokenizer, local};
+use crate::{
+    inference::{LanguageModel, Result},
+    model::{Tokenizer, format},
+};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
@@ -58,9 +61,9 @@ impl Scripted {
             sequence: 0,
             parked: HashMap::new(),
             vocab: tokenizer.vocab_size(),
-            opening: local::opening(tokenizer, true).unwrap(),
-            unthinking: local::opening(tokenizer, false).unwrap(),
-            end: tokenizer.special(local::IM_END).unwrap(),
+            opening: format::opening(tokenizer, true).unwrap(),
+            unthinking: format::opening(tokenizer, false).unwrap(),
+            end: tokenizer.special(format::IM_END).unwrap(),
             max_len,
             hold: None,
             said: 0,

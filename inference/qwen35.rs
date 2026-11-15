@@ -15,7 +15,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
-    inference::{Gguf, LanguageModel, Result, gguf, hub, quants},
+    inference::{Gguf, LanguageModel, Result, gguf, quants},
+    model::hub,
 };
 
 /// The model as `dwim` names it.
@@ -157,7 +158,7 @@ impl Config {
         // implemented.
         if let Some(recurrent) = gguf.get(&format!("{arch}.attention.recurrent_layers")) {
             let recurrent = match recurrent {
-                crate::inference::gguf::Value::Array(values) => values,
+                crate::model::gguf::Value::Array(values) => values,
                 _ => return Err("the list of linear layers is not a list".into()),
             };
             if recurrent.len() < config.layers
@@ -1530,7 +1531,7 @@ mod tests {
     use super::*;
     use crate::{
         gpu::{Cpu, Gpu},
-        inference::gguf::Value,
+        model::gguf::Value,
     };
 
     struct Rng(u64);
@@ -2071,7 +2072,7 @@ mod tests {
 
     fn real_model(path: &Path) {
         let gguf = Arc::new(Gguf::open(path).unwrap());
-        let tokenizer = crate::inference::Tokenizer::from_gguf(&gguf).unwrap();
+        let tokenizer = crate::model::Tokenizer::from_gguf(&gguf).unwrap();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();
         let mut model = Model::load(gguf, device, 256, |_, _| {}).unwrap();

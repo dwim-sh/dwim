@@ -3,6 +3,8 @@
 pub mod gpu;
 pub mod harness;
 pub mod inference;
+pub mod model;
+pub mod providers;
 pub mod server;
 pub mod sys;
 pub mod tools;

@@ -19,7 +19,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::harness::{self, Event, Log};
-use dwim::inference::{Device, Size};
+use dwim::model::{Device, Size};
 
 use crate::{
     session::{self, Settings},

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::inference::Sampler;
+use crate::model::Sampling;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -111,7 +111,7 @@ impl Log {
         device: &str,
         dir: &Path,
         context: usize,
-        sampler: &Sampler,
+        sampling: Sampling,
         thinking_budget: Option<usize>,
         system: &str,
     ) {
@@ -125,11 +125,11 @@ impl Log {
                 "device": device,
                 "dir": dir.display().to_string(),
                 "context": context,
-                "temperature": decimal(sampler.temperature),
-                "top_k": sampler.top_k,
-                "top_p": decimal(sampler.top_p),
-                "min_p": decimal(sampler.min_p),
-                "seed": sampler.seed,
+                "temperature": decimal(sampling.temperature),
+                "top_k": sampling.top_k,
+                "top_p": decimal(sampling.top_p),
+                "min_p": decimal(sampling.min_p),
+                "seed": sampling.seed,
                 "thinking_budget": thinking_budget,
                 "system": system,
             }),
@@ -185,8 +185,8 @@ impl Log {
         thought_ended: bool,
         cut: bool,
         tokens: usize,
-        before: &crate::inference::Stats,
-        after: &crate::inference::Stats,
+        before: &crate::model::Stats,
+        after: &crate::model::Stats,
     ) {
         let seconds = (after.prompt.seconds + after.thought.seconds + after.answer.seconds)
             - (before.prompt.seconds + before.thought.seconds + before.answer.seconds);
@@ -264,7 +264,7 @@ impl Log {
     /// tokens and seconds of each kind and the tool calls and their
     /// seconds.
     pub fn finish(&mut self, tokens: usize, stats: &Stats) {
-        let tally = |tally: &crate::inference::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
+        let tally = |tally: &crate::model::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
         let model = &stats.model;
         self.write(
             "end",

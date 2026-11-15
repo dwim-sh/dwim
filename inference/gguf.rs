@@ -11,12 +11,7 @@
 //! Strings are a u64 length and the bytes. A tensor's dimensions are
 //! innermost first, so a matrix of `[rows, cols]` is written `cols, rows`.
 
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{self, Read},
-    path::Path,
-};
+use std::{collections::BTreeMap, fs::File, io, ops::Deref, path::Path};
 
 use crate::{
     gpu::{
@@ -25,65 +20,9 @@ use crate::{
         quant,
     },
     inference::{Result, quants},
+    model::gguf::{Metadata, Reader, Value},
     sys::mmap::Map,
 };
-
-/// A metadata value.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    F32(f32),
-    Bool(bool),
-    Str(String),
-    Array(Vec<Value>),
-    U64(u64),
-    I64(i64),
-    F64(f64),
-}
-
-impl Value {
-    /// The value as an integer, whichever width it was written in.
-    pub fn as_i64(&self) -> Option<i64> {
-        Some(match *self {
-            Value::U8(v) => v as i64,
-            Value::I8(v) => v as i64,
-            Value::U16(v) => v as i64,
-            Value::I16(v) => v as i64,
-            Value::U32(v) => v as i64,
-            Value::I32(v) => v as i64,
-            Value::U64(v) => v as i64,
-            Value::I64(v) => v,
-            _ => return None,
-        })
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match *self {
-            Value::F32(v) => Some(v as f64),
-            Value::F64(v) => Some(v),
-            _ => self.as_i64().map(|v| v as f64),
-        }
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match *self {
-            Value::Bool(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Value::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-}
 
 /// The tensor types the models use: llama.cpp's numbering.
 pub const F32: u32 = 0;
@@ -165,61 +104,16 @@ impl Info {
 pub struct Gguf {
     map: Map,
     data_start: usize,
-    meta: BTreeMap<String, Value>,
+    meta: Metadata,
     tensors: BTreeMap<String, Info>,
 }
 
-struct Reader<R> {
-    inner: R,
-    read: usize,
-}
+/// A file reads as its metadata.
+impl Deref for Gguf {
+    type Target = Metadata;
 
-impl<R: Read> Reader<R> {
-    fn bytes(&mut self, n: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0; n];
-        self.inner.read_exact(&mut buf)?;
-        self.read += n;
-        Ok(buf)
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
-    }
-
-    fn string(&mut self) -> Result<String> {
-        let len = self.u64()? as usize;
-        Ok(String::from_utf8(self.bytes(len)?)?)
-    }
-
-    fn value(&mut self, kind: u32) -> Result<Value> {
-        Ok(match kind {
-            0 => Value::U8(self.bytes(1)?[0]),
-            1 => Value::I8(self.bytes(1)?[0] as i8),
-            2 => Value::U16(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap())),
-            3 => Value::I16(i16::from_le_bytes(self.bytes(2)?.try_into().unwrap())),
-            4 => Value::U32(self.u32()?),
-            5 => Value::I32(self.u32()? as i32),
-            6 => Value::F32(f32::from_bits(self.u32()?)),
-            7 => Value::Bool(self.bytes(1)?[0] != 0),
-            8 => Value::Str(self.string()?),
-            9 => {
-                let kind = self.u32()?;
-                let len = self.u64()? as usize;
-                let mut values = Vec::with_capacity(len.min(1 << 20));
-                for _ in 0..len {
-                    values.push(self.value(kind)?);
-                }
-                Value::Array(values)
-            }
-            10 => Value::U64(self.u64()?),
-            11 => Value::I64(self.u64()? as i64),
-            12 => Value::F64(f64::from_bits(self.u64()?)),
-            other => return Err(format!("unknown metadata type {other}").into()),
-        })
+    fn deref(&self) -> &Metadata {
+        &self.meta
     }
 }
 
@@ -227,25 +121,9 @@ impl Gguf {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        let mut r = Reader {
-            inner: io::BufReader::new(&file),
-            read: 0,
-        };
-        if r.bytes(4)? != b"GGUF" {
-            return Err(format!("{} is not a GGUF file", path.display()).into());
-        }
-        let version = r.u32()?;
-        if version != 3 {
-            return Err(format!("GGUF version {version} is not supported").into());
-        }
-        let n_tensors = r.u64()?;
-        let n_meta = r.u64()?;
-        let mut meta = BTreeMap::new();
-        for _ in 0..n_meta {
-            let key = r.string()?;
-            let kind = r.u32()?;
-            meta.insert(key, r.value(kind)?);
-        }
+        let mut r = Reader::new(io::BufReader::new(&file));
+        let (meta, n_tensors) =
+            Metadata::read(&mut r).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut tensors = BTreeMap::new();
         for _ in 0..n_tensors {
             let name = r.string()?;
@@ -269,7 +147,7 @@ impl Gguf {
             .get("general.alignment")
             .and_then(Value::as_i64)
             .unwrap_or(32) as usize;
-        let data_start = r.read.div_ceil(alignment) * alignment;
+        let data_start = r.position().div_ceil(alignment) * alignment;
 
         Ok(Self {
             map: Map::new(&file, len)?,
@@ -277,48 +155,6 @@ impl Gguf {
             meta,
             tensors,
         })
-    }
-
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.meta.get(key)
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.meta.keys().map(String::as_str)
-    }
-
-    fn need(&self, key: &str) -> Result<&Value> {
-        self.meta
-            .get(key)
-            .ok_or_else(|| format!("missing metadata '{key}'").into())
-    }
-
-    pub fn u32(&self, key: &str) -> Result<u32> {
-        let v = self
-            .need(key)?
-            .as_i64()
-            .ok_or_else(|| format!("metadata '{key}' is not an integer"))?;
-        Ok(u32::try_from(v)?)
-    }
-
-    pub fn f32(&self, key: &str) -> Result<f32> {
-        Ok(self
-            .need(key)?
-            .as_f64()
-            .ok_or_else(|| format!("metadata '{key}' is not a number"))? as f32)
-    }
-
-    pub fn str(&self, key: &str) -> Result<&str> {
-        self.need(key)?
-            .as_str()
-            .ok_or_else(|| format!("metadata '{key}' is not a string").into())
-    }
-
-    pub fn array(&self, key: &str) -> Result<&[Value]> {
-        match self.need(key)? {
-            Value::Array(values) => Ok(values),
-            _ => Err(format!("metadata '{key}' is not an array").into()),
-        }
     }
 
     pub fn tensors(&self) -> impl Iterator<Item = &str> {

@@ -3,17 +3,16 @@
 //! it samples.
 
 use std::{
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
 
-use serde::{Deserialize, Serialize};
-
 use crate::{
-    gpu::{self, Cpu, Device as _, Gpu},
-    inference::{Download, Format, Gguf, LanguageModel, Result, Sampler, Tokenizer, fetch, qwen35},
+    gpu::{Cpu, Device as _, Gpu},
+    inference::{Download, Gguf, LanguageModel, Result, Sampler, fetch, qwen35},
+    model::{Device, Format, Size, Tokenizer},
 };
 
 /// Tokens of conversation the model has room for when the device cannot
@@ -32,40 +31,6 @@ const MIN_CONTEXT: usize = 16384;
 /// fitted to the memory free: for the device's scratch buffers, the
 /// driver, and whatever else starts in the meantime.
 const HEADROOM: u64 = 256 << 20;
-
-/// Where to run the model.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Device {
-    Cpu,
-    Gpu,
-}
-
-impl Device {
-    /// The API the GPU is driven through on this system.
-    pub const BACKEND: &str = gpu::BACKEND;
-}
-
-impl fmt::Display for Device {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Device::Cpu => "cpu",
-            Device::Gpu => "gpu",
-        })
-    }
-}
-
-/// How many sessions the model has room for at once, the tokens of
-/// conversation each has room for, and the device memory they take:
-/// `model` bytes for the weights and the activations, which the sessions
-/// share, and `conversation` bytes more for each session, for its recurrent
-/// states and its tokens of context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Size {
-    pub sessions: usize,
-    pub context: usize,
-    pub model: u64,
-    pub conversation: u64,
-}
 
 /// How much of the model is in a directory: how many of its files, out
 /// of how many, and their size in bytes.

@@ -22,7 +22,6 @@
 //! the thread that reads the connection.
 
 pub mod protocol;
-mod remote;
 
 use std::{
     cell::RefCell,
@@ -45,13 +44,14 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::inference::{Chunk, Format, LanguageModel, Local, Sampler, Session, Size};
 use crate::server::protocol::{
-    Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
+    Generation, Opened, Piece, Request, Response, State, Status, Welcome,
 };
 use crate::sys;
-
-pub use crate::server::remote::{Connection, Remote};
+use crate::{
+    inference::{LanguageModel, Local, Sampler},
+    model::{Chunk, Format, Session, Size},
+};
 
 /// How long the server goes without a session before it exits, by
 /// default: long enough that a session started soon after the last ended
@@ -280,7 +280,7 @@ impl Server {
                                     device: device.clone(),
                                     size,
                                     capacity: session.capacity(),
-                                    sampling: Sampling::of(session.sampler()),
+                                    sampling: session.sampling(),
                                     state: state(&session),
                                 };
                                 eprintln!(
@@ -681,7 +681,11 @@ impl LanguageModel for Shared {
 mod tests {
     use std::time::Instant;
 
-    use crate::inference::{Session, Tokenizer, Turn, testing::Scripted};
+    use crate::{
+        inference::testing::Scripted,
+        model::{Session, Tokenizer, Turn},
+        providers::dwim::{Connection, Remote},
+    };
 
     use super::*;
 
@@ -749,7 +753,7 @@ mod tests {
     }
 
     /// The text of a reply to `message`.
-    fn ask(session: &mut Remote, message: &str) -> (String, crate::inference::Reply) {
+    fn ask(session: &mut Remote, message: &str) -> (String, crate::model::Reply) {
         let mut text = String::new();
         let reply = session
             .send(message, |chunk| {
