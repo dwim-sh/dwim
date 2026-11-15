@@ -22,14 +22,22 @@ program. One package: `lib.rs` is the library, `cli/` and
 ## Layout
 
 - `cli/` - the `dwim` command: options, the shell, `serve`, `bench`
-- `inference/` - running the model: `gguf`, `quants`, `tokenizer`,
-  `qwen35` (the transformer, documented there), `model` (loading and
-  sizing), `local`, `states` (saved system prompts), `hub` (the Hugging
-  Face cache), `fetch` (downloads into it)
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   compaction, thinking budget, transcript
-- `server/` - the process that has the model; every session is a client
-  over a Unix socket (`protocol`, `remote`)
+- `providers/` - where a session's model runs, a directory each: `dwim`
+  is a session on the dwim server over its Unix socket (`remote`), and
+  reaching or starting that server (`launch`)
+- `server/` - the process that has the model, and the `protocol` its
+  sessions speak
+- `inference/` - running the model on this machine: `gguf`, `quants`,
+  `qwen35` (the transformer, documented there), `model` (loading and
+  sizing), `local`, `sampler`, `states` (saved system prompts), `fetch`
+  (downloads into the cache)
+- `model/` - what is known of the model wherever it runs: `session` (the
+  `Session` the harness holds), `format` (the chat format), `tokenizer`,
+  `gguf` (a file's header), `hub` (the Hugging Face cache). It takes
+  nothing from the directories above, and `providers/` take nothing from
+  `inference/`
 - `tools/` - the tools, one file each; `call` parses a call
 - `gpu/` - the `Device` trait; `cpu` is the reference, `vulkan` (WGSL
   kernels, compiled by `build.rs`), `metal` (MSL kernels), `quant`, `float`
