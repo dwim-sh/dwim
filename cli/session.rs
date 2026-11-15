@@ -282,9 +282,18 @@ fn device(session: &mut Session) -> String {
 /// for.
 pub fn open(
     settings: &Settings,
-    mut on_status: impl FnMut(Status) + Send + 'static,
+    on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
+    open_with(settings, system, on_status)
+}
+
+/// Opens a session as [`open`] does, with `system` for its system prompt.
+pub fn open_with(
+    settings: &Settings,
+    system: String,
+    mut on_status: impl FnMut(Status) + Send + 'static,
+) -> Result<(Session, String), Box<dyn Error>> {
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
             "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}",

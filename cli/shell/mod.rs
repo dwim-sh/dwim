@@ -3,6 +3,7 @@
 //! stays responsive while it downloads, loads, and generates.
 
 mod cmd;
+mod ideas;
 pub mod picker;
 mod view;
 mod worker;
@@ -39,9 +40,16 @@ use crate::{
 };
 
 use cmd::Command;
+use ideas::{Idea, Ideas};
 use picker::{Picker, Providers};
 use view::Segment;
 use worker::{Reply, Request, Worker};
+
+/// How long the user pauses typing before the model reads the draft.
+const PAUSE: Duration = Duration::from_millis(500);
+
+/// Fewest bytes of a draft the model reads: fewer say too little.
+const MIN_DRAFT: usize = 12;
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
@@ -58,6 +66,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let model = variant.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
+    let ideas = Ideas::spawn(settings.clone());
     let worker = Worker::spawn(settings, log);
 
     let mut app = App {
@@ -98,6 +107,10 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         doing: None,
         redirect: None,
         unheeded: false,
+        ideas,
+        draft: 0,
+        edited: None,
+        idea: None,
         lines: Vec::new(),
         blank: false,
         worker,
@@ -300,6 +313,14 @@ struct App {
     /// whether the message was taken in: the model may go on with the step
     /// it was at as if there were none.
     unheeded: bool,
+    /// What the model makes of the message being typed: the thread that
+    /// reads it, the number of the last draft given it, when the input
+    /// last changed, if it has not been given since, and the idea for the
+    /// latest draft that has one.
+    ideas: Ideas,
+    draft: u64,
+    edited: Option<Instant>,
+    idea: Option<Idea>,
     /// Lines waiting to be printed above the live region, and whether the
     /// last line printed there was blank.
     lines: Vec<Line>,
@@ -321,6 +342,7 @@ impl App {
                 dirty = false;
             }
             if event::poll(TICK)? {
+                let before = self.input.text().to_string();
                 match event::read()? {
                     Key::Key(key) if key.kind != KeyEventKind::Release => {
                         if self.key(key) {
@@ -330,8 +352,12 @@ impl App {
                     Key::Paste(text) => self.input.insert(&tui::sanitize(&text)),
                     _ => {}
                 }
+                if self.input.text() != before {
+                    self.edited = Some(Instant::now());
+                }
                 dirty = true;
             }
+            dirty |= self.ideate();
             loop {
                 match self.worker.try_recv() {
                     Ok(reply) => self.reply(reply)?,
@@ -344,6 +370,43 @@ impl App {
             }
             dirty |= self.signed_in();
         }
+    }
+
+    /// Gives the model the message being typed once the user pauses, and
+    /// takes what it makes of it: returns whether there is anything new to
+    /// show. A message is read only while nothing else is asked of the
+    /// model, and not a command, nor one too short to say anything.
+    fn ideate(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(idea) = self.ideas.try_recv() {
+            if idea.draft == self.draft {
+                self.idea = Some(idea);
+                changed = true;
+            }
+        }
+        if self.edited.is_some_and(|at| at.elapsed() >= PAUSE) {
+            self.edited = None;
+            let text = self.input.text().trim().to_string();
+            if self.ready
+                && matches!(self.status, Status::Idle)
+                && text.len() >= MIN_DRAFT
+                && !text.starts_with('/')
+            {
+                self.draft += 1;
+                self.ideas.read(self.draft, &text);
+                // Thinking, until the first of the idea comes.
+                self.idea = Some(Idea {
+                    draft: self.draft,
+                    text: "…".to_string(),
+                    done: false,
+                });
+                changed = true;
+            } else if text.is_empty() {
+                self.idea = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Handles a key press, returning whether to quit.
@@ -680,6 +743,8 @@ impl App {
         }
         self.input.take();
         self.recalled = None;
+        self.idea = None;
+        self.edited = None;
         if self.history.last() != Some(&message) {
             self.history.push(message.clone());
         }
@@ -1275,6 +1340,22 @@ impl App {
             live.push(tui::boxed(vec![prompt, content], columns));
         }
         live.push(border("╰", "╯"));
+        // What the model makes of the message being typed.
+        if let Some(idea) = &self.idea
+            && !self.input.is_empty()
+            && matches!(self.status, Status::Idle)
+        {
+            let lines = tui::wrap(&idea.text, columns.saturating_sub(6).max(1));
+            for text in lines.into_iter().filter(|line| !line.trim().is_empty()) {
+                let text = if idea.done {
+                    span(text).italic()
+                } else {
+                    span(text).italic().dark_grey()
+                };
+                live.push(vec![span("  ┊ ").cyan(), text]);
+            }
+            live.push(Line::new());
+        }
         live.push(self.footer());
 
         let lines = std::mem::take(&mut self.lines);
