@@ -61,12 +61,14 @@ pub trait Provider {
 }
 
 /// What a reply came to: the reply, its text as it was shown, which with
-/// the reply's calls is the turn it adds to the conversation, and where
-/// the conversation is after it.
+/// the reply's calls is the turn it adds to the conversation, the thought
+/// behind it if the turn is to keep it, and where the conversation is
+/// after it.
 #[derive(Debug, Default, PartialEq)]
 pub struct Completion {
     pub reply: Reply,
     pub text: String,
+    pub thought: String,
     pub state: State,
 }
 

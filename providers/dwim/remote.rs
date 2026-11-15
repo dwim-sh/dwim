@@ -249,7 +249,14 @@ impl Provider for Remote {
             _ => ControlFlow::Continue(()),
         })?;
         match response {
-            Response::Reply { reply, text, state } => Ok(Completion { reply, text, state }),
+            Response::Reply { reply, text, state } => Ok(Completion {
+                reply,
+                text,
+                // The server's model has read the thought already, and
+                // reads the reply without it from then on.
+                thought: String::new(),
+                state,
+            }),
             other => Err(unexpected(&other)),
         }
     }

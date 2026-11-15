@@ -804,11 +804,13 @@ mod tests {
             Turn::Reply {
                 text: checking,
                 calls,
+                thought: String::new(),
             },
             Turn::Results(vec!["Mon".to_string()]),
             Turn::Reply {
                 text: monday,
                 calls: Vec::new(),
+                thought: String::new(),
             },
         ];
         replayed.replay(&turns).unwrap();
@@ -912,11 +914,13 @@ mod tests {
             Turn::Reply {
                 text: "Checking.\n\n".to_string(),
                 calls: vec![call.to_string()],
+                thought: String::new(),
             },
             Turn::Results(vec!["Mon".to_string()]),
             Turn::Reply {
                 text: "Monday.".to_string(),
                 calls: Vec::new(),
+                thought: String::new(),
             },
         ];
         session.replay(&turns).unwrap();
@@ -1046,6 +1050,7 @@ mod tests {
             Turn::Reply {
                 text: "Checking in.".to_string(),
                 calls: Vec::new(),
+                thought: String::new(),
             },
         ];
         session.replay(&turns).unwrap();
@@ -1185,6 +1190,7 @@ mod tests {
                 .measure(&Turn::Reply {
                     text: String::new(),
                     calls: Vec::new(),
+                    thought: String::new(),
                 })
                 .unwrap();
         let heads_len: usize = heads
