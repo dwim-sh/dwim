@@ -107,6 +107,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         doing: None,
         redirect: None,
         unheeded: false,
+        feedforward: true,
         ideas,
         draft: 0,
         edited: None,
@@ -313,6 +314,9 @@ struct App {
     /// whether the message was taken in: the model may go on with the step
     /// it was at as if there were none.
     unheeded: bool,
+    /// Whether the model reads the message being typed, as `/feedforward`
+    /// has it.
+    feedforward: bool,
     /// What the model makes of the message being typed: the thread that
     /// reads it, the number of the last draft given it, when the input
     /// last changed, if it has not been given since, and the idea for the
@@ -387,7 +391,8 @@ impl App {
         if self.edited.is_some_and(|at| at.elapsed() >= PAUSE) {
             self.edited = None;
             let text = self.input.text().trim().to_string();
-            if self.ready
+            if self.feedforward
+                && self.ready
                 && matches!(self.status, Status::Idle)
                 && text.len() >= MIN_DRAFT
                 && !text.starts_with('/')
@@ -1172,6 +1177,14 @@ impl App {
             Command::Help => view::help(columns),
             Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
             Command::Auto => view::notice(view::auto_notice(self.auto)),
+            Command::Feedforward => view::notice(view::feedforward_notice(self.feedforward)),
+            Command::SetFeedforward(on) => {
+                self.feedforward = on;
+                if !on {
+                    self.idea = None;
+                }
+                view::notice(view::feedforward_notice(on))
+            }
             Command::Model
             | Command::Provider
             | Command::Compact

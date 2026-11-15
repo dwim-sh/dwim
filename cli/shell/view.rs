@@ -219,6 +219,16 @@ pub fn auto_notice(auto: bool) -> String {
     }
 }
 
+/// What the `/feedforward` command says of feedforward, and how setting
+/// it is acknowledged.
+pub fn feedforward_notice(on: bool) -> String {
+    if on {
+        "Feedforward on: the model says how it reads a message as you type it".to_string()
+    } else {
+        "Feedforward off: the model reads a message only once you send it".to_string()
+    }
+}
+
 /// Most steps of a plan shown over the input box: of a longer one, the
 /// steps done are counted in a line, and the last of those to come.
 const PLAN_STEPS: usize = 8;
