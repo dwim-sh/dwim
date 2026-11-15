@@ -7,6 +7,12 @@ pub fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// The directory for what the user has set a program up with
+/// (`~/.config`, or on macOS `~/Library/Application Support`).
+pub fn config() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
 /// The directory for files that can be made again (`~/.cache`, or on
 /// macOS `~/Library/Caches`).
 pub fn cache() -> Option<PathBuf> {

@@ -52,9 +52,9 @@ ahead of time.
 
 - **Local by default.** Runs commands, reads their output, and keeps
   going, all on your machine.
-- **A bigger model when you need it.** With `OPENROUTER_API_KEY` set,
-  `/model` moves the session to Qwen3.8 Max at OpenRouter, and back. The
-  conversation goes with it.
+- **A bigger model when you need it.** `/provider` signs in to OpenRouter
+  in your browser, and `/model` moves the session to Qwen3.8 Max there,
+  and back. The conversation goes with it.
 - **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
   or more, decoding several tokens at a time with the drafter its file
   ships.

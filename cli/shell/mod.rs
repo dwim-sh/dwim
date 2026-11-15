@@ -11,7 +11,12 @@ use std::{
     env,
     error::Error,
     path::{Path, PathBuf},
-    sync::mpsc::TryRecvError,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -21,7 +26,11 @@ use crossterm::{
 };
 use dwim::harness::{self, Event, Log};
 use dwim::model::{Device, Size, Variant};
-use dwim::providers::{Kind, openrouter};
+use dwim::providers::{
+    Kind,
+    openrouter::{self, login::Login},
+};
+use dwim::sys::browser;
 
 use crate::{
     session::{self, Settings},
@@ -29,7 +38,7 @@ use crate::{
 };
 
 use cmd::Command;
-use picker::Picker;
+use picker::{Picker, Providers};
 use view::Segment;
 use worker::{Reply, Request, Worker};
 
@@ -63,6 +72,8 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         cwd: env::current_dir().unwrap_or_default(),
         input: Input::default(),
         picker: None,
+        providers: None,
+        signin: None,
         history: Vec::new(),
         recalled: None,
         status: Status::Connecting(Instant::now()),
@@ -100,6 +111,60 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let ready = app.ready;
     app.into_worker().finish(ready);
     result
+}
+
+/// A sign-in to OpenRouter under way.
+struct Signin {
+    /// The address that sends the browser to OpenRouter, and whether the
+    /// browser was opened at it.
+    url: String,
+    opened: bool,
+    since: Instant,
+    /// Set to call the sign-in off, which dropping it does.
+    cancelled: Arc<AtomicBool>,
+    /// The key, once the user has agreed in the browser, or why there is
+    /// none.
+    key: Receiver<Result<Option<String>, String>>,
+}
+
+impl Signin {
+    /// The sign-in as rows, and which of them the cursor is on: what it
+    /// waits for, and where to go if the browser is not there.
+    fn rows(&self) -> (Vec<Line>, usize) {
+        const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+        let frame = SPINNER[(self.since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
+        let go = if self.opened {
+            "If the browser did not open, go to "
+        } else {
+            "Open your browser at "
+        };
+        let rows = vec![
+            vec![span("  Sign in to OpenRouter").bold()],
+            Line::new(),
+            vec![
+                span(format!(
+                    "  {frame} Waiting for you to agree in the browser…"
+                )),
+                span(format!(" {}s", self.since.elapsed().as_secs())).dark_grey(),
+            ],
+            vec![
+                span(format!("    {go}")).dark_grey(),
+                span(&self.url).underlined(),
+            ],
+            Line::new(),
+            vec![
+                span("    OpenRouter makes a key for dwim, which is kept on this machine")
+                    .dark_grey(),
+            ],
+        ];
+        (rows, 2)
+    }
+}
+
+impl Drop for Signin {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// What the model is doing.
@@ -164,6 +229,11 @@ struct App {
     input: Input,
     /// The model picker, while it is open in place of the input box.
     picker: Option<Picker>,
+    /// The provider picker, while it is open in place of the input box.
+    providers: Option<Providers>,
+    /// The sign-in to OpenRouter under way, shown in place of the input
+    /// box.
+    signin: Option<Signin>,
     /// Messages sent so far, and which one is recalled into the input.
     history: Vec<String>,
     recalled: Option<usize>,
@@ -212,7 +282,7 @@ impl App {
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let mut dirty = true;
         loop {
-            if dirty || !matches!(self.status, Status::Idle) {
+            if dirty || !matches!(self.status, Status::Idle) || self.signin.is_some() {
                 self.draw()?;
                 dirty = false;
             }
@@ -238,6 +308,7 @@ impl App {
                 }
                 dirty = true;
             }
+            dirty |= self.signed_in();
         }
     }
 
@@ -247,6 +318,17 @@ impl App {
         let busy = !matches!(self.status, Status::Idle);
         if self.picker.is_some() {
             self.pick(key);
+            return false;
+        }
+        if self.providers.is_some() {
+            self.pick_provider(key);
+            return false;
+        }
+        if self.signin.is_some() {
+            if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+                self.signin = None;
+                self.say(&view::notice("Sign-in to OpenRouter cancelled"));
+            }
             return false;
         }
         match key.code {
@@ -336,18 +418,134 @@ impl App {
                         let lines = self.model_listing();
                         self.say(&lines);
                     }
-                    Some((provider, variant)) => {
-                        self.reply.clear();
-                        self.committed = 0;
-                        self.interrupted = false;
-                        self.status = Status::Switching(Instant::now());
-                        self.worker.send(Request::Model(provider, variant));
-                    }
+                    Some((provider, variant)) => self.switch(provider, variant),
                     None => {}
                 }
             }
             _ => {}
         }
+    }
+
+    /// Handles a key press while the provider picker is open: up and down
+    /// move over the providers, enter picks, and esc closes the picker.
+    /// Picking the provider the session is on shows it; picking another
+    /// moves the conversation there, after signing in to it if there is no
+    /// key to it.
+    fn pick_provider(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(providers) = &mut self.providers else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => providers.step(false),
+            KeyCode::Down => providers.step(true),
+            KeyCode::Char('p') if ctrl => providers.step(false),
+            KeyCode::Char('n') if ctrl => providers.step(true),
+            KeyCode::Esc => self.providers = None,
+            KeyCode::Char('c') if ctrl => self.providers = None,
+            KeyCode::Enter => {
+                let picked = providers.picked();
+                self.providers = None;
+                match picked {
+                    Some(Kind::OpenRouter) if openrouter::key().is_none() => self.sign_in(),
+                    Some(provider) if provider == self.provider => {
+                        self.say(&view::notice(view::provider_notice(
+                            self.provider,
+                            self.variant,
+                        )));
+                    }
+                    Some(provider) => self.switch(provider, self.variant_at(provider)),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The model the session goes on with at `provider`: the one it is on,
+    /// but for the large one, which does not run on this machine.
+    fn variant_at(&self, provider: Kind) -> Variant {
+        match provider {
+            Kind::Local => Variant::Medium,
+            Kind::OpenRouter => self.variant,
+        }
+    }
+
+    /// Moves the conversation to `variant` at `provider`.
+    fn switch(&mut self, provider: Kind, variant: Variant) {
+        self.reply.clear();
+        self.committed = 0;
+        self.interrupted = false;
+        self.status = Status::Switching(Instant::now());
+        self.worker.send(Request::Model(provider, variant));
+    }
+
+    /// Starts signing in to OpenRouter: opens the browser, and waits for
+    /// the key on a thread of its own.
+    fn sign_in(&mut self) {
+        let login = match Login::start() {
+            Ok(login) => login,
+            Err(e) => {
+                self.say(&view::notice(format!("Cannot sign in to OpenRouter: {e}")));
+                return;
+            }
+        };
+        let url = login.url();
+        let opened = browser::open(&url).is_ok();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, key) = mpsc::channel();
+        thread::spawn({
+            let cancelled = cancelled.clone();
+            move || {
+                let _ = sender.send(login.wait(&cancelled).map_err(|e| e.to_string()));
+            }
+        });
+        self.signin = Some(Signin {
+            url,
+            opened,
+            since: Instant::now(),
+            cancelled,
+            key,
+        });
+    }
+
+    /// Goes on from a sign-in that is over, if it is: keeps the key, and
+    /// moves the conversation to OpenRouter. Returns whether it was over.
+    fn signed_in(&mut self) -> bool {
+        let Some(signin) = &self.signin else {
+            return false;
+        };
+        let key = match signin.key.try_recv() {
+            Ok(key) => key,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("the sign-in stopped unexpectedly".to_string()),
+        };
+        self.signin = None;
+        match key.and_then(|key| match key {
+            Some(key) => openrouter::login::save(&key)
+                .map(Some)
+                .map_err(|e| format!("cannot keep the key: {e}")),
+            None => Ok(None),
+        }) {
+            Ok(Some(path)) => {
+                self.say(&view::notice(format!(
+                    "Signed in to OpenRouter · key kept in {}",
+                    view::tilde(&path)
+                )));
+                if self.provider != Kind::OpenRouter {
+                    self.switch(Kind::OpenRouter, self.variant);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.lines.push(vec![
+                    span("● ").red(),
+                    span(format!("error: signing in to OpenRouter: {e}")),
+                ]);
+                self.lines.push(Line::new());
+            }
+        }
+        true
     }
 
     /// Stops the reply being generated, if any.
@@ -418,6 +616,10 @@ impl App {
                     session::providers(),
                     (self.provider, self.variant),
                 ));
+                return;
+            }
+            Some(Ok(Command::Provider)) => {
+                self.providers = Some(Providers::new(session::provider_choices(), self.provider));
                 return;
             }
             Some(Ok(command)) => {
@@ -713,7 +915,6 @@ impl App {
     fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
         let lines = match command {
-            Command::Provider => view::notice(view::provider_notice(self.provider, self.variant)),
             Command::Stats => {
                 let details =
                     session::accounting(&self.stats, self.loading, self.started.elapsed());
@@ -731,6 +932,7 @@ impl App {
             Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
             Command::Auto => view::notice(view::auto_notice(self.auto)),
             Command::Model
+            | Command::Provider
             | Command::Compact
             | Command::SetThinkingBudget(_)
             | Command::SetAuto(_)
@@ -807,16 +1009,29 @@ impl App {
                 .dark_grey(),
             ]
         };
-        // The model picker, in place of the input box while it is open.
-        if let Some(picker) = &self.picker {
+        // A picker, or the sign-in, in place of the input box while it is
+        // open.
+        let panel = if let Some(picker) = &self.picker {
+            Some((
+                picker.rows(),
+                "  ↑↓ model · ←→ provider · enter to select · esc to cancel",
+            ))
+        } else if let Some(providers) = &self.providers {
+            Some((
+                providers.rows(),
+                "  ↑↓ provider · enter to select · esc to cancel",
+            ))
+        } else {
+            self.signin
+                .as_ref()
+                .map(|signin| (signin.rows(), "  esc to cancel"))
+        };
+        if let Some(((rows, row), keys)) = panel {
             live.push(vec![span("─".repeat(columns)).dark_grey()]);
-            let (rows, row) = picker.rows();
             let cursor = (live.len() + row, 2);
             live.extend(rows);
             live.push(Line::new());
-            live.push(vec![
-                span("  ↑↓ model · ←→ provider · enter to select · esc to cancel").dark_grey(),
-            ]);
+            live.push(vec![span(keys).dark_grey()]);
             let lines = std::mem::take(&mut self.lines);
             if let Some(last) = lines.last() {
                 self.blank = last.is_empty();

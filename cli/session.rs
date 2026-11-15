@@ -20,7 +20,10 @@ use dwim::providers::{
 };
 use dwim::sys::memory;
 
-use crate::{model, shell::picker::Group};
+use crate::{
+    model,
+    shell::picker::{Choice, Group},
+};
 
 pub use dwim::server::protocol::Status;
 
@@ -87,7 +90,7 @@ pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Kind, Box<dyn 
         (Some(kind), _) => Ok(kind),
         (None, Variant::Large) if key => Ok(Kind::OpenRouter),
         (None, Variant::Large) => Err(format!(
-            "{} runs at OpenRouter, and {} is not set",
+            "{} runs at OpenRouter, and there is no key to it: /provider signs in, or set {}",
             Variant::Large,
             openrouter::KEY
         )
@@ -112,7 +115,30 @@ pub fn providers() -> Vec<Group> {
             models: vec![Variant::Medium, Variant::Large],
             unavailable: openrouter::key()
                 .is_none()
-                .then(|| format!("needs {}", openrouter::KEY)),
+                .then(|| "/provider signs in".to_string()),
+        },
+    ]
+}
+
+/// The providers, each with what picking it comes to, for the provider
+/// picker. This machine cannot be picked without the memory for a model;
+/// OpenRouter can be without a key to it, which picking it signs in for.
+pub fn provider_choices() -> Vec<Choice> {
+    vec![
+        Choice {
+            provider: Kind::Local,
+            name: "This machine",
+            note: format!("{} in the dwim server", Variant::Medium),
+            unavailable: memory::check().err().map(|e| e.to_string()),
+        },
+        Choice {
+            provider: Kind::OpenRouter,
+            name: "OpenRouter",
+            note: match openrouter::key() {
+                Some(_) => "signed in".to_string(),
+                None => "sign in with your browser to get a key".to_string(),
+            },
+            unavailable: None,
         },
     ]
 }
