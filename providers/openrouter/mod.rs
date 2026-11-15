@@ -173,8 +173,10 @@ impl OpenRouter {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        if let Some(thought) = thought {
-            body["reasoning"] = json!({ "max_tokens": thought });
+        match thought {
+            Some(0) => body["reasoning"] = json!({ "enabled": false }),
+            Some(thought) => body["reasoning"] = json!({ "max_tokens": thought }),
+            None => {}
         }
         let most = thought
             .filter(|_| closing.is_some())
@@ -403,9 +405,14 @@ impl Provider for OpenRouter {
         chat: &Chat,
         heads: &[&str],
         limit: usize,
-        _: &Generation,
+        generation: &Generation,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<(Answer, State)> {
+        // A plain answer thinks within the session's limit, if it has one
+        // under the answer's own: none at all if it is none.
+        let thought = generation
+            .thought_limit
+            .map_or(ANSWER_THOUGHT, |tokens| tokens.min(ANSWER_THOUGHT));
         // A plain answer calls no tools, so none are declared.
         let (mut messages, _) = messages(chat);
         // The headings cannot be written into the answer for the model, so
@@ -423,8 +430,8 @@ impl Provider for OpenRouter {
         }
         let outcome = self.complete(
             (messages, Vec::new()),
-            limit + ANSWER_THOUGHT,
-            Some(ANSWER_THOUGHT),
+            limit + thought,
+            Some(thought),
             None,
             |chunk| match chunk {
                 Chunk::Text(text) => on_text(text),
