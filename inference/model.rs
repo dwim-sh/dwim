@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     gpu::{self, Cpu, Device as _, Gpu},
-    inference::{Download, Format, Gguf, LanguageModel, Result, Sampler, Tokenizer, fetch, qwen35},
+    inference::{Download, Gguf, LanguageModel, Result, Sampler, fetch, qwen35},
+    model::{Format, Tokenizer},
 };
 
 /// Tokens of conversation the model has room for when the device cannot

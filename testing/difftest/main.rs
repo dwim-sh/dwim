@@ -254,7 +254,7 @@ impl Run {
     /// Has the CPU run `prompt` in the pieces the GPU will, and then write
     /// the continuation a token at a time.
     fn record(cpu: &mut Model<Cpu>, gguf: &Gguf, prompt: &str) -> Result<Self> {
-        let tokenizer = dwim::inference::Tokenizer::from_gguf(gguf)?;
+        let tokenizer = dwim::model::Tokenizer::from_gguf(gguf)?;
         let mut run = Self {
             tokens: tokenizer.encode(prompt)?,
             prompt: 0,

@@ -45,11 +45,14 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::inference::{Chunk, Format, LanguageModel, Local, Sampler, Session, Size};
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
 };
 use crate::sys;
+use crate::{
+    inference::{Chunk, LanguageModel, Local, Sampler, Session, Size},
+    model::Format,
+};
 
 pub use crate::server::remote::{Connection, Remote};
 
@@ -681,7 +684,10 @@ impl LanguageModel for Shared {
 mod tests {
     use std::time::Instant;
 
-    use crate::inference::{Session, Tokenizer, Turn, testing::Scripted};
+    use crate::{
+        inference::{Session, testing::Scripted},
+        model::{Tokenizer, Turn},
+    };
 
     use super::*;
 

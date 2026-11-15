@@ -40,6 +40,13 @@ impl Metadata {
         Ok((Self { values }, n_tensors))
     }
 
+    /// Metadata of `values`, as a file would carry them.
+    pub fn new(values: impl IntoIterator<Item = (String, Value)>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.values.get(key)
     }

@@ -2072,7 +2072,7 @@ mod tests {
 
     fn real_model(path: &Path) {
         let gguf = Arc::new(Gguf::open(path).unwrap());
-        let tokenizer = crate::inference::Tokenizer::from_gguf(&gguf).unwrap();
+        let tokenizer = crate::model::Tokenizer::from_gguf(&gguf).unwrap();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();
         let mut model = Model::load(gguf, device, 256, |_, _| {}).unwrap();

@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::inference::{Answer, Chunk, Reply, Sampler, Size, Stats, Turn};
+use crate::{
+    inference::{Answer, Chunk, Reply, Sampler, Size, Stats},
+    model::Turn,
+};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]

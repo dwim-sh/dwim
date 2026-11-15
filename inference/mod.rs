@@ -11,18 +11,18 @@ mod sampler;
 mod states;
 #[cfg(test)]
 pub mod testing;
-mod tokenizer;
 
 pub use fetch::Download;
 pub use gguf::Gguf;
-pub use local::{Answer, Chunk, DRAFTS, Format, Local, Reply, Stats, Tally, Turn};
+pub use local::{Answer, Chunk, DRAFTS, Local, Reply, Stats, Tally};
 pub use model::{Device, Model, OnDisk, Progress, Size};
 pub use sampler::Sampler;
-pub use tokenizer::Tokenizer;
 
 pub use crate::model::Result;
 
 use std::ops::ControlFlow;
+
+use crate::model::Turn;
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.

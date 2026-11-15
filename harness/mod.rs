@@ -41,8 +41,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::inference::{Chunk, Session, Turn};
 use crate::tools::{ToolCall, Tools, bash, read};
+use crate::{
+    inference::{Chunk, Session},
+    model::Turn,
+};
 
 pub use crate::harness::log::Log;
 
@@ -1012,7 +1015,10 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use crate::inference::{Format, Local, Sampler, Tokenizer, testing::Scripted};
+    use crate::{
+        inference::{Local, Sampler, testing::Scripted},
+        model::{Format, Tokenizer},
+    };
 
     use super::*;
 
