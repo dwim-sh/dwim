@@ -65,8 +65,8 @@ pub fn dir() -> Option<PathBuf> {
 /// hung if it runs for seconds, so batches are kept short.
 pub const BATCH: usize = 64;
 
-/// Most tokens the model drafts at once: a batch to be verified holds them
-/// and the token before.
+/// Most tokens the drafter drafts at once. A batch to be verified may hold
+/// more, drafted otherwise: up to a [`BATCH`], with the token before them.
 pub const MAX_DRAFTS: usize = 8;
 
 /// The architecture, read from the GGUF metadata.
@@ -293,7 +293,7 @@ impl Memory {
             activations += linear
                 * (c.ssm_width() + BATCH * (2 * c.k_dim() + c.v_dim() + 2 * c.v_heads))
                 + c.hidden
-                + MAX_DRAFTS * c.vocab;
+                + (BATCH - 1) * c.vocab;
         }
         let kv_dim = c.kv_heads * c.head_dim;
         Ok(Self {
@@ -1076,7 +1076,7 @@ impl<D: Device> LanguageModel for Model<D> {
         let Some(draft) = &self.draft else {
             return Vec::new();
         };
-        let k = k.min(self.verifiable(pos));
+        let k = k.min(MAX_DRAFTS).min(self.verifiable(pos));
         let p = Pass {
             c: &self.config,
             d: &self.device,
@@ -1105,7 +1105,7 @@ impl<D: Device> LanguageModel for Model<D> {
         if self.draft.is_none() || !seq.carry || !seq.verified.is_empty() || pos == 0 {
             return 0;
         }
-        MAX_DRAFTS.min(seq.max_len.saturating_sub(pos + 1))
+        (BATCH - 1).min(seq.max_len.saturating_sub(pos + 1))
     }
 
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
@@ -1115,7 +1115,7 @@ impl<D: Device> LanguageModel for Model<D> {
             "a batch is being verified, or none was run before"
         );
         assert!(
-            !tokens.is_empty() && tokens.len() <= MAX_DRAFTS + 1,
+            !tokens.is_empty() && tokens.len() <= BATCH,
             "a batch of {} tokens is not one to verify",
             tokens.len()
         );
@@ -1460,7 +1460,7 @@ impl<D: Device> State<D> {
             up: d.alloc(BATCH * c.intermediate),
             gate_ffn: d.alloc(BATCH * c.intermediate),
             intermediate: c.intermediate,
-            logits: d.alloc(if c.drafter { MAX_DRAFTS + 1 } else { 1 } * c.vocab),
+            logits: d.alloc(if c.drafter { BATCH } else { 1 } * c.vocab),
             rope,
             drafted: d.alloc(c.hidden),
             ssm_scratch: (0..if c.drafter { slots } else { 0 })

@@ -67,8 +67,9 @@ pub struct Local<M: LanguageModel> {
     speculation: Option<Speculation>,
     /// The conversation's tokens, for the drafts copied from them: where
     /// its last tokens were written before, what followed them is drafted
-    /// in place of the drafter's tokens.
+    /// in place of the drafter's tokens, up to `copy` tokens of it.
     copies: Copies,
+    copy: usize,
     /// Tokens of the context kept free by stopping a reply short of them.
     reserve: usize,
     /// Most tokens a thought may run to, if they are limited, and what is
@@ -83,13 +84,22 @@ pub struct Local<M: LanguageModel> {
 /// Tokens the model drafts after each token picked, by default.
 pub const DRAFTS: usize = 4;
 
+/// Tokens copied from the conversation to verify at once, to begin with.
+/// A copy the reply keeps whole is followed by one twice as long, up to as
+/// many tokens as the model verifies at once, and one it leaves part way
+/// by one this long again: a batch takes longer the more tokens it holds,
+/// which is time lost on the tokens that are not kept.
+const COPY: usize = 8;
+
 /// A batch the model is verifying: the token picked and the tokens
 /// drafted after it, the logits after each, and how many of them the
-/// reply has picked so far, the last of which it is at the logits after.
+/// reply has picked so far, the last of which it is at the logits after;
+/// and whether the drafts were copied from the conversation.
 struct Speculation {
     tokens: Vec<u32>,
     rows: Vec<Vec<f32>>,
     at: usize,
+    copied: bool,
 }
 
 /// What tokens fed to the model count as.
@@ -114,6 +124,7 @@ impl<M: LanguageModel> Local<M> {
             drafts: DRAFTS,
             speculation: None,
             copies: Copies::default(),
+            copy: COPY,
             reserve: 0,
             thought_limit: None,
             closing: None,
@@ -446,10 +457,9 @@ impl<M: LanguageModel> Local<M> {
     /// logits are at hand, and the reply moves on through the batch;
     /// otherwise what was verified before it is committed, and the model
     /// verifies drafts in one pass with the token: what followed the
-    /// conversation's last tokens where they were written before, as many
-    /// tokens of it as the model verifies at once, or else what its
-    /// drafter drafts after the token. It runs the token alone where it
-    /// does not verify or has no room to.
+    /// conversation's last tokens where they were written before, or else
+    /// what its drafter drafts after the token. It runs the token alone
+    /// where it does not verify or has no room to.
     fn step(&mut self, token: u32, kind: Kind) -> Result<Vec<f32>> {
         if let Some(spec) = &mut self.speculation {
             if spec.tokens.get(spec.at + 1) == Some(&token) {
@@ -474,11 +484,11 @@ impl<M: LanguageModel> Local<M> {
             .max_len()
             .saturating_sub(self.len + 1 + self.ending + self.reserve);
         self.copies.extend(&[token]);
-        let most = self.model.verifiable(self.len).min(room);
-        let drafts = match (self.drafts.min(room), self.copies.following(most)) {
-            (0, _) => Vec::new(),
-            (k, []) => self.model.draft(token, self.len, k),
-            (_, copied) => copied.to_vec(),
+        let most = self.copy.min(self.model.verifiable(self.len)).min(room);
+        let (drafts, copied) = match (self.drafts.min(room), self.copies.following(most)) {
+            (0, _) => (Vec::new(), false),
+            (k, []) => (self.model.draft(token, self.len, k), false),
+            (_, copy) => (copy.to_vec(), true),
         };
         let logits = if drafts.is_empty() {
             self.model.forward(&[token], self.len)
@@ -494,6 +504,7 @@ impl<M: LanguageModel> Local<M> {
                 tokens,
                 rows,
                 at: 0,
+                copied,
             });
             first
         };
@@ -509,6 +520,14 @@ impl<M: LanguageModel> Local<M> {
     fn commit(&mut self) {
         if let Some(spec) = self.speculation.take() {
             self.model.rewind(spec.at + 1);
+            if spec.copied {
+                let whole = spec.at + 1 == spec.tokens.len();
+                self.copy = if whole {
+                    self.copy.saturating_mul(2)
+                } else {
+                    COPY
+                };
+            }
         }
     }
 
@@ -735,7 +754,7 @@ mod tests {
             (said, session.stats(), session.model().fed.clone())
         };
         let (plain, _, fed) = run(0);
-        let (said, stats, fed_drafting) = run(8);
+        let (said, stats, fed_drafting) = run(63);
         assert_eq!(plain, script.split_once("</think>").unwrap().1);
         // The same reply, and the model left having read the same tokens.
         assert_eq!(said, plain);
