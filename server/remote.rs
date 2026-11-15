@@ -15,8 +15,8 @@ use crate::server::{
     protocol::{Generation, Opened, Piece, Request, Response, State, Status, Welcome},
 };
 use crate::{
-    inference::{Answer, Chunk, Reply, Result, Session, Size, Stats},
-    model::{Sampling, Turn},
+    inference::Size,
+    model::{Answer, Chunk, Reply, Result, Sampling, Session, Stats, Turn},
 };
 
 /// A connection to the server, before a session is opened on it.

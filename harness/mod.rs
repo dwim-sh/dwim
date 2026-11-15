@@ -41,11 +41,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::model::{Chunk, Session, Turn};
 use crate::tools::{ToolCall, Tools, bash, read};
-use crate::{
-    inference::{Chunk, Session},
-    model::Turn,
-};
 
 pub use crate::harness::log::Log;
 
@@ -480,7 +477,7 @@ pub struct Harness<S: Session> {
 /// doing, and the tools'.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
-    pub model: crate::inference::Stats,
+    pub model: crate::model::Stats,
     /// Tool calls run, and the time they took.
     pub calls: usize,
     pub tool_seconds: f64,

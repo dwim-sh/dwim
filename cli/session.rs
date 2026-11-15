@@ -15,7 +15,8 @@ use std::{
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::inference::{Device, Model, Progress, Tally};
+use dwim::inference::{Device, Model, Progress};
+use dwim::model::Tally;
 use dwim::server::{self, Connection, Remote, protocol::Welcome};
 use dwim::sys;
 

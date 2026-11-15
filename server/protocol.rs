@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    inference::{Answer, Chunk, Reply, Size, Stats},
-    model::{Sampling, Turn},
+    inference::Size,
+    model::{Answer, Chunk, Reply, Sampling, Stats, Turn},
 };
 
 /// What a client asks of the server.
@@ -165,7 +165,7 @@ pub struct State {
     pub stats: Stats,
 }
 
-/// A piece of a reply, as [`crate::inference::Chunk`] has it, owned.
+/// A piece of a reply, as [`crate::model::Chunk`] has it, owned.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Piece {
     Thought(String),

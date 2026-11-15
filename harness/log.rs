@@ -185,8 +185,8 @@ impl Log {
         thought_ended: bool,
         cut: bool,
         tokens: usize,
-        before: &crate::inference::Stats,
-        after: &crate::inference::Stats,
+        before: &crate::model::Stats,
+        after: &crate::model::Stats,
     ) {
         let seconds = (after.prompt.seconds + after.thought.seconds + after.answer.seconds)
             - (before.prompt.seconds + before.thought.seconds + before.answer.seconds);
@@ -264,7 +264,7 @@ impl Log {
     /// tokens and seconds of each kind and the tool calls and their
     /// seconds.
     pub fn finish(&mut self, tokens: usize, stats: &Stats) {
-        let tally = |tally: &crate::inference::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
+        let tally = |tally: &crate::model::Tally| json!({ "tokens": tally.tokens, "seconds": round(tally.seconds) });
         let model = &stats.model;
         self.write(
             "end",

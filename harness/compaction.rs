@@ -11,7 +11,7 @@
 use std::{error::Error, fmt::Write};
 
 use crate::harness::{Entry, Event, Harness, OnEvent, environment};
-use crate::{inference::Session, model::Turn};
+use crate::model::{Session, Turn};
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.

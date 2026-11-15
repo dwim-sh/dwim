@@ -50,8 +50,8 @@ use crate::server::protocol::{
 };
 use crate::sys;
 use crate::{
-    inference::{Chunk, LanguageModel, Local, Sampler, Session, Size},
-    model::Format,
+    inference::{LanguageModel, Local, Sampler, Size},
+    model::{Chunk, Format, Session},
 };
 
 pub use crate::server::remote::{Connection, Remote};
@@ -685,8 +685,8 @@ mod tests {
     use std::time::Instant;
 
     use crate::{
-        inference::{Session, testing::Scripted},
-        model::{Tokenizer, Turn},
+        inference::testing::Scripted,
+        model::{Session, Tokenizer, Turn},
     };
 
     use super::*;
@@ -755,7 +755,7 @@ mod tests {
     }
 
     /// The text of a reply to `message`.
-    fn ask(session: &mut Remote, message: &str) -> (String, crate::inference::Reply) {
+    fn ask(session: &mut Remote, message: &str) -> (String, crate::model::Reply) {
         let mut text = String::new();
         let reply = session
             .send(message, |chunk| {

@@ -1,5 +1,5 @@
-//! Inference: Qwen3.8-27B, its tokenizer and weights, and a session
-//! with it.
+//! Inference: Qwen3.8-27B run on this machine, from its weights, and a
+//! session with it.
 
 mod fetch;
 pub mod gguf;
@@ -14,15 +14,11 @@ pub mod testing;
 
 pub use fetch::Download;
 pub use gguf::Gguf;
-pub use local::{Answer, Chunk, DRAFTS, Local, Reply, Stats, Tally};
+pub use local::{DRAFTS, Local};
 pub use model::{Device, Model, OnDisk, Progress, Size};
 pub use sampler::Sampler;
 
 pub use crate::model::Result;
-
-use std::ops::ControlFlow;
-
-use crate::model::{Sampling, Turn};
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.
@@ -135,74 +131,4 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
     fn select_sequence(&mut self, id: usize) -> Result<()> {
         (**self).select_sequence(id)
     }
-}
-
-/// A session with the model, a conversation with it, as the harness holds
-/// one: a [`Local`] on a model in this process, or a `server::Remote`,
-/// kept with the server that has the model and reached over its socket.
-pub trait Session {
-    /// Forgets the conversation, so that a system prompt can open another.
-    fn clear(&mut self) -> Result<()>;
-
-    /// Feeds `turns` as the conversation so far, without a reply to them.
-    fn replay(&mut self, turns: &[Turn]) -> Result<()>;
-
-    /// Number of tokens `turn` takes when fed.
-    fn measure(&mut self, turn: &Turn) -> Result<usize>;
-
-    /// Most tokens a plain answer to `message` takes with its framing, if
-    /// it is limited to `limit` tokens.
-    fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize>;
-
-    /// Number of tokens in the conversation so far.
-    fn tokens(&self) -> usize;
-
-    /// Number of tokens the conversation has room for in all.
-    fn capacity(&self) -> usize;
-
-    /// Tokens the conversation has room for before the reserve.
-    fn free(&self) -> usize;
-
-    /// Keeps `tokens` of the context free: a reply stops short of them.
-    fn reserve(&mut self, tokens: usize);
-
-    /// Ends a thought that runs to `tokens`, if they are limited, or that
-    /// repeats itself, with `closing` written into it as the model's own.
-    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str);
-
-    /// Feeds the results of the tool calls the last reply made, without a
-    /// reply.
-    fn feed_results(&mut self, outputs: &[String]) -> Result<()>;
-
-    /// Where the conversation's time has gone so far.
-    fn stats(&self) -> Stats;
-
-    /// How the model's tokens are sampled.
-    fn sampling(&self) -> Sampling;
-
-    /// Sends a message from the user, streaming the reply to `on_chunk`,
-    /// which ends it early by breaking.
-    fn send(
-        &mut self,
-        message: &str,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply>;
-
-    /// Sends the results of the tool calls the last reply made, and
-    /// streams the reply to them like `send`.
-    fn respond(
-        &mut self,
-        outputs: &[String],
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply>;
-
-    /// Has the model answer `message` plainly, under `heads` in turn, in
-    /// at most `limit` tokens, streaming the answer to `on_text`.
-    fn answer(
-        &mut self,
-        message: &str,
-        heads: &[&str],
-        limit: usize,
-        on_text: impl FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Answer>;
 }
