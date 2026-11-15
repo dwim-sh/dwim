@@ -22,7 +22,7 @@ pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
         return Err("a server needs room for one session at least".into());
     }
     let hello = Hello {
-        model: settings.model.clone(),
+        model: settings.model.name().to_string(),
         device: settings.device.to_string(),
         context: settings.context,
         room: sessions,

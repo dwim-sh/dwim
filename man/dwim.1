@@ -66,8 +66,30 @@ Device to run the model on:
 .BR cpu .
 .TP
 .BI \-\-model " model"
-Model to run (default:
-.BR qwen3.8\-27b ).
+Model to run, by size:
+.B medium
+(default), which is
+.BR qwen3.8\-27b ,
+or
+.BR large ,
+which is
+.BR qwen3.8\-2.4t\-a95b ,
+of the same family. The large model takes more memory than a machine
+has, and runs only at a provider.
+.TP
+.BI \-\-provider " provider"
+Where the model runs:
+.BR local ,
+in the dwim server on this machine, or
+.BR openrouter ,
+at OpenRouter, with the key in
+.BR OPENROUTER_API_KEY .
+Without the option, the model runs on this machine where it can, and at
+OpenRouter where it cannot and there is a key. A session at OpenRouter
+loads no model, has room for 131072 tokens of conversation unless
+.B \-\-context
+says, and sends the conversation there: what the agent reads of the
+project leaves the machine, and each request is charged for.
 .TP
 .BI \-\-sessions " n"
 Most sessions the server has room for at once (default: 2). The weights
@@ -140,7 +162,8 @@ editing of files, stay here.
 When answering a prompt given on the command line, print where the time
 went once the reply ends: the time loading the model; the tokens read as
 prompts, generated while thinking, and generated as the reply, with the
-time and rate of each; and the tools run.
+time and rate of each; the tools run; and what a provider charged, where
+the model runs at one.
 .TP
 .B \-\-thinking
 Show the model's thinking, and the files it reads, in the shell from the
@@ -207,6 +230,9 @@ Lines starting with a slash are commands:
 .B /model
 Show the model, the device it runs on, where its weights are kept, and
 how many tokens of conversation it has room for.
+.TP
+.B /provider
+Show where the model runs.
 .TP
 .B /stats
 Show where the session's time has gone, as
@@ -374,6 +400,9 @@ exits, and any left by an earlier
 .B dwim
 that is no longer running are removed by the next one to start.
 .SH ENVIRONMENT
+.TP
+.B OPENROUTER_API_KEY
+The key to OpenRouter, for a model that runs there.
 .TP
 .B HF_HUB_CACHE
 Where the Hugging Face cache is, instead of

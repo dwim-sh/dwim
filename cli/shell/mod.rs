@@ -19,7 +19,8 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::harness::{self, Event, Log};
-use dwim::model::{Device, Size};
+use dwim::model::{Device, Size, Variant};
+use dwim::providers::{Kind, openrouter};
 
 use crate::{
     session::{self, Settings},
@@ -39,7 +40,10 @@ const TICK: Duration = Duration::from_millis(80);
 /// keeping a transcript of the session in `log`.
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
-    let model = settings.model.clone();
+    let variant = settings.model;
+    let provider = session::provider(&settings)?;
+    let context = settings.context.unwrap_or(openrouter::CONTEXT);
+    let model = variant.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
     let worker = Worker::spawn(settings, log);
@@ -47,6 +51,9 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let mut app = App {
         screen: Screen::new()?,
         model,
+        variant,
+        provider,
+        context,
         device,
         device_name: None,
         size: None,
@@ -142,6 +149,11 @@ enum Status {
 struct App {
     screen: Screen,
     model: String,
+    /// The model by size, where it runs, and the tokens of conversation a
+    /// session at a provider has room for.
+    variant: Variant,
+    provider: Kind,
+    context: usize,
     /// The kind of device the model runs on, and its name once it is open.
     device: Device,
     device_name: Option<String>,
@@ -619,6 +631,10 @@ impl App {
     fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
         let lines = match command {
+            Command::Model if self.provider == Kind::OpenRouter => {
+                view::hosted_listing(self.variant, self.context, columns)
+            }
+            Command::Provider => view::notice(view::provider_notice(self.provider, self.variant)),
             Command::Model => view::model_listing(
                 &self.model,
                 self.device,

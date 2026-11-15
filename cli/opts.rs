@@ -2,16 +2,24 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use argh::FromArgs;
 use dwim::inference::Model;
-use dwim::model::{Device, Size};
+use dwim::model::{Device, Size, Variant};
+use dwim::providers::Kind;
 
 use crate::{model, session::Settings, tui};
 
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
-    /// model to run (default: qwen3.8-27b)
-    #[argh(option, default = "Model::NAME.to_string()")]
-    pub model: String,
+    /// model to run, by size: medium (default), which is qwen3.8-27b, or
+    /// large, qwen3.8-2.4t-a95b
+    #[argh(option, default = "Variant::Medium")]
+    pub model: Variant,
+
+    /// where the model runs: local, on this machine, or openrouter, with
+    /// the key in OPENROUTER_API_KEY (default: local where the model runs
+    /// here, and openrouter where it does not and there is a key)
+    #[argh(option)]
+    pub provider: Option<Kind>,
 
     /// device to run the model on: gpu (default), or cpu
     #[argh(option, default = "Device::Gpu", from_str_fn(device))]
@@ -98,7 +106,8 @@ impl Opts {
     /// How the model runs, as the options set it.
     pub fn settings(&self) -> Settings {
         Settings {
-            model: self.model.clone(),
+            model: self.model,
+            provider: self.provider,
             device: self.device,
             context: self.context,
             sessions: self.sessions,
@@ -148,7 +157,13 @@ fn temperature(value: &str) -> Result<f32, String> {
 const GROUPS: &[(&str, &[&str])] = &[
     (
         "The model:",
-        &["--context", "--device", "--model", "--sessions"],
+        &[
+            "--context",
+            "--device",
+            "--model",
+            "--provider",
+            "--sessions",
+        ],
     ),
     (
         "Thinking and sampling:",

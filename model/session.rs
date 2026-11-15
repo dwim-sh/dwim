@@ -108,8 +108,9 @@ pub struct Answer {
 
 /// Where a conversation's time has gone: the tokens the model read as
 /// prompts, the ones it generated while thinking, and the ones it
-/// generated as replies, with the time spent on each; and how many tokens
-/// were drafted, and how many of those the sampler accepted.
+/// generated as replies, with the time spent on each; how many tokens
+/// were drafted, and how many of those the sampler accepted; and what a
+/// provider charged for them, in dollars, where one charges.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Stats {
     /// Tokens taken from a saved state rather than read.
@@ -119,6 +120,8 @@ pub struct Stats {
     pub answer: Tally,
     pub drafted: usize,
     pub accepted: usize,
+    #[serde(default)]
+    pub cost: f64,
 }
 
 /// Tokens of one kind, and the seconds the model took over them.
