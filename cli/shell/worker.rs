@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::server::Remote;
+use dwim::providers::dwim::Remote;
 
 use crate::{
     session::{self, Settings},

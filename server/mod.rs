@@ -22,7 +22,6 @@
 //! the thread that reads the connection.
 
 pub mod protocol;
-mod remote;
 
 use std::{
     cell::RefCell,
@@ -53,8 +52,6 @@ use crate::{
     inference::{LanguageModel, Local, Sampler},
     model::{Chunk, Format, Session, Size},
 };
-
-pub use crate::server::remote::{Connection, Remote};
 
 /// How long the server goes without a session before it exits, by
 /// default: long enough that a session started soon after the last ended
@@ -687,6 +684,7 @@ mod tests {
     use crate::{
         inference::testing::Scripted,
         model::{Session, Tokenizer, Turn},
+        providers::dwim::{Connection, Remote},
     };
 
     use super::*;

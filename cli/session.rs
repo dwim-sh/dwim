@@ -17,7 +17,8 @@ use std::{
 use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Model, Progress};
 use dwim::model::{Device, Tally};
-use dwim::server::{self, Connection, Remote, protocol::Welcome};
+use dwim::providers::dwim::{Connection, Remote};
+use dwim::server::{self, protocol::Welcome};
 use dwim::sys;
 
 use crate::model;
