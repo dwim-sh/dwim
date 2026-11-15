@@ -44,13 +44,11 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::server::protocol::{
-    Generation, Opened, Piece, Request, Response, State, Status, Welcome,
-};
+use crate::server::protocol::{Opened, Piece, Request, Response, Status, Welcome};
 use crate::sys;
 use crate::{
     inference::{LanguageModel, Local, Sampler},
-    model::{Chunk, Format, Session, Size},
+    model::{Chunk, Format, Generation, Session, Size, State},
 };
 
 /// How long the server goes without a session before it exits, by

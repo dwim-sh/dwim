@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Answer, Chunk, Reply, Sampling, Size, Stats, Turn};
+use crate::model::{Answer, Chunk, Generation, Reply, Sampling, Size, State, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -79,18 +79,6 @@ pub enum Request {
     Interrupt,
 }
 
-/// How a reply is generated: what the conversation is set to as the reply
-/// starts, which the client keeps and sends with each request for one.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct Generation {
-    /// Tokens of the context kept free: the reply stops short of them.
-    pub reserve: usize,
-    /// Most tokens a thought may run to, if they are limited, and what is
-    /// written to close a thought ended early.
-    pub thought_limit: Option<usize>,
-    pub closing: Option<String>,
-}
-
 /// What the server says back.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Response {
@@ -152,14 +140,6 @@ pub struct Opened {
     pub capacity: usize,
     pub sampling: Sampling,
     pub state: State,
-}
-
-/// Where a conversation is: the tokens in it so far, and where its time
-/// has gone.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct State {
-    pub tokens: usize,
-    pub stats: Stats,
 }
 
 /// A piece of a reply, as [`crate::model::Chunk`] has it, owned.
