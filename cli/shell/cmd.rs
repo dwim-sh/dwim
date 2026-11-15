@@ -5,6 +5,7 @@ use crate::opts;
 /// A slash command, as the user types it after the slash.
 pub enum Command {
     Model,
+    Provider,
     Stats,
     Transcript,
     Compact,
@@ -29,6 +30,7 @@ impl Command {
             });
         match (name, argument) {
             ("model", None) => Ok(Command::Model),
+            ("provider", None) => Ok(Command::Provider),
             ("stats", None) => Ok(Command::Stats),
             ("transcript", None) => Ok(Command::Transcript),
             ("compact", None) => Ok(Command::Compact),
@@ -65,11 +67,12 @@ pub enum ServerAction {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-pub const COMMANDS: [(&str, &str); 8] = [
+pub const COMMANDS: [(&str, &str); 9] = [
     (
         "/model",
         "the model, the device it runs on, and its context window",
     ),
+    ("/provider", "where the model runs"),
     ("/stats", "where this session's time has gone"),
     ("/transcript", "where this session's transcript is"),
     ("/compact", "compact the conversation now"),

@@ -14,9 +14,11 @@ use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Model, Progress};
 use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
-    Conversation,
-    dwim::{self as server, Remote},
+    Any, Conversation, Kind,
+    dwim::{self as server},
+    openrouter::{self, OpenRouter},
 };
+use dwim::sys::memory;
 
 use crate::model;
 
@@ -26,6 +28,8 @@ pub use dwim::server::protocol::Status;
 pub struct Settings {
     /// The model to run.
     pub model: Variant,
+    /// Where it runs, if the command line says.
+    pub provider: Option<Kind>,
     pub device: Device,
     /// Tokens of conversation to make room for in each session, or as
     /// many as fit.
@@ -55,8 +59,9 @@ impl Settings {
     }
 }
 
-/// The session the harness runs on: a conversation on the server.
-pub type Session = Conversation<Remote>;
+/// The session the harness runs on: a conversation at whichever provider
+/// the model runs at.
+pub type Session = Conversation<Any>;
 
 /// The harness around the model, ready for a message.
 pub struct Loaded {
@@ -64,6 +69,31 @@ pub struct Loaded {
     /// How long getting the model ready took: reaching the server, the
     /// loading if it was loading, and the system prompt.
     pub loading: Duration,
+}
+
+/// Where the model runs: where the command line says, and otherwise on
+/// this machine if it can, or at OpenRouter if there is a key to it. The
+/// large model takes more memory than a machine has, and runs only at a
+/// provider.
+pub fn provider(settings: &Settings) -> Result<Kind, Box<dyn Error>> {
+    let key = openrouter::key().is_some();
+    match (settings.provider, settings.model) {
+        (Some(Kind::Local), Variant::Large) => Err(format!(
+            "{} does not run on this machine: it runs with --provider openrouter",
+            Variant::Large
+        )
+        .into()),
+        (Some(kind), _) => Ok(kind),
+        (None, Variant::Large) if key => Ok(Kind::OpenRouter),
+        (None, Variant::Large) => Err(format!(
+            "{} runs at OpenRouter, and {} is not set",
+            Variant::Large,
+            openrouter::KEY
+        )
+        .into()),
+        (None, Variant::Medium) if key && memory::check().is_err() => Ok(Kind::OpenRouter),
+        (None, Variant::Medium) => Ok(Kind::Local),
+    }
 }
 
 /// Fetches the model's files if they are not yet there, reporting the
@@ -119,7 +149,10 @@ pub fn load(
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
     let (mut session, system) = open(settings, on_status)?;
-    let device = session.provider().device().to_string();
+    let device = match session.provider() {
+        Any::Dwim(remote) => remote.device().to_string(),
+        Any::OpenRouter(provider) => format!("OpenRouter · {}", provider.model()),
+    };
     let cwd = env::current_dir()?;
     let mut harness = Harness::new(session, &cwd, {
         let system = system.clone();
@@ -149,15 +182,23 @@ pub fn reopen(
     harness.reopen(session)
 }
 
-/// Reaches the server, starting one if none is running, and opens a
-/// session on it with the system prompt for the working directory, which
-/// it returns with the session. `on_status` is told what the server is
-/// doing meanwhile, and after, when the session waits for another's
-/// request.
+/// Opens a session where the model runs, with the system prompt for the
+/// working directory, which it returns with the session: on the server,
+/// reached, or started if none is running, with `on_status` told what the
+/// server is doing meanwhile, and after, when the session waits for
+/// another's request; or at OpenRouter, where there is nothing to wait
+/// for.
 fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
+    let system = harness::system_prompt(&env::current_dir()?, settings.effort);
+    if provider(settings)? == Kind::OpenRouter {
+        let provider = OpenRouter::new(settings.model, settings.context, settings.temperature)?;
+        let mut session = Conversation::new(Any::OpenRouter(provider));
+        session.start(&system, |_, _| {})?;
+        return Ok((session, system));
+    }
     let connection = server::connect(&settings.server(), &mut on_status)?;
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
@@ -177,12 +218,13 @@ fn open(
     if !size_told {
         on_status(Status::Sized(remote.size()));
     }
-    let mut session = Conversation::new(remote);
-    let system = harness::system_prompt(&env::current_dir()?, settings.effort);
+    let mut session = Conversation::new(Any::Dwim(remote));
     session.start(&system, |read, total| {
         on_status(Status::Prompting { read, total })
     })?;
-    session.provider().on_status(on_status);
+    if let Some(remote) = session.provider().dwim() {
+        remote.on_status(on_status);
+    }
     Ok((session, system))
 }
 

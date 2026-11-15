@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::providers::dwim::{log_path, running, same_build, stop};
+use dwim::providers::dwim::{Remote, log_path, running, same_build, stop};
 
 use crate::{
     session::{self, Settings},
@@ -223,6 +223,9 @@ fn server<F: FnMut(session::Status) + 'static>(
     action: ServerAction,
     on_status: impl Fn() -> F,
 ) -> Result<String, Box<dyn Error>> {
+    if harness.session().provider().dwim().is_none() {
+        return Ok("This session's model runs at OpenRouter · it has no dwim server".to_string());
+    }
     match action {
         ServerAction::Show => Ok(match running() {
             None => "No dwim server is running · the next message starts it".to_string(),
@@ -230,7 +233,7 @@ fn server<F: FnMut(session::Status) + 'static>(
                 let device = if *stopped {
                     welcome.device.to_uppercase()
                 } else {
-                    harness.session().provider().device().to_string()
+                    remote(harness).device().to_string()
                 };
                 let mut notice = format!(
                     "dwim server {} · {} on {device} · {} of {} {} open",
@@ -257,7 +260,7 @@ fn server<F: FnMut(session::Status) + 'static>(
             Ok("The dwim server is stopped · the next message starts it".to_string())
         }
         ServerAction::Stop => {
-            stop(harness.session().provider())?;
+            stop(remote(harness))?;
             *stopped = true;
             Ok("Stopped the dwim server · the next message starts it again".to_string())
         }
@@ -266,7 +269,7 @@ fn server<F: FnMut(session::Status) + 'static>(
         }
         ServerAction::Start | ServerAction::Restart => {
             if !*stopped {
-                stop(harness.session().provider())?;
+                stop(remote(harness))?;
                 *stopped = true;
             }
             session::reopen(settings, harness, on_status())?;
@@ -278,4 +281,13 @@ fn server<F: FnMut(session::Status) + 'static>(
             .to_string())
         }
     }
+}
+
+/// The session `harness` runs on the dwim server.
+fn remote(harness: &mut Harness<session::Session>) -> &mut Remote {
+    harness
+        .session()
+        .provider()
+        .dwim()
+        .expect("the session is on the dwim server")
 }

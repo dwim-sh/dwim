@@ -16,6 +16,7 @@ use std::{
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
 use dwim::inference::Model;
+use dwim::providers::Kind;
 use dwim::sys::{self, memory};
 
 use opts::Opts;
@@ -41,7 +42,13 @@ fn main() {
     }
     let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
-    let result = memory::check().and_then(|()| {
+    let result = (|| {
+        // Running the model here takes the memory for it; a session at a
+        // provider takes none.
+        let local = opts.download || opts.bench || opts.serve;
+        if local || session::provider(&settings)? == Kind::Local {
+            memory::check()?;
+        }
         if opts.download {
             let mut stderr = Stderr::new();
             let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
@@ -59,7 +66,7 @@ fn main() {
             "" => shell::run(settings, opts.thinking, log),
             prompt => once::once(&settings, prompt, opts.stats, log),
         }
-    });
+    })();
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
