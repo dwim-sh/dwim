@@ -128,9 +128,11 @@ pub fn providers() -> Vec<Group> {
 }
 
 /// The providers, each with what picking it comes to, for the provider
-/// picker. This machine cannot be picked without the memory for a model;
-/// OpenRouter can be without a key to it, which picking it signs in for.
-pub fn provider_choices() -> Vec<Choice> {
+/// picker, where the session's model runs at `current`. This machine
+/// cannot be picked without the memory for a model; OpenRouter can be
+/// without a key to it, which picking it signs in for, and picking it
+/// while on it signs in again.
+pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
     vec![
         Choice {
             provider: Kind::Local,
@@ -142,6 +144,9 @@ pub fn provider_choices() -> Vec<Choice> {
             provider: Kind::OpenRouter,
             name: "OpenRouter",
             note: match openrouter::key() {
+                Some(_) if current == Some(Kind::OpenRouter) => {
+                    "signed in · pick to sign in again".to_string()
+                }
                 Some(_) => "signed in".to_string(),
                 None => "sign in with your browser to get a key".to_string(),
             },

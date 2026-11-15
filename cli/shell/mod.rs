@@ -442,9 +442,10 @@ impl App {
 
     /// Handles a key press while the provider picker is open: up and down
     /// move over the providers, enter picks, and esc closes the picker.
-    /// Picking the provider the session is on shows it; picking another
-    /// moves the conversation there, after signing in to it if there is no
-    /// key to it.
+    /// Picking the provider the session is on shows it, but for
+    /// OpenRouter, which is signed in to again, for a key that has expired
+    /// or been revoked; picking another moves the conversation there, after
+    /// signing in to it if there is no key to it.
     fn pick_provider(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(providers) = &mut self.providers else {
@@ -461,7 +462,12 @@ impl App {
                 let picked = providers.picked();
                 self.providers = None;
                 match picked {
-                    Some(Kind::OpenRouter) if openrouter::key().is_none() => self.sign_in(),
+                    Some(Kind::OpenRouter)
+                        if openrouter::key().is_none()
+                            || self.provider == Some(Kind::OpenRouter) =>
+                    {
+                        self.sign_in()
+                    }
                     Some(provider) if Some(provider) == self.provider => {
                         self.say(&view::notice(view::provider_notice(provider, self.variant)));
                     }
@@ -521,7 +527,8 @@ impl App {
     }
 
     /// Goes on from a sign-in that is over, if it is: keeps the key, and
-    /// moves the conversation to OpenRouter. Returns whether it was over.
+    /// moves the conversation to OpenRouter, or opens it there again with
+    /// the new key. Returns whether it was over.
     fn signed_in(&mut self) -> bool {
         let Some(signin) = &self.signin else {
             return false;
@@ -543,9 +550,13 @@ impl App {
                     "Signed in to OpenRouter · key kept in {}",
                     view::tilde(&path)
                 )));
-                if self.provider != Some(Kind::OpenRouter) {
-                    self.switch(Kind::OpenRouter, self.variant);
+                if env::var(openrouter::KEY).is_ok_and(|key| !key.trim().is_empty()) {
+                    self.say(&view::notice(format!(
+                        "{} is set, and is used ahead of the key kept: unset it to use this one",
+                        openrouter::KEY
+                    )));
                 }
+                self.switch(Kind::OpenRouter, self.variant);
             }
             Ok(None) => {}
             Err(e) => {
@@ -632,7 +643,10 @@ impl App {
                 return;
             }
             Some(Ok(Command::Provider)) => {
-                self.providers = Some(Providers::new(session::provider_choices(), self.provider));
+                self.providers = Some(Providers::new(
+                    session::provider_choices(self.provider),
+                    self.provider,
+                ));
                 return;
             }
             Some(Ok(command)) => {

@@ -279,6 +279,12 @@ impl OpenRouter {
                         }
                         _ => format!("OpenRouter: {status}"),
                     };
+                    if status.as_u16() == 401 {
+                        return Err(format!(
+                            "{message} · the key to OpenRouter was refused: /provider signs in again"
+                        )
+                        .into());
+                    }
                     if !(status.as_u16() == 429 || status.is_server_error()) {
                         return Err(message.into());
                     }
