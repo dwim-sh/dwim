@@ -24,18 +24,22 @@ program. One package: `lib.rs` is the library, `cli/` and
 - `cli/` - the `dwim` command: options, the shell, `serve`, `bench`
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   compaction, thinking budget, transcript
-- `providers/` - where a session's model runs, a directory each: `dwim`
-  is a session on the dwim server over its Unix socket (`remote`), and
+- `providers/` - where a session's model runs: `Provider` is a model
+  asked with the whole conversation each time, as a chat API is, and
+  `conversation` the `Session` the harness holds on one. A directory
+  each: `dwim` is the dwim server over its Unix socket (`remote`), and
   reaching or starting that server (`launch`)
-- `server/` - the process that has the model, and the `protocol` its
-  sessions speak
+- `server/` - the process that has the model, and the `protocol` it is
+  asked in: a request carries the whole conversation, and the server
+  reads only what it has not read of it
 - `inference/` - running the model on this machine: `gguf`, `quants`,
   `qwen35` (the transformer, documented there), `model` (loading and
   sizing), `local`, `sampler`, `states` (saved system prompts), `fetch`
   (downloads into the cache)
 - `model/` - what is known of the model wherever it runs: `session` (the
-  `Session` the harness holds), `format` (the chat format), `tokenizer`,
-  `gguf` (a file's header), `hub` (the Hugging Face cache). It takes
+  `Session` the harness holds), `chat` (a conversation as a request
+  carries it), `format` (the chat format), `tokenizer`, `gguf` (a file's
+  header), `hub` (the Hugging Face cache). It takes
   nothing from the directories above, and `providers/` take nothing from
   `inference/`
 - `tools/` - the tools, one file each; `call` parses a call

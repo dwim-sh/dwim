@@ -13,7 +13,10 @@ use std::{
 use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Model, Progress};
 use dwim::model::{Device, Tally};
-use dwim::providers::dwim::{self as server, Remote};
+use dwim::providers::{
+    Conversation,
+    dwim::{self as server, Remote},
+};
 
 use crate::model;
 
@@ -52,9 +55,12 @@ impl Settings {
     }
 }
 
+/// The session the harness runs on: a conversation on the server.
+pub type Session = Conversation<Remote>;
+
 /// The harness around the model, ready for a message.
 pub struct Loaded {
-    pub harness: Harness<Remote>,
+    pub harness: Harness<Session>,
     /// How long getting the model ready took: reaching the server, the
     /// loading if it was loading, and the system prompt.
     pub loading: Duration,
@@ -112,12 +118,12 @@ pub fn load(
     on_status: impl FnMut(Status) + 'static,
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
-    let (session, system) = open(settings, on_status)?;
-    let device = session.device().to_string();
+    let (mut session, system) = open(settings, on_status)?;
+    let device = session.provider().device().to_string();
     let cwd = env::current_dir()?;
     let mut harness = Harness::new(session, &cwd, {
         let system = system.clone();
-        move |session: &mut Remote| session.start(&system, |_, _| {}).map(|_| ())
+        move |session: &mut Session| session.start(&system, |_, _| {})
     })?;
     harness.set_thinking_budget(settings.thinking_budget);
     if let Some(shell) = settings.shell.clone() {
@@ -136,7 +142,7 @@ pub fn load(
 /// [`load`].
 pub fn reopen(
     settings: &Settings,
-    harness: &mut Harness<Remote>,
+    harness: &mut Harness<Session>,
     on_status: impl FnMut(Status) + 'static,
 ) -> Result<(), Box<dyn Error>> {
     let (session, _) = open(settings, on_status)?;
@@ -151,13 +157,13 @@ pub fn reopen(
 fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + 'static,
-) -> Result<(Remote, String), Box<dyn Error>> {
+) -> Result<(Session, String), Box<dyn Error>> {
     let connection = server::connect(&settings.server(), &mut on_status)?;
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
     // through, is told of the device and the size afterwards instead.
     let (mut device_told, mut size_told) = (false, false);
-    let mut session = connection.open(settings.temperature, settings.speculate, |status| {
+    let remote = connection.open(settings.temperature, settings.speculate, |status| {
         match status {
             Status::Device(_) => device_told = true,
             Status::Sized(_) => size_told = true,
@@ -166,16 +172,17 @@ fn open(
         on_status(status)
     })?;
     if !device_told {
-        on_status(Status::Device(session.device().to_string()));
+        on_status(Status::Device(remote.device().to_string()));
     }
     if !size_told {
-        on_status(Status::Sized(session.size()));
+        on_status(Status::Sized(remote.size()));
     }
+    let mut session = Conversation::new(remote);
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     session.start(&system, |read, total| {
         on_status(Status::Prompting { read, total })
     })?;
-    session.on_status(on_status);
+    session.provider().on_status(on_status);
     Ok((session, system))
 }
 

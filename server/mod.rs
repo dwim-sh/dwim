@@ -8,6 +8,13 @@
 //! model, the sampling, and each session's conversation with it, as a
 //! [`Local`], and speaks the [`protocol`].
 //!
+//! A request carries the whole conversation, and the server answers it
+//! from what it is asked alone, as a chat API does. What a session has
+//! read of a conversation stays in its sequence, so a request that goes on
+//! from it costs only what it adds: the server reads the turns that are
+//! new, and reads the conversation over, from the state saved after its
+//! system prompt, only when it is not the one the session has read.
+//!
 //! The model's weights are shared, and each session has a sequence of its
 //! own on the device: its key/value caches, its linear layers' recurrent
 //! states, and what the drafter carries over. The server allocates as many
@@ -44,13 +51,11 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::server::protocol::{
-    Generation, Opened, Piece, Request, Response, State, Status, Welcome,
-};
+use crate::server::protocol::{Opened, Piece, Request, Response, Status, Welcome};
 use crate::sys;
 use crate::{
     inference::{LanguageModel, Local, Sampler},
-    model::{Chunk, Format, Session, Size},
+    model::{Chat, Chunk, Format, Generation, Session, Size, State, Turn},
 };
 
 /// How long the server goes without a session before it exits, by
@@ -136,11 +141,22 @@ struct Inner {
     retiring: AtomicBool,
 }
 
+/// A session as the server has it: the conversation on the model, and what
+/// of a conversation the model has read into it, if anything, which the
+/// next request is read on from.
+struct Served {
+    session: Local<Shared>,
+    read: Option<Chat>,
+}
+
 /// The server: listening on its socket, with the model loading or loaded.
 pub struct Server {
     inner: Arc<Inner>,
     inbox: Receiver<(usize, Message)>,
     idle: Duration,
+    /// Whether the state after a system prompt is saved, and taken up
+    /// from by the next conversation that opens with the prompt.
+    states: bool,
 }
 
 impl Server {
@@ -183,6 +199,7 @@ impl Server {
             inner,
             inbox,
             idle: IDLE,
+            states: true,
         })
     }
 
@@ -190,6 +207,13 @@ impl Server {
     /// [`IDLE`] unless set.
     pub fn set_idle(&mut self, idle: Duration) {
         self.idle = idle;
+    }
+
+    /// Has the server read every system prompt, keeping no state of one
+    /// from one conversation to the next.
+    #[cfg(test)]
+    fn keep_no_states(&mut self) {
+        self.states = false;
     }
 
     /// Tells every connection how loading the model is going.
@@ -235,7 +259,7 @@ impl Server {
         }
         free.reverse();
         let pool = Rc::new(RefCell::new(Pool { model, free }));
-        let mut sessions: HashMap<usize, Local<Shared>> = HashMap::new();
+        let mut sessions: HashMap<usize, Served> = HashMap::new();
         loop {
             if inner.retiring.load(Ordering::Relaxed) && sessions.is_empty() {
                 eprintln!("retired: exiting");
@@ -281,25 +305,32 @@ impl Server {
                                     size,
                                     capacity: session.capacity(),
                                     sampling: session.sampling(),
-                                    state: state(&session),
                                 };
                                 eprintln!(
                                     "session {id} opened on sequence {}",
                                     shared_id(&session)
                                 );
-                                entry.insert(session);
+                                entry.insert(Served {
+                                    session,
+                                    read: None,
+                                });
                                 Response::Opened(opened)
                             },
                         )
                     }),
                 },
                 request => match sessions.get_mut(&id) {
-                    Some(session) => {
-                        let response = serve(session, request, &peer);
+                    Some(served) => {
+                        let response = serve(served, request, &peer, self.states);
                         // A reply that failed part way may leave a batch
                         // being verified: it is committed before another
-                        // session has the model.
-                        session.settle();
+                        // session has the model. What the model has read
+                        // is then not known to be a conversation's, so the
+                        // next request is read from its start.
+                        served.session.settle();
+                        if response.is_err() {
+                            served.read = None;
+                        }
                         response
                     }
                     None => Err("no session is open on this connection".into()),
@@ -420,10 +451,7 @@ fn read(
                 continue;
             }
             request => {
-                if matches!(
-                    request,
-                    Request::Send { .. } | Request::Respond { .. } | Request::Answer { .. }
-                ) {
+                if matches!(request, Request::Reply { .. } | Request::Answer { .. }) {
                     peer.interrupted.store(false, Ordering::Relaxed);
                 }
                 if inner.busy_for(id) {
@@ -465,11 +493,13 @@ fn state<M: LanguageModel>(session: &Local<M>) -> State {
 }
 
 /// Serves a session's request on the model, streaming what there is to
-/// `peer` along the way.
+/// `peer` along the way. The state after a system prompt is saved and
+/// taken up from if `states` says so.
 fn serve(
-    session: &mut Local<Shared>,
+    served: &mut Served,
     request: Request,
     peer: &Peer,
+    states: bool,
 ) -> Result<Response, Box<dyn Error>> {
     let progress = |read: usize, total: usize| {
         let _ = peer.write(&Response::Status(Status::Prompting { read, total }));
@@ -484,67 +514,64 @@ fn serve(
             ControlFlow::Continue(())
         }
     };
-    let on_chunk = |chunk: Chunk| stream(Piece::of(chunk));
     Ok(match request {
-        Request::Start { prompt } => {
-            let restored = session.start(&prompt, progress)?;
-            Response::Started {
-                restored,
-                state: state(session),
-            }
+        Request::Read { chat } => {
+            served.catch_up(&chat.system, &chat.turns, states, progress)?;
+            Response::Read(state(&served.session))
         }
-        Request::System { text } => {
-            session.system(&text, progress)?;
-            Response::Ok(state(session))
-        }
-        Request::Clear => {
-            session.clear()?;
-            Response::Ok(state(session))
-        }
-        Request::Replay { turns } => {
-            session.replay(&turns)?;
-            Response::Ok(state(session))
-        }
-        Request::FeedResults { outputs } => {
-            session.feed_results(&outputs)?;
-            Response::Ok(state(session))
-        }
-        Request::Send {
-            message,
-            generation,
-        } => {
-            generation.apply(session);
-            let reply = session.send(&message, on_chunk)?;
+        Request::Reply { chat, generation } => {
+            let (last, before) = asked(&chat)?;
+            served.catch_up(&chat.system, before, states, progress)?;
+            generation.apply(&mut served.session);
+            // The reply's text as it is streamed, which is the turn the
+            // reply adds, and what the client is told it is.
+            let mut text = String::new();
+            let on_chunk = |chunk: Chunk| {
+                if let Chunk::Text(piece) = chunk {
+                    text.push_str(piece);
+                }
+                stream(Piece::of(chunk))
+            };
+            let reply = match last {
+                Turn::User(message) => served.session.send(message, on_chunk)?,
+                Turn::Results(outputs) => served.session.respond(outputs, on_chunk)?,
+                Turn::Reply { .. } => unreachable!("asked ends with what is replied to"),
+            };
+            served.add(last.clone());
+            served.add(Turn::Reply {
+                text: text.clone(),
+                calls: reply.calls.clone(),
+            });
             Response::Reply {
                 reply,
-                state: state(session),
-            }
-        }
-        Request::Respond {
-            outputs,
-            generation,
-        } => {
-            generation.apply(session);
-            let reply = session.respond(&outputs, on_chunk)?;
-            Response::Reply {
-                reply,
-                state: state(session),
+                text,
+                state: state(&served.session),
             }
         }
         Request::Answer {
-            message,
+            chat,
             heads,
             limit,
             generation,
         } => {
-            generation.apply(session);
+            let (last, before) = asked(&chat)?;
+            let Turn::User(message) = last else {
+                return Err("a plain answer is to a message from the user".into());
+            };
+            served.catch_up(&chat.system, before, states, progress)?;
+            generation.apply(&mut served.session);
             let heads: Vec<&str> = heads.iter().map(String::as_str).collect();
-            let answer = session.answer(&message, &heads, limit, |text| {
+            let answer = served.session.answer(message, &heads, limit, |text| {
                 stream(Piece::Text(text.to_string()))
             })?;
+            served.add(last.clone());
+            served.add(Turn::Reply {
+                text: answer.text.clone(),
+                calls: Vec::new(),
+            });
             Response::Answered {
                 answer,
-                state: state(session),
+                state: state(&served.session),
             }
         }
         Request::Hello { .. }
@@ -554,6 +581,67 @@ fn serve(
         | Request::AnswerTokens { .. }
         | Request::Interrupt => return Err("the request is not a session's".into()),
     })
+}
+
+/// What `chat` asks a reply to, a message from the user or the results of
+/// tool calls, and the turns before it.
+fn asked(chat: &Chat) -> Result<(&Turn, &[Turn]), Box<dyn Error>> {
+    match chat.turns.split_last() {
+        Some((last, before)) if !matches!(last, Turn::Reply { .. }) => Ok((last, before)),
+        _ => Err("the conversation does not end with something to reply to".into()),
+    }
+}
+
+impl Served {
+    /// Has the model read the conversation that opens with `system` and
+    /// goes on with `turns`: the turns it has yet to read, if the
+    /// conversation goes on from the one it has read, and otherwise all of
+    /// it, from the start, telling `on_progress` how the reading of the
+    /// system prompt goes.
+    fn catch_up(
+        &mut self,
+        system: &str,
+        turns: &[Turn],
+        states: bool,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<(), Box<dyn Error>> {
+        let goes_on = self
+            .read
+            .as_ref()
+            .is_some_and(|read| read.system == system && turns.starts_with(&read.turns));
+        if !goes_on {
+            self.read = None;
+            self.session.clear()?;
+            if states {
+                self.session.start(system, on_progress)?;
+            } else {
+                self.session.system(system, on_progress)?;
+            }
+            self.read = Some(Chat {
+                system: system.to_string(),
+                turns: Vec::new(),
+            });
+        }
+        let read = self.read.as_mut().expect("the conversation is open");
+        let new = &turns[read.turns.len()..];
+        if !new.is_empty() {
+            // A reading that fails part way leaves the model with turns
+            // that are not known here.
+            let read = self.read.take().expect("the conversation is open");
+            self.session.replay(new)?;
+            let mut read = read;
+            read.turns.extend_from_slice(new);
+            self.read = Some(read);
+        }
+        Ok(())
+    }
+
+    /// Adds a turn the model has read, or said, to what it has read.
+    fn add(&mut self, turn: Turn) {
+        if let Some(read) = &mut self.read {
+            read.turns.push(turn);
+        }
+    }
 }
 
 impl Generation {
@@ -684,7 +772,10 @@ mod tests {
     use crate::{
         inference::testing::Scripted,
         model::{Session, Tokenizer, Turn},
-        providers::dwim::{Connection, Remote},
+        providers::{
+            Conversation, Provider,
+            dwim::{Connection, Remote},
+        },
     };
 
     use super::*;
@@ -704,7 +795,8 @@ mod tests {
             context: None,
             room: 2,
         };
-        let server = Server::bind(&path, hello).unwrap();
+        let mut server = Server::bind(&path, hello).unwrap();
+        server.keep_no_states();
         let inner = server.inner.clone();
         let handle = thread::spawn(move || {
             let tokenizer = Tokenizer::tiny();
@@ -747,13 +839,13 @@ mod tests {
         (path, handle)
     }
 
-    fn open(path: &Path) -> Remote {
+    fn open(path: &Path) -> Conversation<Remote> {
         let connection = Connection::connect(path).unwrap();
-        connection.open(None, 0, |_| {}).unwrap()
+        Conversation::new(connection.open(None, 0, |_| {}).unwrap())
     }
 
     /// The text of a reply to `message`.
-    fn ask(session: &mut Remote, message: &str) -> (String, crate::model::Reply) {
+    fn ask(session: &mut Conversation<Remote>, message: &str) -> (String, crate::model::Reply) {
         let mut text = String::new();
         let reply = session
             .send(message, |chunk| {
@@ -779,8 +871,8 @@ mod tests {
         );
         let mut a = open(&path);
         let mut b = open(&path);
-        a.system("Be brief.", |_, _| {}).unwrap();
-        b.system("Be brief.", |_, _| {}).unwrap();
+        a.start("Be brief.", |_, _| {}).unwrap();
+        b.start("Be brief.", |_, _| {}).unwrap();
         assert_eq!(a.tokens(), b.tokens());
         let start = a.tokens();
 
@@ -827,7 +919,7 @@ mod tests {
         let tokens = a.tokens();
         a.clear().unwrap();
         assert_eq!(a.tokens(), 0);
-        a.system("Be brief.", |_, _| {}).unwrap();
+        a.start("Be brief.", |_, _| {}).unwrap();
         a.replay(&[Turn::User("hi".to_string())]).unwrap();
         assert!(a.tokens() > start && a.tokens() < tokens);
 
@@ -845,12 +937,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut c = loop {
             match Connection::connect(&path).unwrap().open(None, 0, |_| {}) {
-                Ok(session) => break session,
+                Ok(session) => break Conversation::new(session),
                 Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Err(e) => panic!("{e}"),
             }
         };
-        c.system("Be brief.", |_, _| {}).unwrap();
+        c.start("Be brief.", |_, _| {}).unwrap();
         assert_eq!(c.tokens(), start);
         let b = c;
 
@@ -864,6 +956,28 @@ mod tests {
         drop(connection);
         drop(a);
         drop(b);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_conversation_sent_whole_again_is_read_once() {
+        let (path, handle) = server(&["</think>\n\nOne.", "</think>\n\nTwo."], None);
+        let mut session = open(&path);
+        session.start("Be brief.", |_, _| {}).unwrap();
+        let start = session.stats().prompt.tokens;
+        ask(&mut session, "first");
+        let first = session.stats().prompt.tokens - start;
+        // The second request carries the first exchange again, and the
+        // server reads only what it adds: as much as the first did, the
+        // messages and the replies being as long.
+        let (two, _) = ask(&mut session, "again");
+        assert_eq!(two.trim(), "Two.");
+        assert_eq!(session.stats().prompt.tokens - start, 2 * first);
+
+        let mut connection = Connection::connect(&path).unwrap();
+        connection.retire().unwrap();
+        drop(connection);
+        drop(session);
         handle.join().unwrap();
     }
 
@@ -883,7 +997,7 @@ mod tests {
             Some(20),
         );
         let mut session = open(&path);
-        session.system("Be brief.", |_, _| {}).unwrap();
+        session.start("Be brief.", |_, _| {}).unwrap();
         let mut thoughts = 0;
         let reply = session
             .send("go", |chunk| {

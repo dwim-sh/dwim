@@ -3,10 +3,15 @@
 //! what the server has to say in the meantime, such as a reply's pieces or
 //! how loading is going, streamed ahead of it. One connection holds one
 //! session, and makes one request at a time.
+//!
+//! A request for a reply carries the whole conversation, as a chat API's
+//! does, and nothing a client asks depends on what it asked before. The
+//! server keeps what its session has read of the conversation, and reads
+//! only what a request adds to it.
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Answer, Chunk, Reply, Sampling, Size, Stats, Turn};
+use crate::model::{Answer, Chat, Chunk, Generation, Reply, Sampling, Size, State, Turn};
 
 /// What a client asks of the server.
 #[derive(Debug, Deserialize, Serialize)]
@@ -26,19 +31,13 @@ pub enum Request {
         temperature: Option<f32>,
         speculate: usize,
     },
-    /// Opens the conversation with the system prompt: from the state
-    /// saved after an earlier reading of the same prompt, if there is one,
-    /// and otherwise by reading it, reporting [`Status::Prompting`] as it
-    /// goes. Answered with [`Response::Started`].
-    Start { prompt: String },
-    /// Opens the conversation with a system prompt, reading it, with
-    /// [`Status::Prompting`] as it goes. Answered with [`Response::Ok`].
-    System { text: String },
-    /// Forgets the conversation. Answered with [`Response::Ok`].
-    Clear,
-    /// Feeds turns as the conversation so far. Answered with
-    /// [`Response::Ok`].
-    Replay { turns: Vec<Turn> },
+    /// Reads the conversation, without a reply to it: what the session has
+    /// not read of it yet, or all of it if it is not the conversation the
+    /// session has read, from the state saved after an earlier reading of
+    /// its system prompt where there is one, reporting
+    /// [`Status::Prompting`] as the prompt is read. Answered with
+    /// [`Response::Read`].
+    Read { chat: Chat },
     /// How many tokens a turn takes when fed. Answered with
     /// [`Response::Count`] at once, without waiting for the model.
     Measure { turn: Turn },
@@ -46,28 +45,18 @@ pub enum Request {
     /// limited to `limit` tokens. Answered with [`Response::Count`] at
     /// once.
     AnswerTokens { message: String, limit: usize },
-    /// Feeds the results of the last reply's tool calls, without a reply.
-    /// Answered with [`Response::Ok`].
-    FeedResults { outputs: Vec<String> },
-    /// Sends a message from the user: the reply's pieces are streamed as
+    /// Replies to the conversation, which ends with a message from the
+    /// user or the results of tool calls, having read it as
+    /// [`Request::Read`] does: the reply's pieces are streamed as
     /// [`Response::Chunk`]s, and then it is answered with
     /// [`Response::Reply`].
-    Send {
-        message: String,
-        generation: Generation,
-    },
-    /// Sends the results of the last reply's tool calls, and streams the
-    /// reply to them like `Send`.
-    Respond {
-        outputs: Vec<String>,
-        generation: Generation,
-    },
-    /// Has the model answer the message plainly, under `heads` in turn, in
-    /// at most `limit` tokens: the answer's text is streamed as
-    /// [`Response::Chunk`]s of text, and then it is answered with
-    /// [`Response::Answered`].
+    Reply { chat: Chat, generation: Generation },
+    /// Has the model answer the message the conversation ends with
+    /// plainly, under `heads` in turn, in at most `limit` tokens: the
+    /// answer's text is streamed as [`Response::Chunk`]s of text, and then
+    /// it is answered with [`Response::Answered`].
     Answer {
-        message: String,
+        chat: Chat,
         heads: Vec<String>,
         limit: usize,
         generation: Generation,
@@ -77,18 +66,6 @@ pub enum Request {
     /// the reply it ends is, as it would have been. Sent before the
     /// request it ends was taken up, it ends the reply as it starts.
     Interrupt,
-}
-
-/// How a reply is generated: what the conversation is set to as the reply
-/// starts, which the client keeps and sends with each request for one.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct Generation {
-    /// Tokens of the context kept free: the reply stops short of them.
-    pub reserve: usize,
-    /// Most tokens a thought may run to, if they are limited, and what is
-    /// written to close a thought ended early.
-    pub thought_limit: Option<usize>,
-    pub closing: Option<String>,
 }
 
 /// What the server says back.
@@ -107,16 +84,18 @@ pub enum Response {
     Opened(Opened),
     /// A piece of the reply being generated.
     Chunk(Piece),
-    /// The answer to [`Request::Start`]: whether the state was restored
-    /// rather than the prompt read.
-    Started { restored: bool, state: State },
-    /// The answer to a request that has nothing to say but that it is
-    /// done.
-    Ok(State),
+    /// The answer to [`Request::Read`]: where the conversation is.
+    Read(State),
     /// The answer to [`Request::Measure`] and [`Request::AnswerTokens`].
     Count(usize),
-    /// The answer to [`Request::Send`] and [`Request::Respond`].
-    Reply { reply: Reply, state: State },
+    /// The answer to [`Request::Reply`]: the reply, its text as it was
+    /// streamed, which with its calls is the turn it adds to the
+    /// conversation, and where the conversation is after it.
+    Reply {
+        reply: Reply,
+        text: String,
+        state: State,
+    },
     /// The answer to [`Request::Answer`].
     Answered { answer: Answer, state: State },
     /// The request failed, or could not be read.
@@ -143,23 +122,13 @@ pub struct Welcome {
 }
 
 /// A session as opened: the device the model runs on, its size, the tokens
-/// the conversation has room for, how its tokens are sampled, and where the
-/// conversation is.
+/// a conversation has room for, and how its tokens are sampled.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Opened {
     pub device: String,
     pub size: Size,
     pub capacity: usize,
     pub sampling: Sampling,
-    pub state: State,
-}
-
-/// Where a conversation is: the tokens in it so far, and where its time
-/// has gone.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct State {
-    pub tokens: usize,
-    pub stats: Stats,
 }
 
 /// A piece of a reply, as [`crate::model::Chunk`] has it, owned.

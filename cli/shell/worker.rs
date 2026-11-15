@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::providers::dwim::{Remote, log_path, running, same_build, stop};
+use dwim::providers::dwim::{log_path, running, same_build, stop};
 
 use crate::{
     session::{self, Settings},
@@ -218,7 +218,7 @@ fn work(
 /// `on_status` makes what is told what the server does as it starts.
 fn server<F: FnMut(session::Status) + 'static>(
     settings: &Settings,
-    harness: &mut Harness<Remote>,
+    harness: &mut Harness<session::Session>,
     stopped: &mut bool,
     action: ServerAction,
     on_status: impl Fn() -> F,
@@ -230,7 +230,7 @@ fn server<F: FnMut(session::Status) + 'static>(
                 let device = if *stopped {
                     welcome.device.to_uppercase()
                 } else {
-                    harness.session().device().to_string()
+                    harness.session().provider().device().to_string()
                 };
                 let mut notice = format!(
                     "dwim server {} · {} on {device} · {} of {} {} open",
@@ -257,7 +257,7 @@ fn server<F: FnMut(session::Status) + 'static>(
             Ok("The dwim server is stopped · the next message starts it".to_string())
         }
         ServerAction::Stop => {
-            stop(harness.session())?;
+            stop(harness.session().provider())?;
             *stopped = true;
             Ok("Stopped the dwim server · the next message starts it again".to_string())
         }
@@ -266,7 +266,7 @@ fn server<F: FnMut(session::Status) + 'static>(
         }
         ServerAction::Start | ServerAction::Restart => {
             if !*stopped {
-                stop(harness.session())?;
+                stop(harness.session().provider())?;
                 *stopped = true;
             }
             session::reopen(settings, harness, on_status())?;

@@ -1,5 +1,5 @@
-//! A session with the model as the server has it, held over a connection
-//! to the server: the [`Session`] the harness runs on.
+//! The model as the server has it, reached over a connection to the
+//! server: a [`Provider`], asked with the whole conversation each time.
 
 use std::{
     error::Error,
@@ -10,10 +10,13 @@ use std::{
     path::Path,
 };
 
-use crate::model::{Answer, Chunk, Reply, Result, Sampling, Session, Size, Stats, Turn};
-use crate::server::{
-    build,
-    protocol::{Generation, Opened, Piece, Request, Response, State, Status, Welcome},
+use crate::{
+    model::{Answer, Chat, Chunk, Generation, Result, Sampling, Size, State, Turn},
+    providers::{Completion, Provider},
+    server::{
+        build,
+        protocol::{Opened, Piece, Request, Response, Status, Welcome},
+    },
 };
 
 /// A connection to the server, before a session is opened on it.
@@ -77,17 +80,13 @@ impl Connection {
             size,
             capacity,
             sampling,
-            state,
         } = opened;
         Ok(Remote {
             connection: self,
             device,
             size,
             capacity,
-            tokens: state.tokens,
-            stats: state.stats,
             sampling,
-            generation: Generation::default(),
             on_status: Box::new(|_| {}),
         })
     }
@@ -139,19 +138,15 @@ fn unexpected(response: &Response) -> Box<dyn Error> {
     format!("unexpected response from the dwim server: {response:?}").into()
 }
 
-/// A session with the model, held over a connection to the server. What
-/// a request changes about the conversation, the tokens in it and where
-/// its time has gone, comes back with each answer; what the client sets,
-/// the reserve and the thinking budget, goes with each request for a reply.
+/// A session on the server, held over a connection to it. The server
+/// keeps what the session has read of a conversation, so a request that
+/// goes on from the last costs only what it adds.
 pub struct Remote {
     connection: Connection,
     device: String,
     size: Size,
     capacity: usize,
-    tokens: usize,
-    stats: Stats,
     sampling: Sampling,
-    generation: Generation,
     /// Told when the server has this session wait for another's request.
     on_status: Box<dyn FnMut(Status)>,
 }
@@ -179,33 +174,6 @@ impl Remote {
         self.on_status = Box::new(on_status);
     }
 
-    /// Opens the conversation with the system prompt, from the state the
-    /// server saved after an earlier reading of the same prompt if there
-    /// is one, reporting the reading as [`Remote::system`] does, and
-    /// returns whether the state was restored.
-    pub fn start(&mut self, prompt: &str, on_progress: impl FnMut(usize, usize)) -> Result<bool> {
-        let request = Request::Start {
-            prompt: prompt.to_string(),
-        };
-        match self.call(&request, prompting(on_progress))? {
-            Response::Started { restored, state } => {
-                self.update(state);
-                Ok(restored)
-            }
-            other => Err(unexpected(&other)),
-        }
-    }
-
-    /// Opens the conversation with a system prompt, reading it whether or
-    /// not the server has the state of an earlier reading, reporting how
-    /// many of its tokens the model has read so far, out of how many.
-    pub fn system(&mut self, text: &str, on_progress: impl FnMut(usize, usize)) -> Result<()> {
-        let request = Request::System {
-            text: text.to_string(),
-        };
-        self.done(&request, prompting(on_progress))
-    }
-
     /// Makes a request, as [`Connection::call`] does, telling `on_status`
     /// when the session waits for another's request.
     fn call(
@@ -223,21 +191,6 @@ impl Remote {
         })
     }
 
-    /// Makes a request whose answer says only that it is done.
-    fn done(
-        &mut self,
-        request: &Request,
-        on: impl FnMut(&Response) -> ControlFlow<()>,
-    ) -> Result<()> {
-        match self.call(request, on)? {
-            Response::Ok(state) => {
-                self.update(state);
-                Ok(())
-            }
-            other => Err(unexpected(&other)),
-        }
-    }
-
     /// Makes a request answered with a count.
     fn count(&mut self, request: &Request) -> Result<usize> {
         match self.call(request, |_| ControlFlow::Continue(()))? {
@@ -245,64 +198,15 @@ impl Remote {
             other => Err(unexpected(&other)),
         }
     }
-
-    /// Makes a request for a reply, streaming its chunks to `on_chunk`.
-    fn reply(
-        &mut self,
-        request: &Request,
-        mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        let response = self.call(request, |response| match response {
-            Response::Chunk(piece) => on_chunk(piece.chunk()),
-            _ => ControlFlow::Continue(()),
-        })?;
-        match response {
-            Response::Reply { reply, state } => {
-                self.update(state);
-                Ok(reply)
-            }
-            other => Err(unexpected(&other)),
-        }
-    }
-
-    fn update(&mut self, state: State) {
-        self.tokens = state.tokens;
-        self.stats = state.stats;
-    }
 }
 
-/// What passes the progress of a prompt being read on to `on_progress`.
-fn prompting(
-    mut on_progress: impl FnMut(usize, usize),
-) -> impl FnMut(&Response) -> ControlFlow<()> {
-    move |response| {
-        if let Response::Status(Status::Prompting { read, total }) = response {
-            on_progress(*read, *total);
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-impl Piece {
-    fn chunk(&self) -> Chunk<'_> {
-        match self {
-            Piece::Thought(text) => Chunk::Thought(text),
-            Piece::Text(text) => Chunk::Text(text),
-            Piece::Token => Chunk::Token,
-        }
-    }
-}
-
-impl Session for Remote {
-    fn clear(&mut self) -> Result<()> {
-        self.done(&Request::Clear, |_| ControlFlow::Continue(()))
+impl Provider for Remote {
+    fn capacity(&self) -> usize {
+        self.capacity
     }
 
-    fn replay(&mut self, turns: &[Turn]) -> Result<()> {
-        let request = Request::Replay {
-            turns: turns.to_vec(),
-        };
-        self.done(&request, |_| ControlFlow::Continue(()))
+    fn sampling(&self) -> Sampling {
+        self.sampling
     }
 
     fn measure(&mut self, turn: &Turn) -> Result<usize> {
@@ -316,90 +220,71 @@ impl Session for Remote {
         })
     }
 
-    fn tokens(&self) -> usize {
-        self.tokens
+    fn read(&mut self, chat: &Chat, mut on_progress: impl FnMut(usize, usize)) -> Result<State> {
+        let request = Request::Read { chat: chat.clone() };
+        let response = self.call(&request, |response| {
+            if let Response::Status(Status::Prompting { read, total }) = response {
+                on_progress(*read, *total);
+            }
+            ControlFlow::Continue(())
+        })?;
+        match response {
+            Response::Read(state) => Ok(state),
+            other => Err(unexpected(&other)),
+        }
     }
 
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn free(&self) -> usize {
-        self.capacity
-            .saturating_sub(self.tokens + self.generation.reserve)
-    }
-
-    fn reserve(&mut self, tokens: usize) {
-        self.generation.reserve = tokens;
-    }
-
-    fn limit_thoughts(&mut self, tokens: Option<usize>, closing: &str) {
-        self.generation.thought_limit = tokens;
-        self.generation.closing = Some(closing.to_string());
-    }
-
-    fn feed_results(&mut self, outputs: &[String]) -> Result<()> {
-        let request = Request::FeedResults {
-            outputs: outputs.to_vec(),
-        };
-        self.done(&request, |_| ControlFlow::Continue(()))
-    }
-
-    fn stats(&self) -> Stats {
-        self.stats
-    }
-
-    fn sampling(&self) -> Sampling {
-        self.sampling
-    }
-
-    fn send(
+    fn reply(
         &mut self,
-        message: &str,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        let request = Request::Send {
-            message: message.to_string(),
-            generation: self.generation.clone(),
+        chat: &Chat,
+        generation: &Generation,
+        mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Completion> {
+        let request = Request::Reply {
+            chat: chat.clone(),
+            generation: generation.clone(),
         };
-        self.reply(&request, on_chunk)
-    }
-
-    fn respond(
-        &mut self,
-        outputs: &[String],
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Reply> {
-        let request = Request::Respond {
-            outputs: outputs.to_vec(),
-            generation: self.generation.clone(),
-        };
-        self.reply(&request, on_chunk)
+        let response = self.call(&request, |response| match response {
+            Response::Chunk(piece) => on_chunk(piece.chunk()),
+            _ => ControlFlow::Continue(()),
+        })?;
+        match response {
+            Response::Reply { reply, text, state } => Ok(Completion { reply, text, state }),
+            other => Err(unexpected(&other)),
+        }
     }
 
     fn answer(
         &mut self,
-        message: &str,
+        chat: &Chat,
         heads: &[&str],
         limit: usize,
+        generation: &Generation,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Answer> {
+    ) -> Result<(Answer, State)> {
         let request = Request::Answer {
-            message: message.to_string(),
+            chat: chat.clone(),
             heads: heads.iter().map(|head| head.to_string()).collect(),
             limit,
-            generation: self.generation.clone(),
+            generation: generation.clone(),
         };
         let response = self.call(&request, |response| match response {
             Response::Chunk(Piece::Text(text)) => on_text(text),
             _ => ControlFlow::Continue(()),
         })?;
         match response {
-            Response::Answered { answer, state } => {
-                self.update(state);
-                Ok(answer)
-            }
+            Response::Answered { answer, state } => Ok((answer, state)),
             other => Err(unexpected(&other)),
+        }
+    }
+}
+
+impl Piece {
+    fn chunk(&self) -> Chunk<'_> {
+        match self {
+            Piece::Thought(text) => Chunk::Thought(text),
+            Piece::Text(text) => Chunk::Text(text),
+            Piece::Token => Chunk::Token,
         }
     }
 }
