@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::providers::dwim::Remote;
+use dwim::providers::dwim::{Remote, log_path, running, same_build, stop};
 
 use crate::{
     session::{self, Settings},
@@ -224,7 +224,7 @@ fn server<F: FnMut(session::Status) + 'static>(
     on_status: impl Fn() -> F,
 ) -> Result<String, Box<dyn Error>> {
     match action {
-        ServerAction::Show => Ok(match session::running() {
+        ServerAction::Show => Ok(match running() {
             None => "No dwim server is running · the next message starts it".to_string(),
             Some(welcome) => {
                 let device = if *stopped {
@@ -244,10 +244,10 @@ fn server<F: FnMut(session::Status) + 'static>(
                         "sessions"
                     },
                 );
-                if !session::same_build(&welcome) {
+                if !same_build(&welcome) {
                     notice.push_str(" · from another build of dwim");
                 }
-                if let Some(path) = session::log_path() {
+                if let Some(path) = log_path() {
                     notice.push_str(&format!(" · log {}", view::tilde(&path)));
                 }
                 notice
@@ -257,7 +257,7 @@ fn server<F: FnMut(session::Status) + 'static>(
             Ok("The dwim server is stopped · the next message starts it".to_string())
         }
         ServerAction::Stop => {
-            session::stop(harness.session())?;
+            stop(harness.session())?;
             *stopped = true;
             Ok("Stopped the dwim server · the next message starts it again".to_string())
         }
@@ -266,7 +266,7 @@ fn server<F: FnMut(session::Status) + 'static>(
         }
         ServerAction::Start | ServerAction::Restart => {
             if !*stopped {
-                session::stop(harness.session())?;
+                stop(harness.session())?;
                 *stopped = true;
             }
             session::reopen(settings, harness, on_status())?;
