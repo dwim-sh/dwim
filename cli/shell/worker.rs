@@ -7,10 +7,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dwim::harness::{self, Event, Harness, Log};
@@ -21,13 +21,16 @@ use dwim::providers::{
 };
 
 use crate::{
-    session::{self, Settings},
+    session::{self, Session, Settings},
     shell::{cmd::ServerAction, view},
 };
 
 /// Longest the shell waits, on quitting, for the model's thread to stop
 /// the turn in progress and end the transcript.
 const FINISH: Duration = Duration::from_secs(2);
+
+/// How often the thread looks for a request while the model loads.
+const POLL: Duration = Duration::from_millis(50);
 
 /// The model's thread, as the shell has it: where to send requests, and
 /// where the replies come back.
@@ -147,7 +150,8 @@ pub enum Reply {
 }
 
 /// Loads the model as `settings` have it and answers messages until the UI
-/// hangs up, keeping a transcript in `log`.
+/// hangs up, keeping a transcript in `log`. While the model loads, another
+/// can be picked, and is loaded instead.
 fn work(
     mut settings: Settings,
     log: Log,
@@ -155,14 +159,12 @@ fn work(
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(&settings, log, {
-        let replies = replies.clone();
-        move |status| {
-            let _ = replies.send(Reply::Status(status));
-        }
-    })?;
-    let mut harness = loaded.harness;
-    let _ = replies.send(Reply::Ready(loaded.loading));
+    let loading = Instant::now();
+    let Some((session, system)) = open(&mut settings, &requests, replies)? else {
+        return Ok(());
+    };
+    let mut harness = session::harness(&settings, session, system, log)?;
+    let _ = replies.send(Reply::Ready(loading.elapsed()));
     // Whether the session's server was stopped, so the next request that
     // needs the model opens it on another.
     let mut stopped = false;
@@ -240,10 +242,80 @@ fn work(
     Ok(())
 }
 
+/// Opens the session where `settings` have the model, and its system
+/// prompt, without keeping the shell waiting: a model picked meanwhile
+/// changes `settings`, and the session is opened there instead, the one
+/// being opened left to itself. Nothing if the shell hangs up first.
+fn open(
+    settings: &mut Settings,
+    requests: &Receiver<Request>,
+    replies: &Sender<Reply>,
+) -> Result<Option<(Session, String)>, Box<dyn Error>> {
+    let mut opening = Opening::start(settings, replies);
+    loop {
+        match opening.opened.try_recv() {
+            Ok(opened) => return Ok(Some(opened?)),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                return Err("the model stopped loading unexpectedly".into());
+            }
+        }
+        match requests.recv_timeout(POLL) {
+            Ok(Request::Model(provider, variant)) => {
+                opening.left.store(true, Ordering::Relaxed);
+                (settings.provider, settings.model) = (Some(provider), variant);
+                let _ = replies.send(Reply::Model { variant, provider });
+                opening = Opening::start(settings, replies);
+            }
+            Ok(_) => {
+                let _ = replies.send(Reply::Error("the model is still loading".to_string()));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                opening.left.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// A session being opened, on a thread of its own.
+struct Opening {
+    /// The session and its system prompt, once it is open, or why it is
+    /// not.
+    opened: Receiver<Result<(Session, String), String>>,
+    /// Set when the session is no longer wanted: the thread says no more
+    /// of what the server is doing, and the session it opens is dropped.
+    left: Arc<AtomicBool>,
+}
+
+impl Opening {
+    /// Starts opening the session where `settings` have the model, telling
+    /// `replies` what the server is doing meanwhile.
+    fn start(settings: &Settings, replies: &Sender<Reply>) -> Self {
+        let (sender, opened) = mpsc::channel();
+        let left = Arc::new(AtomicBool::new(false));
+        thread::spawn({
+            let settings = settings.clone();
+            let replies = replies.clone();
+            let left = left.clone();
+            move || {
+                let on_status = move |status| {
+                    if !left.load(Ordering::Relaxed) {
+                        let _ = replies.send(Reply::Status(status));
+                    }
+                };
+                let _ = sender.send(session::open(&settings, on_status).map_err(|e| e.to_string()));
+            }
+        });
+        Self { opened, left }
+    }
+}
+
 /// Does what `/server` asks, `action`, for the session `harness` runs,
 /// which `stopped` says is not on a server: returns what to tell of it.
 /// `on_status` makes what is told what the server does as it starts.
-fn server<F: FnMut(session::Status) + 'static>(
+fn server<F: FnMut(session::Status) + Send + 'static>(
     settings: &Settings,
     harness: &mut Harness<session::Session>,
     stopped: &mut bool,

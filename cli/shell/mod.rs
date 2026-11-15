@@ -66,6 +66,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         history: Vec::new(),
         recalled: None,
         status: Status::Connecting(Instant::now()),
+        ready: false,
         started: Instant::now(),
         loading: Duration::ZERO,
         stats: harness::Stats::default(),
@@ -96,15 +97,8 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     // With no more messages to answer, and the turn in progress stopped,
     // the model's thread ends the transcript; while the model is still
     // loading, there is no transcript to end.
-    let loaded = !matches!(
-        app.status,
-        Status::Downloading { .. }
-            | Status::Connecting(_)
-            | Status::Restarting(_)
-            | Status::Starting { .. }
-            | Status::Opening(_)
-    );
-    app.into_worker().finish(loaded);
+    let ready = app.ready;
+    app.into_worker().finish(ready);
     result
 }
 
@@ -174,6 +168,10 @@ struct App {
     history: Vec<String>,
     recalled: Option<usize>,
     status: Status,
+    /// Whether the model is loaded, and the session ready for a message.
+    /// Until it is, the slash commands that need no session still work,
+    /// and `/model` picks another model to load instead.
+    ready: bool,
     /// When the shell started, how long loading the model took, and where
     /// the conversation's time has gone, as of the last reply.
     started: Instant,
@@ -283,7 +281,11 @@ impl App {
                     self.commit(false);
                 }
             }
-            KeyCode::Enter if !busy => self.submit(),
+            KeyCode::Enter
+                if !busy || (!self.ready && self.input.text().trim().starts_with('/')) =>
+            {
+                self.submit()
+            }
             KeyCode::Enter => {}
             KeyCode::Char('a') if ctrl => self.input.home(),
             KeyCode::Char('e') if ctrl => self.input.end(),
@@ -428,6 +430,12 @@ impl App {
             }
         };
 
+        if !self.ready {
+            self.say(&view::notice(
+                "The model is still loading · /model picks another",
+            ));
+            return;
+        }
         self.reply.clear();
         self.segment = Segment::Text;
         self.reply_width = columns.saturating_sub(2);
@@ -442,6 +450,7 @@ impl App {
             Reply::Status(status) => self.status_update(status),
             Reply::Ready(loading) => {
                 self.loading = loading;
+                self.ready = true;
                 self.status = Status::Idle;
             }
             Reply::Reopened => self.status = Status::Reading(Instant::now()),
@@ -480,6 +489,10 @@ impl App {
                 self.variant = variant;
                 self.model = variant.name().to_string();
                 self.provider = provider;
+                // Picked while the model was loading: the pick loads now.
+                if !self.ready {
+                    self.status = Status::Switching(Instant::now());
+                }
                 self.finish();
                 self.lines.push(vec![
                     span(format!("● {}", view::switched(variant, provider))).dark_grey(),
@@ -843,8 +856,54 @@ impl App {
         Ok(())
     }
 
-    /// What the model is doing, with a spinner, while it's busy.
+    /// The line over the input box: what the model is doing, with a
+    /// spinner, while it's busy. While the model loads, which the footer
+    /// tells of, it says what can be done meanwhile instead.
     fn status(&self) -> Option<Line> {
+        if !self.ready {
+            let doing = match self.status {
+                Status::Downloading { .. } => "downloading",
+                _ => "loading",
+            };
+            return (self.provider == Kind::Local).then(|| {
+                vec![
+                    span(format!("● Local model is {doing}")),
+                    span(" · /model picks another model or provider").dark_grey(),
+                ]
+            });
+        }
+        let (frame, verb, details) = self.doing()?;
+        Some(vec![
+            span(format!("{frame} {verb}")).bold(),
+            span(format!(" {details}")).dark_grey(),
+        ])
+    }
+
+    /// The line under the input box: the directory the agent works in, at
+    /// the left, and while the model loads, how far along that is, at the
+    /// right.
+    fn footer(&self) -> Line {
+        let (columns, _) = self.screen.size();
+        let left = format!("  {}", view::tilde(&self.cwd));
+        let right = match self.doing() {
+            Some((frame, verb, details)) if !self.ready => {
+                let details: Vec<&str> = details.split_whitespace().collect();
+                format!("{frame} {verb} {}  ", details.join(" "))
+            }
+            _ => String::new(),
+        };
+        let width = |text: &str| tui::width(&vec![span(text)]);
+        let line = match columns.checked_sub(width(&left) + width(&right)) {
+            _ if right.is_empty() => left,
+            Some(pad) if pad >= 2 => format!("{left}{}{right}", " ".repeat(pad)),
+            _ => format!("  {right}"),
+        };
+        tui::truncate(&vec![span(line).dark_grey()], columns)
+    }
+
+    /// What the model is doing while it's busy: a frame of the spinner,
+    /// what it is doing, and how that goes.
+    fn doing(&self) -> Option<(&'static str, &'static str, String)> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
         let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
         let percent = |done: usize, total: usize| match total {
@@ -913,15 +972,6 @@ impl App {
             ),
         };
         let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
-        Some(vec![
-            span(format!("{frame} {verb}")).bold(),
-            span(format!(" {details}")).dark_grey(),
-        ])
-    }
-
-    /// The line under the input box: the directory the agent works in, at
-    /// the left.
-    fn footer(&self) -> Line {
-        vec![span(format!("  {}", view::tilde(&self.cwd))).dark_grey()]
+        Some((frame, verb, details))
     }
 }
