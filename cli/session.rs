@@ -16,7 +16,7 @@ use std::{
 
 use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Device, Model, Progress, Tally};
-use dwim::server::{self, Client, Connection, protocol::Welcome};
+use dwim::server::{self, Connection, Remote, protocol::Welcome};
 use dwim::sys;
 
 use crate::model;
@@ -58,7 +58,7 @@ pub struct Settings {
 
 /// The harness around the model, ready for a message.
 pub struct Loaded {
-    pub harness: Harness<Client>,
+    pub harness: Harness<Remote>,
     /// How long getting the model ready took: reaching the server, the
     /// loading if it was loading, and the system prompt.
     pub loading: Duration,
@@ -121,7 +121,7 @@ pub fn load(
     let cwd = env::current_dir()?;
     let mut harness = Harness::new(client, &cwd, {
         let system = system.clone();
-        move |client: &mut Client| client.start(&system, |_, _| {}).map(|_| ())
+        move |client: &mut Remote| client.start(&system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(settings.thinking_budget);
     if let Some(shell) = settings.shell.clone() {
@@ -140,7 +140,7 @@ pub fn load(
 /// [`load`].
 pub fn reopen(
     settings: &Settings,
-    harness: &mut Harness<Client>,
+    harness: &mut Harness<Remote>,
     on_status: impl FnMut(Status) + 'static,
 ) -> Result<(), Box<dyn Error>> {
     let (client, _) = open(settings, on_status)?;
@@ -155,7 +155,7 @@ pub fn reopen(
 fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + 'static,
-) -> Result<(Client, String), Box<dyn Error>> {
+) -> Result<(Remote, String), Box<dyn Error>> {
     let connection = connect(settings, &mut on_status)?;
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
@@ -264,7 +264,7 @@ pub fn running() -> Option<Welcome> {
 
 /// Stops the server `client` is a session on, if it has no other: asks it
 /// to go, ends the session, and waits for the server to exit.
-pub fn stop(client: &mut Client) -> Result<(), Box<dyn Error>> {
+pub fn stop(client: &mut Remote) -> Result<(), Box<dyn Error>> {
     let mut connection =
         Connection::connect(&server::socket_path()).map_err(|_| "no dwim server is running")?;
     let welcome = connection.hello()?;

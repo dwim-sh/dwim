@@ -6,7 +6,7 @@
 //! server exits once it has gone a while without a session. The harness,
 //! the tools, and the terminal stay in the client; the server has the
 //! model, the sampling, and each session's conversation with it, as a
-//! [`Chat`], and speaks the [`protocol`].
+//! [`Local`], and speaks the [`protocol`].
 //!
 //! The model's weights are shared, and each session has a sequence of its
 //! own on the device: its key/value caches, its linear layers' recurrent
@@ -45,13 +45,13 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::inference::{Chat, Chunk, Conversation, Format, LanguageModel, Sampler, Size};
+use crate::inference::{Chunk, Format, LanguageModel, Local, Sampler, Session, Size};
 use crate::server::protocol::{
     Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
 };
 use crate::sys;
 
-pub use crate::server::client::{Client, Connection};
+pub use crate::server::client::{Connection, Remote};
 
 /// How long the server goes without a session before it exits, by
 /// default: long enough that a session started soon after the last ended
@@ -235,7 +235,7 @@ impl Server {
         }
         free.reverse();
         let pool = Rc::new(RefCell::new(Pool { model, free }));
-        let mut sessions: HashMap<usize, Chat<Shared>> = HashMap::new();
+        let mut sessions: HashMap<usize, Local<Shared>> = HashMap::new();
         loop {
             if inner.retiring.load(Ordering::Relaxed) && sessions.is_empty() {
                 eprintln!("retired: exiting");
@@ -273,7 +273,7 @@ impl Server {
                         Err("a session is already open on this connection".into())
                     }
                     Entry::Vacant(entry) => Shared::take(&pool).and_then(|shared| {
-                        Chat::new(shared, format.clone(), sampler(temperature)).map(|mut chat| {
+                        Local::new(shared, format.clone(), sampler(temperature)).map(|mut chat| {
                             chat.set_drafts(speculate);
                             let opened = Opened {
                                 device: device.clone(),
@@ -452,7 +452,7 @@ fn not_loaded() -> Response {
 }
 
 /// Where `chat` is, for a response.
-fn state<M: LanguageModel>(chat: &Chat<M>) -> State {
+fn state<M: LanguageModel>(chat: &Local<M>) -> State {
     State {
         tokens: chat.tokens(),
         stats: chat.stats(),
@@ -462,7 +462,7 @@ fn state<M: LanguageModel>(chat: &Chat<M>) -> State {
 /// Serves a session's request on the model, streaming what there is to
 /// `peer` along the way.
 fn serve(
-    chat: &mut Chat<Shared>,
+    chat: &mut Local<Shared>,
     request: Request,
     peer: &Peer,
 ) -> Result<Response, Box<dyn Error>> {
@@ -553,7 +553,7 @@ fn serve(
 
 impl Generation {
     /// Sets `chat` as the client has it for the reply to come.
-    fn apply<M: LanguageModel>(&self, chat: &mut Chat<M>) {
+    fn apply<M: LanguageModel>(&self, chat: &mut Local<M>) {
         chat.reserve(self.reserve);
         if let Some(closing) = &self.closing {
             chat.limit_thoughts(self.thought_limit, closing);
@@ -607,7 +607,7 @@ impl Shared {
 }
 
 /// The number of the sequence a session's chat runs on.
-fn shared_id(chat: &Chat<Shared>) -> usize {
+fn shared_id(chat: &Local<Shared>) -> usize {
     chat.model().id
 }
 
@@ -676,7 +676,7 @@ impl LanguageModel for Shared {
 mod tests {
     use std::time::Instant;
 
-    use crate::inference::{Conversation, Tokenizer, Turn, testing::Scripted};
+    use crate::inference::{Session, Tokenizer, Turn, testing::Scripted};
 
     use super::*;
 
@@ -738,13 +738,13 @@ mod tests {
         (path, handle)
     }
 
-    fn open(path: &Path) -> Client {
+    fn open(path: &Path) -> Remote {
         let connection = Connection::connect(path).unwrap();
         connection.open(None, 0, |_| {}).unwrap()
     }
 
     /// The text of a reply to `message`.
-    fn ask(client: &mut Client, message: &str) -> (String, crate::inference::Reply) {
+    fn ask(client: &mut Remote, message: &str) -> (String, crate::inference::Reply) {
         let mut text = String::new();
         let reply = client
             .send(message, |chunk| {

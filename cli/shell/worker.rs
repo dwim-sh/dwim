@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::server::Client;
+use dwim::server::Remote;
 
 use crate::{
     session::{self, Settings},
@@ -218,7 +218,7 @@ fn work(
 /// `on_status` makes what is told what the server does as it starts.
 fn server<F: FnMut(session::Status) + 'static>(
     settings: &Settings,
-    harness: &mut Harness<Client>,
+    harness: &mut Harness<Remote>,
     stopped: &mut bool,
     action: ServerAction,
     on_status: impl Fn() -> F,

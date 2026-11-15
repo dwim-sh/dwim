@@ -1,5 +1,5 @@
 //! A session with the model as the server has it, held over a connection
-//! to the server: the [`Conversation`] the harness runs on.
+//! to the server: the [`Session`] the harness runs on.
 
 use std::{
     error::Error,
@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use crate::inference::{Answer, Chunk, Conversation, Reply, Result, Sampler, Size, Stats, Turn};
+use crate::inference::{Answer, Chunk, Reply, Result, Sampler, Session, Size, Stats, Turn};
 use crate::server::{
     build,
     protocol::{Generation, Opened, Piece, Request, Response, State, Status, Welcome},
@@ -58,7 +58,7 @@ impl Connection {
         temperature: Option<f32>,
         speculate: usize,
         mut on_status: impl FnMut(Status),
-    ) -> Result<Client> {
+    ) -> Result<Remote> {
         let request = Request::Open {
             temperature,
             speculate,
@@ -79,7 +79,7 @@ impl Connection {
             sampling,
             state,
         } = opened;
-        Ok(Client {
+        Ok(Remote {
             connection: self,
             device,
             size,
@@ -143,7 +143,7 @@ fn unexpected(response: &Response) -> Box<dyn Error> {
 /// a request changes about the conversation, the tokens in it and where
 /// its time has gone, comes back with each answer; what the client sets,
 /// the reserve and the thinking budget, goes with each request for a reply.
-pub struct Client {
+pub struct Remote {
     connection: Connection,
     device: String,
     size: Size,
@@ -156,7 +156,7 @@ pub struct Client {
     on_status: Box<dyn FnMut(Status)>,
 }
 
-impl Client {
+impl Remote {
     /// Ends the session: the server is told it is over, and whatever is
     /// asked of it after fails.
     pub fn close(&mut self) {
@@ -181,7 +181,7 @@ impl Client {
 
     /// Opens the conversation with the system prompt, from the state the
     /// server saved after an earlier reading of the same prompt if there
-    /// is one, reporting the reading as [`Client::system`] does, and
+    /// is one, reporting the reading as [`Remote::system`] does, and
     /// returns whether the state was restored.
     pub fn start(&mut self, prompt: &str, on_progress: impl FnMut(usize, usize)) -> Result<bool> {
         let request = Request::Start {
@@ -293,7 +293,7 @@ impl Piece {
     }
 }
 
-impl Conversation for Client {
+impl Session for Remote {
     fn clear(&mut self) -> Result<()> {
         self.done(&Request::Clear, |_| ControlFlow::Continue(()))
     }

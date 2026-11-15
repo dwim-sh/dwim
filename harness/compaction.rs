@@ -11,7 +11,7 @@
 use std::{error::Error, fmt::Write};
 
 use crate::harness::{Entry, Event, Harness, OnEvent, environment};
-use crate::inference::{Conversation, Turn};
+use crate::inference::{Session, Turn};
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -50,7 +50,7 @@ pub const CONTINUE: &str = "Your reply was stopped short because the context win
 
 /// Reserves room in `chat` for the prompt and the note that a compaction
 /// takes, and returns the most tokens the note may take.
-pub fn reserve<C: Conversation>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
+pub fn reserve<C: Session>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
     let note_tokens = (chat.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
     let reserve = chat.answer_tokens(NOTE_PROMPT, note_tokens)?;
     chat.reserve(reserve);
@@ -62,7 +62,7 @@ pub fn reserve<C: Conversation>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
 /// high-water mark. Returns whether the input may go in: not if the
 /// compaction was interrupted, and an error if the input cannot fit
 /// even so.
-pub fn make_room<C: Conversation>(
+pub fn make_room<C: Session>(
     harness: &mut Harness<C>,
     input: &Turn,
     more: usize,
@@ -85,7 +85,7 @@ pub fn make_room<C: Conversation>(
 }
 
 /// Compacts the conversation, as [`Harness::compact`] does.
-pub fn compact<C: Conversation>(
+pub fn compact<C: Session>(
     harness: &mut Harness<C>,
     on_event: OnEvent,
 ) -> Result<bool, Box<dyn Error>> {
