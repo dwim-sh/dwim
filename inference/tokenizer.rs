@@ -180,7 +180,7 @@ impl Tokenizer {
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
-        for special in crate::inference::chat::SPECIAL_TOKENS {
+        for special in crate::inference::local::SPECIAL_TOKENS {
             tokens.push(Value::Str(special.to_string()));
             types.push(Value::I32(if special.starts_with("<|") {
                 CONTROL as i32

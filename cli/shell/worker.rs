@@ -230,7 +230,7 @@ fn server<F: FnMut(session::Status) + 'static>(
                 let device = if *stopped {
                     welcome.device.to_uppercase()
                 } else {
-                    harness.conversation().device().to_string()
+                    harness.session().device().to_string()
                 };
                 let mut notice = format!(
                     "dwim server {} · {} on {device} · {} of {} {} open",
@@ -257,7 +257,7 @@ fn server<F: FnMut(session::Status) + 'static>(
             Ok("The dwim server is stopped · the next message starts it".to_string())
         }
         ServerAction::Stop => {
-            session::stop(harness.conversation())?;
+            session::stop(harness.session())?;
             *stopped = true;
             Ok("Stopped the dwim server · the next message starts it again".to_string())
         }
@@ -266,7 +266,7 @@ fn server<F: FnMut(session::Status) + 'static>(
         }
         ServerAction::Start | ServerAction::Restart => {
             if !*stopped {
-                session::stop(harness.conversation())?;
+                session::stop(harness.session())?;
                 *stopped = true;
             }
             session::reopen(settings, harness, on_status())?;
