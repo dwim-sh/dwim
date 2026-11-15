@@ -12,7 +12,7 @@ use std::{
 
 use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Model, Progress};
-use dwim::model::{Device, Tally};
+use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
     Conversation,
     dwim::{self as server, Remote},
@@ -24,8 +24,8 @@ pub use dwim::server::protocol::Status;
 
 /// How the model runs, as the command line sets it.
 pub struct Settings {
-    /// The model's name, which is the one model's.
-    pub model: String,
+    /// The model to run.
+    pub model: Variant,
     pub device: Device,
     /// Tokens of conversation to make room for in each session, or as
     /// many as fit.
@@ -47,7 +47,7 @@ impl Settings {
     /// The server the settings ask for.
     fn server(&self) -> server::Options {
         server::Options {
-            model: self.model.clone(),
+            model: self.model.name().to_string(),
             device: self.device,
             context: self.context,
             sessions: self.sessions,
@@ -72,7 +72,7 @@ pub fn fetch_model(
     settings: &Settings,
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = Model::dir(&settings.model)?;
+    let dir = Model::dir(settings.model.name())?;
     Model::fetch(&dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
@@ -129,7 +129,7 @@ pub fn load(
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);
     }
-    harness.keep_log(log, &settings.model, &device, &system);
+    harness.keep_log(log, settings.model.name(), &device, &system);
     Ok(Loaded {
         harness,
         loading: loading.elapsed(),

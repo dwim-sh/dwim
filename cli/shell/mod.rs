@@ -39,7 +39,7 @@ const TICK: Duration = Duration::from_millis(80);
 /// keeping a transcript of the session in `log`.
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
-    let model = settings.model.clone();
+    let model = settings.model.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
     let worker = Worker::spawn(settings, log);

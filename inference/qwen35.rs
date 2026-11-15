@@ -16,11 +16,11 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
     inference::{Gguf, LanguageModel, Result, gguf, quants},
-    model::hub,
+    model::{Variant, hub},
 };
 
 /// The model as `dwim` names it.
-pub const NAME: &str = "qwen3.8-27b";
+pub const NAME: &str = Variant::Medium.name();
 
 /// The file holding the model: a GGUF file, which carries the tokenizer
 /// and the sampling settings too.
