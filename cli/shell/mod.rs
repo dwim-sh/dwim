@@ -3,6 +3,7 @@
 //! stays responsive while it downloads, loads, and generates.
 
 mod cmd;
+pub mod picker;
 mod view;
 mod worker;
 
@@ -28,6 +29,7 @@ use crate::{
 };
 
 use cmd::Command;
+use picker::Picker;
 use view::Segment;
 use worker::{Reply, Request, Worker};
 
@@ -41,7 +43,7 @@ const TICK: Duration = Duration::from_millis(80);
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
     let variant = settings.model;
-    let provider = session::provider(&settings)?;
+    let provider = session::provider(settings.provider, variant)?;
     let context = settings.context.unwrap_or(openrouter::CONTEXT);
     let model = variant.name().to_string();
     let device = settings.device;
@@ -60,6 +62,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         transcript,
         cwd: env::current_dir().unwrap_or_default(),
         input: Input::default(),
+        picker: None,
         history: Vec::new(),
         recalled: None,
         status: Status::Connecting(Instant::now()),
@@ -136,6 +139,8 @@ enum Status {
         total: usize,
     },
     Idle,
+    /// Moving the conversation to another model, since when.
+    Switching(Instant),
     /// Reading the prompt, before the first token of the reply.
     Reading(Instant),
     /// Waiting for the model, which another session has, since when.
@@ -163,6 +168,8 @@ struct App {
     transcript: Option<PathBuf>,
     cwd: PathBuf,
     input: Input,
+    /// The model picker, while it is open in place of the input box.
+    picker: Option<Picker>,
     /// Messages sent so far, and which one is recalled into the input.
     history: Vec<String>,
     recalled: Option<usize>,
@@ -240,6 +247,10 @@ impl App {
     fn key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let busy = !matches!(self.status, Status::Idle);
+        if self.picker.is_some() {
+            self.pick(key);
+            return false;
+        }
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 if matches!(
@@ -294,6 +305,47 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Handles a key press while the model picker is open: left and right
+    /// change the provider, up and down move over the models it runs,
+    /// enter picks, and esc closes the picker. Picking the model the
+    /// session is on, where it runs, shows it; picking another, or another
+    /// provider of it, moves the conversation there.
+    fn pick(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => picker.step(false),
+            KeyCode::Down => picker.step(true),
+            KeyCode::Char('p') if ctrl => picker.step(false),
+            KeyCode::Char('n') if ctrl => picker.step(true),
+            KeyCode::Left => picker.turn(false),
+            KeyCode::Right | KeyCode::Tab => picker.turn(true),
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Char('c') if ctrl => self.picker = None,
+            KeyCode::Enter => {
+                let picked = picker.picked();
+                self.picker = None;
+                match picked {
+                    Some(choice) if choice == (self.provider, self.variant) => {
+                        let lines = self.model_listing();
+                        self.say(&lines);
+                    }
+                    Some((provider, variant)) => {
+                        self.reply.clear();
+                        self.committed = 0;
+                        self.interrupted = false;
+                        self.status = Status::Switching(Instant::now());
+                        self.worker.send(Request::Model(provider, variant));
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Stops the reply being generated, if any.
@@ -359,6 +411,13 @@ impl App {
             Some(Ok(Command::SetThinkingBudget(tokens))) => Request::ThinkingBudget(tokens),
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
             Some(Ok(Command::Server(action))) => Request::Server(action),
+            Some(Ok(Command::Model)) => {
+                self.picker = Some(Picker::new(
+                    session::providers(),
+                    (self.provider, self.variant),
+                ));
+                return;
+            }
             Some(Ok(command)) => {
                 self.command(command);
                 return;
@@ -414,6 +473,16 @@ impl App {
                 self.finish();
                 self.lines.push(vec![
                     span(format!("● {}", view::auto_notice(auto))).dark_grey(),
+                ]);
+                self.lines.push(Line::new());
+            }
+            Reply::Model { variant, provider } => {
+                self.variant = variant;
+                self.model = variant.name().to_string();
+                self.provider = provider;
+                self.finish();
+                self.lines.push(vec![
+                    span(format!("● {}", view::switched(variant, provider))).dark_grey(),
                 ]);
                 self.lines.push(Line::new());
             }
@@ -631,17 +700,7 @@ impl App {
     fn command(&mut self, command: Command) {
         let (columns, _) = self.screen.size();
         let lines = match command {
-            Command::Model if self.provider == Kind::OpenRouter => {
-                view::hosted_listing(self.variant, self.context, columns)
-            }
             Command::Provider => view::notice(view::provider_notice(self.provider, self.variant)),
-            Command::Model => view::model_listing(
-                &self.model,
-                self.device,
-                self.device_name.as_deref(),
-                self.size.as_ref(),
-                columns,
-            ),
             Command::Stats => {
                 let details =
                     session::accounting(&self.stats, self.loading, self.started.elapsed());
@@ -658,7 +717,8 @@ impl App {
             Command::Help => view::help(columns),
             Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
             Command::Auto => view::notice(view::auto_notice(self.auto)),
-            Command::Compact
+            Command::Model
+            | Command::Compact
             | Command::SetThinkingBudget(_)
             | Command::SetAuto(_)
             | Command::Server(_) => {
@@ -666,6 +726,21 @@ impl App {
             }
         };
         self.say(&lines);
+    }
+
+    /// The model the session is on: where it runs, and the room it has.
+    fn model_listing(&self) -> Vec<Line> {
+        let (columns, _) = self.screen.size();
+        match self.provider {
+            Kind::OpenRouter => view::hosted_listing(self.variant, self.context, columns),
+            Kind::Local => view::model_listing(
+                &self.model,
+                self.device,
+                self.device_name.as_deref(),
+                self.size.as_ref(),
+                columns,
+            ),
+        }
     }
 
     /// Prints `lines` above the live region, cut to the terminal's width,
@@ -710,11 +785,6 @@ impl App {
             live.push(status);
         }
 
-        // The input box, as tall as its text but no taller than the screen,
-        // scrolled to show the cursor.
-        let (text, (row, column)) = self.input.layout(columns.saturating_sub(6).max(1));
-        let height = rows.saturating_sub(live.len() + 3).max(1);
-        let first = (row + 1).saturating_sub(height);
         let border = |left: &str, right: &str| {
             vec![
                 span(format!(
@@ -724,6 +794,29 @@ impl App {
                 .dark_grey(),
             ]
         };
+        // The model picker, in place of the input box while it is open.
+        if let Some(picker) = &self.picker {
+            live.push(vec![span("─".repeat(columns)).dark_grey()]);
+            let (rows, row) = picker.rows();
+            let cursor = (live.len() + row, 2);
+            live.extend(rows);
+            live.push(Line::new());
+            live.push(vec![
+                span("  ↑↓ model · ←→ provider · enter to select · esc to cancel").dark_grey(),
+            ]);
+            let lines = std::mem::take(&mut self.lines);
+            if let Some(last) = lines.last() {
+                self.blank = last.is_empty();
+            }
+            self.screen.draw(&lines, &live, cursor)?;
+            return Ok(());
+        }
+
+        // The input box, as tall as its text but no taller than the screen,
+        // scrolled to show the cursor.
+        let (text, (row, column)) = self.input.layout(columns.saturating_sub(6).max(1));
+        let height = rows.saturating_sub(live.len() + 3).max(1);
+        let first = (row + 1).saturating_sub(height);
         live.push(border("╭", "╮"));
         let cursor = (live.len() + row - first, 4 + column);
         for (i, line) in text.into_iter().enumerate().skip(first).take(height) {
@@ -783,6 +876,7 @@ impl App {
                 since,
                 format!("{} · {}", percent(read, total), seconds(since)),
             ),
+            Status::Switching(since) => ("Switching model…", since, seconds(since)),
             Status::Reading(since) => (
                 "Reading…",
                 since,

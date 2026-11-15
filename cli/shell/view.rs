@@ -119,6 +119,14 @@ pub fn provider_notice(provider: Kind, variant: Variant) -> String {
     }
 }
 
+/// How moving the conversation to another model is acknowledged.
+pub fn switched(variant: Variant, provider: Kind) -> String {
+    match provider {
+        Kind::Local => format!("Switched to {variant}, on this machine"),
+        Kind::OpenRouter => format!("Switched to {variant}, at OpenRouter"),
+    }
+}
+
 /// How a download is going: how much of the file has arrived, out of how
 /// much, at what speed, and the time left once the file's size is known.
 /// The fields are padded to fixed widths, as the status line's are.

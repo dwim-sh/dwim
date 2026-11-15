@@ -46,7 +46,7 @@ fn main() {
         // Running the model here takes the memory for it; a session at a
         // provider takes none.
         let local = opts.download || opts.bench || opts.serve;
-        if local || session::provider(&settings)? == Kind::Local {
+        if local || session::provider(settings.provider, settings.model)? == Kind::Local {
             memory::check()?;
         }
         if opts.download {

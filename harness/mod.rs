@@ -587,6 +587,13 @@ impl<S: Session> Harness<S> {
         self.log = log;
     }
 
+    /// Records in the transcript that the conversation goes on with
+    /// `model`, on `device`, as it does after [`Harness::reopen`] on a
+    /// session with another model.
+    pub fn note_model(&mut self, model: &str, device: &str) {
+        self.log.model(model, device, self.session.capacity());
+    }
+
     /// The conversation the harness runs on.
     pub fn session(&mut self) -> &mut S {
         &mut self.session
