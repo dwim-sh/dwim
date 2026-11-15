@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    inference::{Answer, Chunk, Reply, Sampler, Size, Stats},
-    model::Turn,
+    inference::{Answer, Chunk, Reply, Size, Stats},
+    model::{Sampling, Turn},
 };
 
 /// What a client asks of the server.
@@ -163,40 +163,6 @@ pub struct Opened {
 pub struct State {
     pub tokens: usize,
     pub stats: Stats,
-}
-
-/// How tokens are sampled: a sampler's settings.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Sampling {
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub min_p: f32,
-    pub seed: u64,
-}
-
-impl Sampling {
-    /// The settings of `sampler`.
-    pub fn of(sampler: &Sampler) -> Self {
-        Self {
-            temperature: sampler.temperature,
-            top_k: sampler.top_k,
-            top_p: sampler.top_p,
-            min_p: sampler.min_p,
-            seed: sampler.seed,
-        }
-    }
-
-    /// A sampler with the settings.
-    pub fn sampler(&self) -> Sampler {
-        Sampler::new(
-            self.temperature,
-            self.top_k,
-            self.top_p,
-            self.min_p,
-            self.seed,
-        )
-    }
 }
 
 /// A piece of a reply, as [`crate::inference::Chunk`] has it, owned.

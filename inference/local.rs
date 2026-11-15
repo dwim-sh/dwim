@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     inference::{LanguageModel, Result, Sampler, Session},
     model::{
-        Format, Turn,
+        Format, Sampling, Turn,
         format::{CALL_OPENING, Repeats, Utf8Stream, opening},
     },
 };
@@ -598,8 +598,8 @@ impl<M: LanguageModel> Session for Local<M> {
         self.len
     }
 
-    fn sampler(&self) -> &Sampler {
-        &self.sampler
+    fn sampling(&self) -> Sampling {
+        self.sampler.sampling()
     }
 
     fn capacity(&self) -> usize {

@@ -1,3 +1,5 @@
+use crate::model::Sampling;
+
 /// Picks the next token from a model's logits: from the `top_k` most likely
 /// tokens, then the smallest set of those whose probability reaches `top_p`,
 /// leaving out any less than `min_p` times as likely as the most likely, at
@@ -13,6 +15,17 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// The sampler's settings.
+    pub fn sampling(&self) -> Sampling {
+        Sampling {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            seed: self.seed,
+        }
+    }
+
     pub fn new(temperature: f32, top_k: usize, top_p: f32, min_p: f32, seed: u64) -> Self {
         Self {
             temperature,

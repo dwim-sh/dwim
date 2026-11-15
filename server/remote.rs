@@ -15,8 +15,8 @@ use crate::server::{
     protocol::{Generation, Opened, Piece, Request, Response, State, Status, Welcome},
 };
 use crate::{
-    inference::{Answer, Chunk, Reply, Result, Sampler, Session, Size, Stats},
-    model::Turn,
+    inference::{Answer, Chunk, Reply, Result, Session, Size, Stats},
+    model::{Sampling, Turn},
 };
 
 /// A connection to the server, before a session is opened on it.
@@ -89,7 +89,7 @@ impl Connection {
             capacity,
             tokens: state.tokens,
             stats: state.stats,
-            sampler: sampling.sampler(),
+            sampling,
             generation: Generation::default(),
             on_status: Box::new(|_| {}),
         })
@@ -153,7 +153,7 @@ pub struct Remote {
     capacity: usize,
     tokens: usize,
     stats: Stats,
-    sampler: Sampler,
+    sampling: Sampling,
     generation: Generation,
     /// Told when the server has this session wait for another's request.
     on_status: Box<dyn FnMut(Status)>,
@@ -352,8 +352,8 @@ impl Session for Remote {
         self.stats
     }
 
-    fn sampler(&self) -> &Sampler {
-        &self.sampler
+    fn sampling(&self) -> Sampling {
+        self.sampling
     }
 
     fn send(

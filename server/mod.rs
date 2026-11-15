@@ -46,7 +46,7 @@ use std::{
 };
 
 use crate::server::protocol::{
-    Generation, Opened, Piece, Request, Response, Sampling, State, Status, Welcome,
+    Generation, Opened, Piece, Request, Response, State, Status, Welcome,
 };
 use crate::sys;
 use crate::{
@@ -283,7 +283,7 @@ impl Server {
                                     device: device.clone(),
                                     size,
                                     capacity: session.capacity(),
-                                    sampling: Sampling::of(session.sampler()),
+                                    sampling: session.sampling(),
                                     state: state(&session),
                                 };
                                 eprintln!(

@@ -22,7 +22,7 @@ pub use crate::model::Result;
 
 use std::ops::ControlFlow;
 
-use crate::model::Turn;
+use crate::model::{Sampling, Turn};
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.
@@ -177,8 +177,8 @@ pub trait Session {
     /// Where the conversation's time has gone so far.
     fn stats(&self) -> Stats;
 
-    /// The sampler the model's tokens are picked with.
-    fn sampler(&self) -> &Sampler;
+    /// How the model's tokens are sampled.
+    fn sampling(&self) -> Sampling;
 
     /// Sends a message from the user, streaming the reply to `on_chunk`,
     /// which ends it early by breaking.

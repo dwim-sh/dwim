@@ -583,7 +583,7 @@ impl<S: Session> Harness<S> {
             device,
             &self.dir,
             self.session.capacity(),
-            self.session.sampler(),
+            self.session.sampling(),
             self.thinking_budget,
             system,
         );
@@ -1329,7 +1329,7 @@ mod tests {
         ];
         let dir = scratch();
         let mut harness = harness_in(&dir, &scripts, &path);
-        let temperature = harness.session.sampler().temperature;
+        let temperature = harness.session.sampling().temperature;
         let (events, _) = send(&mut harness, "go");
         assert_eq!(
             events,
@@ -1340,7 +1340,7 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
-        assert_eq!(harness.session.sampler().temperature, temperature);
+        assert_eq!(harness.session.sampling().temperature, temperature);
         drop(harness);
         let replies = replies(&path);
         assert_eq!(replies.len(), 4, "{replies:?}");

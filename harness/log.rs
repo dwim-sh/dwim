@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::inference::Sampler;
+use crate::model::Sampling;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -111,7 +111,7 @@ impl Log {
         device: &str,
         dir: &Path,
         context: usize,
-        sampler: &Sampler,
+        sampling: Sampling,
         thinking_budget: Option<usize>,
         system: &str,
     ) {
@@ -125,11 +125,11 @@ impl Log {
                 "device": device,
                 "dir": dir.display().to_string(),
                 "context": context,
-                "temperature": decimal(sampler.temperature),
-                "top_k": sampler.top_k,
-                "top_p": decimal(sampler.top_p),
-                "min_p": decimal(sampler.min_p),
-                "seed": sampler.seed,
+                "temperature": decimal(sampling.temperature),
+                "top_k": sampling.top_k,
+                "top_p": decimal(sampling.top_p),
+                "min_p": decimal(sampling.min_p),
+                "seed": sampling.seed,
                 "thinking_budget": thinking_budget,
                 "system": system,
             }),
