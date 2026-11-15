@@ -1,6 +1,6 @@
 //! The model's size as the command line shows it, in words.
 
-use dwim::inference::Size;
+use dwim::model::Size;
 
 /// `size` as words: the memory the model takes, and the tokens of context
 /// and the memory they take.

@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use argh::FromArgs;
-use dwim::inference::{Device, Model, Size};
+use dwim::inference::Model;
+use dwim::model::{Device, Size};
 
 use crate::{model, session::Settings, tui};
 

@@ -15,7 +15,7 @@ pub mod testing;
 pub use fetch::Download;
 pub use gguf::Gguf;
 pub use local::{DRAFTS, Local};
-pub use model::{Device, Model, OnDisk, Progress, Size};
+pub use model::{Model, OnDisk, Progress};
 pub use sampler::Sampler;
 
 pub use crate::model::Result;

@@ -10,13 +10,10 @@ use std::{
     path::Path,
 };
 
+use crate::model::{Answer, Chunk, Reply, Result, Sampling, Session, Size, Stats, Turn};
 use crate::server::{
     build,
     protocol::{Generation, Opened, Piece, Request, Response, State, Status, Welcome},
-};
-use crate::{
-    inference::Size,
-    model::{Answer, Chunk, Reply, Result, Sampling, Session, Stats, Turn},
 };
 
 /// A connection to the server, before a session is opened on it.

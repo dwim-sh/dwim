@@ -50,8 +50,8 @@ use crate::server::protocol::{
 };
 use crate::sys;
 use crate::{
-    inference::{LanguageModel, Local, Sampler, Size},
-    model::{Chunk, Format, Session},
+    inference::{LanguageModel, Local, Sampler},
+    model::{Chunk, Format, Session, Size},
 };
 
 pub use crate::server::remote::{Connection, Remote};

@@ -6,11 +6,13 @@ pub mod gguf;
 pub mod hub;
 mod sampling;
 mod session;
+mod size;
 mod tokenizer;
 
 pub use format::{Format, Turn};
 pub use sampling::Sampling;
 pub use session::{Answer, Chunk, Reply, Session, Stats, Tally};
+pub use size::{Device, Size};
 pub use tokenizer::Tokenizer;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
