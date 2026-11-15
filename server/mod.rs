@@ -729,6 +729,10 @@ impl LanguageModel for Shared {
         self.model().draft(token, pos, k)
     }
 
+    fn verifiable(&self, pos: usize) -> usize {
+        self.model().verifiable(pos)
+    }
+
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         self.model().verify(tokens, pos)
     }

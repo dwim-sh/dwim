@@ -1,6 +1,7 @@
 //! Inference: Qwen3.8-27B run on this machine, from its weights, and a
 //! session with it.
 
+mod copies;
 mod fetch;
 pub mod gguf;
 mod local;
@@ -44,11 +45,17 @@ pub trait LanguageModel {
     /// [`verify`](Self::verify).
     fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32>;
 
+    /// Most tokens drafted to follow a token picked at position `pos`
+    /// that the model can verify in a batch with it, whoever drafted them:
+    /// none where it cannot verify, as a model without a drafter cannot,
+    /// nor any model before it has run a token or while it is verifying.
+    fn verifiable(&self, pos: usize) -> usize;
+
     /// Runs `tokens`, the first at position `pos`, as a batch to be
-    /// verified: a token picked and the tokens drafted after it. Returns
-    /// the logits after each, a row per token, and commits none of them
-    /// until [`rewind`](Self::rewind) says how many to keep. Only for a
-    /// model that drafted them.
+    /// verified: a token picked and the tokens drafted after it, no more
+    /// of them than are [`verifiable`](Self::verifiable). Returns the
+    /// logits after each, a row per token, and commits none of them until
+    /// [`rewind`](Self::rewind) says how many to keep.
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32>;
 
     /// Commits the first `keep` tokens of the batch being verified, one at
@@ -98,6 +105,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
         (**self).draft(token, pos, k)
+    }
+
+    fn verifiable(&self, pos: usize) -> usize {
+        (**self).verifiable(pos)
     }
 
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {

@@ -123,6 +123,9 @@ thinks about as long as
 .BI \-\-speculate " n"
 Tokens the model drafts ahead and verifies in one pass; 0 decodes a token
 at a time (default: 4).
+Where a reply repeats what the conversation already holds, as an edit
+retypes the lines of a file, what followed there is verified in place of
+the drafts, up to eight tokens at once.
 .TP
 .BI \-\-temperature " t"
 Sample at temperature

@@ -1076,6 +1076,7 @@ impl<D: Device> LanguageModel for Model<D> {
         let Some(draft) = &self.draft else {
             return Vec::new();
         };
+        let k = k.min(self.verifiable(pos));
         let p = Pass {
             c: &self.config,
             d: &self.device,
@@ -1083,10 +1084,6 @@ impl<D: Device> LanguageModel for Model<D> {
         };
         let (c, d) = (p.c, p.d);
         let s = &mut self.state;
-        let k = k.min(MAX_DRAFTS).min(s.seq.max_len.saturating_sub(pos + 1));
-        if !s.seq.carry || !s.seq.verified.is_empty() || pos == 0 || k == 0 {
-            return Vec::new();
-        }
         let mut drafts = Vec::with_capacity(k);
         let mut next = token;
         for i in 0..k {
@@ -1098,6 +1095,17 @@ impl<D: Device> LanguageModel for Model<D> {
             drafts.push(next);
         }
         drafts
+    }
+
+    /// A batch to verify carries the hidden states the drafter catches up
+    /// from, so that only a model with a drafter verifies, and only once a
+    /// batch before has left it a hidden state to start from.
+    fn verifiable(&self, pos: usize) -> usize {
+        let seq = &self.state.seq;
+        if self.draft.is_none() || !seq.carry || !seq.verified.is_empty() || pos == 0 {
+            return 0;
+        }
+        MAX_DRAFTS.min(seq.max_len.saturating_sub(pos + 1))
     }
 
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {

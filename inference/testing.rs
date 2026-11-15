@@ -41,6 +41,21 @@ pub struct Scripted {
     hold: Option<(usize, Box<dyn FnMut() + Send>)>,
     /// How many tokens it has said of the reply under way.
     said: usize,
+    /// Most drafts it verifies in a batch, and the batch being verified:
+    /// the model as it was before the batch, and the batch's tokens.
+    verifies: usize,
+    verifying: Option<(Box<Replies>, Vec<u32>)>,
+}
+
+/// What the model's replies go by: the tokens fed, the scripts left, the
+/// reply under way, and how much of it is said.
+#[derive(Clone)]
+struct Replies {
+    fed: Vec<u32>,
+    scripts: VecDeque<Vec<u32>>,
+    saying: VecDeque<u32>,
+    pending: Option<bool>,
+    said: usize,
 }
 
 impl Scripted {
@@ -67,6 +82,25 @@ impl Scripted {
             max_len,
             hold: None,
             said: 0,
+            verifies: 0,
+            verifying: None,
+        }
+    }
+
+    /// Has the model verify batches of a token and up to `drafts` tokens
+    /// drafted after it. It still drafts nothing itself.
+    pub fn verifies(mut self, drafts: usize) -> Self {
+        self.verifies = drafts;
+        self
+    }
+
+    fn replies(&self) -> Replies {
+        Replies {
+            fed: self.fed.clone(),
+            scripts: self.scripts.clone(),
+            saying: self.saying.clone(),
+            pending: self.pending,
+            said: self.said,
         }
     }
 
@@ -197,12 +231,42 @@ impl LanguageModel for Scripted {
         Vec::new()
     }
 
-    fn verify(&mut self, _tokens: &[u32], _pos: usize) -> Vec<f32> {
-        unreachable!("a scripted model drafts nothing")
+    fn verifiable(&self, pos: usize) -> usize {
+        if self.verifying.is_some() {
+            return 0;
+        }
+        self.verifies.min(self.max_len.saturating_sub(pos + 1))
     }
 
-    fn rewind(&mut self, _keep: usize) {
-        unreachable!("a scripted model drafts nothing")
+    /// Says what it would after each token of the batch, fed one at a
+    /// time, and keeps what it was before them to go back to.
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        assert!(tokens.len() <= self.verifiable(pos) + 1);
+        let before = Box::new(self.replies());
+        let rows = (0..tokens.len())
+            .flat_map(|i| self.forward(&tokens[i..=i], pos + i))
+            .collect();
+        self.verifying = Some((before, tokens.to_vec()));
+        rows
+    }
+
+    /// Goes back to before the batch, and is fed the tokens kept.
+    fn rewind(&mut self, keep: usize) {
+        let (before, tokens) = self.verifying.take().expect("a batch being verified");
+        assert!((1..=tokens.len()).contains(&keep));
+        let Replies {
+            fed,
+            scripts,
+            saying,
+            pending,
+            said,
+        } = *before;
+        (self.fed, self.scripts, self.saying) = (fed, scripts, saying);
+        (self.pending, self.said) = (pending, said);
+        let pos = self.fed.len();
+        for i in 0..keep {
+            self.forward(&tokens[i..=i], pos + i);
+        }
     }
 
     fn mark(&mut self) -> bool {
