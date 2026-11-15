@@ -103,7 +103,7 @@ pub fn hosted_listing(variant: Variant, context: usize, columns: usize) -> Vec<L
     report(header, table(rows), columns)
 }
 
-/// Where the model runs, for the `/provider` command.
+/// Where the model runs, for the provider picked that the session is on.
 pub fn provider_notice(provider: Kind, variant: Variant) -> String {
     match provider {
         Kind::Local => format!(
@@ -111,10 +111,9 @@ pub fn provider_notice(provider: Kind, variant: Variant) -> String {
             variant.size()
         ),
         Kind::OpenRouter => format!(
-            "{} runs at OpenRouter, as {}, with the key in {}",
+            "{} runs at OpenRouter, as {}",
             variant.size(),
-            openrouter::model(variant),
-            openrouter::KEY
+            openrouter::model(variant)
         ),
     }
 }

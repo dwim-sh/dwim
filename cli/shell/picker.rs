@@ -2,6 +2,9 @@
 //! under them the provider on a line of its own, changed with the left
 //! and right arrows. A model the provider does not run is shown, but not to
 //! be picked, and neither is a provider that cannot be used.
+//!
+//! And the provider picker the `/provider` command opens: the providers,
+//! each with what picking it comes to.
 
 use crossterm::style::Stylize;
 use dwim::model::Variant;
@@ -154,6 +157,93 @@ impl Picker {
     }
 }
 
+/// The providers to pick from, and which the cursor is on.
+pub struct Providers {
+    choices: Vec<Choice>,
+    /// Where the session's model runs.
+    current: Kind,
+    at: usize,
+}
+
+/// A provider to pick: what picking it comes to, or why it cannot be
+/// picked.
+pub struct Choice {
+    pub provider: Kind,
+    pub name: &'static str,
+    pub note: String,
+    pub unavailable: Option<String>,
+}
+
+impl Providers {
+    /// A picker of `choices`, on the provider the session's model runs at,
+    /// `current`, if it can be picked.
+    pub fn new(choices: Vec<Choice>, current: Kind) -> Self {
+        let usable = |choice: &Choice| choice.unavailable.is_none();
+        let at = choices
+            .iter()
+            .position(|choice| choice.provider == current && usable(choice))
+            .or_else(|| choices.iter().position(usable))
+            .unwrap_or(0);
+        Self {
+            choices,
+            current,
+            at,
+        }
+    }
+
+    /// Moves the cursor down, or up, to the next provider that can be
+    /// picked, if there is one that way.
+    pub fn step(&mut self, down: bool) {
+        let usable = |&i: &usize| self.choices[i].unavailable.is_none();
+        let next = if down {
+            (self.at + 1..self.choices.len()).find(usable)
+        } else {
+            (0..self.at).rfind(usable)
+        };
+        self.at = next.unwrap_or(self.at);
+    }
+
+    /// The provider the cursor is on, if it can be picked.
+    pub fn picked(&self) -> Option<Kind> {
+        let choice = &self.choices[self.at];
+        choice.unavailable.is_none().then_some(choice.provider)
+    }
+
+    /// The picker as rows, and which of them the cursor is on: the
+    /// providers, the one the session is on ticked, each with what picking
+    /// it comes to, and one that cannot be picked dimmed, with why.
+    pub fn rows(&self) -> (Vec<Line>, usize) {
+        let names = self.choices.iter().map(|c| c.name.len()).max().unwrap_or(0);
+        let mut rows = vec![vec![span("  Select provider").bold()], Line::new()];
+        let mut cursor = 0;
+        for (i, choice) in self.choices.iter().enumerate() {
+            let name = format!("{:<names$}  ", choice.name);
+            let tick = if choice.provider == self.current {
+                "  ✓"
+            } else {
+                ""
+            };
+            rows.push(match &choice.unavailable {
+                Some(why) => vec![span(format!("    {name}{why}")).dark_grey()],
+                None if i == self.at => {
+                    cursor = rows.len();
+                    vec![
+                        span(format!("  › {name}")).bold(),
+                        span(&choice.note),
+                        span(tick).bold(),
+                    ]
+                }
+                None => vec![
+                    span(format!("    {name}")),
+                    span(&choice.note).dark_grey(),
+                    span(tick),
+                ],
+            });
+        }
+        (rows, cursor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +285,26 @@ mod tests {
         picker.step(true);
         picker.turn(false);
         assert_eq!(picker.picked(), Some((Kind::Local, Variant::Medium)));
+    }
+
+    #[test]
+    fn does_not_step_to_a_provider_that_cannot_be_picked() {
+        let choice = |provider, unavailable: Option<&str>| Choice {
+            provider,
+            name: "",
+            note: String::new(),
+            unavailable: unavailable.map(str::to_string),
+        };
+        let mut providers = Providers::new(
+            vec![
+                choice(Kind::Local, Some("too little memory")),
+                choice(Kind::OpenRouter, None),
+            ],
+            Kind::Local,
+        );
+        assert_eq!(providers.picked(), Some(Kind::OpenRouter));
+        providers.step(false);
+        assert_eq!(providers.picked(), Some(Kind::OpenRouter));
     }
 
     #[test]

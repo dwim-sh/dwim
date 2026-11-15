@@ -301,6 +301,7 @@ version = "0.0.12"
 dependencies = [
  "argh",
  "ash",
+ "base64",
  "crossterm",
  "dirs",
  "fancy-regex",
@@ -310,6 +311,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "rayon",
+ "ring",
  "serde",
  "serde_json",
  "unicode-width",

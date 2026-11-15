@@ -83,7 +83,9 @@ Where the model runs:
 in the dwim server on this machine, or
 .BR openrouter ,
 at OpenRouter, with the key in
-.BR OPENROUTER_API_KEY .
+.BR OPENROUTER_API_KEY ,
+or the one kept from signing in with
+.BR /provider .
 Without the option, the model runs on this machine where it can, and at
 OpenRouter where it cannot and there is a key. A session at OpenRouter
 loads no model, has room for 131072 tokens of conversation unless
@@ -244,7 +246,15 @@ where its weights are kept, and how many tokens of conversation it has
 room for.
 .TP
 .B /provider
-Show where the model runs.
+Open a picker of the providers, this machine and OpenRouter:
+up and down move over them, enter picks, esc cancels.
+Picking another provider moves the conversation there.
+Picking OpenRouter without a key to it signs in first: the browser opens
+at OpenRouter, which asks whether to make a key for
+.BR dwim ,
+and the key it makes is kept for the sessions to come.
+Where the browser does not open, the address to go to is shown.
+Picking the provider the session is on shows where the model runs.
 .TP
 .B /stats
 Show where the session's time has gone, as
@@ -330,6 +340,12 @@ to free the space;
 downloads the model again on the next run. The cache is in the same place
 on every system.
 .TP
+.I ~/.config/dwim/openrouter.key
+The key to OpenRouter kept from signing in with
+.BR /provider ,
+readable by the user alone. Remove the file to sign out. On macOS it is in
+.IR "~/Library/Application Support/dwim/" .
+.TP
 .I ~/.cache/dwim/states/
 The model's state after the system prompt, saved when a prompt is first
 read and taken up by later runs with the same model and prompt in place of
@@ -414,7 +430,9 @@ that is no longer running are removed by the next one to start.
 .SH ENVIRONMENT
 .TP
 .B OPENROUTER_API_KEY
-The key to OpenRouter, for a model that runs there.
+The key to OpenRouter, for a model that runs there, used instead of the
+one kept from signing in with
+.BR /provider .
 .TP
 .B HF_HUB_CACHE
 Where the Hugging Face cache is, instead of

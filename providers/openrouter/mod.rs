@@ -24,6 +24,7 @@
 //! what the provider said the last request took, with an estimate of what
 //! was added since.
 
+pub mod login;
 mod stream;
 
 use std::{
@@ -47,7 +48,8 @@ use crate::{
 
 use stream::{Outcome, Usage};
 
-/// The environment variable the key to OpenRouter is read from.
+/// The environment variable the key to OpenRouter is read from, ahead of
+/// the key kept from a sign-in.
 pub const KEY: &str = "OPENROUTER_API_KEY";
 
 /// Where a chat is completed.
@@ -90,11 +92,14 @@ pub struct OpenRouter {
 }
 
 impl OpenRouter {
-    /// The model `variant` at OpenRouter, with the key in the environment,
+    /// The model `variant` at OpenRouter, with the key in the environment
+    /// or kept from a sign-in,
     /// with room for `context` tokens of conversation, or [`CONTEXT`],
     /// sampled at `temperature`, or as the model's makers recommend.
     pub fn new(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Self> {
-        let key = key().ok_or_else(|| format!("{KEY} is not set: it is the key to OpenRouter"))?;
+        let key = key().ok_or_else(|| {
+            format!("there is no key to OpenRouter: /provider signs in, or set {KEY}")
+        })?;
         let agent = Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
@@ -443,9 +448,13 @@ pub fn model(variant: Variant) -> &'static str {
     }
 }
 
-/// The key to OpenRouter, if the environment has one.
+/// The key to OpenRouter, if there is one: the environment's, or else the
+/// one kept from a sign-in.
 pub fn key() -> Option<String> {
-    env::var(KEY).ok().filter(|key| !key.trim().is_empty())
+    env::var(KEY)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(login::saved)
 }
 
 /// Tokens a turn's framing takes, about: the tags around it, and its role.
