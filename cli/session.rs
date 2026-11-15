@@ -25,6 +25,7 @@ use crate::{model, shell::picker::Group};
 pub use dwim::server::protocol::Status;
 
 /// How the model runs, as the command line sets it.
+#[derive(Clone)]
 pub struct Settings {
     /// The model to run.
     pub model: Variant,
@@ -165,10 +166,25 @@ pub fn load_model(
 pub fn load(
     settings: &Settings,
     log: Log,
-    on_status: impl FnMut(Status) + 'static,
+    on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
-    let (mut session, system) = open(settings, on_status)?;
+    let (session, system) = open(settings, on_status)?;
+    let harness = harness(settings, session, system, log)?;
+    Ok(Loaded {
+        harness,
+        loading: loading.elapsed(),
+    })
+}
+
+/// Builds the harness around `session`, opened with the system prompt
+/// `system`, with `settings`, keeping a transcript in `log`.
+pub fn harness(
+    settings: &Settings,
+    mut session: Session,
+    system: String,
+    log: Log,
+) -> Result<Harness<Session>, Box<dyn Error>> {
     let device = device(&mut session);
     let cwd = env::current_dir()?;
     let mut harness = Harness::new(session, &cwd, {
@@ -180,10 +196,7 @@ pub fn load(
         harness.set_shell(shell);
     }
     harness.keep_log(log, settings.model.name(), &device, &system);
-    Ok(Loaded {
-        harness,
-        loading: loading.elapsed(),
-    })
+    Ok(harness)
 }
 
 /// Opens the session over on a server, starting one if none is running,
@@ -193,7 +206,7 @@ pub fn load(
 pub fn reopen(
     settings: &Settings,
     harness: &mut Harness<Session>,
-    on_status: impl FnMut(Status) + 'static,
+    on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(), Box<dyn Error>> {
     let (session, _) = open(settings, on_status)?;
     harness.reopen(session)
@@ -207,7 +220,7 @@ pub fn reopen(
 pub fn switch(
     settings: &Settings,
     harness: &mut Harness<Session>,
-    on_status: impl FnMut(Status) + 'static,
+    on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<Kind, Box<dyn Error>> {
     reopen(settings, harness, on_status)?;
     let device = device(harness.session());
@@ -229,9 +242,9 @@ fn device(session: &mut Session) -> String {
 /// server is doing meanwhile, and after, when the session waits for
 /// another's request; or at OpenRouter, where there is nothing to wait
 /// for.
-fn open(
+pub fn open(
     settings: &Settings,
-    mut on_status: impl FnMut(Status) + 'static,
+    mut on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     if provider(settings.provider, settings.model)? == Kind::OpenRouter {

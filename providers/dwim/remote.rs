@@ -148,7 +148,7 @@ pub struct Remote {
     capacity: usize,
     sampling: Sampling,
     /// Told when the server has this session wait for another's request.
-    on_status: Box<dyn FnMut(Status)>,
+    on_status: Box<dyn FnMut(Status) + Send>,
 }
 
 impl Remote {
@@ -170,7 +170,7 @@ impl Remote {
 
     /// Has `on_status` told what the server is doing while a request of
     /// this session's waits: that the model is busy with another session's.
-    pub fn on_status(&mut self, on_status: impl FnMut(Status) + 'static) {
+    pub fn on_status(&mut self, on_status: impl FnMut(Status) + Send + 'static) {
         self.on_status = Box::new(on_status);
     }
 
