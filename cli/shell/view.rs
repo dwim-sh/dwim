@@ -118,6 +118,37 @@ pub fn provider_notice(provider: Kind, variant: Variant) -> String {
     }
 }
 
+/// What the shell says on starting where the model has nowhere to run:
+/// why, under `reason`, and what to do about it, whether or not there is
+/// a key to OpenRouter.
+pub fn nowhere(reason: &str, key: bool, columns: usize) -> Vec<Line> {
+    let mut reason = reason.to_string();
+    if let Some(first) = reason.get(..1) {
+        reason.replace_range(..1, &first.to_uppercase());
+    }
+    report(
+        vec![span("● "), span("No model to run yet").bold()],
+        vec![reason, connect_hint(key)],
+        columns,
+    )
+}
+
+/// What to do to have a model where none runs, whether or not there is a
+/// key to OpenRouter.
+pub fn connect_hint(key: bool) -> String {
+    if key {
+        "/provider picks where the model runs".to_string()
+    } else {
+        "/provider signs in to OpenRouter, which runs the model for you".to_string()
+    }
+}
+
+/// What a command that needs a model says while there is none, whether
+/// or not there is a key to OpenRouter.
+pub fn no_provider(key: bool) -> String {
+    format!("No model to answer yet · {}", connect_hint(key))
+}
+
 /// How moving the conversation to another model is acknowledged.
 pub fn switched(variant: Variant, provider: Kind) -> String {
     match provider {

@@ -145,7 +145,10 @@ pub enum Reply {
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
     Error(String),
-    /// The model is gone: it could not be fetched or loaded.
+    /// The session could not be opened where the model was to run, and
+    /// why: none is, until another model or provider is picked.
+    Unopened(String),
+    /// The model's thread is gone.
     Failed(String),
 }
 
@@ -245,34 +248,47 @@ fn work(
 /// Opens the session where `settings` have the model, and its system
 /// prompt, without keeping the shell waiting: a model picked meanwhile
 /// changes `settings`, and the session is opened there instead, the one
-/// being opened left to itself. Nothing if the shell hangs up first.
+/// being opened left to itself. Where the model has nowhere to run, or
+/// the session cannot be opened, nothing is opened until one is picked.
+/// Nothing if the shell hangs up first.
 fn open(
     settings: &mut Settings,
     requests: &Receiver<Request>,
     replies: &Sender<Reply>,
 ) -> Result<Option<(Session, String)>, Box<dyn Error>> {
-    let mut opening = Opening::start(settings, replies);
+    let mut opening = session::provider(settings.provider, settings.model)?
+        .map(|_| Opening::start(settings, replies));
     loop {
-        match opening.opened.try_recv() {
-            Ok(opened) => return Ok(Some(opened?)),
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                return Err("the model stopped loading unexpectedly".into());
+        if let Some(open) = &opening {
+            match open.opened.try_recv() {
+                Ok(Ok(opened)) => return Ok(Some(opened)),
+                Ok(Err(e)) => {
+                    let _ = replies.send(Reply::Unopened(e));
+                    opening = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err("the model stopped loading unexpectedly".into());
+                }
             }
         }
         match requests.recv_timeout(POLL) {
             Ok(Request::Model(provider, variant)) => {
-                opening.left.store(true, Ordering::Relaxed);
+                if let Some(open) = &opening {
+                    open.left.store(true, Ordering::Relaxed);
+                }
                 (settings.provider, settings.model) = (Some(provider), variant);
                 let _ = replies.send(Reply::Model { variant, provider });
-                opening = Opening::start(settings, replies);
+                opening = Some(Opening::start(settings, replies));
             }
             Ok(_) => {
                 let _ = replies.send(Reply::Error("the model is still loading".to_string()));
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                opening.left.store(true, Ordering::Relaxed);
+                if let Some(open) = &opening {
+                    open.left.store(true, Ordering::Relaxed);
+                }
                 return Ok(None);
             }
         }
