@@ -3,7 +3,6 @@
 
 mod fetch;
 pub mod gguf;
-mod hub;
 mod local;
 mod model;
 pub mod quants;

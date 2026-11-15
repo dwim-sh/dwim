@@ -15,7 +15,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
-    inference::{Gguf, LanguageModel, Result, gguf, hub, quants},
+    inference::{Gguf, LanguageModel, Result, gguf, quants},
+    model::hub,
 };
 
 /// The model as `dwim` names it.

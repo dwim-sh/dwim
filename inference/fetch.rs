@@ -10,9 +10,12 @@ use std::{
     time::Duration,
 };
 
-use crate::inference::{
-    Result, hub,
-    qwen35::{self, File},
+use crate::{
+    inference::{
+        Result,
+        qwen35::{self, File},
+    },
+    model::hub,
 };
 
 /// How long a partial download can go without being written to before it is
