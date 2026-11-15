@@ -171,7 +171,7 @@ impl Tokenizer {
     /// merge, and the special tokens of the chat format.
     #[cfg(test)]
     pub fn tiny() -> Self {
-        use crate::inference::gguf::{self, Value};
+        use crate::{inference::gguf, model::gguf::Value};
 
         let mut tokens: Vec<Value> = byte_chars()
             .iter()

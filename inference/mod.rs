@@ -20,9 +20,9 @@ pub use model::{Device, Model, OnDisk, Progress, Size};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;
 
-use std::ops::ControlFlow;
+pub use crate::model::Result;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use std::ops::ControlFlow;
 
 /// A model that predicts the next token, keeping the sequence so far in
 /// its own state.

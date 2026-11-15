@@ -158,7 +158,7 @@ impl Config {
         // implemented.
         if let Some(recurrent) = gguf.get(&format!("{arch}.attention.recurrent_layers")) {
             let recurrent = match recurrent {
-                crate::inference::gguf::Value::Array(values) => values,
+                crate::model::gguf::Value::Array(values) => values,
                 _ => return Err("the list of linear layers is not a list".into()),
             };
             if recurrent.len() < config.layers
@@ -1531,7 +1531,7 @@ mod tests {
     use super::*;
     use crate::{
         gpu::{Cpu, Gpu},
-        inference::gguf::Value,
+        model::gguf::Value,
     };
 
     struct Rng(u64);
