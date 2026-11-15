@@ -251,6 +251,10 @@ pub fn accounting(stats: &harness::Stats, loading: Duration, total: Duration) ->
             ),
         );
     }
+    // What a provider charged, where the model runs at one.
+    if m.cost > 0.0 {
+        lines.push(format!("{:<8}{:>13}", "cost", format!("${:.4}", m.cost)));
+    }
     lines
         .into_iter()
         .map(|line| line.trim_end().to_string())

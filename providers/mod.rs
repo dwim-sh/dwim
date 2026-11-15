@@ -8,6 +8,7 @@
 
 mod conversation;
 pub mod dwim;
+pub mod openrouter;
 
 use std::ops::ControlFlow;
 
