@@ -55,12 +55,23 @@ pub const SPECIAL_TOKENS: [&str; 9] = [
 
 /// A turn of a conversation, as a transcript of it keeps them: what the
 /// user said; what the model replied, as the text it showed and the tool
-/// calls it made as written, without the thought behind them; and what the
-/// tools returned.
+/// calls it made as written; and what the tools returned.
+///
+/// A reply has the thought behind it where the provider that made it gave
+/// one to keep, and is empty otherwise. The chat template writes the
+/// thoughts of the replies since the user's last message and leaves out
+/// the ones before: a model that calls a tool goes on from what it had
+/// worked out, and one that is not shown its thought works it out again
+/// after every call.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Turn {
     User(String),
-    Reply { text: String, calls: Vec<String> },
+    Reply {
+        text: String,
+        calls: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thought: String,
+    },
     Results(Vec<String>),
 }
 
@@ -143,7 +154,7 @@ impl Format {
     pub fn encode(&self, turn: &Turn) -> Result<Vec<u32>> {
         match turn {
             Turn::User(message) => self.user(message),
-            Turn::Reply { text, calls } => self.reply(text, calls),
+            Turn::Reply { text, calls, .. } => self.reply(text, calls),
             Turn::Results(outputs) => self.results(outputs),
         }
     }
@@ -169,7 +180,10 @@ impl Format {
     }
 
     /// A reply already made as a turn: an empty thought, its text, and its
-    /// tool calls as written, each in a `<tool_call>` block. The newlines
+    /// tool calls as written, each in a `<tool_call>` block. A reply is
+    /// written without its thought wherever it comes: the model on this
+    /// machine reads a turn once, and to leave a thought out after the
+    /// user's next message would have it read the turn over. The newlines
     /// the model puts between the thought and the text are the template's
     /// to write, so the text's leading newlines are left out.
     pub fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>> {

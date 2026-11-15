@@ -9,11 +9,20 @@
 //! put it. A reply's calls go as the calls they were, and their results as
 //! messages from the tools.
 //!
-//! What only a server of dwim's own can do is done without: a thought is
-//! limited by asking the provider to, with no closing written into it, a
-//! plain answer is asked to write its headings itself, and tokens are
-//! counted by what the provider said the last request took, with an
-//! estimate of what was added since.
+//! A reply's thought is kept with it, and goes back with the replies made
+//! since the user's last message, as the model's chat template writes
+//! them: asked again after a tool call without what it had thought, the
+//! model works its plan out over again, at length, and calls another tool
+//! in place of acting on it.
+//!
+//! What only a server of dwim's own can do is done without. A closing
+//! cannot be written into a thought, and a provider asked to limit one
+//! may not, so a thought that runs to its limit is ended here: the reply
+//! is dropped where it is, and asked for again, with the thought so far
+//! and the closing put to the model as a reminder to act on. A plain
+//! answer is asked to write its headings itself, and tokens are counted by
+//! what the provider said the last request took, with an estimate of what
+//! was added since.
 
 mod stream;
 
@@ -36,7 +45,7 @@ use crate::{
     tools::ToolCall,
 };
 
-use stream::Outcome;
+use stream::{Outcome, Usage};
 
 /// The environment variable the key to OpenRouter is read from.
 pub const KEY: &str = "OPENROUTER_API_KEY";
@@ -58,6 +67,10 @@ const MAX_REPLY: usize = 32_768;
 /// the provider counts both against the most a reply may run to.
 const ANSWER_THOUGHT: usize = 2048;
 
+/// Bytes of a thought to a token, about, as prose runs: a thought is
+/// counted against its limit as it streams, in text.
+const THOUGHT_BYTES: usize = 4;
+
 /// How often a request that was refused for now, or did not get through,
 /// is made again, and how long it waits first.
 const RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
@@ -65,6 +78,8 @@ const RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 /// A model at OpenRouter.
 pub struct OpenRouter {
     agent: Agent,
+    /// Where a chat is completed: [`URL`].
+    url: String,
     key: String,
     variant: Variant,
     capacity: usize,
@@ -87,6 +102,7 @@ impl OpenRouter {
             .new_agent();
         Ok(Self {
             agent,
+            url: URL.to_string(),
             key,
             variant,
             capacity: context.unwrap_or(CONTEXT),
@@ -125,17 +141,20 @@ impl OpenRouter {
     }
 
     /// Asks for a reply to `messages`, with the tools they declare, of at
-    /// most `limit` tokens, thinking
-    /// for at most `thought` of them if that is limited, streaming it to
-    /// `on_chunk`, and counts what it took.
+    /// most `limit` tokens, streaming it to `on_chunk`, and counts what it
+    /// took. A thought is asked to run to at most `thought` tokens, if
+    /// they are limited, and one that runs to them regardless is ended
+    /// with `closing`, if there is one, as the model's own: the reply is
+    /// asked for again, to go on from the thought so far and the closing.
     fn complete(
         &mut self,
         messages: (Vec<Value>, Vec<Value>),
         limit: usize,
         thought: Option<usize>,
-        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+        closing: Option<&str>,
+        mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Outcome> {
-        let (messages, tools) = messages;
+        let (mut messages, tools) = messages;
         let mut body = json!({
             "model": self.model(),
             "messages": messages,
@@ -152,6 +171,63 @@ impl OpenRouter {
         if let Some(thought) = thought {
             body["reasoning"] = json!({ "max_tokens": thought });
         }
+        let most = thought
+            .filter(|_| closing.is_some())
+            .map(|tokens| tokens * THOUGHT_BYTES);
+        let mut bytes = 0;
+        let mut over = false;
+        let mut outcome = self.ask(&body, |chunk| {
+            let thinking = matches!(chunk, Chunk::Thought(_));
+            if let Chunk::Thought(piece) = &chunk {
+                bytes += piece.len();
+            }
+            on_chunk(chunk)?;
+            if thinking && most.is_some_and(|most| bytes >= most) {
+                over = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        let Some(closing) = closing.filter(|_| over) else {
+            return Ok(outcome);
+        };
+        outcome.thought = format!("{}\n\n{closing}", outcome.thought.trim_end());
+        outcome.thought_ended = true;
+        if on_chunk(Chunk::Thought(&format!("\n\n{closing}\n"))).is_break() {
+            return Ok(outcome);
+        }
+        if let Some(last) = messages.last_mut() {
+            let asked = format!(
+                "{}\n\n{}",
+                last["content"].as_str().unwrap_or(""),
+                ended(&outcome.thought)
+            );
+            last["content"] = Value::String(asked);
+        }
+        // The model may think again, since a provider can refuse a
+        // request that asks for none: it thinks on from where the thought
+        // was ended, and that thought is let run.
+        body["messages"] = Value::Array(messages);
+        let again = self.ask(&body, on_chunk)?;
+        if !again.thought.trim().is_empty() {
+            outcome.thought.push_str("\n\n");
+            outcome.thought.push_str(again.thought.trim());
+        }
+        Ok(Outcome {
+            thought: outcome.thought,
+            thought_ended: true,
+            ..again
+        })
+    }
+
+    /// Posts a request for a reply, reads the reply as it streams to
+    /// `on_chunk`, and counts what the provider says it took: a reply
+    /// ended early is not counted, since the provider does not get to say.
+    fn ask(
+        &mut self,
+        body: &Value,
+        on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<Outcome> {
         let started = Instant::now();
         let response = self.post(&body.to_string())?;
         let waited = started.elapsed().as_secs_f64();
@@ -180,7 +256,7 @@ impl OpenRouter {
         loop {
             let sent = self
                 .agent
-                .post(URL)
+                .post(&self.url)
                 .header("Authorization", &format!("Bearer {}", self.key))
                 .header("Content-Type", "application/json")
                 .header("X-Title", "dwim")
@@ -212,16 +288,15 @@ impl OpenRouter {
         }
     }
 
-    /// Where `chat` is once a reply of `text` and `calls` follows it:
-    /// counted by the provider if the reply's stream said, and estimated
-    /// otherwise, as when the reply was ended early.
-    fn after(&mut self, chat: &Chat, outcome: &Outcome) -> State {
-        let reply = Turn::Reply {
-            text: outcome.text.clone(),
-            calls: outcome.calls.clone(),
-        };
-        let tokens = match outcome.usage {
-            // The thought is not part of the conversation that goes on.
+    /// Where `chat` is once `reply` follows it: counted by the provider
+    /// if the reply's stream said what it `used`, and estimated otherwise,
+    /// as when the reply was ended early.
+    fn after(&mut self, chat: &Chat, reply: Turn, used: Option<Usage>) -> State {
+        let kept = matches!(&reply, Turn::Reply { thought, .. } if !thought.is_empty());
+        let tokens = match used {
+            // A thought the reply keeps goes back with the turn's
+            // requests; one it does not is no part of what goes on.
+            Some(usage) if kept => usage.prompt + usage.completion,
             Some(usage) => usage.prompt + usage.completion - usage.reasoning.min(usage.completion),
             None => self.count(chat) + estimate(&reply),
         };
@@ -280,21 +355,34 @@ impl Provider for OpenRouter {
                     ..Reply::default()
                 },
                 text: String::new(),
+                thought: String::new(),
                 state: State {
                     tokens: self.count(chat),
                     stats: self.stats,
                 },
             });
         }
-        let outcome = self.complete(messages(chat), room, generation.thought_limit, on_chunk)?;
-        let state = self.after(chat, &outcome);
+        let outcome = self.complete(
+            messages(chat),
+            room,
+            generation.thought_limit,
+            generation.closing.as_deref(),
+            on_chunk,
+        )?;
+        let reply = Turn::Reply {
+            text: outcome.text.clone(),
+            calls: outcome.calls.clone(),
+            thought: outcome.thought.clone(),
+        };
+        let state = self.after(chat, reply, outcome.usage);
         Ok(Completion {
             reply: Reply {
                 calls: outcome.calls,
                 cut: outcome.cut,
-                thought_ended: false,
+                thought_ended: outcome.thought_ended,
             },
             text: outcome.text,
+            thought: outcome.thought,
             state,
         })
     }
@@ -326,12 +414,19 @@ impl Provider for OpenRouter {
             (messages, Vec::new()),
             limit + ANSWER_THOUGHT,
             Some(ANSWER_THOUGHT),
+            None,
             |chunk| match chunk {
                 Chunk::Text(text) => on_text(text),
                 _ => ControlFlow::Continue(()),
             },
         )?;
-        let state = self.after(chat, &outcome);
+        // A plain answer stands without its thought.
+        let reply = Turn::Reply {
+            text: outcome.text.clone(),
+            calls: Vec::new(),
+            thought: String::new(),
+        };
+        let state = self.after(chat, reply, outcome.usage);
         let answer = Answer {
             text: outcome.text,
             cut: outcome.cut,
@@ -363,8 +458,14 @@ fn estimate(turn: &Turn) -> usize {
     FRAMING
         + match turn {
             Turn::User(message) => tokens_of(message),
-            Turn::Reply { text, calls } => {
-                tokens_of(text) + calls.iter().map(|call| tokens_of(call) + 2).sum::<usize>()
+            Turn::Reply {
+                text,
+                calls,
+                thought,
+            } => {
+                tokens_of(thought)
+                    + tokens_of(text)
+                    + calls.iter().map(|call| tokens_of(call) + 2).sum::<usize>()
             }
             Turn::Results(outputs) => outputs.iter().map(|output| tokens_of(output) + 4).sum(),
         }
@@ -374,13 +475,26 @@ fn tokens_of(text: &str) -> usize {
     text.len().div_ceil(3)
 }
 
+/// What a model whose thought was ended at its limit is told in place of
+/// thinking again: the `thought`, with its closing, which it goes on from.
+fn ended(thought: &str) -> String {
+    format!(
+        "<system-reminder>Your thinking for this reply reached its limit and was ended. This is what you thought:\n\n{thought}\n\nDo not think it over again. Act on it now: call a tool, or reply.</system-reminder>"
+    )
+}
+
 /// `chat` as the messages of a request, and the tools it declares: the
 /// system prompt without its declaration of the tools, and a message for
 /// each turn. A reply's calls go as calls, each with a name of its own for
 /// its result to answer to, and a turn of results as a message from the
-/// tool for each.
+/// tool for each. A reply made since the user's last message goes with
+/// the thought behind it, as the model's chat template writes one.
 fn messages(chat: &Chat) -> (Vec<Value>, Vec<Value>) {
     let (system, tools) = declared(&chat.system);
+    let asked = chat
+        .turns
+        .iter()
+        .rposition(|turn| matches!(turn, Turn::User(_)));
     let mut messages = vec![json!({ "role": "system", "content": system })];
     // The names of the calls of the last reply, for their results.
     let mut ids: Vec<String> = Vec::new();
@@ -389,9 +503,16 @@ fn messages(chat: &Chat) -> (Vec<Value>, Vec<Value>) {
             Turn::User(message) => {
                 messages.push(json!({ "role": "user", "content": message }));
             }
-            Turn::Reply { text, calls } => {
+            Turn::Reply {
+                text,
+                calls,
+                thought,
+            } => {
                 ids = (0..calls.len()).map(|i| format!("call_{n}_{i}")).collect();
                 let mut message = json!({ "role": "assistant", "content": text });
+                if !thought.is_empty() && asked.is_none_or(|asked| n > asked) {
+                    message["reasoning"] = Value::String(thought.clone());
+                }
                 if !calls.is_empty() {
                     let calls: Vec<Value> = calls.iter().zip(&ids).map(call).collect();
                     message["tool_calls"] = Value::Array(calls);
@@ -464,7 +585,171 @@ fn declared(system: &str) -> (String, Vec<Value>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, Read, Write},
+        net::TcpListener,
+    };
+
     use super::*;
+
+    /// A reply as a provider streams it: an event for each delta, and
+    /// then what it used.
+    fn events(deltas: &[Value]) -> String {
+        let mut body = String::new();
+        for delta in deltas {
+            let event = json!({ "choices": [{ "delta": delta }] });
+            body.push_str(&format!("data: {event}\n\n"));
+        }
+        let usage =
+            json!({ "choices": [], "usage": { "prompt_tokens": 10, "completion_tokens": 2 } });
+        body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+        body
+    }
+
+    /// A model at a provider on this machine that answers the requests it
+    /// gets with `replies` in turn, and the thread that hands back what
+    /// it was asked.
+    fn provider(replies: Vec<String>) -> (OpenRouter, thread::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let serving = thread::spawn(move || {
+            let mut asked = Vec::new();
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim().to_ascii_lowercase();
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                asked.push(serde_json::from_slice(&body).unwrap());
+                // A client that has heard enough is gone before the end.
+                let _ = reader.get_mut().write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}")
+                        .as_bytes(),
+                );
+            }
+            asked
+        });
+        let provider = OpenRouter {
+            agent: Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .new_agent(),
+            url,
+            key: "key".to_string(),
+            variant: Variant::Large,
+            capacity: CONTEXT,
+            sampling: Sampling {
+                temperature: 0.6,
+                top_k: 20,
+                top_p: 0.95,
+                min_p: 0.0,
+                seed: 0,
+            },
+            stats: Stats::default(),
+            counted: None,
+        };
+        (provider, serving)
+    }
+
+    #[test]
+    fn a_thought_that_runs_to_its_limit_is_ended_and_the_reply_asked_again() {
+        // The provider was asked for a thought of two tokens, and thinks
+        // on: the reply is dropped there, and asked for again, from the
+        // thought so far and the closing.
+        let thinking: Vec<Value> = (0..50)
+            .map(|_| json!({ "reasoning": "Let me reconsider. " }))
+            .chain([json!({ "content": "Never said." })])
+            .collect();
+        let (mut provider, serving) = provider(vec![
+            events(&thinking),
+            events(&[json!({ "content": "Done." })]),
+        ]);
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        let generation = Generation {
+            reserve: 0,
+            thought_limit: Some(2),
+            closing: Some("I will decide now.".to_string()),
+        };
+        let mut thoughts = String::new();
+        let completion = provider
+            .reply(&chat, &generation, |chunk| {
+                if let Chunk::Thought(piece) = chunk {
+                    thoughts.push_str(piece);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let asked = serving.join().unwrap();
+
+        assert_eq!(completion.text, "Done.");
+        assert!(completion.reply.thought_ended);
+        assert_eq!(
+            completion.thought,
+            "Let me reconsider.\n\nI will decide now."
+        );
+        assert_eq!(thoughts, "Let me reconsider. \n\nI will decide now.\n");
+        // The second request has the thought and its closing, after the
+        // message the reply is to.
+        assert_eq!(asked.len(), 2);
+        let last = asked[1]["messages"].as_array().unwrap().last().unwrap();
+        let content = last["content"].as_str().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(content.starts_with("Fix it."), "{content}");
+        assert!(
+            content.contains("Let me reconsider.\n\nI will decide now."),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_reply_goes_with_its_thought_until_the_user_says_more() {
+        let reply = |thought: &str| Turn::Reply {
+            text: String::new(),
+            calls: vec![r#"{"name": "bash", "arguments": {"command": "ls"}}"#.to_string()],
+            thought: thought.to_string(),
+        };
+        let mut chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![
+                Turn::User("What is here?".to_string()),
+                reply("I will list the files, then read the first."),
+                Turn::Results(vec!["a.rs".to_string()]),
+            ],
+        };
+        // Asked again after the tool's result, the model has what it
+        // thought before the call.
+        let (messages, _) = messages(&chat);
+        assert_eq!(
+            messages[2]["reasoning"],
+            "I will list the files, then read the first."
+        );
+
+        // Once the user has said more, the thoughts before are left out,
+        // and the ones since go.
+        chat.turns.extend([
+            Turn::User("And there?".to_string()),
+            reply("The same again, elsewhere."),
+            Turn::Results(vec!["b.rs".to_string()]),
+        ]);
+        let (messages, _) = super::messages(&chat);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2].get("reasoning").is_none());
+        assert_eq!(messages[5]["reasoning"], "The same again, elsewhere.");
+    }
 
     /// A system prompt that declares a tool as the harness does.
     const SYSTEM: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Run.\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format:\n\n<tool_call>\n</tool_call>\n\n<IMPORTANT>\nReminder\n</IMPORTANT>\n\nBe brief.";
@@ -494,6 +779,7 @@ mod tests {
                             .to_string(),
                         r#"{"name": "read", "arguments": {"path": "a.rs"}}"#.to_string(),
                     ],
+                    thought: String::new(),
                 },
                 Turn::Results(vec!["a.rs".to_string(), "fn main() {}".to_string()]),
             ],

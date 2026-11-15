@@ -467,6 +467,7 @@ mod tests {
                 Turn::Reply {
                     text: "Ok.".to_string(),
                     calls: Vec::new(),
+                    thought: String::new(),
                 },
                 n,
             )

@@ -803,6 +803,7 @@ impl<S: Session> Harness<S> {
                 Turn::Reply {
                     text,
                     calls: reply.calls.clone(),
+                    thought: String::new(),
                 },
                 false,
             )?;
@@ -940,6 +941,7 @@ impl<S: Session> Harness<S> {
             Turn::Reply {
                 text: answer.text,
                 calls: Vec::new(),
+                thought: String::new(),
             },
             false,
         )?;
@@ -1605,7 +1607,7 @@ mod tests {
             turns[turns.len() - 2]
         );
         assert!(
-            matches!(turns.last(), Some(Turn::Reply { text, calls }) if text == "I looked three times." && calls.is_empty()),
+            matches!(turns.last(), Some(Turn::Reply { text, calls, .. }) if text == "I looked three times." && calls.is_empty()),
             "{:?}",
             turns.last()
         );

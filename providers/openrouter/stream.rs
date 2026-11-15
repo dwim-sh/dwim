@@ -17,10 +17,15 @@ use crate::model::{Chunk, Result};
 /// What a reply came to, as the stream gave it.
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
+    /// The thought behind the reply, as it was streamed.
+    pub thought: String,
     /// The reply's text as shown, without its calls.
     pub text: String,
     /// The calls the reply made, each as a `<tool_call>` block's body.
     pub calls: Vec<String>,
+    /// Whether the thought was ended at its limit, rather than by the
+    /// model: the stream does not say, and whoever ended it does.
+    pub thought_ended: bool,
     /// Whether the reply was ended by `on_chunk` breaking.
     pub interrupted: bool,
     /// Whether the reply ran to the most tokens it was allowed.
@@ -79,6 +84,7 @@ pub fn read(
         let delta = &choice["delta"];
         let mut flow = ControlFlow::Continue(());
         if let Some(thought) = delta["reasoning"].as_str().filter(|s| !s.is_empty()) {
+            outcome.thought.push_str(thought);
             flow = on_chunk(Chunk::Thought(thought));
         }
         if flow.is_continue()

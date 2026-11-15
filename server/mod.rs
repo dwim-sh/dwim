@@ -541,6 +541,7 @@ fn serve(
             served.add(Turn::Reply {
                 text: text.clone(),
                 calls: reply.calls.clone(),
+                thought: String::new(),
             });
             Response::Reply {
                 reply,
@@ -568,6 +569,7 @@ fn serve(
             served.add(Turn::Reply {
                 text: answer.text.clone(),
                 calls: Vec::new(),
+                thought: String::new(),
             });
             Response::Answered {
                 answer,
@@ -900,6 +902,7 @@ mod tests {
         let turn = Turn::Reply {
             text: "Ok.".to_string(),
             calls: vec!["<function=bash>\n</function>".to_string()],
+            thought: String::new(),
         };
         let format = Format::new(Tokenizer::tiny()).unwrap();
         assert_eq!(a.measure(&turn).unwrap(), format.measure(&turn).unwrap());

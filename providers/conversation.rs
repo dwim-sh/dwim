@@ -59,6 +59,7 @@ impl<P: Provider> Conversation<P> {
         self.chat.turns.push(Turn::Reply {
             text: completion.text,
             calls: completion.reply.calls.clone(),
+            thought: completion.thought,
         });
         Ok(completion.reply)
     }
@@ -152,6 +153,7 @@ impl<P: Provider> Session for Conversation<P> {
         self.chat.turns.push(Turn::Reply {
             text: answer.text.clone(),
             calls: Vec::new(),
+            thought: String::new(),
         });
         Ok(answer)
     }
@@ -214,6 +216,7 @@ mod tests {
                     ..Reply::default()
                 },
                 text: "Looking.".to_string(),
+                thought: "They ask what is here.".to_string(),
                 state: State {
                     tokens: 10 * (2 + chat.turns.len()),
                     ..State::default()
@@ -256,9 +259,11 @@ mod tests {
             last.turns,
             [
                 Turn::User("What is here?".to_string()),
+                // The reply goes back with the thought behind it.
                 Turn::Reply {
                     text: "Looking.".to_string(),
                     calls: vec!["ls".to_string()],
+                    thought: "They ask what is here.".to_string(),
                 },
                 Turn::Results(vec!["a.rs".to_string()]),
             ]
