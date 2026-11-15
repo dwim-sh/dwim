@@ -116,12 +116,12 @@ pub fn load(
     on_status: impl FnMut(Status) + 'static,
 ) -> Result<Loaded, Box<dyn Error>> {
     let loading = Instant::now();
-    let (client, system) = open(settings, on_status)?;
-    let device = client.device().to_string();
+    let (session, system) = open(settings, on_status)?;
+    let device = session.device().to_string();
     let cwd = env::current_dir()?;
-    let mut harness = Harness::new(client, &cwd, {
+    let mut harness = Harness::new(session, &cwd, {
         let system = system.clone();
-        move |client: &mut Remote| client.start(&system, |_, _| {}).map(|_| ())
+        move |session: &mut Remote| session.start(&system, |_, _| {}).map(|_| ())
     })?;
     harness.set_thinking_budget(settings.thinking_budget);
     if let Some(shell) = settings.shell.clone() {
@@ -143,8 +143,8 @@ pub fn reopen(
     harness: &mut Harness<Remote>,
     on_status: impl FnMut(Status) + 'static,
 ) -> Result<(), Box<dyn Error>> {
-    let (client, _) = open(settings, on_status)?;
-    harness.reopen(client)
+    let (session, _) = open(settings, on_status)?;
+    harness.reopen(session)
 }
 
 /// Reaches the server, starting one if none is running, and opens a
@@ -161,7 +161,7 @@ fn open(
     // A session that connects once the model is loaded, or part way
     // through, is told of the device and the size afterwards instead.
     let (mut device_told, mut size_told) = (false, false);
-    let mut client = connection.open(settings.temperature, settings.speculate, |status| {
+    let mut session = connection.open(settings.temperature, settings.speculate, |status| {
         match status {
             Status::Device(_) => device_told = true,
             Status::Sized(_) => size_told = true,
@@ -170,17 +170,17 @@ fn open(
         on_status(status)
     })?;
     if !device_told {
-        on_status(Status::Device(client.device().to_string()));
+        on_status(Status::Device(session.device().to_string()));
     }
     if !size_told {
-        on_status(Status::Sized(client.size()));
+        on_status(Status::Sized(session.size()));
     }
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
-    client.start(&system, |read, total| {
+    session.start(&system, |read, total| {
         on_status(Status::Prompting { read, total })
     })?;
-    client.on_status(on_status);
-    Ok((client, system))
+    session.on_status(on_status);
+    Ok((session, system))
 }
 
 /// Where `stats` say a session's time has gone, as lines, given how long loading the model took and
@@ -262,9 +262,9 @@ pub fn running() -> Option<Welcome> {
         .ok()
 }
 
-/// Stops the server `client` is a session on, if it has no other: asks it
+/// Stops the server `session` is on, if it has no other: asks it
 /// to go, ends the session, and waits for the server to exit.
-pub fn stop(client: &mut Remote) -> Result<(), Box<dyn Error>> {
+pub fn stop(session: &mut Remote) -> Result<(), Box<dyn Error>> {
     let mut connection =
         Connection::connect(&server::socket_path()).map_err(|_| "no dwim server is running")?;
     let welcome = connection.hello()?;
@@ -279,7 +279,7 @@ pub fn stop(client: &mut Remote) -> Result<(), Box<dyn Error>> {
     }
     connection.retire()?;
     drop(connection);
-    client.close();
+    session.close();
     wait_for_exit(welcome.pid);
     Ok(())
 }

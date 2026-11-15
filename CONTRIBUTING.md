@@ -71,7 +71,7 @@ drafter, and
 `cargo run --bin difftest` checks the GPU against the CPU with it, on a
 few prompts run in pieces of different sizes and on their continuations
 run a token at a time, and on the same prompts run again with a detour
-marked and rewound halfway through, as the chat drops a thought. The CPU's
+marked and rewound halfway through, as a session drops a thought. The CPU's
 side is
 recorded into `target/difftest/` on the first run, which takes minutes, and
 again only when the CPU's or the model's code changes; after that a run

@@ -411,9 +411,9 @@ pub enum Event {
 /// What a turn's events go to, which ends the turn early by breaking.
 type OnEvent<'a> = &'a mut dyn FnMut(Event) -> ControlFlow<()>;
 
-/// What opens the conversation over with the system prompt, once the chat
+/// What opens the conversation over with the system prompt, once the session
 /// is cleared: from a saved state, or by reading the prompt again.
-type Restart<C> = Box<dyn FnMut(&mut C) -> Result<(), Box<dyn Error>>>;
+type Restart<S> = Box<dyn FnMut(&mut S) -> Result<(), Box<dyn Error>>>;
 
 /// How a turn ended: with a reply of text alone, or interrupted; or with
 /// the reply stopped short for room.
@@ -434,8 +434,8 @@ struct Entry {
 
 /// The loop around a [`Session`] that runs the tools the model calls
 /// and feeds the results back, until the model replies with text alone.
-pub struct Harness<C: Session> {
-    chat: C,
+pub struct Harness<S: Session> {
+    session: S,
     tools: Tools,
     /// Where the agent is, until the first message carries it.
     environment: Option<String>,
@@ -447,9 +447,9 @@ pub struct Harness<C: Session> {
     /// The conversation since the system prompt, or since it was last
     /// compacted.
     transcript: Vec<Entry>,
-    /// Opens the conversation over with the system prompt, once the chat
+    /// Opens the conversation over with the system prompt, once the session
     /// is cleared.
-    restart: Restart<C>,
+    restart: Restart<S>,
     /// Most tokens of a note.
     note_tokens: usize,
     /// The thinking budget: most tokens a thought may run to, if they
@@ -483,18 +483,18 @@ pub struct Stats {
     pub tool_seconds: f64,
 }
 
-impl<C: Session> Harness<C> {
-    /// An agent on `chat`, which has read the system prompt, working in
+impl<S: Session> Harness<S> {
+    /// An agent on `session`, which has read the system prompt, working in
     /// `dir`, with `restart` to open the conversation over with the same
-    /// prompt once the chat is cleared, when the conversation is compacted.
+    /// prompt once the session is cleared, when the conversation is compacted.
     pub fn new(
-        mut chat: C,
+        mut session: S,
         dir: &Path,
-        restart: impl FnMut(&mut C) -> Result<(), Box<dyn Error>> + 'static,
+        restart: impl FnMut(&mut S) -> Result<(), Box<dyn Error>> + 'static,
     ) -> Result<Self, Box<dyn Error>> {
-        let note_tokens = compaction::reserve(&mut chat)?;
+        let note_tokens = compaction::reserve(&mut session)?;
         let mut harness = Self {
-            chat,
+            session,
             tools: Tools::new(dir),
             environment: Some(environment(dir)),
             dir: dir.to_path_buf(),
@@ -524,7 +524,7 @@ impl<C: Session> Harness<C> {
         self.log.thinking_budget(tokens);
     }
 
-    /// Has the chat end a thought at `tokens`, the thinking budget, if
+    /// Has the session end a thought at `tokens`, the thinking budget, if
     /// there is one, with the closing for where the turn is: to check with
     /// a tool before the model has called one in the turn, when it is
     /// thinking from memory, and to decide from the results once it has.
@@ -535,7 +535,7 @@ impl<C: Session> Harness<C> {
             DECIDE_CLOSING
         };
         self.thinking_budget = tokens;
-        self.chat.limit_thoughts(tokens, closing);
+        self.session.limit_thoughts(tokens, closing);
     }
 
     /// Runs the model's shell commands through `shell`, as `shell -c
@@ -579,8 +579,8 @@ impl<C: Session> Harness<C> {
             model,
             device,
             &self.dir,
-            self.chat.capacity(),
-            self.chat.sampler(),
+            self.session.capacity(),
+            self.session.sampler(),
             self.thinking_budget,
             system,
         );
@@ -588,17 +588,17 @@ impl<C: Session> Harness<C> {
     }
 
     /// The conversation the harness runs on.
-    pub fn conversation(&mut self) -> &mut C {
-        &mut self.chat
+    pub fn session(&mut self) -> &mut S {
+        &mut self.session
     }
 
-    /// Goes on with the conversation on `chat`, a conversation opened
+    /// Goes on with the conversation on `session`, a conversation opened
     /// afresh with the system prompt, in place of the one it was on: reads
     /// the conversation so far back into it, with where the agent is ahead
     /// of the first message if that went ahead of it when it was sent.
-    pub fn reopen(&mut self, chat: C) -> Result<(), Box<dyn Error>> {
-        self.chat = chat;
-        self.note_tokens = compaction::reserve(&mut self.chat)?;
+    pub fn reopen(&mut self, session: S) -> Result<(), Box<dyn Error>> {
+        self.session = session;
+        self.note_tokens = compaction::reserve(&mut self.session)?;
         let mut turns: Vec<Turn> = self
             .transcript
             .iter()
@@ -611,14 +611,14 @@ impl<C: Session> Harness<C> {
         {
             *message = format!("{}\n\n{message}", environment(&self.dir));
         }
-        self.chat.replay(&turns)?;
+        self.session.replay(&turns)?;
         Ok(())
     }
 
     /// Where the conversation's time has gone so far.
     pub fn stats(&self) -> Stats {
         Stats {
-            model: self.chat.stats(),
+            model: self.session.stats(),
             calls: self.calls,
             tool_seconds: self.tool_seconds,
         }
@@ -725,7 +725,8 @@ impl<C: Session> Harness<C> {
         let mut last = None;
         loop {
             if let Turn::User(message) = &input {
-                self.log.user(message, ahead.as_deref(), self.chat.tokens());
+                self.log
+                    .user(message, ahead.as_deref(), self.session.tokens());
             }
             // Where the agent is goes ahead of the first message as fed;
             // the transcript keeps the message alone, since a compaction
@@ -750,7 +751,7 @@ impl<C: Session> Harness<C> {
                 let Turn::Results(outputs) = &fed else {
                     return Err("the cap is reached by tool results".into());
                 };
-                self.chat.feed_results(outputs)?;
+                self.session.feed_results(outputs)?;
                 self.record(input, prompt)?;
                 let outcome = self.account(on_event)?;
                 if outcome == Outcome::Cut || !self.go_on() {
@@ -763,7 +764,7 @@ impl<C: Session> Harness<C> {
             }
             self.limit_thoughts(self.thinking_budget);
             let mut text = String::new();
-            let before = self.chat.stats();
+            let before = self.session.stats();
             let reply = {
                 let collect = |chunk: Chunk| {
                     match chunk {
@@ -777,8 +778,8 @@ impl<C: Session> Harness<C> {
                     on_event(event(chunk))
                 };
                 match &fed {
-                    Turn::User(message) => self.chat.send(message, collect)?,
-                    Turn::Results(outputs) => self.chat.respond(outputs, collect)?,
+                    Turn::User(message) => self.session.send(message, collect)?,
+                    Turn::Results(outputs) => self.session.respond(outputs, collect)?,
                     Turn::Reply { .. } => return Err("a reply is the model's to make".into()),
                 }
             };
@@ -786,9 +787,9 @@ impl<C: Session> Harness<C> {
                 &reply.calls,
                 reply.thought_ended,
                 reply.cut,
-                self.chat.tokens(),
+                self.session.tokens(),
                 &before,
-                &self.chat.stats(),
+                &self.session.stats(),
             );
             self.record(input, prompt)?;
             self.record(
@@ -882,13 +883,13 @@ impl<C: Session> Harness<C> {
     /// word that their output was dropped instead.
     fn close(&mut self, mut outputs: Vec<String>) -> Result<(), Box<dyn Error>> {
         let mut turn = Turn::Results(outputs.clone());
-        if self.chat.measure(&turn)? > self.chat.free() {
+        if self.session.measure(&turn)? > self.session.free() {
             for output in outputs.iter_mut().filter(|output| *output != NOT_RUN) {
                 *output = DROPPED.to_string();
             }
             turn = Turn::Results(outputs.clone());
         }
-        self.chat.feed_results(&outputs)?;
+        self.session.feed_results(&outputs)?;
         self.record(turn, false)
     }
 
@@ -911,10 +912,10 @@ impl<C: Session> Harness<C> {
     /// an account of the turn, which it gives without tools, reported as
     /// `Text` pieces, and records the exchange. The turn ends with it.
     fn account(&mut self, on_event: OnEvent) -> Result<Outcome, Box<dyn Error>> {
-        self.log.user(STEPS_PROMPT, None, self.chat.tokens());
-        let before = self.chat.stats();
+        self.log.user(STEPS_PROMPT, None, self.session.tokens());
+        let before = self.session.stats();
         let answer = self
-            .chat
+            .session
             .answer(STEPS_PROMPT, &[], self.account_limit(), |text| {
                 self.log.stream("text", text);
                 on_event(Event::Text(text.to_string()))
@@ -923,9 +924,9 @@ impl<C: Session> Harness<C> {
             &[],
             false,
             answer.cut,
-            self.chat.tokens(),
+            self.session.tokens(),
             &before,
-            &self.chat.stats(),
+            &self.session.stats(),
         );
         self.record(Turn::User(STEPS_PROMPT.to_string()), true)?;
         self.record(
@@ -945,18 +946,19 @@ impl<C: Session> Harness<C> {
     /// Most tokens of the account of a turn: [`ACCOUNT_TOKENS`], or a
     /// sixteenth of the context if that is less.
     fn account_limit(&self) -> usize {
-        ACCOUNT_TOKENS.min(self.chat.capacity() / 16)
+        ACCOUNT_TOKENS.min(self.session.capacity() / 16)
     }
 
     /// Most tokens the account of a turn takes, with the prompt for it.
     fn account_tokens(&mut self) -> Result<usize, Box<dyn Error>> {
-        self.chat.answer_tokens(STEPS_PROMPT, self.account_limit())
+        self.session
+            .answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
     /// Adds a turn to the transcript, a user turn as the harness's own
     /// `prompt` or the user's message.
     fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
-        let tokens = self.chat.measure(&turn)?;
+        let tokens = self.session.measure(&turn)?;
         self.transcript.push(Entry {
             turn,
             tokens,
@@ -966,11 +968,11 @@ impl<C: Session> Harness<C> {
     }
 }
 
-impl<C: Session> Drop for Harness<C> {
+impl<S: Session> Drop for Harness<S> {
     /// Ends the transcript: the session finished.
     fn drop(&mut self) {
         let stats = self.stats();
-        self.log.finish(self.chat.tokens(), &stats);
+        self.log.finish(self.session.tokens(), &stats);
     }
 }
 
@@ -1051,25 +1053,25 @@ mod tests {
     /// which says `scripts` in turn and `note` when asked for a note.
     pub fn harness(scripts: &[String], max_len: usize, note: &str) -> Harness<Local<Scripted>> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        Harness::new(chat(scripts, max_len, note), dir, |chat| {
-            chat.system("Be brief.", |_, _| {})
+        Harness::new(session(scripts, max_len, note), dir, |session| {
+            session.system("Be brief.", |_, _| {})
         })
         .unwrap()
     }
 
     /// A conversation as `harness` has it, opened with its system prompt.
-    fn chat(scripts: &[String], max_len: usize, note: &str) -> Local<Scripted> {
+    fn session(scripts: &[String], max_len: usize, note: &str) -> Local<Scripted> {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
-        let mut chat = Local::new(
+        let mut session = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
-        chat.system("Be brief.", |_, _| {}).unwrap();
-        chat
+        session.system("Be brief.", |_, _| {}).unwrap();
+        session
     }
 
     #[test]
@@ -1081,9 +1083,9 @@ mod tests {
         let mut harness = harness(&scripts, 8000, "");
         send(&mut harness, "one");
         send(&mut harness, "two");
-        let tokens = harness.chat.tokens();
-        harness.reopen(chat(&[], 8000, "")).unwrap();
-        assert_eq!(harness.chat.tokens(), tokens);
+        let tokens = harness.session.tokens();
+        harness.reopen(session(&[], 8000, "")).unwrap();
+        assert_eq!(harness.session.tokens(), tokens);
     }
 
     #[test]
@@ -1094,11 +1096,11 @@ mod tests {
         // same, and as much room is free as was.
         let mut harness = harness(&[], 8000, "");
         harness.set_thinking_budget(Some(100));
-        let free = harness.chat.free();
+        let free = harness.session.free();
         harness
-            .reopen(chat(&[reply(1000, false)], 8000, ""))
+            .reopen(session(&[reply(1000, false)], 8000, ""))
             .unwrap();
-        assert_eq!(harness.chat.free(), free);
+        assert_eq!(harness.session.free(), free);
         let mut thought = String::new();
         harness
             .send("go", |event| {
@@ -1276,15 +1278,17 @@ mod tests {
         let tokenizer = Tokenizer::tiny();
         let scripts: Vec<&str> = scripts.iter().map(String::as_str).collect();
         let model = Scripted::new(&tokenizer, &scripts, max_len);
-        let mut chat = Local::new(
+        let mut session = Local::new(
             model,
             Format::new(tokenizer).unwrap(),
             Sampler::new(1.0, 1, 0.95, 0.0, 1),
         )
         .unwrap();
-        chat.system("Be brief.", |_, _| {}).unwrap();
-        let mut harness =
-            Harness::new(chat, dir, |chat| chat.system("Be brief.", |_, _| {})).unwrap();
+        session.system("Be brief.", |_, _| {}).unwrap();
+        let mut harness = Harness::new(session, dir, |session| {
+            session.system("Be brief.", |_, _| {})
+        })
+        .unwrap();
         harness.set_thinking_budget(Some(100));
         harness.keep_log(Log::create(path).unwrap(), "tiny", "cpu", "Be brief.");
         harness
@@ -1308,7 +1312,7 @@ mod tests {
     #[test]
     fn thinks_before_every_reply() {
         // A change made does not turn thinking off, nor does a command
-        // that fails: every reply thinks, at the sampling the chat was
+        // that fails: every reply thinks, at the sampling the session was
         // made with.
         let path = std::env::temp_dir().join(format!("dwim-thinks-{}.jsonl", std::process::id()));
         let scripts = [
@@ -1319,7 +1323,7 @@ mod tests {
         ];
         let dir = scratch();
         let mut harness = harness_in(&dir, &scripts, &path);
-        let temperature = harness.chat.sampler().temperature;
+        let temperature = harness.session.sampler().temperature;
         let (events, _) = send(&mut harness, "go");
         assert_eq!(
             events,
@@ -1330,7 +1334,7 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "made\n");
-        assert_eq!(harness.chat.sampler().temperature, temperature);
+        assert_eq!(harness.session.sampler().temperature, temperature);
         drop(harness);
         let replies = replies(&path);
         assert_eq!(replies.len(), 4, "{replies:?}");
@@ -1409,7 +1413,7 @@ mod tests {
         );
         let tokenizer = Tokenizer::tiny();
         let fed: Vec<u8> = harness
-            .chat
+            .session
             .model()
             .fed
             .iter()

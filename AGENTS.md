@@ -24,12 +24,12 @@ program. One package: `lib.rs` is the library, `cli/` and
 - `cli/` - the `dwim` command: options, the shell, `serve`, `bench`
 - `inference/` - running the model: `gguf`, `quants`, `tokenizer`,
   `qwen35` (the transformer, documented there), `model` (loading and
-  sizing), `chat`, `states` (saved system prompts), `hub` (the Hugging
+  sizing), `local`, `states` (saved system prompts), `hub` (the Hugging
   Face cache), `fetch` (downloads into it)
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   compaction, thinking budget, transcript
 - `server/` - the process that has the model; every session is a client
-  over a Unix socket (`protocol`, `client`)
+  over a Unix socket (`protocol`, `remote`)
 - `tools/` - the tools, one file each; `call` parses a call
 - `gpu/` - the `Device` trait; `cpu` is the reference, `vulkan` (WGSL
   kernels, compiled by `build.rs`), `metal` (MSL kernels), `quant`, `float`

@@ -48,12 +48,12 @@ const NOTE_HEAD: &str = "The conversation so far was compacted to make room in t
 /// conversation compacted, so that it goes on.
 pub const CONTINUE: &str = "Your reply was stopped short because the context window was full, and the conversation has been compacted since. Go on from where you left off.";
 
-/// Reserves room in `chat` for the prompt and the note that a compaction
+/// Reserves room in `session` for the prompt and the note that a compaction
 /// takes, and returns the most tokens the note may take.
-pub fn reserve<C: Session>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
-    let note_tokens = (chat.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
-    let reserve = chat.answer_tokens(NOTE_PROMPT, note_tokens)?;
-    chat.reserve(reserve);
+pub fn reserve<S: Session>(session: &mut S) -> Result<usize, Box<dyn Error>> {
+    let note_tokens = (session.capacity() / 32).clamp(NOTE_TOKENS.0, NOTE_TOKENS.1);
+    let reserve = session.answer_tokens(NOTE_PROMPT, note_tokens)?;
+    session.reserve(reserve);
     Ok(note_tokens)
 }
 
@@ -62,21 +62,21 @@ pub fn reserve<C: Session>(chat: &mut C) -> Result<usize, Box<dyn Error>> {
 /// high-water mark. Returns whether the input may go in: not if the
 /// compaction was interrupted, and an error if the input cannot fit
 /// even so.
-pub fn make_room<C: Session>(
-    harness: &mut Harness<C>,
+pub fn make_room<S: Session>(
+    harness: &mut Harness<S>,
     input: &Turn,
     more: usize,
     on_event: OnEvent,
 ) -> Result<bool, Box<dyn Error>> {
-    let needed = harness.chat.measure(input)? + more;
-    let capacity = harness.chat.capacity();
-    if harness.chat.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
+    let needed = harness.session.measure(input)? + more;
+    let capacity = harness.session.capacity();
+    if harness.session.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
         && !harness.transcript.is_empty()
         && !compact(harness, on_event)?
     {
         return Ok(false);
     }
-    if needed > harness.chat.free() {
+    if needed > harness.session.free() {
         return Err(
             format!("a message of {needed} tokens does not fit in the context window").into(),
         );
@@ -85,8 +85,8 @@ pub fn make_room<C: Session>(
 }
 
 /// Compacts the conversation, as [`Harness::compact`] does.
-pub fn compact<C: Session>(
-    harness: &mut Harness<C>,
+pub fn compact<S: Session>(
+    harness: &mut Harness<S>,
     on_event: OnEvent,
 ) -> Result<bool, Box<dyn Error>> {
     if harness.transcript.is_empty() {
@@ -96,10 +96,10 @@ pub fn compact<C: Session>(
     if on_event(Event::Compacting).is_break() {
         return Ok(false);
     }
-    let before = harness.chat.tokens();
+    let before = harness.session.tokens();
     let mut interrupted = false;
     let note = harness
-        .chat
+        .session
         .answer(NOTE_PROMPT, &NOTE_HEADS, harness.note_tokens, |text| {
             harness.log.stream("note", text);
             let flow = on_event(Event::Note(text.to_string()));
@@ -111,7 +111,7 @@ pub fn compact<C: Session>(
         return Ok(false);
     }
 
-    let capacity = harness.chat.capacity();
+    let capacity = harness.session.capacity();
     let start = tail(&harness.transcript, capacity / TAIL);
     let messages = messages(&harness.transcript[..start], capacity / MESSAGES);
     let head = note_turn(
@@ -128,14 +128,14 @@ pub fn compact<C: Session>(
     );
     let turns: Vec<Turn> = kept.iter().map(|(turn, _)| turn.clone()).collect();
 
-    harness.chat.clear()?;
-    (harness.restart)(&mut harness.chat)?;
-    harness.chat.replay(&turns)?;
+    harness.session.clear()?;
+    (harness.restart)(&mut harness.session)?;
+    harness.session.replay(&turns)?;
     harness.transcript.clear();
     for (turn, prompt) in kept {
         harness.record(turn, prompt)?;
     }
-    let after = harness.chat.tokens();
+    let after = harness.session.tokens();
     harness
         .log
         .compacted(before, after, &head, harness.transcript.len() - 1);
@@ -247,7 +247,7 @@ mod tests {
             " keep going.<|im_end|> none.<|im_end|> nothing.<|im_end|> more of the same.",
         );
         let reserve = harness
-            .chat
+            .session
             .answer_tokens(NOTE_PROMPT, harness.note_tokens)
             .unwrap();
         let mut messages = 0;
@@ -262,7 +262,7 @@ mod tests {
                 events,
                 ["thought", "text", "call", "output", "thought", "text"]
             );
-            assert!(harness.chat.tokens() <= max_len - reserve);
+            assert!(harness.session.tokens() <= max_len - reserve);
         };
         assert!(messages > 1);
         // The compaction comes before the message or the tool results
@@ -315,11 +315,11 @@ mod tests {
             "{:?}",
             turns.last()
         );
-        let fed = &harness.chat.model().fed;
+        let fed = &harness.session.model().fed;
         let expected = Tokenizer::tiny().encode_with_special(&format!("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{head}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")).unwrap();
         assert_eq!(&fed[..expected.len()], expected);
-        assert!(harness.chat.tokens() < max_len / 2);
-        assert_eq!(harness.chat.tokens(), fed.len());
+        assert!(harness.session.tokens() < max_len / 2);
+        assert_eq!(harness.session.tokens(), fed.len());
 
         // The conversation goes on, and the earlier note is not a message
         // of the user's the next time.
@@ -363,7 +363,7 @@ mod tests {
         // The replies are long thoughts: not the budget's business here.
         harness.set_thinking_budget(None);
         let reserve = harness
-            .chat
+            .session
             .answer_tokens(NOTE_PROMPT, harness.note_tokens)
             .unwrap();
         for i in 0..3 {
@@ -395,7 +395,7 @@ mod tests {
                 .iter()
                 .any(|turn| matches!(turn, Turn::User(message) if message == "message 3"))
         );
-        assert!(harness.chat.tokens() <= max_len - reserve);
+        assert!(harness.session.tokens() <= max_len - reserve);
     }
 
     #[test]

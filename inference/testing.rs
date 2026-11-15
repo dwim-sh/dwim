@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::inference::{LanguageModel, Result, Tokenizer, chat};
+use crate::inference::{LanguageModel, Result, Tokenizer, local};
 
 /// A model that says what it is told to: it records every token fed to it,
 /// and each time the chat template opens a reply for it, it says the next
@@ -58,9 +58,9 @@ impl Scripted {
             sequence: 0,
             parked: HashMap::new(),
             vocab: tokenizer.vocab_size(),
-            opening: chat::opening(tokenizer, true).unwrap(),
-            unthinking: chat::opening(tokenizer, false).unwrap(),
-            end: tokenizer.special(chat::IM_END).unwrap(),
+            opening: local::opening(tokenizer, true).unwrap(),
+            unthinking: local::opening(tokenizer, false).unwrap(),
+            end: tokenizer.special(local::IM_END).unwrap(),
             max_len,
             hold: None,
             said: 0,
@@ -121,7 +121,7 @@ impl LanguageModel for Scripted {
         // A reply's prompt ends with the template's opening of one, and
         // the reply is then sampled a token at a time. The script is taken
         // up only once the sampling starts: a prompt read in batches may
-        // end a batch at an opening it goes on past, and the chat may
+        // end a batch at an opening it goes on past, and the session may
         // write tokens into a reply it has just opened, such as a head,
         // for the script to be said from. Either way, a batch that does
         // not end at an opening leaves the reply as it was: opened and
@@ -157,7 +157,7 @@ impl LanguageModel for Scripted {
             Some(unthinking) => self.peek(unthinking).unwrap_or(self.end),
             None => {
                 let next = self.saying.front().copied().unwrap_or(self.end);
-                // The chat ends a reply, or a section of an answer, at
+                // The session ends a reply, or a section of an answer, at
                 // `<|im_end|>` without feeding it: it is said now.
                 if next == self.end {
                     self.saying.pop_front();

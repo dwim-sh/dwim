@@ -1,10 +1,10 @@
-//! Inference: Qwen3.8-27B, its tokenizer and weights, and a chat
-//! around it.
+//! Inference: Qwen3.8-27B, its tokenizer and weights, and a session
+//! with it.
 
-mod chat;
 mod fetch;
 pub mod gguf;
 mod hub;
+mod local;
 mod model;
 pub mod quants;
 pub mod qwen35;
@@ -14,9 +14,9 @@ mod states;
 pub mod testing;
 mod tokenizer;
 
-pub use chat::{Answer, Chunk, DRAFTS, Format, Local, Reply, Stats, Tally, Turn};
 pub use fetch::Download;
 pub use gguf::Gguf;
+pub use local::{Answer, Chunk, DRAFTS, Format, Local, Reply, Stats, Tally, Turn};
 pub use model::{Device, Model, OnDisk, Progress, Size};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;

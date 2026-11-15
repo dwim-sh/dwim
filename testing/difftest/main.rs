@@ -12,7 +12,7 @@
 //! time, as when the model writes; after every piece, its next-token
 //! distribution must agree with the CPU's. Then it runs them again with a
 //! detour: halfway through the prompt it marks its state, runs other
-//! tokens, and rewinds to the mark, as the chat does to drop a thought,
+//! tokens, and rewinds to the mark, as the session does to drop a thought,
 //! and must agree with the CPU's straight run just the same.
 
 use std::{

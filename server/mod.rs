@@ -21,8 +21,8 @@
 //! that need no model, such as measuring a turn, are answered at once, by
 //! the thread that reads the connection.
 
-mod client;
 pub mod protocol;
+mod remote;
 
 use std::{
     cell::RefCell,
@@ -51,7 +51,7 @@ use crate::server::protocol::{
 };
 use crate::sys;
 
-pub use crate::server::client::{Connection, Remote};
+pub use crate::server::remote::{Connection, Remote};
 
 /// How long the server goes without a session before it exits, by
 /// default: long enough that a session started soon after the last ended
@@ -273,28 +273,33 @@ impl Server {
                         Err("a session is already open on this connection".into())
                     }
                     Entry::Vacant(entry) => Shared::take(&pool).and_then(|shared| {
-                        Local::new(shared, format.clone(), sampler(temperature)).map(|mut chat| {
-                            chat.set_drafts(speculate);
-                            let opened = Opened {
-                                device: device.clone(),
-                                size,
-                                capacity: chat.capacity(),
-                                sampling: Sampling::of(chat.sampler()),
-                                state: state(&chat),
-                            };
-                            eprintln!("session {id} opened on sequence {}", shared_id(&chat));
-                            entry.insert(chat);
-                            Response::Opened(opened)
-                        })
+                        Local::new(shared, format.clone(), sampler(temperature)).map(
+                            |mut session| {
+                                session.set_drafts(speculate);
+                                let opened = Opened {
+                                    device: device.clone(),
+                                    size,
+                                    capacity: session.capacity(),
+                                    sampling: Sampling::of(session.sampler()),
+                                    state: state(&session),
+                                };
+                                eprintln!(
+                                    "session {id} opened on sequence {}",
+                                    shared_id(&session)
+                                );
+                                entry.insert(session);
+                                Response::Opened(opened)
+                            },
+                        )
                     }),
                 },
                 request => match sessions.get_mut(&id) {
-                    Some(chat) => {
-                        let response = serve(chat, request, &peer);
+                    Some(session) => {
+                        let response = serve(session, request, &peer);
                         // A reply that failed part way may leave a batch
                         // being verified: it is committed before another
                         // session has the model.
-                        chat.settle();
+                        session.settle();
                         response
                     }
                     None => Err("no session is open on this connection".into()),
@@ -451,18 +456,18 @@ fn not_loaded() -> Response {
     }
 }
 
-/// Where `chat` is, for a response.
-fn state<M: LanguageModel>(chat: &Local<M>) -> State {
+/// Where `session` is, for a response.
+fn state<M: LanguageModel>(session: &Local<M>) -> State {
     State {
-        tokens: chat.tokens(),
-        stats: chat.stats(),
+        tokens: session.tokens(),
+        stats: session.stats(),
     }
 }
 
 /// Serves a session's request on the model, streaming what there is to
 /// `peer` along the way.
 fn serve(
-    chat: &mut Local<Shared>,
+    session: &mut Local<Shared>,
     request: Request,
     peer: &Peer,
 ) -> Result<Response, Box<dyn Error>> {
@@ -482,48 +487,48 @@ fn serve(
     let on_chunk = |chunk: Chunk| stream(Piece::of(chunk));
     Ok(match request {
         Request::Start { prompt } => {
-            let restored = chat.start(&prompt, progress)?;
+            let restored = session.start(&prompt, progress)?;
             Response::Started {
                 restored,
-                state: state(chat),
+                state: state(session),
             }
         }
         Request::System { text } => {
-            chat.system(&text, progress)?;
-            Response::Ok(state(chat))
+            session.system(&text, progress)?;
+            Response::Ok(state(session))
         }
         Request::Clear => {
-            chat.clear()?;
-            Response::Ok(state(chat))
+            session.clear()?;
+            Response::Ok(state(session))
         }
         Request::Replay { turns } => {
-            chat.replay(&turns)?;
-            Response::Ok(state(chat))
+            session.replay(&turns)?;
+            Response::Ok(state(session))
         }
         Request::FeedResults { outputs } => {
-            chat.feed_results(&outputs)?;
-            Response::Ok(state(chat))
+            session.feed_results(&outputs)?;
+            Response::Ok(state(session))
         }
         Request::Send {
             message,
             generation,
         } => {
-            generation.apply(chat);
-            let reply = chat.send(&message, on_chunk)?;
+            generation.apply(session);
+            let reply = session.send(&message, on_chunk)?;
             Response::Reply {
                 reply,
-                state: state(chat),
+                state: state(session),
             }
         }
         Request::Respond {
             outputs,
             generation,
         } => {
-            generation.apply(chat);
-            let reply = chat.respond(&outputs, on_chunk)?;
+            generation.apply(session);
+            let reply = session.respond(&outputs, on_chunk)?;
             Response::Reply {
                 reply,
-                state: state(chat),
+                state: state(session),
             }
         }
         Request::Answer {
@@ -532,14 +537,14 @@ fn serve(
             limit,
             generation,
         } => {
-            generation.apply(chat);
+            generation.apply(session);
             let heads: Vec<&str> = heads.iter().map(String::as_str).collect();
-            let answer = chat.answer(&message, &heads, limit, |text| {
+            let answer = session.answer(&message, &heads, limit, |text| {
                 stream(Piece::Text(text.to_string()))
             })?;
             Response::Answered {
                 answer,
-                state: state(chat),
+                state: state(session),
             }
         }
         Request::Hello { .. }
@@ -552,11 +557,11 @@ fn serve(
 }
 
 impl Generation {
-    /// Sets `chat` as the client has it for the reply to come.
-    fn apply<M: LanguageModel>(&self, chat: &mut Local<M>) {
-        chat.reserve(self.reserve);
+    /// Sets `session` as the client has it for the reply to come.
+    fn apply<M: LanguageModel>(&self, session: &mut Local<M>) {
+        session.reserve(self.reserve);
         if let Some(closing) = &self.closing {
-            chat.limit_thoughts(self.thought_limit, closing);
+            session.limit_thoughts(self.thought_limit, closing);
         }
     }
 }
@@ -606,9 +611,9 @@ impl Shared {
     }
 }
 
-/// The number of the sequence a session's chat runs on.
-fn shared_id(chat: &Local<Shared>) -> usize {
-    chat.model().id
+/// The number of the sequence a session runs on.
+fn shared_id(session: &Local<Shared>) -> usize {
+    session.model().id
 }
 
 impl Drop for Shared {
@@ -744,9 +749,9 @@ mod tests {
     }
 
     /// The text of a reply to `message`.
-    fn ask(client: &mut Remote, message: &str) -> (String, crate::inference::Reply) {
+    fn ask(session: &mut Remote, message: &str) -> (String, crate::inference::Reply) {
         let mut text = String::new();
-        let reply = client
+        let reply = session
             .send(message, |chunk| {
                 if let Chunk::Text(piece) = chunk {
                     text.push_str(piece);
@@ -795,7 +800,7 @@ mod tests {
         assert_eq!(four.trim(), "Four.");
         assert!(reply.calls.is_empty());
 
-        // Measuring needs no model, and agrees with a chat's measure.
+        // Measuring needs no model, and agrees with a session's measure.
         let turn = Turn::Reply {
             text: "Ok.".to_string(),
             calls: vec!["<function=bash>\n</function>".to_string()],
@@ -836,7 +841,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut c = loop {
             match Connection::connect(&path).unwrap().open(None, 0, |_| {}) {
-                Ok(client) => break client,
+                Ok(session) => break session,
                 Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Err(e) => panic!("{e}"),
             }
@@ -873,10 +878,10 @@ mod tests {
             ],
             Some(20),
         );
-        let mut client = open(&path);
-        client.system("Be brief.", |_, _| {}).unwrap();
+        let mut session = open(&path);
+        session.system("Be brief.", |_, _| {}).unwrap();
         let mut thoughts = 0;
-        let reply = client
+        let reply = session
             .send("go", |chunk| {
                 if let Chunk::Thought(_) = chunk {
                     thoughts += 1;
@@ -893,14 +898,14 @@ mod tests {
         // never said.
         assert!(thoughts < 100, "{thoughts}");
         assert!(reply.calls.is_empty());
-        let (next, _) = ask(&mut client, "on");
+        let (next, _) = ask(&mut session, "on");
         assert_eq!(next.trim(), "Next.");
 
         // A server with no sessions exits once idle.
         let mut connection = Connection::connect(&path).unwrap();
         connection.retire().unwrap();
         drop(connection);
-        drop(client);
+        drop(session);
         handle.join().unwrap();
     }
 
@@ -951,12 +956,12 @@ mod tests {
                 .unwrap();
         });
         let mut seen = Vec::new();
-        let client = connection
+        let session = connection
             .open(None, 0, |status| seen.push(status))
             .unwrap();
         assert_eq!(seen, [Status::Weights { done: 1, total: 2 }]);
-        assert_eq!(client.capacity(), 1 << 12);
-        drop(client);
+        assert_eq!(session.capacity(), 1 << 12);
+        drop(session);
         handle.join().unwrap();
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(!path.exists());
