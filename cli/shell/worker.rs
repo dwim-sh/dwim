@@ -14,7 +14,11 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::providers::dwim::{Remote, log_path, running, same_build, stop};
+use dwim::model::Variant;
+use dwim::providers::{
+    Kind,
+    dwim::{Remote, log_path, running, same_build, stop},
+};
 
 use crate::{
     session::{self, Settings},
@@ -48,7 +52,7 @@ impl Worker {
             let stop = stop.clone();
             move || {
                 let _done = done;
-                if let Err(e) = work(&settings, log, requests_rx, &replies_tx, &stop) {
+                if let Err(e) = work(settings, log, requests_rx, &replies_tx, &stop) {
                     let _ = replies_tx.send(Reply::Failed(e.to_string()));
                 }
             }
@@ -110,6 +114,9 @@ pub enum Request {
     /// Show, stop, start or restart the server, as the `/server` command
     /// asks.
     Server(ServerAction),
+    /// Go on with the conversation on this model at this provider, as
+    /// picked with the `/model` command.
+    Model(Kind, Variant),
 }
 
 /// What the model thread reports back.
@@ -129,6 +136,8 @@ pub enum Reply {
     ThinkingBudget(Option<usize>),
     /// Auto mode, as now set.
     Auto(bool),
+    /// The model the conversation is now on, and where it runs.
+    Model { variant: Variant, provider: Kind },
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
@@ -137,16 +146,16 @@ pub enum Reply {
     Failed(String),
 }
 
-/// Loads the model and answers messages until the UI hangs up, keeping a
-/// transcript in `log`.
+/// Loads the model as `settings` have it and answers messages until the UI
+/// hangs up, keeping a transcript in `log`.
 fn work(
-    settings: &Settings,
+    mut settings: Settings,
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let loaded = session::load(settings, log, {
+    let loaded = session::load(&settings, log, {
         let replies = replies.clone();
         move |status| {
             let _ = replies.send(Reply::Status(status));
@@ -174,7 +183,7 @@ fn work(
             }
         };
         if stopped && matches!(request, Request::Message(_) | Request::Compact) {
-            if let Err(e) = session::reopen(settings, &mut harness, on_status()) {
+            if let Err(e) = session::reopen(&settings, &mut harness, on_status()) {
                 let _ = replies.send(Reply::Error(e.to_string()));
                 let _ = replies.send(Reply::Done(harness.stats()));
                 continue;
@@ -185,7 +194,7 @@ fn work(
         let result = match request {
             Request::Message(message) => harness.send(&message, on_event),
             Request::Server(action) => {
-                server(settings, &mut harness, &mut stopped, action, on_status).map(|notice| {
+                server(&settings, &mut harness, &mut stopped, action, on_status).map(|notice| {
                     let _ = replies.send(Reply::Notice(notice));
                 })
             }
@@ -203,6 +212,24 @@ fn work(
                 harness.set_auto(auto);
                 let _ = replies.send(Reply::Auto(auto));
                 Ok(())
+            }
+            Request::Model(provider, variant) => {
+                let before = (settings.provider, settings.model);
+                (settings.provider, settings.model) = (Some(provider), variant);
+                match session::switch(&settings, &mut harness, on_status()) {
+                    Ok(provider) => {
+                        stopped = false;
+                        let _ = replies.send(Reply::Model { variant, provider });
+                        Ok(())
+                    }
+                    // The session may be neither model's by now: the next
+                    // message opens it over on the model it was on.
+                    Err(e) => {
+                        (settings.provider, settings.model) = before;
+                        stopped = true;
+                        Err(e)
+                    }
+                }
             }
         };
         if let Err(e) = result {

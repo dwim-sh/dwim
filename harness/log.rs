@@ -211,6 +211,15 @@ impl Log {
         self.write("thinking_budget", json!({ "tokens": tokens }));
     }
 
+    /// Records that the conversation goes on with `model`, on `device`,
+    /// with `context` tokens of room.
+    pub fn model(&mut self, model: &str, device: &str, context: usize) {
+        self.write(
+            "model",
+            json!({ "model": model, "device": device, "context": context }),
+        );
+    }
+
     /// Records a tool call about to run.
     pub fn call(&mut self, name: &str, detail: &str) {
         self.write("call", json!({ "name": name, "detail": detail }));

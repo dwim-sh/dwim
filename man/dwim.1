@@ -228,8 +228,20 @@ doing. The line under the box names the directory the agent works in.
 Lines starting with a slash are commands:
 .TP
 .B /model
-Show the model, the device it runs on, where its weights are kept, and
-how many tokens of conversation it has room for.
+Open a picker of the models,
+.B medium
+and
+.BR large ,
+and under them the provider that runs them:
+up and down move over the models, left and right change the provider,
+enter picks, esc cancels.
+Picking another model, or another provider, moves the conversation
+there.
+A model the provider does not run is shown, but cannot be picked, and
+neither can a provider that cannot be used.
+Picking the model the session is on shows it: the device it runs on,
+where its weights are kept, and how many tokens of conversation it has
+room for.
 .TP
 .B /provider
 Show where the model runs.
