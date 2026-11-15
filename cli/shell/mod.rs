@@ -76,7 +76,10 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         signin: None,
         history: Vec::new(),
         recalled: None,
-        status: Status::Connecting(Instant::now()),
+        status: match provider {
+            Some(_) => Status::Connecting(Instant::now()),
+            None => Status::Idle,
+        },
         ready: false,
         started: Instant::now(),
         loading: Duration::ZERO,
@@ -94,6 +97,15 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         blank: false,
         worker,
     };
+    if provider.is_none() {
+        let (columns, _) = app.screen.size();
+        let lines = view::nowhere(
+            &session::nowhere(variant),
+            openrouter::key().is_some(),
+            columns,
+        );
+        app.say(&lines);
+    }
     let result = app.run();
     // Leave the conversation on screen, but not the input box, with where
     // the transcript is as the last word and a blank line between it and
@@ -213,10 +225,10 @@ enum Status {
 struct App {
     screen: Screen,
     model: String,
-    /// The model by size, where it runs, and the tokens of conversation a
-    /// session at a provider has room for.
+    /// The model by size, where it runs, if anywhere yet, and the tokens
+    /// of conversation a session at a provider has room for.
     variant: Variant,
-    provider: Kind,
+    provider: Option<Kind>,
     context: usize,
     /// The kind of device the model runs on, and its name once it is open.
     device: Device,
@@ -414,7 +426,9 @@ impl App {
                 let picked = picker.picked();
                 self.picker = None;
                 match picked {
-                    Some(choice) if choice == (self.provider, self.variant) => {
+                    Some((provider, variant))
+                        if Some(provider) == self.provider && variant == self.variant =>
+                    {
                         let lines = self.model_listing();
                         self.say(&lines);
                     }
@@ -448,11 +462,8 @@ impl App {
                 self.providers = None;
                 match picked {
                     Some(Kind::OpenRouter) if openrouter::key().is_none() => self.sign_in(),
-                    Some(provider) if provider == self.provider => {
-                        self.say(&view::notice(view::provider_notice(
-                            self.provider,
-                            self.variant,
-                        )));
+                    Some(provider) if Some(provider) == self.provider => {
+                        self.say(&view::notice(view::provider_notice(provider, self.variant)));
                     }
                     Some(provider) => self.switch(provider, self.variant_at(provider)),
                     None => {}
@@ -532,7 +543,7 @@ impl App {
                     "Signed in to OpenRouter · key kept in {}",
                     view::tilde(&path)
                 )));
-                if self.provider != Kind::OpenRouter {
+                if self.provider != Some(Kind::OpenRouter) {
                     self.switch(Kind::OpenRouter, self.variant);
                 }
             }
@@ -612,10 +623,12 @@ impl App {
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
             Some(Ok(Command::Server(action))) => Request::Server(action),
             Some(Ok(Command::Model)) => {
-                self.picker = Some(Picker::new(
-                    session::providers(),
-                    (self.provider, self.variant),
-                ));
+                let groups = session::providers();
+                if groups.iter().all(|group| group.unavailable.is_some()) {
+                    self.say(&view::notice(view::no_provider(false)));
+                } else {
+                    self.picker = Some(Picker::new(groups, self.provider, self.variant));
+                }
                 return;
             }
             Some(Ok(Command::Provider)) => {
@@ -633,9 +646,10 @@ impl App {
         };
 
         if !self.ready {
-            self.say(&view::notice(
-                "The model is still loading · /model picks another",
-            ));
+            self.say(&view::notice(match self.provider {
+                Some(_) => "The model is still loading · /model picks another".to_string(),
+                None => view::no_provider(openrouter::key().is_some()),
+            }));
             return;
         }
         self.reply.clear();
@@ -688,17 +702,20 @@ impl App {
                 self.lines.push(Line::new());
             }
             Reply::Model { variant, provider } => {
+                let notice = match self.provider {
+                    Some(_) => view::switched(variant, provider),
+                    None => view::provider_notice(provider, variant),
+                };
                 self.variant = variant;
                 self.model = variant.name().to_string();
-                self.provider = provider;
+                self.provider = Some(provider);
                 // Picked while the model was loading: the pick loads now.
                 if !self.ready {
                     self.status = Status::Switching(Instant::now());
                 }
                 self.finish();
-                self.lines.push(vec![
-                    span(format!("● {}", view::switched(variant, provider))).dark_grey(),
-                ]);
+                self.lines
+                    .push(vec![span(format!("● {notice}")).dark_grey()]);
                 self.lines.push(Line::new());
             }
             Reply::Error(e) => {
@@ -706,6 +723,16 @@ impl App {
                 self.lines
                     .push(vec![span("● ").red(), span(format!("error: {e}"))]);
                 self.lines.push(Line::new());
+            }
+            Reply::Unopened(e) => {
+                self.finish();
+                self.lines
+                    .push(vec![span("● ").red(), span(format!("error: {e}"))]);
+                self.lines.push(Line::new());
+                self.provider = None;
+                self.device_name = None;
+                self.size = None;
+                self.status = Status::Idle;
             }
             Reply::Failed(e) => return Err(e.into()),
         }
@@ -947,8 +974,9 @@ impl App {
     fn model_listing(&self) -> Vec<Line> {
         let (columns, _) = self.screen.size();
         match self.provider {
-            Kind::OpenRouter => view::hosted_listing(self.variant, self.context, columns),
-            Kind::Local => view::model_listing(
+            None => view::notice(view::no_provider(openrouter::key().is_some())),
+            Some(Kind::OpenRouter) => view::hosted_listing(self.variant, self.context, columns),
+            Some(Kind::Local) => view::model_listing(
                 &self.model,
                 self.device,
                 self.device_name.as_deref(),
@@ -1053,7 +1081,9 @@ impl App {
                 (0, _) => span("› ").dark_grey(),
                 _ => span("  "),
             };
-            let content = if self.input.is_empty() {
+            let content = if self.input.is_empty() && self.provider.is_none() {
+                span("Type /provider to connect a model").dark_grey()
+            } else if self.input.is_empty() {
                 span("Ask anything, or describe what to build").dark_grey()
             } else {
                 span(line)
@@ -1080,12 +1110,21 @@ impl App {
                 Status::Downloading { .. } => "downloading",
                 _ => "loading",
             };
-            return (self.provider == Kind::Local).then(|| {
-                vec![
+            return match self.provider {
+                None => Some(vec![
+                    span("● No model yet"),
+                    span(format!(
+                        " · {}",
+                        view::connect_hint(openrouter::key().is_some())
+                    ))
+                    .dark_grey(),
+                ]),
+                Some(Kind::Local) => Some(vec![
                     span(format!("● Local model is {doing}")),
                     span(" · /model picks another model or provider").dark_grey(),
-                ]
-            });
+                ]),
+                Some(Kind::OpenRouter) => None,
+            };
         }
         let (frame, verb, details) = self.doing()?;
         Some(vec![

@@ -78,8 +78,10 @@ pub struct Loaded {
 /// Where `model` runs: at `provider` if the command line named one, and
 /// otherwise on this machine if it can, or at OpenRouter if there is a key
 /// to it. The large model takes more memory than a machine has, and runs
-/// only at a provider.
-pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Kind, Box<dyn Error>> {
+/// only at a provider. Nowhere, if the command line named no provider and
+/// the model can run neither here nor at OpenRouter without a key: the
+/// shell starts without a model then, for `/provider` to sign in.
+pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
     let key = openrouter::key().is_some();
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
@@ -87,16 +89,21 @@ pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Kind, Box<dyn 
             Variant::Large
         )
         .into()),
-        (Some(kind), _) => Ok(kind),
-        (None, Variant::Large) if key => Ok(Kind::OpenRouter),
-        (None, Variant::Large) => Err(format!(
-            "{} runs at OpenRouter, and there is no key to it: /provider signs in, or set {}",
-            Variant::Large,
-            openrouter::KEY
-        )
-        .into()),
-        (None, Variant::Medium) if key && memory::check().is_err() => Ok(Kind::OpenRouter),
-        (None, Variant::Medium) => Ok(Kind::Local),
+        (Some(kind), _) => Ok(Some(kind)),
+        (None, Variant::Large) if key => Ok(Some(Kind::OpenRouter)),
+        (None, Variant::Large) => Ok(None),
+        (None, Variant::Medium) if memory::check().is_ok() => Ok(Some(Kind::Local)),
+        (None, Variant::Medium) if key => Ok(Some(Kind::OpenRouter)),
+        (None, Variant::Medium) => Ok(None),
+    }
+}
+
+/// Why `model` has nowhere to run, when [`provider`] finds none: why it
+/// does not run on this machine, which leaves OpenRouter, without a key.
+pub fn nowhere(model: Variant) -> String {
+    match (model, memory::check()) {
+        (Variant::Medium, Err(e)) => e.to_string(),
+        _ => format!("{model} runs only at OpenRouter"),
     }
 }
 
@@ -273,7 +280,15 @@ pub fn open(
     mut on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
-    if provider(settings.provider, settings.model)? == Kind::OpenRouter {
+    let Some(kind) = provider(settings.provider, settings.model)? else {
+        return Err(format!(
+            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}",
+            nowhere(settings.model),
+            openrouter::KEY
+        )
+        .into());
+    };
+    if kind == Kind::OpenRouter {
         let provider = OpenRouter::new(settings.model, settings.context, settings.temperature)?;
         let mut session = Conversation::new(Any::OpenRouter(provider));
         session.start(&system, |_, _| {})?;

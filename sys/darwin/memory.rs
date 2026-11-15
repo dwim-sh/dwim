@@ -17,7 +17,7 @@ pub fn check() -> Result<(), Box<dyn Error>> {
     let memory = total().ok_or("cannot determine the memory size")?;
     if memory < MIN {
         return Err(format!(
-            "dwim requires {} GiB or more DRAM on a Mac, and this one has {} GiB",
+            "the model needs a Mac with {} GiB of memory, and this one has {} GiB",
             MIN >> 30,
             memory >> 30
         )

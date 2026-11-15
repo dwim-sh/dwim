@@ -15,8 +15,8 @@ use crate::tui::{Line, span};
 /// The providers and the models to pick from, and which the cursor is on.
 pub struct Picker {
     groups: Vec<Group>,
-    /// The model the session is on, and where it runs.
-    current: (Kind, Variant),
+    /// The model the session is on, and where it runs, if anywhere.
+    current: Option<(Kind, Variant)>,
     /// Which of the providers is picked, and the model the cursor is on.
     provider: usize,
     model: Variant,
@@ -30,20 +30,20 @@ pub struct Group {
 }
 
 impl Picker {
-    /// A picker of the models `groups` run, on the provider and the model
-    /// the session is on, `current`.
-    pub fn new(groups: Vec<Group>, current: (Kind, Variant)) -> Self {
+    /// A picker of the models `groups` run, on the provider the session's
+    /// model runs at, if it runs anywhere, and the model, `variant`.
+    pub fn new(groups: Vec<Group>, provider: Option<Kind>, variant: Variant) -> Self {
         let usable = |group: &Group| group.unavailable.is_none();
-        let provider = groups
+        let at = groups
             .iter()
-            .position(|group| group.provider == current.0 && usable(group))
+            .position(|group| Some(group.provider) == provider && usable(group))
             .or_else(|| groups.iter().position(usable))
             .unwrap_or(0);
         let mut picker = Self {
             groups,
-            current,
-            provider,
-            model: current.1,
+            current: provider.map(|provider| (provider, variant)),
+            provider: at,
+            model: variant,
         };
         picker.settle();
         picker
@@ -97,7 +97,7 @@ impl Picker {
         let mut cursor = 0;
         for &model in &models {
             let size = format!("{:<sizes$}  ", model.size());
-            let tick = if (group.provider, model) == self.current {
+            let tick = if Some((group.provider, model)) == self.current {
                 "  ✓"
             } else {
                 ""
@@ -116,13 +116,24 @@ impl Picker {
             });
         }
 
-        let mut providers = vec![span("  Provider  ")];
+        // The providers on a line, and under it, after a blank line, why
+        // each that cannot be used cannot, lined up under the names.
+        const LABEL: &str = "  Provider  ";
+        let mut providers = vec![span(LABEL)];
+        let mut reasons = Vec::new();
         for (i, group) in self.groups.iter().enumerate() {
             let name = group.provider.to_string();
             match &group.unavailable {
                 Some(why) => {
                     providers.push(span(format!(" {name} ")).dark_grey().crossed_out());
-                    providers.push(span(format!(" {why}")).dark_grey());
+                    reasons.push(vec![
+                        span(format!(
+                            "{:width$}{name}: {why}",
+                            "",
+                            width = LABEL.len() + 1
+                        ))
+                        .dark_grey(),
+                    ]);
                 }
                 None if i == self.provider => {
                     providers.push(span(format!(" {name} ")).bold().reverse())
@@ -133,6 +144,10 @@ impl Picker {
         }
         rows.push(Line::new());
         rows.push(providers);
+        if !reasons.is_empty() {
+            rows.push(Line::new());
+            rows.extend(reasons);
+        }
         (rows, cursor)
     }
 
@@ -160,8 +175,8 @@ impl Picker {
 /// The providers to pick from, and which the cursor is on.
 pub struct Providers {
     choices: Vec<Choice>,
-    /// Where the session's model runs.
-    current: Kind,
+    /// Where the session's model runs, if anywhere.
+    current: Option<Kind>,
     at: usize,
 }
 
@@ -177,11 +192,11 @@ pub struct Choice {
 impl Providers {
     /// A picker of `choices`, on the provider the session's model runs at,
     /// `current`, if it can be picked.
-    pub fn new(choices: Vec<Choice>, current: Kind) -> Self {
+    pub fn new(choices: Vec<Choice>, current: Option<Kind>) -> Self {
         let usable = |choice: &Choice| choice.unavailable.is_none();
         let at = choices
             .iter()
-            .position(|choice| choice.provider == current && usable(choice))
+            .position(|choice| Some(choice.provider) == current && usable(choice))
             .or_else(|| choices.iter().position(usable))
             .unwrap_or(0);
         Self {
@@ -218,7 +233,7 @@ impl Providers {
         let mut cursor = 0;
         for (i, choice) in self.choices.iter().enumerate() {
             let name = format!("{:<names$}  ", choice.name);
-            let tick = if choice.provider == self.current {
+            let tick = if Some(choice.provider) == self.current {
                 "  ✓"
             } else {
                 ""
@@ -262,7 +277,8 @@ mod tests {
                     unavailable: openrouter,
                 },
             ],
-            (Kind::Local, Variant::Medium),
+            Some(Kind::Local),
+            Variant::Medium,
         )
     }
 
@@ -300,7 +316,7 @@ mod tests {
                 choice(Kind::Local, Some("too little memory")),
                 choice(Kind::OpenRouter, None),
             ],
-            Kind::Local,
+            None,
         );
         assert_eq!(providers.picked(), Some(Kind::OpenRouter));
         providers.step(false);
