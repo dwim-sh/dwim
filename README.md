@@ -5,7 +5,7 @@
 
 *Do what I mean.*
 
-**A coding agent that runs on your own GPU.**
+**A coding agent that you control.**
 
 The agent, the model, and the engine that runs it, in one Rust program.
 Local by default: no API key, no cloud, and nothing leaves your machine
