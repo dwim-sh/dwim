@@ -41,8 +41,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{Chunk, Session, Turn};
-use crate::tools::{ToolCall, Tools, bash, read};
+use crate::{
+    model::{Chunk, Session, Turn},
+    sys,
+    tools::{ToolCall, Tools, bash, read},
+};
 
 pub use crate::harness::log::Log;
 
@@ -139,6 +142,10 @@ const RECALL_CLOSING: &str = "I am not certain of this from memory, so I will ch
 /// and was sent by the second closing to the git history, three calls
 /// that bore nothing on the fix.
 const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need is in the output above. I will go with what I have worked out rather than go over it again: if there is a change to make, I make it now with edit, and otherwise I reply with it.";
+
+/// Why the machine is kept from idle sleep while a turn runs, as the
+/// system lists it.
+const AWAKE: &str = "dwim is running a turn";
 
 /// Most tokens of the account of a turn that reached [`MAX_CALLS`], in a
 /// context with room for it. A small context allows a sixteenth of itself.
@@ -672,12 +679,15 @@ impl<S: Session> Harness<S> {
     }
 
     /// Runs `work`, reporting to `on_event`, and records in the log how it
-    /// ended, if not on its own: with an error, or interrupted.
+    /// ended, if not on its own: with an error, or interrupted. The
+    /// machine is kept from idle sleep until it ends, however it does: a
+    /// Mac left to a long turn went to sleep in the middle of a command.
     fn ended<T>(
         &mut self,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
         work: impl FnOnce(&mut Self, OnEvent) -> Result<T, Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>> {
+        let _awake = sys::awake::hold(AWAKE);
         let mut interrupted = false;
         let result = work(self, &mut |event| {
             let flow = on_event(event);
