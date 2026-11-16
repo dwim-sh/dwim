@@ -44,6 +44,10 @@ const NOTE_HEADS: [&str; 4] = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:
 /// How the note turn opens after a compaction.
 const NOTE_HEAD: &str = "The conversation so far was compacted to make room in the context window. This is the note you wrote before it was cleared, to go on from:";
 
+/// How the turn opens that a conversation cleared at the end of a step of
+/// the plan starts over from.
+const STEP_HEAD: &str = "The conversation so far was cleared at the end of a step of the plan, to make room in the context window. What you found and did is kept in the plan, which says what each finished step came to:";
+
 /// What the model is told after a reply of its was stopped short and the
 /// conversation compacted, so that it goes on.
 pub const CONTINUE: &str = "Your reply was stopped short because the context window was full, and the conversation has been compacted since. Go on from where you left off.";
@@ -117,9 +121,44 @@ pub fn compact<S: Session>(
     let head = note_turn(
         &environment(&harness.dir),
         &note,
+        &harness.tools.plan().brief(),
         &messages,
         start < harness.transcript.len(),
     );
+    restart(harness, head, start, before, on_event)?;
+    Ok(true)
+}
+
+/// Starts the conversation over at the end of a step of the plan, cleared
+/// down to the plan: from the system prompt, it reads back where the agent
+/// is, the plan with what each finished step came to, the user's messages,
+/// and the last reply, whose calls finished the step and whose results are
+/// yet to be fed. The model writes no note: what it said each step came
+/// to is the note.
+pub fn start_over<S: Session>(
+    harness: &mut Harness<S>,
+    on_event: OnEvent,
+) -> Result<(), Box<dyn Error>> {
+    let before = harness.session.tokens();
+    let start = tail(&harness.transcript, 0);
+    let messages = messages(&harness.said, harness.session.capacity() / MESSAGES);
+    let head = step_turn(
+        &environment(&harness.dir),
+        &harness.tools.plan().brief(),
+        &messages,
+    );
+    restart(harness, head, start, before, on_event)
+}
+
+/// Starts the conversation over from the system prompt with `head`, and
+/// the transcript from `start` read back after it; it took `before` tokens.
+fn restart<S: Session>(
+    harness: &mut Harness<S>,
+    head: String,
+    start: usize,
+    before: usize,
+    on_event: OnEvent,
+) -> Result<(), Box<dyn Error>> {
     let mut kept = vec![(Turn::User(head.clone()), true)];
     kept.extend(
         harness.transcript[start..]
@@ -140,7 +179,7 @@ pub fn compact<S: Session>(
         .log
         .compacted(before, after, &head, harness.transcript.len() - 1);
     let _ = on_event(Event::Compacted { before, after });
-    Ok(true)
+    Ok(())
 }
 
 /// Where the exchanges to read back after a compaction start in the
@@ -192,24 +231,51 @@ fn messages(entries: &[Entry], budget: usize) -> Vec<&str> {
 }
 
 /// The turn that opens a compacted conversation: where the agent is, the
-/// note, the user's earlier messages, and whether the most recent
-/// exchanges follow.
-fn note_turn(environment: &str, note: &str, messages: &[&str], exchanges: bool) -> String {
+/// note, the `plan` as it stands if there is one, the user's earlier
+/// messages, and whether the most recent exchanges follow.
+fn note_turn(
+    environment: &str,
+    note: &str,
+    plan: &str,
+    messages: &[&str],
+    exchanges: bool,
+) -> String {
     let note = note.trim();
     let mut text = format!(
         "{environment}\n\n{NOTE_HEAD}\n\n<note>\n{}\n</note>",
         if note_empty(note) { "(none)" } else { note }
     );
+    if !plan.is_empty() {
+        write!(
+            text,
+            "\n\nThe plan of the work as it stands:\n\n<plan>\n{plan}\n</plan>"
+        )
+        .expect("a String takes any write");
+    }
+    said(&mut text, messages);
+    if exchanges {
+        text.push_str("\n\nThe most recent exchanges follow as they were.");
+    }
+    text
+}
+
+/// The turn that opens a conversation cleared at the end of a step: where
+/// the agent is, the `plan`, and the user's messages.
+fn step_turn(environment: &str, plan: &str, messages: &[&str]) -> String {
+    let mut text = format!("{environment}\n\n{STEP_HEAD}\n\n<plan>\n{plan}\n</plan>");
+    said(&mut text, messages);
+    text.push_str("\n\nYour last calls follow, and their results after them, which name the step now under way. Read again whatever you need for it.");
+    text
+}
+
+/// Adds the user's `messages` so far to `text`, if there are any.
+fn said(text: &mut String, messages: &[&str]) {
     if !messages.is_empty() {
         text.push_str("\n\nThe user's messages so far, oldest first:");
         for message in messages {
             write!(text, "\n\n<message>\n{message}\n</message>").expect("a String takes any write");
         }
     }
-    if exchanges {
-        text.push_str("\n\nThe most recent exchanges follow as they were.");
-    }
-    text
 }
 
 /// Whether the model wrote nothing in `note`: it is blank, or it is the
@@ -403,7 +469,7 @@ mod tests {
         // The headings are written for the model: a note with nothing
         // under any of them says nothing, like a blank one.
         for note in ["", "Task:\n\nFindings:\n\nDone:\n\nNext:"] {
-            let head = note_turn("env", note, &[], false);
+            let head = note_turn("env", note, "", &[], false);
             assert!(head.contains("<note>\n(none)\n</note>"), "{head}");
         }
         for note in [
@@ -411,7 +477,7 @@ mod tests {
             "Task:\n\nFindings:\n\nDone:\n\nNext: go on.",
             "Go on.",
         ] {
-            let head = note_turn("env", note, &[], false);
+            let head = note_turn("env", note, "", &[], false);
             assert!(head.contains(&format!("<note>\n{note}\n</note>")), "{head}");
         }
     }

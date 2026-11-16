@@ -23,7 +23,7 @@ program. One package: `lib.rs` is the library, `cli/` and
 
 - `cli/` - the `dwim` command: options, the shell, `serve`, `bench`
 - `harness/` - the agent: system prompt (includes this file), tool loop,
-  compaction, thinking budget, transcript
+  the plan of the work, compaction, thinking budget, transcript
 - `providers/` - where a session's model runs: `Provider` is a model
   asked with the whole conversation each time, as a chat API is, and
   `conversation` the `Session` the harness holds on one. A directory

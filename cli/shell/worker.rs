@@ -114,6 +114,8 @@ pub enum Request {
     ThinkingBudget(Option<usize>),
     /// Turn auto mode on or off, as the `/auto` command asks.
     Auto(bool),
+    /// Set the plan of the work aside.
+    SetPlanAside,
     /// Show, stop, start or restart the server, as the `/server` command
     /// asks.
     Server(ServerAction),
@@ -216,6 +218,10 @@ fn work(
             Request::Auto(auto) => {
                 harness.set_auto(auto);
                 let _ = replies.send(Reply::Auto(auto));
+                Ok(())
+            }
+            Request::SetPlanAside => {
+                harness.set_plan_aside();
                 Ok(())
             }
             Request::Model(provider, variant) => {

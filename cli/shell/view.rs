@@ -9,6 +9,7 @@ use dwim::inference::{Model, OnDisk};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{Kind, openrouter};
 use dwim::sys;
+use dwim::tools::plan::{Plan, Step};
 
 use crate::{
     model,
@@ -28,7 +29,8 @@ pub fn help(columns: usize) -> Vec<Line> {
         .iter()
         .map(|(name, what)| format!("{name:<width$}{what}"))
         .collect();
-    lines.push("ctrl+o shows or hides the thought · esc interrupts · ctrl+d quits".to_string());
+    lines.push("enter while it works changes its course · esc interrupts".to_string());
+    lines.push("ctrl+o shows or hides the thought · ctrl+d quits".to_string());
     report(vec![span("● "), span("Commands").bold()], lines, columns)
 }
 
@@ -215,6 +217,243 @@ pub fn auto_notice(auto: bool) -> String {
     } else {
         "Auto mode off: the model asks when it has something to ask".to_string()
     }
+}
+
+/// Most steps of a plan shown over the input box: of a longer one, the
+/// steps done are counted in a line, and the last of those to come.
+const PLAN_STEPS: usize = 8;
+
+/// Most of the choices a plan made that are shown over the input box.
+const PLAN_ASSUMES: usize = 4;
+
+/// Most cells of the bar that says how far along a plan is.
+const PLAN_BAR: usize = 16;
+
+/// The plan of the work over the input box: a heading with a bar that
+/// says how far along it is, then the steps, a line each, marked done,
+/// under way or to come, with what a step changed and whether that was
+/// checked at the right, then the choices the model made where the request
+/// left them open. Under the step under way goes `doing`, what the model
+/// is at. The plan of a model not `working` is paused, for the user to
+/// take up or set aside.
+pub fn plan(plan: &Plan, doing: Option<&str>, working: bool, columns: usize) -> Vec<Line> {
+    let steps = plan.steps();
+    let under_way = plan.under_way();
+    let mut heading = vec![span("● ").cyan(), span("Plan ").bold()];
+    heading.extend(bar(plan));
+    heading.push(span(format!(" {} of {}", plan.done(), steps.len())).dark_grey());
+    if !working {
+        heading.push(span(" · paused · esc sets it aside").dark_grey());
+    }
+    let mut lines = vec![tui::truncate(&heading, columns)];
+    // Of a long plan, the steps done but the last are counted, and the
+    // steps to come past the next few.
+    let long = steps.len() > PLAN_STEPS;
+    let first = if long {
+        plan.done().saturating_sub(1)
+    } else {
+        0
+    };
+    let end = if long {
+        (first + PLAN_STEPS).min(steps.len())
+    } else {
+        steps.len()
+    };
+    if first > 0 {
+        lines.push(vec![span(format!("  ✓ {first} earlier steps")).dark_grey()]);
+    }
+    for (i, step) in steps.iter().enumerate().take(end).skip(first) {
+        let current = under_way == Some(i);
+        // What the step rests on goes at the right, and the step is cut
+        // to leave it room.
+        let rests = rests_on(step, current);
+        let room = columns
+            .saturating_sub(4 + tui::width(&rests) + if rests.is_empty() { 0 } else { 2 })
+            .max(8);
+        let text = tui::fit(&plain(&step.text), room);
+        let pad = columns.saturating_sub(4 + tui::width(&vec![span(&text)]) + tui::width(&rests));
+        let mut line = match (step.done, current) {
+            (true, _) => vec![span("  ✓ ").green(), span(text).dark_grey()],
+            (false, true) => vec![span("  ◆ ").cyan(), span(text).bold()],
+            (false, false) => vec![span("  ○ ").dark_grey(), span(text)],
+        };
+        if !rests.is_empty() {
+            line.push(span(" ".repeat(pad)));
+            line.extend(rests);
+        }
+        lines.push(tui::truncate(&line, columns));
+        if current && let Some(doing) = doing {
+            let doing = tui::fit(doing, columns.saturating_sub(6));
+            lines.push(vec![span(format!("    ⎿ {doing}")).dark_grey()]);
+        }
+    }
+    if end < steps.len() {
+        lines.push(vec![
+            span(format!("  ○ {} more", steps.len() - end)).dark_grey(),
+        ]);
+    }
+    let assumes = plan.assumes();
+    if !assumes.is_empty() {
+        lines.push(Line::new());
+        lines.push(vec![span("  Assumptions").dark_grey().bold()]);
+        for assume in assumes.iter().take(PLAN_ASSUMES) {
+            let assume = tui::fit(&plain(assume), columns.saturating_sub(4));
+            lines.push(vec![span(format!("  · {assume}")).dark_grey()]);
+        }
+        if assumes.len() > PLAN_ASSUMES {
+            lines.push(vec![
+                span(format!("  · {} more", assumes.len() - PLAN_ASSUMES)).dark_grey(),
+            ]);
+        }
+    }
+    lines
+}
+
+/// What stands over the input box while the model works with no plan
+/// laid out yet: word that none is, and `doing`, what the model is at.
+pub fn no_plan(doing: Option<&str>, columns: usize) -> Vec<Line> {
+    let mut lines = vec![vec![
+        span("● ").cyan(),
+        span("Plan").bold(),
+        span(" · working out the steps").dark_grey(),
+    ]];
+    if let Some(doing) = doing {
+        let doing = tui::fit(doing, columns.saturating_sub(6));
+        lines.push(vec![span(format!("    ⎿ {doing}")).dark_grey()]);
+    }
+    lines
+}
+
+/// What goes into the conversation as the plan changes from `old` to
+/// `new`: the steps when it is laid out or they change, the choices made
+/// when they are new, and each step as it is finished, with what it came
+/// to and what it rests on.
+pub fn plan_news(old: &Plan, new: &Plan, columns: usize) -> Vec<Line> {
+    let mut lines = Vec::new();
+    if new.is_empty() {
+        return lines;
+    }
+    let texts = |plan: &Plan| -> Vec<String> {
+        plan.steps().iter().map(|step| step.text.clone()).collect()
+    };
+    // A paragraph under `first`, a prefix, wrapped to the terminal and
+    // dimmed.
+    let under = |lines: &mut Vec<Line>, first: &str, text: &str| {
+        let indent = " ".repeat(tui::width(&vec![span(first)]));
+        for (i, text) in tui::wrap(text, columns.saturating_sub(indent.len()))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if i == 0 { first } else { &indent };
+            lines.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
+        }
+    };
+    if texts(old) != texts(new) {
+        lines.push(vec![
+            span("● ").cyan(),
+            span(if old.is_empty() {
+                "Plan"
+            } else {
+                "Plan changed"
+            })
+            .bold(),
+        ]);
+        for (i, step) in new
+            .steps()
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| !step.done)
+        {
+            under(&mut lines, &format!("  {}. ", i + 1), &plain(&step.text));
+        }
+        lines.push(Line::new());
+    }
+    if old.assumes() != new.assumes() && !new.assumes().is_empty() {
+        lines.push(vec![span("● ").cyan(), span("Assumptions").bold()]);
+        for assume in new.assumes() {
+            under(&mut lines, "  · ", &plain(assume));
+        }
+        lines.push(Line::new());
+    }
+    for step in new.steps().iter().take(new.done()).skip(old.done()) {
+        for (i, text) in tui::wrap(&plain(&step.text), columns.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let mark = if i == 0 {
+                span("✓ ").green()
+            } else {
+                span("  ")
+            };
+            lines.push(vec![mark, span(text).bold()]);
+        }
+        if !step.result.is_empty() {
+            under(&mut lines, "  ⎿ ", &step.result);
+        }
+        if !step.changed.is_empty() {
+            let files = match step.changed.len() {
+                1..=3 => step.changed.join(", "),
+                n => format!("{n} files"),
+            };
+            let mut line = vec![span(format!("  ⎿ {files} · ")).dark_grey()];
+            match &step.check {
+                Some(check) => {
+                    line.push(span(tui::fit(&check.command, 60)).dark_grey());
+                    line.push(if check.passed {
+                        span(" ✓").green()
+                    } else {
+                        span(" ✗ failed").red()
+                    });
+                }
+                None => line.push(span("unchecked").yellow()),
+            }
+            lines.push(tui::truncate(&line, columns));
+        }
+        lines.push(Line::new());
+    }
+    lines
+}
+
+/// The bar that says how far along `plan` is: a cell a step, or fewer for
+/// a long plan, filled for the steps done.
+fn bar(plan: &Plan) -> Line {
+    let steps = plan.steps().len();
+    let cells = steps.min(PLAN_BAR);
+    let filled = (plan.done() * cells).checked_div(steps).unwrap_or(0);
+    vec![
+        span("▰".repeat(filled)).cyan(),
+        span("▱".repeat(cells - filled)).dark_grey(),
+    ]
+}
+
+/// What a step of the plan rests on, in a few words, to go at the right
+/// of its line: the file it changed, or how many, and a mark for whether
+/// the command run since succeeded. A step done whose change had nothing
+/// run since is unchecked; of the step under way, `current`, that is not
+/// said, since it is not over. Nothing for a step that changed nothing.
+fn rests_on(step: &Step, current: bool) -> Line {
+    let files = match step.changed.as_slice() {
+        [] => return Line::new(),
+        [one] => one.rsplit('/').next().unwrap_or(one).to_string(),
+        many => format!("{} files", many.len()),
+    };
+    let mut line = vec![span(files).dark_grey()];
+    match &step.check {
+        Some(check) if check.passed => line.push(span(" ✓").green()),
+        Some(_) => line.push(span(" ✗").red()),
+        None if current => {}
+        None => line.push(span(" unchecked").yellow()),
+    }
+    line
+}
+
+/// `text` as it reads on a line of the plan: without the backticks a
+/// model puts around names, and on one line.
+fn plain(text: &str) -> String {
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One line said in place of a reply.

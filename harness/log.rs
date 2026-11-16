@@ -240,6 +240,12 @@ impl Log {
         self.write("nudge", json!({ "text": text }));
     }
 
+    /// Records the plan of the work as it now stands, as the model is told
+    /// it: empty once it is set aside, or the work is over.
+    pub fn plan(&mut self, plan: &str) {
+        self.write("plan", json!({ "plan": plan }));
+    }
+
     /// Records that the conversation is being compacted.
     pub fn compacting(&mut self) {
         self.write("compacting", json!({}));

@@ -1,17 +1,20 @@
 //! The tools the model can call: `bash`, which runs a shell command,
 //! `read`, which gives it a file a page at a time, `edit`, which replaces
 //! a string in a file with another, `write`, which writes a file whole,
-//! `grep`, which searches files for a pattern, and `glob`, which lists
-//! the files whose paths match one. Each is a [`Tool`]: the signature the
+//! `grep`, which searches files for a pattern, `glob`, which lists the
+//! files whose paths match one, and `plan` and `done`, which lay out the
+//! plan of the work and finish a step of it. Each is a [`Tool`]: the signature the
 //! system prompt declares it with, whether it changes a file, how a call
 //! reads on screen, and what it does. The tools work in the directory the
 //! agent does: a path a call gives is taken from there.
 
 pub mod bash;
 mod call;
+mod done;
 mod edit;
 mod glob;
 mod grep;
+pub mod plan;
 pub mod read;
 mod write;
 
@@ -24,6 +27,7 @@ use serde_json::Value;
 
 use crate::tools::bash::Bash;
 pub use crate::tools::call::ToolCall;
+use crate::tools::plan::Plan;
 
 /// A tool: what the model is told of it, and what it does.
 pub struct Tool {
@@ -40,13 +44,15 @@ pub struct Tool {
 }
 
 /// The tools, in the order the system prompt lists them.
-static TOOLS: [Tool; 6] = [
+static TOOLS: [Tool; 8] = [
     bash::TOOL,
     read::TOOL,
     edit::TOOL,
     write::TOOL,
     grep::TOOL,
     glob::TOOL,
+    plan::TOOL,
+    done::TOOL,
 ];
 
 /// The tool called `name`.
@@ -145,6 +151,8 @@ impl Signature {
 pub struct Tools {
     dir: PathBuf,
     bash: Bash,
+    /// The plan of the work, as the model has laid it out.
+    plan: Plan,
 }
 
 impl Tools {
@@ -154,7 +162,18 @@ impl Tools {
         Self {
             dir: dir.to_path_buf(),
             bash: Bash::default(),
+            plan: Plan::default(),
         }
+    }
+
+    /// The plan of the work, as it stands.
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    /// Forgets the plan of the work.
+    pub fn clear_plan(&mut self) {
+        self.plan.clear();
     }
 
     /// Runs bash commands through `shell`, as `shell -c command`, instead
@@ -163,12 +182,24 @@ impl Tools {
         self.bash.set_shell(shell);
     }
 
-    /// Runs a call, returning what the model should see.
+    /// Runs a call, returning what the model should see, and notes for
+    /// the step of the plan under way what the call changed, or the
+    /// command it ran and whether that succeeded.
     pub fn run(&mut self, call: &ToolCall) -> Output {
-        match tool(&call.name) {
-            Some(tool) => Output::of((tool.run)(self, &call.arguments), tool.changes),
-            None => Output::of(Err(format!("unknown tool '{}'", call.name)), false),
+        let Some(tool) = tool(&call.name) else {
+            return Output::of(Err(format!("unknown tool '{}'", call.name)), false);
+        };
+        let result = (tool.run)(self, &call.arguments);
+        if let Ok(text) = &result {
+            if tool.changes {
+                if let Some(path) = string(&call.arguments, "path") {
+                    self.plan.changed(path);
+                }
+            } else if let Some(command) = bash::command(tool, &call.arguments) {
+                self.plan.ran(command, bash::succeeded(text));
+            }
         }
+        Output::of(result, tool.changes)
     }
 }
 
