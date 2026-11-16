@@ -882,7 +882,7 @@ impl App {
                 }
                 self.lines.push(Line::new());
             }
-            Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
+            Event::Cut | Event::Capped { .. } | Event::Compacting | Event::Compacted { .. } => {}
         }
     }
 
