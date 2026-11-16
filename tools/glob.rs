@@ -307,11 +307,12 @@ fn segment(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::path::PathBuf;
 
     use serde_json::json;
 
     use super::*;
+    use crate::sys;
 
     /// Runs the call in `arguments` with `dir` as the working directory,
     /// as the model sees the result.
@@ -495,14 +496,14 @@ mod tests {
         let private = dir.join("private");
         fs::create_dir(&private).unwrap();
         fs::write(private.join("p.rs"), "").unwrap();
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        sys::fs::set_readable(&private, false).unwrap();
         if fs::read_dir(&private).is_err() {
             assert_eq!(
                 list("*.rs"),
                 "a.rs\nsrc/b.rs\nsrc/deep/c.rs\n[3 files matching *.rs; private could not be read]"
             );
         }
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        sys::fs::set_readable(&private, true).unwrap();
         fs::remove_dir_all(&private).unwrap();
         // Built directories are left out, unless the pattern names them.
         for file in ["node_modules/m.js", "target/t.rs"] {

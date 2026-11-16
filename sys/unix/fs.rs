@@ -2,9 +2,9 @@
 //! `std::fs` has for every system.
 
 use std::{
-    fs::{DirBuilder, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
     io,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -28,4 +28,34 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// Makes `path` a symbolic link to `target`, which need not be there.
 pub fn symlink(target: &Path, path: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, path)
+}
+
+/// Makes `path` a program the user can run, leaving the rest of its
+/// permissions as they are.
+pub fn make_executable(path: &Path) -> io::Result<()> {
+    let mode = mode_of(path)?;
+    set_mode(path, mode | 0o100)
+}
+
+/// Makes `path` readable, or not, to anyone: a directory that is not is one
+/// whose names cannot be listed. The rest of its permissions are left as
+/// they are.
+pub fn set_readable(path: &Path, readable: bool) -> io::Result<()> {
+    let mode = mode_of(path)?;
+    let mode = if readable {
+        mode | 0o444
+    } else {
+        mode & !0o444
+    };
+    set_mode(path, mode)
+}
+
+/// Sets the permission bits of `path` to `mode`, as this system counts them.
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// The permission bits of `path`, as this system counts them.
+fn mode_of(path: &Path) -> io::Result<u32> {
+    fs::metadata(path).map(|metadata| metadata.mode())
 }

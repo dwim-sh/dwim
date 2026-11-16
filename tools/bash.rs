@@ -607,7 +607,7 @@ fn report(stdout: &Stream, stderr: &Stream, status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
+    use std::{sync::mpsc, time::Duration};
 
     use super::*;
     use crate::tools::ToolCall;
@@ -652,7 +652,7 @@ mod tests {
     fn runs_through_the_shell_set() {
         let script = env::temp_dir().join(format!("dwim-shell-{}", process::id()));
         fs::write(&script, "#!/bin/sh\necho via; exec sh \"$@\"\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        sys::fs::make_executable(&script).unwrap();
         let mut bash = Bash::default();
         bash.set_shell(script.clone());
         assert_eq!(sh("echo hi", &mut bash), "via\nhi\n[exit code 0]");
