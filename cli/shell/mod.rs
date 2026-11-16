@@ -218,6 +218,9 @@ enum Status {
     Switching(Instant),
     /// Reading the prompt, before the first token of the reply.
     Reading(Instant),
+    /// Running a tool the model called, since when: the model has nothing
+    /// to do until the tool's output arrives.
+    Running(Instant),
     /// Waiting for the model, which another session has, since when.
     Waiting(Instant),
     Generating {
@@ -359,7 +362,10 @@ impl App {
             KeyCode::Char('c') if ctrl => {
                 if matches!(
                     self.status,
-                    Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+                    Status::Reading(_)
+                        | Status::Running(_)
+                        | Status::Waiting(_)
+                        | Status::Generating { .. }
                 ) {
                     self.interrupt();
                 } else if !self.input.is_empty() {
@@ -606,7 +612,10 @@ impl App {
         self.ready
             && matches!(
                 self.status,
-                Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+                Status::Reading(_)
+                    | Status::Running(_)
+                    | Status::Waiting(_)
+                    | Status::Generating { .. }
             )
     }
 
@@ -960,7 +969,7 @@ impl App {
                 ]);
                 self.doing = Some(format!("{name}({detail})"));
                 self.call = name;
-                self.status = Status::Reading(Instant::now());
+                self.status = Status::Running(Instant::now());
             }
             Event::Output(output) => {
                 if self.call == "plan" || self.call == "done" {
@@ -988,6 +997,8 @@ impl App {
                     }
                 }
                 self.lines.push(Line::new());
+                // The tool is done, and its output is the model's to read.
+                self.status = Status::Reading(Instant::now());
             }
             Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
         }
@@ -1312,15 +1323,24 @@ impl App {
 
     /// What the model is doing while it's busy: a frame of the spinner,
     /// what it is doing, and how that goes.
-    fn doing(&self) -> Option<(&'static str, &'static str, String)> {
+    fn doing(&self) -> Option<(&'static str, String, String)> {
         const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
         let seconds = |since: Instant| format!("{}s", since.elapsed().as_secs());
         let percent = |done: usize, total: usize| match total {
             0 => "  0%".to_string(),
             _ => format!("{:>3}%", done * 100 / total),
         };
+        let frame =
+            |since: Instant| SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
+            Status::Running(since) => {
+                return Some((
+                    frame(since),
+                    format!("Running {}…", self.call),
+                    format!("{} · esc to interrupt", seconds(since)),
+                ));
+            }
             Status::Downloading {
                 since, done, total, ..
             } => (
@@ -1380,7 +1400,6 @@ impl App {
                 },
             ),
         };
-        let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
-        Some((frame, verb, details))
+        Some((frame(since), verb.to_string(), details))
     }
 }
