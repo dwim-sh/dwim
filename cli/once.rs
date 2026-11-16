@@ -60,6 +60,8 @@ struct Printer {
     replied: bool,
     /// Whether standard error is part way through a line of thought.
     thinking: bool,
+    /// The plan as last printed.
+    plan: String,
 }
 
 impl Printer {
@@ -100,6 +102,16 @@ impl Printer {
                 eprintln!("{name}({detail})");
             }
             Event::Output(output) => eprintln!("{output}"),
+            Event::Plan(plan) => {
+                // Not for what is known of a step alone: the calls that
+                // add to it are printed as they are.
+                let plan = plan.brief();
+                if plan != self.plan {
+                    self.end_thought();
+                    eprintln!("[plan]\n{plan}");
+                    self.plan = plan;
+                }
+            }
             Event::Token | Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
         }
     }

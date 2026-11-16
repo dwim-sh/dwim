@@ -31,6 +31,7 @@ use dwim::providers::{
     openrouter::{self, login::Login},
 };
 use dwim::sys::browser;
+use dwim::tools::plan::Plan;
 
 use crate::{
     session::{self, Settings},
@@ -93,6 +94,9 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         verbose,
         thinking_budget,
         auto: false,
+        plan: Plan::default(),
+        doing: None,
+        redirect: None,
         lines: Vec::new(),
         blank: false,
         worker,
@@ -278,6 +282,14 @@ struct App {
     thinking_budget: Option<usize>,
     /// Whether auto mode is on, as the harness last said.
     auto: bool,
+    /// The plan of the work, as the harness last reported it, and the call
+    /// the model last made, which is what it is doing in the step under
+    /// way.
+    plan: Plan,
+    doing: Option<String>,
+    /// What the user wrote while the model worked: the model is stopped
+    /// for it, and it is sent once the turn has ended.
+    redirect: Option<String>,
     /// Lines waiting to be printed above the live region, and whether the
     /// last line printed there was blank.
     lines: Vec<Line>,
@@ -357,6 +369,12 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => return true,
+            // With no turn to stop, esc sets a plan with steps left aside.
+            KeyCode::Esc if !busy && self.ready && self.waiting() => {
+                self.plan = Plan::default();
+                self.say(&[vec![span("● The plan is set aside").dark_grey()]]);
+                self.worker.send(Request::SetPlanAside);
+            }
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter
                 if key
@@ -379,6 +397,11 @@ impl App {
                 if !busy || (!self.ready && self.input.text().trim().starts_with('/')) =>
             {
                 self.submit()
+            }
+            // While the model works, a message changes its course: the
+            // model is stopped to take it in, and goes on from the plan.
+            KeyCode::Enter if self.working() && !self.input.text().trim().starts_with('/') => {
+                self.change_course()
             }
             KeyCode::Enter => {}
             KeyCode::Char('a') if ctrl => self.input.home(),
@@ -572,13 +595,46 @@ impl App {
 
     /// Stops the reply being generated, if any.
     fn interrupt(&mut self) {
-        if matches!(
-            self.status,
-            Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
-        ) {
+        if self.working() {
             self.worker.interrupt();
             self.interrupted = true;
         }
+    }
+
+    /// Whether the model is at work on a turn.
+    fn working(&self) -> bool {
+        self.ready
+            && matches!(
+                self.status,
+                Status::Reading(_) | Status::Waiting(_) | Status::Generating { .. }
+            )
+    }
+
+    /// Whether a plan with steps left waits for the user.
+    fn waiting(&self) -> bool {
+        !self.plan.is_empty() && !self.plan.finished() && !self.working()
+    }
+
+    /// Takes what the input box holds as a message that changes the course
+    /// of the work under way: stops the model, and keeps the message to
+    /// send once the turn has ended. The plan is the harness's to keep, so
+    /// nothing done is lost by stopping: the model gets the message with
+    /// the plan as it stands, and goes on from there.
+    fn change_course(&mut self) {
+        let message = self.input.text().trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        self.input.take();
+        self.recalled = None;
+        if self.history.last() != Some(&message) {
+            self.history.push(message.clone());
+        }
+        self.redirect = Some(match self.redirect.take() {
+            Some(earlier) => format!("{earlier}\n\n{message}"),
+            None => message,
+        });
+        self.interrupt();
     }
 
     /// Steps through the messages sent so far, like a shell's history.
@@ -612,20 +668,7 @@ impl App {
             self.history.push(message.clone());
         }
 
-        let (columns, _) = self.screen.size();
-        self.lines.push(Line::new());
-        for (i, line) in tui::wrap(&message, columns.saturating_sub(2))
-            .into_iter()
-            .enumerate()
-        {
-            let prompt = if i == 0 {
-                span("› ").bold()
-            } else {
-                span("  ")
-            };
-            self.lines.push(vec![prompt, span(line).bold()]);
-        }
-        self.lines.push(Line::new());
+        self.echo(&message);
 
         let request = match message.strip_prefix('/').map(Command::parse) {
             None => Request::Message(message),
@@ -666,11 +709,36 @@ impl App {
             }));
             return;
         }
+        self.start(request);
+    }
+
+    /// Prints a message from the user into the conversation.
+    fn echo(&mut self, message: &str) {
+        let (columns, _) = self.screen.size();
+        self.lines.push(Line::new());
+        for (i, line) in tui::wrap(message, columns.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let prompt = if i == 0 {
+                span("› ").bold()
+            } else {
+                span("  ")
+            };
+            self.lines.push(vec![prompt, span(line).bold()]);
+        }
+        self.lines.push(Line::new());
+    }
+
+    /// Asks the model's thread for `request`, a turn, starting a reply.
+    fn start(&mut self, request: Request) {
+        let (columns, _) = self.screen.size();
         self.reply.clear();
         self.segment = Segment::Text;
         self.reply_width = columns.saturating_sub(2);
         self.committed = 0;
         self.interrupted = false;
+        self.doing = None;
         self.status = Status::Reading(Instant::now());
         self.worker.send(request);
     }
@@ -689,10 +757,21 @@ impl App {
                 self.stats = stats;
                 self.reply.truncate(self.reply.trim_end().len());
                 self.commit(true);
-                if self.interrupted {
-                    self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
-                }
+                self.doing = None;
                 self.status = Status::Idle;
+                // What the user wrote while the model worked is the next
+                // message, which the model was stopped for.
+                match self.redirect.take() {
+                    Some(message) if self.ready => {
+                        self.finish();
+                        self.echo(&message);
+                        self.start(Request::Message(message));
+                    }
+                    _ if self.interrupted => {
+                        self.lines.push(vec![span("  ⎿ Interrupted").dark_grey()]);
+                    }
+                    _ => {}
+                }
             }
             Reply::Notice(text) => {
                 self.finish();
@@ -849,18 +928,46 @@ impl App {
                     },
                 };
             }
+            Event::Plan(plan) => {
+                self.finish();
+                let (columns, _) = self.screen.size();
+                self.lines
+                    .extend(view::plan_news(&self.plan, &plan, columns));
+                // What the model was at was the step before's.
+                if plan.done() != self.plan.done() {
+                    self.doing = None;
+                }
+                self.plan = plan;
+            }
+            // The plan shows over the input box, and a step in the
+            // conversation as it is finished: not the calls that say so,
+            // unless one goes wrong.
+            Event::Call { name, .. } if name == "plan" || name == "done" => {
+                self.call = name;
+                self.status = Status::Reading(Instant::now());
+            }
+            Event::Output(output)
+                if (self.call == "plan" || self.call == "done")
+                    && !output.starts_with("error:") => {}
             Event::Call { name, detail } => {
                 self.finish();
                 let detail: Vec<&str> = detail.split_whitespace().collect();
+                let detail = detail.join(" ");
                 self.lines.push(vec![
                     span("● "),
                     span(&name).bold(),
-                    span(format!("({})", detail.join(" "))).dark_grey(),
+                    span(format!("({detail})")).dark_grey(),
                 ]);
+                self.doing = Some(format!("{name}({detail})"));
                 self.call = name;
                 self.status = Status::Reading(Instant::now());
             }
             Event::Output(output) => {
+                if self.call == "plan" || self.call == "done" {
+                    self.finish();
+                    self.lines
+                        .push(vec![span("● "), span(self.call.clone()).bold()]);
+                }
                 let (columns, _) = self.screen.size();
                 let output = tui::sanitize(&output);
                 // A file read is long and the model's to read: unless
@@ -1038,6 +1145,36 @@ impl App {
         if !live.is_empty() || !blank {
             live.push(Line::new());
         }
+        // The plan as it stands, while it has steps left or the model is
+        // still at work, and what the user wrote that the model is being
+        // stopped for.
+        let working = self.working();
+        if self.plan.is_empty() && working {
+            live.extend(view::no_plan(self.doing.as_deref(), columns));
+            live.push(Line::new());
+        }
+        if !self.plan.is_empty() && (working || !self.plan.finished()) {
+            live.extend(view::plan(
+                &self.plan,
+                self.doing.as_deref().filter(|_| working),
+                working,
+                columns,
+            ));
+            live.push(Line::new());
+        }
+        if let Some(message) = &self.redirect {
+            for (i, text) in tui::wrap(message, columns.saturating_sub(4))
+                .into_iter()
+                .enumerate()
+            {
+                let prefix = if i == 0 { "› " } else { "  " };
+                live.push(vec![span(format!("{prefix}{text}")).dark_grey()]);
+            }
+            live.push(vec![
+                span("  ⎿ stopping the model to take this in").dark_grey(),
+            ]);
+            live.push(Line::new());
+        }
         if let Some(status) = self.status() {
             live.push(status);
         }
@@ -1097,6 +1234,10 @@ impl App {
             };
             let content = if self.input.is_empty() && self.provider.is_none() {
                 span("Type /provider to connect a model").dark_grey()
+            } else if self.input.is_empty() && working {
+                span("Say what to change, and it changes course · esc stops it").dark_grey()
+            } else if self.input.is_empty() && self.waiting() {
+                span("Say go on, or what to change in the plan").dark_grey()
             } else if self.input.is_empty() {
                 span("Ask anything, or describe what to build").dark_grey()
             } else {

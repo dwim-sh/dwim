@@ -25,6 +25,13 @@
 //! mark, `compaction` has the model write a note and starts the
 //! conversation over from it.
 //!
+//! The model lays out the work as a plan, with the `plan` tool, and the
+//! tools keep it from then on: the harness reports it as it changes, for
+//! the user to watch, reads it back to the model with a message that comes
+//! while steps are left, until the user sets it aside, asks after the
+//! steps left when the model stops short of them, and, once the conversation has grown long, starts each
+//! step in a conversation cleared down to the plan.
+//!
 //! Given a [`Log`], the harness keeps a transcript of the whole session in
 //! it, thoughts and compactions included, for finding out afterwards where
 //! a session's tokens went.
@@ -42,7 +49,7 @@ use std::{
 };
 
 use crate::model::{Chunk, Session, Turn};
-use crate::tools::{ToolCall, Tools, bash, read};
+use crate::tools::{ToolCall, Tools, bash, plan::Plan, read};
 
 pub use crate::harness::log::Log;
 
@@ -86,7 +93,9 @@ pub const THINKING_BUDGET: Option<usize> = Some(2048);
 /// reply with what it has: a turn that runs this long without a reply has
 /// lost its way, and the user is better served by an account of it than
 /// by another call. A hundred is far past what a task's worth of calls
-/// takes.
+/// takes. Under a plan they are counted from the start of the step under
+/// way: a turn of five steps took 94 calls to its fifth, and was stopped
+/// in the middle of it.
 pub const MAX_CALLS: usize = 100;
 
 /// Tool calls in a row without one that changed a file, after
@@ -140,6 +149,19 @@ const RECALL_CLOSING: &str = "I am not certain of this from memory, so I will ch
 /// that bore nothing on the fix.
 const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need is in the output above. I will go with what I have worked out rather than go over it again: if there is a change to make, I make it now with edit, and otherwise I reply with it.";
 
+/// What the model is asked when it replies without a call while the plan
+/// it has been working has steps left, once a turn: a model that finishes
+/// the last step tends to reply without saying the step is done, and the
+/// plan the user reads would say the work stopped short of it.
+const STEPS_LEFT: &str = "The plan has steps that are not done. If the step under way is finished, call done with what it came to, and go on with the next. If you cannot go on without the user, reply with what you need from them.";
+
+/// The share of the context past which a step of the plan starts in a
+/// conversation cleared down to the plan: half. A step's end is where the
+/// least is lost by clearing, since what the step came to is in the plan,
+/// and the compaction that would otherwise come at the high-water mark
+/// comes mid-step and costs a note. The share is not measured.
+const FRESH: usize = 2;
+
 /// Most tokens of the account of a turn that reached [`MAX_CALLS`], in a
 /// context with room for it. A small context allows a sixteenth of itself.
 const ACCOUNT_TOKENS: usize = 1024;
@@ -148,7 +170,7 @@ const ACCOUNT_TOKENS: usize = 1024;
 /// tools' own limits in it.
 fn instructions() -> String {
     format!(
-        r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, and grep and glob tools that search files for text and for names, and you may use them at any time without asking.
+        r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, grep and glob tools that search files for text and for names, and plan and done tools that lay out the plan of the work for the user and finish a step of it, and you may use them at any time without asking.
 
 - For anything about the project, its files, its git history, or the system, run commands to find out before you answer. Don't answer from memory when a command can tell you.
 - While you think, notice when you are recalling how code works rather than reading it: "I think", "I recall", "I believe", "probably". The code here is one version of the project, and may not be the one you remember. Stop the thought there, and read or run that code instead. The same goes for going back and forth: when you have written "wait" or "actually" about the same question twice, stop and find out with a tool. One read or one run settles what more thinking will not.
@@ -166,6 +188,9 @@ fn instructions() -> String {
 - When you believe you know the fix, make it with edit and run your reproduction or the tests: that is the check. Don't first prove the fix in your head. An edit can be undone, and running the changed code tells you more than reasoning about it.
 - Where what you see differs from what the request describes, the request says what the code should do: check what you see against that, rather than conclude there is nothing to fix.
 - A `<system-reminder>` block at the end of a tool's result is from the harness, not the tool: read it and follow it.
+- For any request that changes something, call plan first: before reading more than a file or two, lay out the steps as you see them now, starting with what you need to find out, such as `find where fetch() retries`. The user watches the plan to see where you are headed, and a plan that is roughly right now is worth more to them than one that is exact later. Call plan again when what you learn changes the steps to come. Then take the steps in order, and call done as each is finished, which tells you the next. Only a question needs no plan.
+- Don't stop to ask the user to choose. Where the request leaves a choice open, make the choice a careful engineer would, give it in the plan's `assumes`, such as a default, a limit, or which cases you cover, and go on: the user says if they want otherwise.
+- When a message from the user comes while the plan has steps left, the plan as it stands follows the message. If the message changes the work, call plan with the steps to come as they now should be, and go on from there; if it only asks something, answer it and leave the plan as it is.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#,
@@ -406,6 +431,10 @@ pub enum Event {
         before: usize,
         after: usize,
     },
+    /// The plan of the work, as it now stands: laid out, changed, a step
+    /// of it finished, or what is known of a step added to. Empty once the
+    /// work it was the plan of is over.
+    Plan(Plan),
 }
 
 /// What a turn's events go to, which ends the turn early by breaking.
@@ -469,6 +498,15 @@ pub struct Harness<S: Session> {
     /// been this turn.
     auto: bool,
     went_on: usize,
+    /// The plan as last reported, to report it when it changes.
+    shown: Plan,
+    /// Whether the model has laid out the plan or finished a step of it
+    /// this turn, and whether it has been asked after the steps left.
+    planned: bool,
+    asked: bool,
+    /// The user's messages of the session, which a conversation cleared at
+    /// a step's end reads back.
+    said: Vec<Entry>,
     /// The transcript of the whole session.
     log: Log,
 }
@@ -510,6 +548,10 @@ impl<S: Session> Harness<S> {
             nudge_after: NUDGE_AFTER,
             auto: false,
             went_on: 0,
+            shown: Plan::default(),
+            planned: false,
+            asked: false,
+            said: Vec::new(),
             log: Log::none(),
         };
         harness.limit_thoughts(THINKING_BUDGET);
@@ -561,6 +603,14 @@ impl<S: Session> Harness<S> {
     /// off unless set.
     pub fn set_auto(&mut self, auto: bool) {
         self.auto = auto;
+    }
+
+    /// Sets the plan of the work aside, as the user does who has moved on
+    /// from it with steps left: the model is no longer told of it.
+    pub fn set_plan_aside(&mut self) {
+        self.tools.clear_plan();
+        self.shown = Plan::default();
+        self.log.plan("");
     }
 
     /// Sets how many tool calls the model may make in one turn before it
@@ -695,7 +745,23 @@ impl<S: Session> Harness<S> {
         self.steps = 0;
         self.unchanged = 0;
         self.went_on = 0;
-        let mut outcome = self.run(Turn::User(message.to_string()), false, ahead, on_event)?;
+        self.planned = false;
+        self.asked = false;
+        let turn = Turn::User(message.to_string());
+        let tokens = self.session.measure(&turn)?;
+        self.said.push(Entry {
+            turn,
+            tokens,
+            prompt: false,
+        });
+        let after = self.plan_so_far(on_event);
+        let mut outcome = self.run(
+            Turn::User(message.to_string()),
+            false,
+            ahead,
+            after,
+            on_event,
+        )?;
         if outcome == Outcome::Cut {
             if on_event(Event::Cut).is_break() {
                 return Ok(());
@@ -704,6 +770,7 @@ impl<S: Session> Harness<S> {
                 outcome = self.run(
                     Turn::User(compaction::CONTINUE.to_string()),
                     true,
+                    None,
                     None,
                     on_event,
                 )?;
@@ -715,18 +782,52 @@ impl<S: Session> Harness<S> {
         Ok(())
     }
 
+    /// What follows a message from the user of the plan, if one is there:
+    /// the plan as it stands, if it has steps left. One with every step
+    /// done was the plan of work that is over, and is forgotten.
+    fn plan_so_far(&mut self, on_event: OnEvent) -> Option<String> {
+        if self.tools.plan().finished() {
+            self.tools.clear_plan();
+            self.show_plan(on_event);
+        }
+        let plan = self.tools.plan();
+        (!plan.is_empty()).then(|| {
+            format!(
+                "<system-reminder>The plan of the work has steps left. As it stands:\n\n{}\n\nDo what the message above asks. If it changes the work, call plan with the steps to come as they now should be, and go on from there. If it asks for the work to go on, go on with the step under way. If it asks something else, such as a question, answer that and leave the plan as it is.</system-reminder>",
+                plan.brief()
+            )
+        })
+    }
+
+    /// Reports the plan to `on_event`, if it has changed since it was last
+    /// reported, and returns whether it had.
+    fn show_plan(&mut self, on_event: OnEvent) -> bool {
+        let changed = *self.tools.plan() != self.shown;
+        if changed {
+            let brief = self.tools.plan().brief();
+            if brief != self.shown.brief() {
+                self.log.plan(&brief);
+            }
+            self.shown = self.tools.plan().clone();
+            let _ = on_event(Event::Plan(self.shown.clone()));
+        }
+        changed
+    }
+
     /// Feeds `input`, a message or tool results, with `ahead` before it if
     /// there is anything, and runs the tools the reply calls, feeding their
     /// results back, until the model replies with text alone, is
     /// interrupted, or is stopped short for room; or until it has made
     /// [`MAX_CALLS`] calls in the turn, when it is asked to reply with
     /// what it has. A message that is the harness's own `prompt` rather
-    /// than the user's is kept as such.
+    /// than the user's is kept as such. A message is followed by `after`,
+    /// if there is any, as fed.
     fn run(
         &mut self,
         mut input: Turn,
         mut prompt: bool,
         mut ahead: Option<String>,
+        mut after: Option<String>,
         on_event: OnEvent,
     ) -> Result<Outcome, Box<dyn Error>> {
         let mut last = None;
@@ -735,11 +836,18 @@ impl<S: Session> Harness<S> {
                 self.log
                     .user(message, ahead.as_deref(), self.session.tokens());
             }
-            // Where the agent is goes ahead of the first message as fed;
-            // the transcript keeps the message alone, since a compaction
-            // says where the agent is afresh.
-            let fed = match (&input, ahead.take()) {
-                (Turn::User(message), Some(ahead)) => Turn::User(format!("{ahead}\n\n{message}")),
+            // Where the agent is goes ahead of the first message as fed,
+            // and the plan as it stands after one that comes while steps
+            // are left; the transcript keeps the message alone, since a
+            // compaction says where the agent is, and the plan, afresh.
+            let fed = match (&input, ahead.take(), after.take()) {
+                (Turn::User(message), ahead, after) if ahead.is_some() || after.is_some() => {
+                    if let Some(after) = &after {
+                        self.log.nudge(after);
+                    }
+                    let parts = [ahead.as_deref(), Some(message.as_str()), after.as_deref()];
+                    Turn::User(parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n"))
+                }
                 _ => input.clone(),
             };
             // The results that reach the cap need room for the account
@@ -771,6 +879,7 @@ impl<S: Session> Harness<S> {
             }
             self.limit_thoughts(self.thinking_budget);
             let mut text = String::new();
+            let mut stopped = false;
             let before = self.session.stats();
             let reply = {
                 let collect = |chunk: Chunk| {
@@ -782,7 +891,9 @@ impl<S: Session> Harness<S> {
                         }
                         Chunk::Token => {}
                     }
-                    on_event(event(chunk))
+                    let flow = on_event(event(chunk));
+                    stopped |= flow.is_break();
+                    flow
                 };
                 match &fed {
                     Turn::User(message) => self.session.send(message, collect)?,
@@ -811,10 +922,18 @@ impl<S: Session> Harness<S> {
                 return Ok(Outcome::Cut);
             }
             if reply.calls.is_empty() {
-                if !self.go_on() {
+                if self.go_on() {
+                    input = Turn::User(GO_ON.to_string());
+                } else if !stopped
+                    && self.planned
+                    && !self.asked
+                    && self.tools.plan().under_way().is_some()
+                {
+                    self.asked = true;
+                    input = Turn::User(STEPS_LEFT.to_string());
+                } else {
                     return Ok(Outcome::Done);
                 }
-                input = Turn::User(GO_ON.to_string());
                 prompt = true;
                 continue;
             }
@@ -823,6 +942,7 @@ impl<S: Session> Harness<S> {
             // calls that remain get word that they were not run.
             let mut outputs = Vec::new();
             let mut interrupted = false;
+            let done = self.tools.plan().done();
             for call in &reply.calls {
                 let mut seconds = None;
                 let mut changed = false;
@@ -851,6 +971,7 @@ impl<S: Session> Harness<S> {
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
                             changed = output.changed;
+                            self.planned |= self.show_plan(on_event);
                             output.text
                         }
                     }
@@ -869,6 +990,22 @@ impl<S: Session> Harness<S> {
             if interrupted {
                 self.close(outputs)?;
                 return Ok(Outcome::Done);
+            }
+            // The step that starts once one is finished starts in a
+            // conversation cleared down to the plan, if this one has
+            // grown long.
+            // A step finished is the sign that the turn has not lost its
+            // way, which the cap on a turn's calls is there to catch: the
+            // calls are counted from the step's start. The step that
+            // starts then starts in a conversation cleared down to the
+            // plan, if this one has grown long.
+            if self.tools.plan().done() > done {
+                self.steps = 0;
+                if self.tools.plan().under_way().is_some()
+                    && self.session.tokens() > self.session.capacity() / FRESH
+                {
+                    compaction::start_over(self, on_event)?;
+                }
             }
             if self.unchanged >= self.nudge_after
                 && let Some(last) = outputs.last_mut()
@@ -1157,6 +1294,7 @@ mod tests {
                         "note"
                     }
                     Event::Compacted { .. } => "compacted",
+                    Event::Plan(_) => "plan",
                 };
                 events.push(name);
                 ControlFlow::Continue(())
@@ -1498,6 +1636,273 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), "made\n");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reply after a short thought that calls `tool` with `parameters`.
+    fn calling(tool: &str, parameters: &[(&str, &str)]) -> String {
+        let parameters: String = parameters
+            .iter()
+            .map(|(name, value)| format!("<parameter={name}>\n{value}\n</parameter>\n"))
+            .collect();
+        format!(
+            "{}\n</think>\n\n<tool_call>\n<function={tool}>\n{parameters}</function>\n</tool_call>",
+            filler(10)
+        )
+    }
+
+    /// Sends `message`, and returns the plan each time it was reported.
+    fn plans(harness: &mut Harness<Local<Scripted>>, message: &str) -> Vec<Plan> {
+        let mut plans = Vec::new();
+        harness
+            .send(message, |event| {
+                if let Event::Plan(plan) = event {
+                    plans.push(plan);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        plans
+    }
+
+    #[test]
+    fn keeps_the_plan_the_model_lays_out_and_what_each_step_rests_on() {
+        // The model lays out two steps, changes a file, runs a command, and
+        // says each step is done: the plan is reported as it changes, the
+        // first step with the file it changed and the command run after.
+        let dir = scratch();
+        let path = dir.join("log.jsonl");
+        let scripts = [
+            calling(
+                "plan",
+                &[
+                    ("steps", "- write the file\n- look it over"),
+                    ("assumes", "one line"),
+                ],
+            ),
+            calling("write", &[("path", "a.txt"), ("content", "made")]),
+            calling("bash", &[("command", "cat DIR/a.txt")]),
+            calling("done", &[("result", "a.txt holds made")]),
+            calling("done", &[("result", "it reads well")]),
+            reply(10, false),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let plans = plans(&mut harness, "go");
+        let first = plans.first().unwrap();
+        assert_eq!(first.steps().len(), 2);
+        assert_eq!(first.under_way(), Some(0));
+        assert_eq!(first.assumes(), ["one line"]);
+        let last = plans.last().unwrap();
+        assert!(last.finished(), "{last:?}");
+        let step = &last.steps()[0];
+        assert_eq!(step.result, "a.txt holds made");
+        assert_eq!(step.changed, ["a.txt"]);
+        let check = step.check.as_ref().unwrap();
+        assert!(
+            check.passed && check.command.starts_with("cat "),
+            "{check:?}"
+        );
+        assert_eq!(last.steps()[1].changed, Vec::<String>::new());
+        // The model is told the step under way as each is finished.
+        let results: Vec<&String> = harness
+            .transcript()
+            .filter_map(|turn| match turn {
+                Turn::Results(outputs) => outputs.last(),
+                _ => None,
+            })
+            .collect();
+        assert!(results[0].contains("Step 1 of 2 is under way: write the file"));
+        assert!(results[3].contains("Step 2 of 2 is under way: look it over"));
+        assert!(results[4].contains("Every step of the plan is done"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn asks_after_the_steps_left_when_the_model_stops_short_of_them() {
+        // The model finishes the work and replies without saying the last
+        // step is done: it is asked once, says so, and replies again.
+        let scripts = [
+            calling("plan", &[("steps", "one\ntwo")]),
+            calling("done", &[("result", "did one")]),
+            reply(10, false),
+            calling("done", &[("result", "did two")]),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        let plans = plans(&mut harness, "go");
+        assert!(plans.last().unwrap().finished());
+        let asked = |harness: &Harness<Local<Scripted>>| {
+            harness
+                .transcript()
+                .filter(|turn| matches!(turn, Turn::User(text) if text == STEPS_LEFT))
+                .count()
+        };
+        assert_eq!(asked(&harness), 1);
+
+        // One that stops short again after it is asked has its say: the
+        // turn ends there, with the step left.
+        let scripts = [
+            calling("plan", &[("steps", "one\ntwo")]),
+            reply(10, false),
+            reply(10, false),
+            reply(10, false),
+        ];
+        let mut harness = self::harness(&scripts, 100_000, "");
+        let plans = self::plans(&mut harness, "go");
+        assert_eq!(plans.last().unwrap().under_way(), Some(0));
+        assert_eq!(asked(&harness), 1);
+
+        // One the user stops mid-reply is not asked: the user has the say.
+        let scripts = [
+            calling("plan", &[("steps", "one\ntwo")]),
+            reply(10, false),
+            reply(10, false),
+        ];
+        let mut harness = self::harness(&scripts, 100_000, "");
+        let mut planned = false;
+        harness
+            .send("go", |event| match event {
+                Event::Plan(_) => {
+                    planned = true;
+                    ControlFlow::Continue(())
+                }
+                Event::Thought(_) if planned => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            })
+            .unwrap();
+        assert_eq!(asked(&harness), 0);
+    }
+
+    #[test]
+    fn counts_the_calls_toward_the_cap_from_the_start_of_a_step() {
+        // Under a cap of three calls, a plan of two steps takes six: the
+        // step finished starts the count over, and the turn ends with the
+        // model's reply, not with the account asked for at the cap.
+        let scripts = [
+            calling("plan", &[("steps", "one\ntwo")]),
+            reply_calling(10, "bash", "command", "echo 1"),
+            calling("done", &[("result", "did one")]),
+            reply_calling(10, "bash", "command", "echo 2"),
+            calling("done", &[("result", "did two")]),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        harness.set_call_limit(3);
+        let plans = plans(&mut harness, "go");
+        assert!(plans.last().unwrap().finished());
+        assert!(
+            !harness
+                .transcript()
+                .any(|turn| matches!(turn, Turn::User(text) if text == STEPS_PROMPT))
+        );
+    }
+
+    #[test]
+    fn a_message_while_steps_are_left_is_followed_by_the_plan() {
+        // The turn is interrupted with a step left. The next message goes
+        // to the model with the plan as it stands after it, and the model
+        // changes the steps to come; the step done stays done.
+        let dir = scratch();
+        let path = dir.join("log.jsonl");
+        let scripts = [
+            calling("plan", &[("steps", "one\ntwo\nthree")]),
+            calling("done", &[("result", "did one")]),
+            calling("plan", &[("steps", "two\nfour")]),
+            reply(10, false),
+            reply(10, false),
+            reply(10, false),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        let mut calls = 0;
+        harness
+            .send("go", |event| {
+                calls += usize::from(matches!(event, Event::Output(_)));
+                if calls == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        let plans = plans(&mut harness, "not three, four");
+        let texts: Vec<(&str, bool)> = plans
+            .last()
+            .unwrap()
+            .steps()
+            .iter()
+            .map(|step| (step.text.as_str(), step.done))
+            .collect();
+        assert_eq!(texts, [("one", true), ("two", false), ("four", false)]);
+        // A plan set aside is not read back with the next message.
+        harness.set_plan_aside();
+        assert!(self::plans(&mut harness, "what is the time?").is_empty());
+        drop(harness);
+        let reminders: Vec<String> = records(&path)
+            .iter()
+            .filter(|record| record["type"] == "nudge")
+            .map(|record| record["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reminders.len(), 1, "{reminders:?}");
+        assert!(
+            reminders[0].contains("1. [done] one: did one\n2. [under way] two\n3. [to come] three"),
+            "{reminders:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn starts_a_step_in_a_conversation_cleared_down_to_the_plan_once_it_is_long() {
+        // The first step ends with the conversation past half the context:
+        // the next starts from the plan, the user's message, and the reply
+        // that finished the step, with its results.
+        let scripts = [
+            calling("plan", &[("steps", "find it\nfix it\ncheck it")]),
+            reply_saying(10, 4200, true),
+            calling("done", &[("result", "it is in send(), stream.rs:120")]),
+            calling("done", &[("result", "fixed")]),
+            reply(10, false),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 8000, "");
+        let (events, _) = send(&mut harness, "fix the retries");
+        assert!(events.contains(&"compacted"), "{events:?}");
+        assert!(
+            !events.contains(&"note"),
+            "the model writes no note: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|&&event| event == "compacted").count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            harness.session.tokens() < 4000,
+            "{}",
+            harness.session.tokens()
+        );
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::User(head) = turns[0] else {
+            panic!("{:?}", turns[0])
+        };
+        assert!(head.starts_with("# Environment\n"), "{head}");
+        assert!(
+            head.contains("<plan>\n1. [done] find it: it is in send(), stream.rs:120\n2. [under way] fix it\n3. [to come] check it\n</plan>"),
+            "{head}"
+        );
+        assert!(!head.contains(&filler(100)), "{head}");
+        assert!(
+            head.contains("<message>\nfix the retries\n</message>"),
+            "{head}"
+        );
+        assert!(
+            matches!(turns[1], Turn::Reply { calls, .. } if calls.len() == 1),
+            "{:?}",
+            turns[1]
+        );
+        assert!(
+            matches!(turns[2], Turn::Results(outputs) if outputs[0].contains("Step 2 of 3 is under way: fix it")),
+            "{:?}",
+            turns[2]
+        );
     }
 
     #[test]

@@ -51,6 +51,27 @@ pub fn truncate(line: &Line, columns: usize) -> Line {
     truncated
 }
 
+/// `text` cut down to at most `columns` wide, with an ellipsis for what
+/// is cut.
+pub fn fit(text: &str, columns: usize) -> String {
+    if text.width() <= columns {
+        return text.to_string();
+    }
+    let mut left = columns.saturating_sub(1);
+    let mut fitted = String::new();
+    for c in text.chars() {
+        let width = c.width().unwrap_or(0);
+        if width > left {
+            break;
+        }
+        fitted.push(c);
+        left -= width;
+    }
+    fitted.truncate(fitted.trim_end().len());
+    fitted.push('…');
+    fitted
+}
+
 /// A row of a box `columns` wide: `content` between its sides, padded or
 /// cut to fit.
 pub fn boxed(content: Line, columns: usize) -> Line {

@@ -297,6 +297,21 @@ the server. A server with other sessions open is not stopped.
 .B /help
 List the commands and the keys.
 .PP
+For work of more than a step or two the model lays out a plan, which the
+shell shows over the input box while the model works: the steps, of which
+one is under way, and the choices the model made where the request left
+them open. Under the step under way is what the model is doing. A step
+that is finished goes into the conversation with what it came to, the
+files it changed, and the command run since with whether it succeeded;
+a step that changed files with nothing run since is marked unchecked.
+.PP
+A message entered while the model works changes its course: the model is
+stopped, and gets the message with the plan as it stands, the steps done
+kept. It changes the steps to come to fit, and goes on.
+A plan with steps left when the model stops waits for the next message;
+.B Esc
+then sets it aside.
+.PP
 The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O
 shows it: pressed while the model thinks, it prints the thought so far and
