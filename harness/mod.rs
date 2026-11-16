@@ -38,6 +38,7 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, atomic::AtomicBool},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -551,6 +552,15 @@ impl<S: Session> Harness<S> {
     /// while the model, and its reading and editing of files, stay here.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.tools.set_shell(shell);
+    }
+
+    /// Has `interrupt`, once set, kill the command a tool is running. A
+    /// turn is interrupted by `on_event` breaking, which a tool that is
+    /// running does not see: set `interrupt` as well, and the command
+    /// ends at once, with a result that says so, and the turn at the
+    /// event for that result.
+    pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+        self.tools.set_interrupt(interrupt);
     }
 
     /// Sets how many tool calls in a row without one that changed a file
@@ -1469,6 +1479,53 @@ mod tests {
         assert_ne!(outputs[0], NOT_RUN);
         assert_eq!(outputs[1], NOT_RUN);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_command_that_is_running() {
+        // As the shell interrupts: a flag the tools have, set while the
+        // first of the reply's two commands runs, which the events break
+        // on. The command is killed, both calls are answered, and the
+        // next message follows a whole exchange.
+        use std::{sync::atomic::Ordering, thread, time::Duration};
+
+        let call = |command: &str| {
+            format!(
+                "<tool_call>\n<function=bash>\n<parameter=command>\n{command}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let scripts = [
+            format!(
+                "{}\n</think>\n\n{}\n{}",
+                filler(10),
+                call("sleep 30"),
+                call("echo next")
+            ),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        let interrupt = Arc::new(AtomicBool::new(false));
+        harness.set_interrupt(interrupt.clone());
+        let start = Instant::now();
+        thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                interrupt.store(true, Ordering::Relaxed);
+            });
+            send_until(&mut harness, "go", |_| interrupt.load(Ordering::Relaxed));
+        });
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(shape(&harness), "urt");
+        let Some(Turn::Results(outputs)) = harness.transcript().last() else {
+            panic!("the calls were not answered")
+        };
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert!(outputs[0].contains("interrupted"), "{outputs:?}");
+        assert!(!outputs[0].contains("timeout"), "{outputs:?}");
+        assert_eq!(outputs[1], NOT_RUN);
+        interrupt.store(false, Ordering::Relaxed);
+        send(&mut harness, "what happened?");
+        assert_eq!(shape(&harness), "urtur");
     }
 
     #[test]
