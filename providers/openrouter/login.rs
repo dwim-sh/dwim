@@ -1,5 +1,4 @@
-//! Signing in to OpenRouter for a key, in the user's browser, and keeping
-//! the key from one run to the next.
+//! Signing in to OpenRouter for a key, in the user's browser.
 //!
 //! It goes as OpenRouter's OAuth with PKCE does. A server on this machine
 //! waits at a port of its own. The browser is sent to that server, which
@@ -10,10 +9,8 @@
 //! to is short enough to type, where it does not open by itself.
 
 use std::{
-    fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
@@ -27,7 +24,9 @@ use ring::{
 use serde_json::{Value, json};
 use ureq::Agent;
 
-use crate::{model::Result, sys};
+use crate::model::Result;
+
+use super::Secret;
 
 /// Where the user agrees to a key being made.
 const AUTH: &str = "https://openrouter.ai/auth";
@@ -82,7 +81,7 @@ impl Login {
 
     /// Waits for the user to agree in the browser, and returns the key
     /// OpenRouter made; or nothing, once `cancelled` is set.
-    pub fn wait(self, cancelled: &AtomicBool) -> Result<Option<String>> {
+    pub fn wait(self, cancelled: &AtomicBool) -> Result<Option<Secret>> {
         match self.code(cancelled)? {
             Some(code) => exchange(&code, &self.verifier).map(Some),
             None => Ok(None),
@@ -165,34 +164,9 @@ impl Login {
     }
 }
 
-/// Keeps `key` for the runs to come, readable by the user alone, and
-/// returns the file it is in. Its directory is the user's alone too, so
-/// that no one else can see the key's name or replace the file.
-pub fn save(key: &str) -> Result<PathBuf> {
-    let path = path().ok_or("there is no directory to keep the key in")?;
-    if let Some(dir) = path.parent() {
-        sys::fs::create_private_dir(dir)?;
-    }
-    let mut file = sys::fs::create_private(&path)?;
-    writeln!(file, "{key}")?;
-    Ok(path)
-}
-
-/// The key kept from a sign-in, if there is one.
-pub fn saved() -> Option<String> {
-    let key = fs::read_to_string(path()?).ok()?;
-    Some(key.trim().to_string()).filter(|key| !key.is_empty())
-}
-
-/// Where the key is kept: in the user's configuration directory
-/// (`~/.config`, or on macOS `~/Library/Application Support`).
-fn path() -> Option<PathBuf> {
-    Some(sys::dirs::config()?.join("dwim").join("openrouter.key"))
-}
-
 /// Exchanges `code` for a key, with the secret whose hash OpenRouter was
 /// given.
-fn exchange(code: &str, verifier: &str) -> Result<String> {
+fn exchange(code: &str, verifier: &str) -> Result<Secret> {
     let agent = Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(30)))
@@ -211,7 +185,7 @@ fn exchange(code: &str, verifier: &str) -> Result<String> {
     let text = response.into_body().read_to_string()?;
     let answer: Value = serde_json::from_str(&text).unwrap_or_default();
     match answer["key"].as_str() {
-        Some(key) => Ok(key.to_string()),
+        Some(key) => Ok(Secret::new(key.trim().to_string())),
         None => {
             let why = answer["error"]["message"].as_str().unwrap_or(text.trim());
             Err(format!("OpenRouter gave no key ({status}): {why}").into())

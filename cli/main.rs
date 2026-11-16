@@ -16,13 +16,15 @@ use std::{
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
 use dwim::inference::Model;
-use dwim::providers::Kind;
+use dwim::providers::{Kind, openrouter};
 use dwim::sys::{self, memory};
 
 use opts::Opts;
 use session::Stderr;
 
 fn main() {
+    // SAFETY: no thread has been started yet.
+    unsafe { openrouter::take_from_environment() };
     let args: Vec<String> = env::args().collect();
     let command = args[0].rsplit('/').next().unwrap_or(&args[0]);
     let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();

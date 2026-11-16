@@ -6,4 +6,5 @@ pub mod fs;
 pub mod mmap;
 pub mod net;
 pub mod process;
+pub mod secret_file;
 pub mod user;
