@@ -4,7 +4,6 @@
 use std::{
     env,
     fs::{self, OpenOptions},
-    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
     thread,
@@ -215,15 +214,17 @@ fn spawn(options: &Options) -> Result<()> {
         }
         None => Stdio::null(),
     };
-    let status = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(r#"exec "$0" "$@" &"#)
         .arg(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log)
-        .process_group(0)
+        .stderr(log);
+    sys::process::own_group(&mut command);
+    let status = command
         .status()
         .map_err(|e| format!("cannot start the dwim server: {e}"))?;
     if !status.success() {
