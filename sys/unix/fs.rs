@@ -9,14 +9,18 @@ use std::{
 };
 
 /// Creates the file at `path` for writing, empty, and readable by the user
-/// alone if it was not there before.
+/// alone, whether or not it was there before.
 pub fn create_private(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    // The mode given at opening is only that of a file made there: one
+    // that was there already keeps its own.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// Creates the directory at `path`, and any of its parents that are not
@@ -58,4 +62,21 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 /// The permission bits of `path`, as this system counts them.
 fn mode_of(path: &Path) -> io::Result<u32> {
     fs::metadata(path).map(|metadata| metadata.mode())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, process};
+
+    use super::*;
+
+    #[test]
+    fn a_private_file_that_was_readable_by_others_no_longer_is() {
+        let path = env::temp_dir().join(format!("dwim-private-{}", process::id()));
+        fs::write(&path, "old").unwrap();
+        set_mode(&path, 0o644).unwrap();
+        drop(create_private(&path).unwrap());
+        assert_eq!(mode_of(&path).unwrap() & 0o777, 0o600);
+        fs::remove_file(&path).unwrap();
+    }
 }

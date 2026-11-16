@@ -14,8 +14,8 @@ mod linux;
 mod unix;
 
 #[cfg(target_vendor = "apple")]
-pub use darwin::{browser, memory};
+pub use darwin::{browser, memory, secrets};
 #[cfg(not(target_vendor = "apple"))]
-pub use linux::{browser, memory};
+pub use linux::{browser, memory, secrets};
 
 pub use unix::{dirs, fs, mmap, net, process, user};
