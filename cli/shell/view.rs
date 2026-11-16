@@ -235,14 +235,25 @@ const PLAN_BAR: usize = 16;
 /// checked at the right, then the choices the model made where the request
 /// left them open. Under the step under way goes `doing`, what the model
 /// is at. The plan of a model not `working` is paused, for the user to
-/// take up or set aside.
-pub fn plan(plan: &Plan, doing: Option<&str>, working: bool, columns: usize) -> Vec<Line> {
+/// take up or set aside. A `stale` plan is from before the user's last
+/// message, which the model has yet to answer: it is greyed out, and its
+/// heading says so.
+pub fn plan(
+    plan: &Plan,
+    doing: Option<&str>,
+    working: bool,
+    stale: bool,
+    columns: usize,
+) -> Vec<Line> {
     let steps = plan.steps();
     let under_way = plan.under_way();
+    let doing = doing.filter(|_| !stale);
     let mut heading = vec![span("● ").cyan(), span("Plan ").bold()];
     heading.extend(bar(plan));
     heading.push(span(format!(" {} of {}", plan.done(), steps.len())).dark_grey());
-    if !working {
+    if stale {
+        heading.push(span(" · from before your message").yellow());
+    } else if !working {
         heading.push(span(" · paused · esc sets it aside").dark_grey());
     }
     let mut lines = vec![tui::truncate(&heading, columns)];
@@ -273,6 +284,10 @@ pub fn plan(plan: &Plan, doing: Option<&str>, working: bool, columns: usize) -> 
         let text = tui::fit(&plain(&step.text), room);
         let pad = columns.saturating_sub(4 + tui::width(&vec![span(&text)]) + tui::width(&rests));
         let mut line = match (step.done, current) {
+            _ if stale => {
+                let mark = if step.done { "  ✓ " } else { "  ○ " };
+                vec![span(mark).dark_grey(), span(text).dark_grey()]
+            }
             (true, _) => vec![span("  ✓ ").green(), span(text).dark_grey()],
             (false, true) => vec![span("  ◆ ").cyan(), span(text).bold()],
             (false, false) => vec![span("  ○ ").dark_grey(), span(text)],
