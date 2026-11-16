@@ -1,7 +1,7 @@
 //! Ideas while the user types: before a message is sent, the model says in
-//! a line or two how it reads the draft so far, and where in the project
-//! the work would land, so that the user can correct it by rewording,
-//! before anything runs. It runs on a thread and a session of its own,
+//! a few marked lines what it would do with the draft so far, what the
+//! draft leaves open, and what is risky in it, so that the user can settle
+//! it by rewording, before anything runs. It runs on a thread and a session of its own,
 //! with a short prompt of its own and no thinking, so that it answers in
 //! about a second; a draft that changes while it answers ends the answer,
 //! and the newer draft is read instead.
@@ -20,13 +20,17 @@ use dwim::model::Session as _;
 use crate::session::{self, Session, Settings};
 
 /// Most tokens of an idea.
-const LIMIT: usize = 80;
+const LIMIT: usize = 120;
 
 /// Most of the project's file names the prompt lists.
 const MAX_FILES: usize = 400;
 
 /// How the model is asked for ideas, ahead of where it is and the files.
-const PROMPT: &str = "You watch a developer type a request to dwim, a coding agent working in the project below, and show them, before they send it, how you read what they have typed so far, so that they can correct you as they type. Reply with one or two short lines and nothing else: what you take them to want, put plainly, and where in the project it would land, naming files when the file list makes them likely. No preamble, no questions, no code, no promises. Where the draft could mean two things, give the likelier reading, and the other after \"or\". A draft cut off mid-word is still being typed: read what it is heading for.";
+const PROMPT: &str = "You watch a developer type a request to dwim, a coding agent working in the project below. Before they send it, tell them what they cannot see from what they wrote: what dwim would do, and what in the request is open. Never restate the request: they know what they asked. Reply with at most three lines of at most fifteen words each, and nothing else, each starting with one of these marks:\n\
+→ what dwim would do, as steps beginning with a verb, naming the files the file list makes likely, and ending with what it hands back: a report, or changed files and how they are checked\n\
+? something left open that would change the work, and the choice dwim makes if not told (\"? fix them too, or only report? assumes report\")\n\
+! a risk, only where dwim would change something: a change that is large, hard to undo, or outside the project\n\
+Leave out a mark with nothing to say, never write one with \"none\": a clear, safe request gets a single → line. No preamble, no code, no promises. A draft cut off mid-word is still being typed: read what it is heading for.";
 
 /// What the thread says of a draft: the idea so far, and whether it is
 /// whole.
