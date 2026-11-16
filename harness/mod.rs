@@ -5,7 +5,8 @@
 //! thought is ended early only when it repeats itself, or at a thinking
 //! budget if one is set. A turn ends when the model replies with text
 //! alone, or, after a great many calls without a reply, when it is asked
-//! to say what it has done and what remains. The harness refuses a call
+//! to say what it has done and what remains, and the user is told that
+//! the limit ended the turn. The harness refuses a call
 //! that repeats the one before it, whose output is already there.
 //!
 //! A [`Harness`] wraps a [`Session`] and reports each turn's thoughts, text,
@@ -38,11 +39,15 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, atomic::AtomicBool},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{Chunk, Session, Turn};
-use crate::tools::{ToolCall, Tools, bash, read};
+use crate::{
+    model::{Chunk, Session, Turn},
+    sys,
+    tools::{ToolCall, Tools, bash, read},
+};
 
 pub use crate::harness::log::Log;
 
@@ -139,6 +144,10 @@ const RECALL_CLOSING: &str = "I am not certain of this from memory, so I will ch
 /// and was sent by the second closing to the git history, three calls
 /// that bore nothing on the fix.
 const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need is in the output above. I will go with what I have worked out rather than go over it again: if there is a change to make, I make it now with edit, and otherwise I reply with it.";
+
+/// Why the machine is kept from idle sleep while a turn runs, as the
+/// system lists it.
+const AWAKE: &str = "dwim is running a turn";
 
 /// Most tokens of the account of a turn that reached [`MAX_CALLS`], in a
 /// context with room for it. A small context allows a sixteenth of itself.
@@ -396,6 +405,11 @@ pub enum Event {
     Output(String),
     /// The reply was stopped short because the context window was full.
     Cut,
+    /// The turn ended at the limit of this many tool calls, with the
+    /// account the model gave of it, which came before as text.
+    Capped {
+        calls: usize,
+    },
     /// The conversation is being compacted: the model is writing the note
     /// it will go on from, which follows in `Note` pieces.
     Compacting,
@@ -546,6 +560,15 @@ impl<S: Session> Harness<S> {
         self.tools.set_shell(shell);
     }
 
+    /// Has `interrupt`, once set, kill the command a tool is running. A
+    /// turn is interrupted by `on_event` breaking, which a tool that is
+    /// running does not see: set `interrupt` as well, and the command
+    /// ends at once, with a result that says so, and the turn at the
+    /// event for that result.
+    pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+        self.tools.set_interrupt(interrupt);
+    }
+
     /// Sets how many tool calls in a row without one that changed a file
     /// the model may make before it is reminded to make its change,
     /// [`NUDGE_AFTER`] unless set.
@@ -672,12 +695,15 @@ impl<S: Session> Harness<S> {
     }
 
     /// Runs `work`, reporting to `on_event`, and records in the log how it
-    /// ended, if not on its own: with an error, or interrupted.
+    /// ended, if not on its own: with an error, or interrupted. The
+    /// machine is kept from idle sleep until it ends, however it does: a
+    /// Mac left to a long turn went to sleep in the middle of a command.
     fn ended<T>(
         &mut self,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
         work: impl FnOnce(&mut Self, OnEvent) -> Result<T, Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>> {
+        let _awake = sys::awake::hold(AWAKE);
         let mut interrupted = false;
         let result = work(self, &mut |event| {
             let flow = on_event(event);
@@ -761,7 +787,15 @@ impl<S: Session> Harness<S> {
                 self.session.feed_results(outputs)?;
                 self.record(input, prompt)?;
                 let outcome = self.account(on_event)?;
-                if outcome == Outcome::Cut || !self.go_on() {
+                if outcome == Outcome::Cut {
+                    return Ok(outcome);
+                }
+                if !self.go_on() {
+                    // The account reads as any reply does, so the user
+                    // is told what ended the turn.
+                    let _ = on_event(Event::Capped {
+                        calls: self.max_calls,
+                    });
                     return Ok(outcome);
                 }
                 self.steps = 0;
@@ -918,7 +952,8 @@ impl<S: Session> Harness<S> {
 
     /// Asks the model, once it has made [`MAX_CALLS`] calls in a turn, for
     /// an account of the turn, which it gives without tools, reported as
-    /// `Text` pieces, and records the exchange. The turn ends with it.
+    /// `Text` pieces, and records the exchange. The turn ends with it,
+    /// unless auto mode has the model go on.
     fn account(&mut self, on_event: OnEvent) -> Result<Outcome, Box<dyn Error>> {
         self.log.user(STEPS_PROMPT, None, self.session.tokens());
         let before = self.session.stats();
@@ -996,11 +1031,14 @@ fn said_done(text: &str) -> bool {
 
 impl Event {
     /// What the user is told of the event, for the ones that are told
-    /// rather than shown: the reply stopped short, and the compaction as
-    /// it starts and as it ends.
+    /// rather than shown: the reply stopped short, the turn ended at the
+    /// call limit, and the compaction as it starts and as it ends.
     pub fn notice(&self) -> Option<String> {
         match self {
             Event::Cut => Some("Stopped short: the context window is full".to_string()),
+            Event::Capped { calls } => Some(format!(
+                "Stopped at the limit of {calls} tool calls in a turn · send a message to go on with the work"
+            )),
             Event::Compacting => Some("Compacting the conversation…".to_string()),
             Event::Compacted { before, after } => {
                 Some(format!("Compacted from {before} to {after} tokens"))
@@ -1151,6 +1189,7 @@ mod tests {
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
                     Event::Cut => "cut",
+                    Event::Capped { .. } => "capped",
                     Event::Compacting => "compacting",
                     Event::Note(text) => {
                         note.push_str(&text);
@@ -1462,6 +1501,53 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupt_ends_the_command_that_is_running() {
+        // As the shell interrupts: a flag the tools have, set while the
+        // first of the reply's two commands runs, which the events break
+        // on. The command is killed, both calls are answered, and the
+        // next message follows a whole exchange.
+        use std::{sync::atomic::Ordering, thread, time::Duration};
+
+        let call = |command: &str| {
+            format!(
+                "<tool_call>\n<function=bash>\n<parameter=command>\n{command}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let scripts = [
+            format!(
+                "{}\n</think>\n\n{}\n{}",
+                filler(10),
+                call("sleep 30"),
+                call("echo next")
+            ),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        let interrupt = Arc::new(AtomicBool::new(false));
+        harness.set_interrupt(interrupt.clone());
+        let start = Instant::now();
+        thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                interrupt.store(true, Ordering::Relaxed);
+            });
+            send_until(&mut harness, "go", |_| interrupt.load(Ordering::Relaxed));
+        });
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(shape(&harness), "urt");
+        let Some(Turn::Results(outputs)) = harness.transcript().last() else {
+            panic!("the calls were not answered")
+        };
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert!(outputs[0].contains("interrupted"), "{outputs:?}");
+        assert!(!outputs[0].contains("timeout"), "{outputs:?}");
+        assert_eq!(outputs[1], NOT_RUN);
+        interrupt.store(false, Ordering::Relaxed);
+        send(&mut harness, "what happened?");
+        assert_eq!(shape(&harness), "urtur");
+    }
+
+    #[test]
     fn reminds_the_model_to_change_a_file_after_many_calls_without() {
         // Under a nudge of three: the results of the third call without a
         // change carry the reminder, and the count starts over after it;
@@ -1566,7 +1652,8 @@ mod tests {
         let mut harness = harness(&scripts, 100_000, "I looked twice.");
         harness.set_call_limit(2);
         harness.set_auto(true);
-        send(&mut harness, "go");
+        let (events, _) = send(&mut harness, "go");
+        assert!(!events.contains(&"capped"), "{events:?}");
         let turns: Vec<&Turn> = harness.transcript().collect();
         let at = turns
             .iter()
@@ -1584,8 +1671,9 @@ mod tests {
     fn asks_for_an_account_at_the_call_cap() {
         // Three calls under a cap of three: the results of the third are
         // fed, the model is asked for an account of the turn, which it
-        // gives without tools, and the turn ends. The next message starts
-        // the count over.
+        // gives without tools, and the turn ends, with word after the
+        // account that the cap ended it. The next message starts the
+        // count over.
         let scripts: Vec<String> = (0..6)
             .map(|i| reply_calling(10, "bash", "command", &format!("echo {i}")))
             .collect();
@@ -1596,7 +1684,7 @@ mod tests {
             events,
             [
                 "thought", "text", "call", "output", "thought", "text", "call", "output",
-                "thought", "text", "call", "output", "text"
+                "thought", "text", "call", "output", "text", "capped"
             ],
             "{events:?}"
         );
@@ -1613,6 +1701,12 @@ mod tests {
         );
         let (events, _) = send(&mut harness, "again");
         assert_eq!(events[..4], ["thought", "text", "call", "output"]);
+        // A turn that ends with a reply under the cap has no such word.
+        let scripts = [reply(10, true), reply(10, false)];
+        let mut under = self::harness(&scripts, 100_000, "");
+        under.set_call_limit(3);
+        let (events, _) = send(&mut under, "go");
+        assert!(!events.contains(&"capped"), "{events:?}");
     }
 
     #[test]

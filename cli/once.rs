@@ -66,6 +66,7 @@ impl Printer {
     fn print(&mut self, event: Event) {
         if let Some(notice) = event.notice() {
             self.end_thought();
+            self.end_reply();
             eprintln!("[{notice}]");
             return;
         }
@@ -100,7 +101,20 @@ impl Printer {
                 eprintln!("{name}({detail})");
             }
             Event::Output(output) => eprintln!("{output}"),
-            Event::Token | Event::Cut | Event::Compacting | Event::Compacted { .. } => {}
+            Event::Token
+            | Event::Cut
+            | Event::Capped { .. }
+            | Event::Compacting
+            | Event::Compacted { .. } => {}
+        }
+    }
+
+    /// Ends the reply printed so far with a newline, if there is any, so
+    /// that a notice after it starts a line of its own on a terminal.
+    fn end_reply(&mut self) {
+        if self.replied {
+            println!();
+            self.replied = false;
         }
     }
 
@@ -117,8 +131,6 @@ impl Drop for Printer {
     /// Ends the reply with a newline, as a command's output should end.
     fn drop(&mut self) {
         self.end_thought();
-        if self.replied {
-            println!();
-        }
+        self.end_reply();
     }
 }

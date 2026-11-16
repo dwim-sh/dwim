@@ -18,6 +18,7 @@ mod write;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use serde_json::Value;
@@ -161,6 +162,12 @@ impl Tools {
     /// of `sh`.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.bash.set_shell(shell);
+    }
+
+    /// Has `interrupt`, once set, kill the command `bash` is running:
+    /// the other tools end soon enough by themselves.
+    pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+        self.bash.set_interrupt(interrupt);
     }
 
     /// Runs a call, returning what the model should see.

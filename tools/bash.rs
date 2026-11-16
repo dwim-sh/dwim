@@ -4,7 +4,11 @@
 //! error, with a line of how it ended that is always there. A command
 //! that runs to its timeout is killed, with what it started, and the
 //! model is told, so that a test that hangs or a server that was never
-//! going to end does not hold the session until the user notices. A stream
+//! going to end does not hold the session until the user notices. A
+//! command still running when the turn is interrupted is killed the same
+//! way, at once: the tool is given the flag the user's interrupt sets, and
+//! looks at it as the command runs, where it once ran a hung command to
+//! its timeout, or for good with none, whatever the user pressed. A stream
 //! that outgrows its preview is shown by its start and its end, and is
 //! kept whole in a file of the tool's own, which the result names along
 //! with the line to `read` it from, so the model can get the rest with
@@ -38,11 +42,12 @@ use std::{
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
+        mpsc::{self, RecvTimeoutError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -112,6 +117,10 @@ fn run(tools: &mut Tools, arguments: &Value) -> Result<String, String> {
 /// a server that was never going to end, does not hold the session long.
 pub const TIMEOUT: u64 = 300;
 
+/// How often a running command's interrupt and timeout are looked at:
+/// often enough that an interrupt seems to stop the command at once.
+const POLL: Duration = Duration::from_millis(50);
+
 /// What the model is told for a command that would take away changes it
 /// has made to the project's tracked files.
 const DISCARDS: &str = "not run: this would take away the changes you have made to the project's files (git stash, checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your change, undo it with edit, run what you want, and then make the change again with edit. git diff shows your changes.";
@@ -150,6 +159,8 @@ pub struct Bash {
     calls: usize,
     /// Most bytes of a stream kept in its file.
     retain: u64,
+    /// Set to kill the command that is running: the turn was interrupted.
+    interrupt: Arc<AtomicBool>,
 }
 
 /// Tells apart the output directories of the tools of one process.
@@ -165,6 +176,7 @@ impl Default for Bash {
             outputs: tmp.join(format!("dwim-{}-{n}", process::id())),
             calls: 0,
             retain: RETAINED,
+            interrupt: Arc::default(),
         }
     }
 }
@@ -175,6 +187,12 @@ impl Bash {
     /// that has what the project needs installed.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.shell = shell;
+    }
+
+    /// Has `interrupt`, once set, kill the command that is running, and
+    /// what it started, as its timeout does.
+    pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+        self.interrupt = interrupt;
     }
 
     /// The file for the `stream` of the command being run.
@@ -219,7 +237,8 @@ impl Bash {
             .current_dir(workdir.as_deref().unwrap_or(dir));
         // In a session of its own, which is a process group of its own
         // with the command's ID, so that the timeout ends what the
-        // command started along with it, and with no controlling
+        // command started along with it, as an interrupt does, and with
+        // no controlling
         // terminal, so that nothing it runs can open the user's.
         sys::process::own_session(&mut shell);
         let mut child = shell
@@ -230,38 +249,59 @@ impl Bash {
         let mut stderr = Stream::new("stderr", self);
         let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let (done, finished) = mpsc::channel::<()>();
-        let timed_out = AtomicBool::new(false);
+        let interrupt = &self.interrupt;
         // Each pipe is read on its own thread, so that neither fills up and
         // blocks the command while the other is being read; a third kills
-        // the command's process group at the timeout, which closes the
-        // pipes too, unless the command ends first.
-        let waited = thread::scope(|s| {
+        // the command's process group when the turn is interrupted or at
+        // the timeout, which closes the pipes too, unless the command ends
+        // first.
+        let (waited, killed) = thread::scope(|s| {
             s.spawn(|| stderr.drain(err));
-            if let Some(timeout) = timeout {
-                let timed_out = &timed_out;
-                s.spawn(move || {
-                    if finished.recv_timeout(timeout).is_err() {
-                        timed_out.store(true, Ordering::Relaxed);
-                        sys::process::kill_group(pid);
+            let watch = s.spawn(move || {
+                let started = Instant::now();
+                loop {
+                    match finished.recv_timeout(POLL) {
+                        Err(RecvTimeoutError::Timeout) => {}
+                        _ => return None,
                     }
-                });
-            }
+                    let killed = if interrupt.load(Ordering::Relaxed) {
+                        Killed::Interrupted
+                    } else if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                        Killed::TimedOut
+                    } else {
+                        continue;
+                    };
+                    sys::process::kill_group(pid);
+                    return Some(killed);
+                }
+            });
             stdout.drain(out);
             let waited = child.wait();
             let _ = done.send(());
-            waited
+            (waited, watch.join().ok().flatten())
         });
-        let status = match waited {
-            Ok(_) if timed_out.load(Ordering::Relaxed) => format!(
+        let status = match (waited, killed) {
+            (Ok(_), Some(Killed::Interrupted)) => INTERRUPTED.to_string(),
+            (Ok(_), Some(Killed::TimedOut)) => format!(
                 "[killed after {} s, the timeout; give a longer timeout if the command needs it, or 0 for none]",
                 timeout.unwrap_or_default().as_secs()
             ),
-            Ok(status) => ended(status),
-            Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
+            (Ok(status), None) => ended(status),
+            (Err(e), _) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
         Ok(report(&stdout, &stderr, &status))
     }
 }
+
+/// Why a command was killed before it ended.
+enum Killed {
+    Interrupted,
+    TimedOut,
+}
+
+/// How a command killed because the turn was interrupted ended, as the
+/// last line of its result.
+const INTERRUPTED: &str = "[killed: the turn was interrupted while the command ran]";
 
 impl Drop for Bash {
     fn drop(&mut self) {
@@ -700,6 +740,42 @@ mod tests {
             )
             .starts_with("error: 'timeout' is")
         );
+    }
+
+    #[test]
+    fn kills_a_command_when_interrupted() {
+        // With no timeout, as a command the model gave none would run for
+        // good: the interrupt, set a moment in, ends the command and the
+        // one it started, whose ID it printed.
+        let mut bash = Bash::default();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        bash.set_interrupt(interrupt.clone());
+        let start = Instant::now();
+        let output = thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                interrupt.store(true, Ordering::Relaxed);
+            });
+            run(
+                &mut bash,
+                &serde_json::json!({
+                    "command": "sleep 30 & echo $!; sleep 30; echo end",
+                    "timeout": 0
+                }),
+            )
+        });
+        assert!(start.elapsed() < Duration::from_secs(5), "{output}");
+        assert!(output.ends_with(INTERRUPTED), "{output}");
+        assert!(!output.contains("end"), "{output}");
+        let child: u32 = output.lines().next().unwrap().parse().unwrap();
+        while sys::process::alive(child) {
+            assert!(start.elapsed() < Duration::from_secs(5), "{child} lives");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The next command runs once the flag is cleared, as the shell
+        // clears it for the next message.
+        interrupt.store(false, Ordering::Relaxed);
+        assert_eq!(sh("echo hi", &mut bash), "hi\n[exit code 0]");
     }
 
     #[test]

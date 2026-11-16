@@ -160,13 +160,15 @@ fn work(
     log: Log,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     let loading = Instant::now();
     let Some((session, system)) = open(&mut settings, &requests, replies)? else {
         return Ok(());
     };
     let mut harness = session::harness(&settings, session, system, log)?;
+    // A command that is running is stopped with the turn.
+    harness.set_interrupt(stop.clone());
     let _ = replies.send(Reply::Ready(loading.elapsed()));
     // Whether the session's server was stopped, so the next request that
     // needs the model opens it on another.
