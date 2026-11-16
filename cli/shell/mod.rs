@@ -97,6 +97,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         plan: Plan::default(),
         doing: None,
         redirect: None,
+        unheeded: false,
         lines: Vec::new(),
         blank: false,
         worker,
@@ -293,6 +294,12 @@ struct App {
     /// What the user wrote while the model worked: the model is stopped
     /// for it, and it is sent once the turn has ended.
     redirect: Option<String>,
+    /// Whether the model has yet to answer the user's last message: until
+    /// it calls plan, which it is told to do first, or the turn ends, the
+    /// plan shown is from before the message. Another call says nothing of
+    /// whether the message was taken in: the model may go on with the step
+    /// it was at as if there were none.
+    unheeded: bool,
     /// Lines waiting to be printed above the live region, and whether the
     /// last line printed there was blank.
     lines: Vec<Line>,
@@ -748,6 +755,7 @@ impl App {
         self.committed = 0;
         self.interrupted = false;
         self.doing = None;
+        self.unheeded = matches!(request, Request::Message(_));
         self.status = Status::Reading(Instant::now());
         self.worker.send(request);
     }
@@ -767,6 +775,7 @@ impl App {
                 self.reply.truncate(self.reply.trim_end().len());
                 self.commit(true);
                 self.doing = None;
+                self.unheeded = false;
                 self.status = Status::Idle;
                 // What the user wrote while the model worked is the next
                 // message, which the model was stopped for.
@@ -905,6 +914,14 @@ impl App {
 
     /// Shows something that happened in the turn.
     fn event(&mut self, event: Event) {
+        // The model has answered the message once a call of plan goes
+        // through, even with the steps unchanged, which reports no plan.
+        if let Event::Output(output) = &event
+            && self.call == "plan"
+            && !output.starts_with("error:")
+        {
+            self.unheeded = false;
+        }
         if let Some(notice) = event.notice() {
             self.finish();
             if event == Event::Compacting {
@@ -1169,6 +1186,7 @@ impl App {
                 &self.plan,
                 self.doing.as_deref().filter(|_| working),
                 working,
+                self.unheeded || self.redirect.is_some(),
                 columns,
             ));
             live.push(Line::new());

@@ -190,7 +190,7 @@ fn instructions() -> String {
 - A `<system-reminder>` block at the end of a tool's result is from the harness, not the tool: read it and follow it.
 - For any request that changes something, call plan first: before reading more than a file or two, lay out the steps as you see them now, starting with what you need to find out, such as `find where fetch() retries`. The user watches the plan to see where you are headed, and a plan that is roughly right now is worth more to them than one that is exact later. Call plan again when what you learn changes the steps to come. Then take the steps in order, and call done as each is finished, which tells you the next. Only a question needs no plan.
 - Don't stop to ask the user to choose. Where the request leaves a choice open, make the choice a careful engineer would, give it in the plan's `assumes`, such as a default, a limit, or which cases you cover, and go on: the user says if they want otherwise.
-- When a message from the user comes while the plan has steps left, the plan as it stands follows the message. If the message changes the work, call plan with the steps to come as they now should be, and go on from there; if it only asks something, answer it and leave the plan as it is.
+- When a message from the user comes while the plan has steps left, the plan as it stands follows the message. If the work goes on, call plan first, with the steps to come as they now should be, the same ones if the message changes none, and go on from there; if it only asks something, answer it and leave the plan as it is.
 - Keep going until the request is done, then reply in a few sentences with what you found or did.
 
 For example, for "review commit abc123", run `git show abc123` and point out bugs and risks in the change; for "what files are here?", run `ls`; for "what time is it?", run `date`."#,
@@ -793,7 +793,7 @@ impl<S: Session> Harness<S> {
         let plan = self.tools.plan();
         (!plan.is_empty()).then(|| {
             format!(
-                "<system-reminder>The plan of the work has steps left. As it stands:\n\n{}\n\nDo what the message above asks. If it changes the work, call plan with the steps to come as they now should be, and go on from there. If it asks for the work to go on, go on with the step under way. If it asks something else, such as a question, answer that and leave the plan as it is.</system-reminder>",
+                "<system-reminder>The plan of the work has steps left. As it stands:\n\n{}\n\nDo what the message above asks. If the work goes on, call plan first, before any other tool, with the steps to come as they now should be: the same steps if the message changes none of them. Until you do, the user is shown the plan as from before their message. If the message only asks something, such as a question, answer that and leave the plan as it is.</system-reminder>",
                 plan.brief()
             )
         })

@@ -30,7 +30,7 @@ pub const TOOL: Tool = Tool {
 
 fn signature() -> Signature {
     Signature {
-        description: "Lay out the plan of the work, which the user watches while you work: the steps you will take, in order. The first is under way at once; call done as each is finished, and you are told the next. Call plan again only to change the steps that are not done yet, which the steps given replace; the ones done are kept.".to_string(),
+        description: "Lay out the plan of the work, which the user watches while you work: the steps you will take, in order. The first is under way at once; call done as each is finished, and you are told the next. Call plan again to change the steps that are not done yet, which the steps given replace, or to confirm them after a message from the user; the ones done are kept, and so is where a step given again was.".to_string(),
         parameters: vec![
             Parameter::string(
                 "steps",
