@@ -410,7 +410,7 @@ mod tests {
             refused("/")
         );
         // A symbolic link out of it leads outside too.
-        std::os::unix::fs::symlink(&dir, src.join("up")).unwrap();
+        crate::sys::fs::symlink(&dir, &src.join("up")).unwrap();
         assert_eq!(
             run_in(&src, &json!({ "pattern": "*.rs", "path": "up" })),
             refused("up")

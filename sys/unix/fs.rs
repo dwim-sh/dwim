@@ -24,3 +24,8 @@ pub fn create_private(path: &Path) -> io::Result<File> {
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
+
+/// Makes `path` a symbolic link to `target`, which need not be there.
+pub fn symlink(target: &Path, path: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, path)
+}
