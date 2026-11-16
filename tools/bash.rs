@@ -107,6 +107,19 @@ fn run(tools: &mut Tools, arguments: &Value) -> Result<String, String> {
     tools.bash.run(&tools.dir, arguments)
 }
 
+/// The command a call of `tool` runs, if the tool is this one.
+pub fn command<'a>(tool: &Tool, arguments: &'a Value) -> Option<&'a str> {
+    (tool.name == NAME)
+        .then(|| string(arguments, "command"))
+        .flatten()
+}
+
+/// Whether the command whose result is `text` ran to the end and
+/// succeeded: its last line says it exited with zero.
+pub fn succeeded(text: &str) -> bool {
+    text.ends_with("[exit code 0]")
+}
+
 /// Seconds a command may run unless the call says otherwise: long enough
 /// for a build or a test run, short enough that a command that hangs, or
 /// a server that was never going to end, does not hold the session long.
