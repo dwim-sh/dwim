@@ -1,4 +1,4 @@
-//! Processes other than this one.
+//! Child processes: sessions, process groups, and signals.
 
 use std::{
     io,
@@ -6,11 +6,11 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-/// Has `command` run in a session of its own, which is a process group of
-/// its own with the command's ID, and has no controlling terminal.
+/// Makes `command` call `setsid(2)` before exec, so the child leads a new
+/// session and process group and has no controlling terminal.
 pub fn own_session(command: &mut Command) {
-    // SAFETY: setsid is safe to call between fork and exec, and the
-    // closure does nothing else there but read errno.
+    // SAFETY: setsid is async-signal-safe, and the closure does nothing
+    // else between fork and exec but read errno.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -21,34 +21,35 @@ pub fn own_session(command: &mut Command) {
     }
 }
 
-/// Has `command` run in a process group of its own with the command's ID,
-/// which keeps a signal sent to this process's group from reaching it.
+/// Makes `command` run in a new process group led by the child, so signals
+/// sent to this process's group, such as Ctrl-C, do not reach it.
 pub fn own_group(command: &mut Command) {
     command.process_group(0);
 }
 
-/// Kills every process in the process group `pid` leads, at once.
+/// Sends `SIGKILL` to the process group led by `pid`.
 pub fn kill_group(pid: u32) {
     // SAFETY: kill only sends a signal; a negative ID names a group.
     unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
-/// Whether a process with `pid` is running. Signal 0 checks without
-/// sending anything, and is refused for another user's process, which is
-/// running all the same.
+/// Returns whether a process with `pid` exists, including a zombie that
+/// has not been reaped.
+///
+/// Probes with `kill(pid, 0)`, treating `EPERM` (another user's process)
+/// as alive.
 pub fn alive(pid: u32) -> bool {
-    // SAFETY: a signal of 0 sends nothing, and only asks whether the
-    // process is there.
+    // SAFETY: signal 0 sends nothing; it only checks that `pid` exists.
     let refused = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
     !refused || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// The signal that killed the process `status` is of, if one did.
+/// Returns the signal that terminated the process, if any.
 pub fn signal(status: ExitStatus) -> Option<i32> {
     status.signal()
 }
 
-/// The name of `signal`, for the ones a command is likely to be killed by.
+/// Returns the name of `signal`, for common termination signals.
 pub fn signal_name(signal: i32) -> Option<&'static str> {
     Some(match signal {
         libc::SIGHUP => "SIGHUP",

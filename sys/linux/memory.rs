@@ -1,26 +1,25 @@
-//! The host's memory, as Linux counts it in `/proc/meminfo`: what there is,
-//! and what it can give without swapping.
+//! Physical memory on Linux, read from `/proc/meminfo`.
 
 use std::{error::Error, fs};
 
-/// Whether the host has the memory to run the model, which is not known
-/// here before the device is open: the weights go in the GPU's memory, and
-/// the device refuses a model that does not fit.
+/// Always succeeds. The weights are loaded into GPU memory, so whether the
+/// model fits is only known once the device is open, which rejects it if
+/// it does not.
 pub fn check() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Bytes of memory the host has in all.
+/// Returns total physical memory in bytes (`MemTotal`).
 pub fn total() -> Option<u64> {
     meminfo("MemTotal")
 }
 
-/// Bytes of memory the host can give without swapping.
+/// Returns memory available without swapping, in bytes (`MemAvailable`).
 pub fn available() -> Option<u64> {
     meminfo("MemAvailable")
 }
 
-/// A field of `/proc/meminfo`, in bytes.
+/// Returns `field` of `/proc/meminfo` in bytes.
 fn meminfo(field: &str) -> Option<u64> {
     let info = fs::read_to_string("/proc/meminfo").ok()?;
     let line = info

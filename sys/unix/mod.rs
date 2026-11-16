@@ -1,5 +1,4 @@
-//! What dwim asks of Unix, which is the same on every system it is built
-//! for.
+//! Interfaces common to all supported Unix systems.
 
 pub mod dirs;
 pub mod fs;
