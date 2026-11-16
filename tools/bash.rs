@@ -32,9 +32,8 @@
 use std::{
     collections::VecDeque,
     env,
-    fs::{self, DirBuilder, File},
+    fs::{self, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -438,10 +437,7 @@ impl Stream {
     /// stream was `before` bytes long before `bytes`.
     fn keep(&mut self, before: u64, bytes: &[u8]) -> io::Result<()> {
         if self.file.is_none() {
-            DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(&self.dir)?;
+            sys::fs::create_private_dir(&self.dir)?;
             let mut file = File::create(&self.path)?;
             let kept = self.head.len().min(self.retain as usize);
             file.write_all(&self.head[..kept])?;

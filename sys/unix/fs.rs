@@ -1,10 +1,10 @@
-//! Files, where what is asked of them is more than `std::fs` has for
-//! every system.
+//! Files and directories, where what is asked of them is more than
+//! `std::fs` has for every system.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{DirBuilder, File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::Path,
 };
 
@@ -17,4 +17,10 @@ pub fn create_private(path: &Path) -> io::Result<File> {
         .truncate(true)
         .mode(0o600)
         .open(path)
+}
+
+/// Creates the directory at `path`, and any of its parents that are not
+/// there, readable by the user alone.
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
