@@ -1,4 +1,4 @@
-//! The user's web browser.
+//! Opening URLs in the default web browser.
 
 use std::{
     io,
@@ -6,7 +6,9 @@ use std::{
     thread,
 };
 
-/// Opens `url` in the user's browser.
+/// Opens `url` in the default web browser with `open`.
+///
+/// Returns once `open` is spawned; it is reaped on a background thread.
 pub fn open(url: &str) -> io::Result<()> {
     let mut child = Command::new("open")
         .arg(url)

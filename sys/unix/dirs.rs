@@ -1,33 +1,34 @@
-//! The user's directories, where each system keeps them.
+//! Per-user directories, following each platform's conventions.
 
 use std::path::PathBuf;
 
-/// The user's home directory.
+/// Returns the user's home directory.
 pub fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// The directory for what the user has set a program up with
-/// (`~/.config`, or on macOS `~/Library/Application Support`).
+/// Returns the user configuration directory: `$XDG_CONFIG_HOME` or
+/// `~/.config` on Linux, `~/Library/Application Support` on macOS.
 pub fn config() -> Option<PathBuf> {
     dirs::config_dir()
 }
 
-/// The directory for files that can be made again (`~/.cache`, or on
-/// macOS `~/Library/Caches`).
+/// Returns the user cache directory: `$XDG_CACHE_HOME` or `~/.cache` on
+/// Linux, `~/Library/Caches` on macOS.
 pub fn cache() -> Option<PathBuf> {
     dirs::cache_dir()
 }
 
-/// The directory for what a program keeps from one run to the next that
-/// is not the user's to edit, such as logs (`~/.local/state`, or on macOS,
-/// where there is none, `~/Library/Application Support`).
+/// Returns the user state directory, for data such as logs that persists
+/// across runs but is not meant to be edited: `$XDG_STATE_HOME` or
+/// `~/.local/state` on Linux. macOS has no equivalent, so this falls back
+/// to `~/Library/Application Support`.
 pub fn state() -> Option<PathBuf> {
     dirs::state_dir().or_else(dirs::data_local_dir)
 }
 
-/// The directory for sockets and the like that last as long as the user is
-/// logged in (`$XDG_RUNTIME_DIR`), where there is one: macOS has none.
+/// Returns `$XDG_RUNTIME_DIR`, for sockets and other files that live as
+/// long as the login session. `None` if it is unset, and always on macOS.
 pub fn runtime() -> Option<PathBuf> {
     dirs::runtime_dir()
 }

@@ -1,24 +1,30 @@
-//! Files mapped into memory.
+//! Read-only memory-mapped files.
 
 use std::{fs::File, io, ops::Deref, os::unix::io::AsRawFd, ptr, slice};
 
-/// The first `len` bytes of a file, mapped into memory to read: its pages
-/// come from the page cache as they are touched. Unmapped when dropped.
+/// A read-only private mapping of the first `len` bytes of a file.
+///
+/// Pages are faulted in from the page cache on access. The mapping is
+/// removed on drop.
 pub struct Map {
     ptr: *const u8,
     len: usize,
 }
 
-// The mapping is read-only and shared freely.
+// SAFETY: the mapping is read-only, so it can be sent and shared across
+// threads.
 unsafe impl Send for Map {}
 unsafe impl Sync for Map {}
 
 impl Map {
     /// Maps the first `len` bytes of `file`, which must be open for
-    /// reading and at least that long.
+    /// reading.
+    ///
+    /// The file must be at least `len` bytes long: touching a page past its
+    /// end raises `SIGBUS`. Fails if `len` is zero.
     pub fn new(file: &File, len: usize) -> io::Result<Self> {
-        // SAFETY: a new mapping, wherever the kernel puts it, of a file
-        // descriptor that is open for the length of the call.
+        // SAFETY: a null address lets the kernel choose one, so no existing
+        // mapping is replaced; the descriptor is open for the call.
         let map = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -43,16 +49,15 @@ impl Deref for Map {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        // SAFETY: the mapping is `len` bytes, readable, and there until
-        // this is dropped.
+        // SAFETY: the mapping is `len` readable bytes and lives until drop.
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 impl Drop for Map {
     fn drop(&mut self) {
-        // SAFETY: the mapping is this one's own, and nothing borrows
-        // from it once it is dropped.
+        // SAFETY: the mapping is owned by `self`, and no borrows of it
+        // outlive `self`.
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }

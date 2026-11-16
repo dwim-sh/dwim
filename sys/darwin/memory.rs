@@ -1,5 +1,6 @@
-//! The host's memory, as macOS counts it in its sysctls: what there is,
-//! and what it can give without swapping. The GPU shares it with the CPU.
+//! Physical memory on macOS, queried with `sysctlbyname(3)`.
+//!
+//! Memory is unified: the GPU allocates from the same pool as the CPU.
 
 use std::{
     error::Error,
@@ -7,12 +8,14 @@ use std::{
     ptr,
 };
 
-/// Memory a Mac needs to run the model: its CPU and GPU share it, and the
-/// weights alone take 16 GB of it.
+/// Minimum physical memory to run the model. The weights alone take 16 GiB
+/// of the unified memory.
 const MIN: u64 = 32 << 30;
 
-/// Refuses a Mac with too little memory to run the model, which is worth
-/// finding out before any weights are downloaded.
+/// Returns an error if the machine has less than 32 GiB of memory.
+///
+/// Cheap enough to call before downloading the weights, so an undersized
+/// machine fails early.
 pub fn check() -> Result<(), Box<dyn Error>> {
     let memory = total().ok_or("cannot determine the memory size")?;
     if memory < MIN {
@@ -26,25 +29,27 @@ pub fn check() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Bytes of memory the host has in all.
+/// Returns total physical memory in bytes (`hw.memsize`).
 pub fn total() -> Option<u64> {
     sysctl(c"hw.memsize")
 }
 
-/// Bytes of memory the host can give without swapping: the share of its
-/// memory the kernel counts as available, as `memory_pressure` reports it.
+/// Returns memory available without swapping, in bytes.
+///
+/// Derived from `kern.memorystatus_level`, the percentage of memory the
+/// kernel considers available, as reported by `memory_pressure(1)`.
 pub fn available() -> Option<u64> {
     let percent: u32 = sysctl(c"kern.memorystatus_level")?;
     Some(total()? / 100 * u64::from(percent.min(100)))
 }
 
-/// The value of the sysctl `name`, an integer of type `T`.
+/// Reads the integer sysctl `name`. Returns `None` if it does not exist or
+/// is not the size of `T`.
 fn sysctl<T: Sysctl>(name: &CStr) -> Option<T> {
     let mut value = T::default();
     let mut len = size_of::<T>();
-    // SAFETY: `value` is a plain integer of `len` bytes, and the kernel
-    // writes at most `len` bytes into it, setting `len` to what it wrote;
-    // `name` is NUL-terminated and outlives the call.
+    // SAFETY: `value` is `len` bytes and the kernel writes at most `len`
+    // bytes to it; `name` is NUL-terminated and outlives the call.
     let status = unsafe {
         sysctlbyname(
             name.as_ptr(),
@@ -57,8 +62,10 @@ fn sysctl<T: Sysctl>(name: &CStr) -> Option<T> {
     (status == 0 && len == size_of::<T>()).then_some(value)
 }
 
-/// An integer a sysctl's value is read as: a type every bit pattern of is
-/// a value, so that whatever the kernel writes into it is one.
+/// Integer types a sysctl value can be read into.
+///
+/// Every bit pattern must be a valid value, since the kernel writes raw
+/// bytes into it.
 trait Sysctl: Default {}
 impl Sysctl for u32 {}
 impl Sysctl for u64 {}
