@@ -82,7 +82,7 @@ pub struct Loaded {
 /// the model can run neither here nor at OpenRouter without a key: the
 /// shell starts without a model then, for `/provider` to sign in.
 pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
-    let key = openrouter::key().is_some();
+    let key = openrouter::has_key();
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
             "{} does not run on this machine: it runs with --provider openrouter",
@@ -120,9 +120,7 @@ pub fn providers() -> Vec<Group> {
         Group {
             provider: Kind::OpenRouter,
             models: vec![Variant::Medium, Variant::Large],
-            unavailable: openrouter::key()
-                .is_none()
-                .then(|| "/provider signs in".to_string()),
+            unavailable: (!openrouter::has_key()).then(|| "/provider signs in".to_string()),
         },
     ]
 }
@@ -143,12 +141,12 @@ pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
         Choice {
             provider: Kind::OpenRouter,
             name: "OpenRouter",
-            note: match openrouter::key() {
-                Some(_) if current == Some(Kind::OpenRouter) => {
+            note: match openrouter::has_key() {
+                true if current == Some(Kind::OpenRouter) => {
                     "signed in · pick to sign in again".to_string()
                 }
-                Some(_) => "signed in".to_string(),
-                None => "sign in with your browser to get a key".to_string(),
+                true => "signed in".to_string(),
+                false => "sign in with your browser to get a key".to_string(),
             },
             unavailable: None,
         },

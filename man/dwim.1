@@ -358,8 +358,22 @@ on every system.
 .I ~/.config/dwim/openrouter.key
 The key to OpenRouter kept from signing in with
 .BR /provider ,
-readable by the user alone. Remove the file to sign out. On macOS it is in
-.IR "~/Library/Application Support/dwim/" .
+readable by the user alone, which keeps other users from it and nothing
+the user runs. Remove the file to sign out. On macOS the key is kept in
+the login keychain instead, as the account
+.B openrouter
+of the service
+.BR dwim :
+the keychain gives it to
+.B dwim
+alone, and asks the user before giving it to anything else, or to a
+.B dwim
+built anew that is not signed by a developer.
+.B security delete\-generic\-password \-s dwim \-a openrouter
+signs out. Where the keychain cannot be used, as over SSH, the key is
+kept in
+.IR "~/Library/Application Support/dwim/openrouter.key" ,
+and moved to the keychain by the first run that can.
 .TP
 .I ~/.cache/dwim/states/
 The model's state after the system prompt, saved when a prompt is first
@@ -448,6 +462,12 @@ that is no longer running are removed by the next one to start.
 The key to OpenRouter, for a model that runs there, used instead of the
 one kept from signing in with
 .BR /provider .
+.B dwim
+takes it out of its environment as it starts, so the commands the model
+runs are not given it, but any program of the user's can still read it
+from the environment
+.B dwim
+was started with: signing in keeps a key better.
 .TP
 .B HF_HUB_CACHE
 Where the Hugging Face cache is, instead of

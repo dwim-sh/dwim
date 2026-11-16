@@ -24,11 +24,11 @@
 //! what the provider said the last request took, with an estimate of what
 //! was added since.
 
+mod key;
 pub mod login;
 mod stream;
 
 use std::{
-    env,
     io::BufReader,
     ops::ControlFlow,
     thread,
@@ -46,11 +46,8 @@ use crate::{
     tools::ToolCall,
 };
 
+pub use key::{KEY, Secret, from_environment, has_key, keep, key, take_from_environment};
 use stream::{Outcome, Usage};
-
-/// The environment variable the key to OpenRouter is read from, ahead of
-/// the key kept from a sign-in.
-pub const KEY: &str = "OPENROUTER_API_KEY";
 
 /// Where a chat is completed.
 const URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -82,7 +79,8 @@ pub struct OpenRouter {
     agent: Agent,
     /// Where a chat is completed: [`URL`].
     url: String,
-    key: String,
+    /// What a request is authorized with: the key, as its header has it.
+    authorization: Secret,
     variant: Variant,
     capacity: usize,
     sampling: Sampling,
@@ -108,7 +106,7 @@ impl OpenRouter {
         Ok(Self {
             agent,
             url: URL.to_string(),
-            key,
+            authorization: authorization(&key),
             variant,
             capacity: context.unwrap_or(CONTEXT),
             sampling: Sampling {
@@ -262,7 +260,7 @@ impl OpenRouter {
             let sent = self
                 .agent
                 .post(&self.url)
-                .header("Authorization", &format!("Bearer {}", self.key))
+                .header("Authorization", self.authorization.expose())
                 .header("Content-Type", "application/json")
                 .header("X-Title", "dwim")
                 .send(body);
@@ -454,13 +452,14 @@ pub fn model(variant: Variant) -> &'static str {
     }
 }
 
-/// The key to OpenRouter, if there is one: the environment's, or else the
-/// one kept from a sign-in.
-pub fn key() -> Option<String> {
-    env::var(KEY)
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(login::saved)
+/// What a request is authorized with by `key`, written once, into room
+/// made for it, so that no copy of the key is left behind.
+fn authorization(key: &Secret) -> Secret {
+    const BEARER: &str = "Bearer ";
+    let mut header = String::with_capacity(BEARER.len() + key.expose().len());
+    header.push_str(BEARER);
+    header.push_str(key.expose());
+    Secret::new(header)
 }
 
 /// Tokens a turn's framing takes, about: the tags around it, and its role.
@@ -661,7 +660,7 @@ mod tests {
                 .build()
                 .new_agent(),
             url,
-            key: "key".to_string(),
+            authorization: authorization(&Secret::new("key".to_string())),
             variant: Variant::Large,
             capacity: CONTEXT,
             sampling: Sampling {

@@ -28,9 +28,9 @@ use dwim::harness::{self, Event, Log};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{
     Kind,
-    openrouter::{self, login::Login},
+    openrouter::{self, Secret, login::Login},
 };
-use dwim::sys::browser;
+use dwim::sys::{browser, secrets::Place};
 use dwim::tools::plan::Plan;
 
 use crate::{
@@ -104,11 +104,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     };
     if provider.is_none() {
         let (columns, _) = app.screen.size();
-        let lines = view::nowhere(
-            &session::nowhere(variant),
-            openrouter::key().is_some(),
-            columns,
-        );
+        let lines = view::nowhere(&session::nowhere(variant), openrouter::has_key(), columns);
         app.say(&lines);
     }
     let result = app.run();
@@ -141,7 +137,7 @@ struct Signin {
     cancelled: Arc<AtomicBool>,
     /// The key, once the user has agreed in the browser, or why there is
     /// none.
-    key: Receiver<Result<Option<String>, String>>,
+    key: Receiver<Result<Option<Secret>, String>>,
 }
 
 impl Signin {
@@ -499,8 +495,7 @@ impl App {
                 self.providers = None;
                 match picked {
                     Some(Kind::OpenRouter)
-                        if openrouter::key().is_none()
-                            || self.provider == Some(Kind::OpenRouter) =>
+                        if !openrouter::has_key() || self.provider == Some(Kind::OpenRouter) =>
                     {
                         self.sign_in()
                     }
@@ -576,17 +571,20 @@ impl App {
         };
         self.signin = None;
         match key.and_then(|key| match key {
-            Some(key) => openrouter::login::save(&key)
+            Some(key) => openrouter::keep(key)
                 .map(Some)
                 .map_err(|e| format!("cannot keep the key: {e}")),
             None => Ok(None),
         }) {
-            Ok(Some(path)) => {
+            Ok(Some(place)) => {
+                let place = match place {
+                    Place::Keychain => "your keychain".to_string(),
+                    Place::File(path) => view::tilde(&path),
+                };
                 self.say(&view::notice(format!(
-                    "Signed in to OpenRouter · key kept in {}",
-                    view::tilde(&path)
+                    "Signed in to OpenRouter · key kept in {place}"
                 )));
-                if env::var(openrouter::KEY).is_ok_and(|key| !key.trim().is_empty()) {
+                if openrouter::from_environment() {
                     self.say(&view::notice(format!(
                         "{} is set, and is used ahead of the key kept: unset it to use this one",
                         openrouter::KEY
@@ -721,7 +719,7 @@ impl App {
         if !self.ready {
             self.say(&view::notice(match self.provider {
                 Some(_) => "The model is still loading · /model picks another".to_string(),
-                None => view::no_provider(openrouter::key().is_some()),
+                None => view::no_provider(openrouter::has_key()),
             }));
             return;
         }
@@ -1123,7 +1121,7 @@ impl App {
     fn model_listing(&self) -> Vec<Line> {
         let (columns, _) = self.screen.size();
         match self.provider {
-            None => view::notice(view::no_provider(openrouter::key().is_some())),
+            None => view::notice(view::no_provider(openrouter::has_key())),
             Some(Kind::OpenRouter) => view::hosted_listing(self.variant, self.context, columns),
             Some(Kind::Local) => view::model_listing(
                 &self.model,
@@ -1297,11 +1295,7 @@ impl App {
             return match self.provider {
                 None => Some(vec![
                     span("● No model yet"),
-                    span(format!(
-                        " · {}",
-                        view::connect_hint(openrouter::key().is_some())
-                    ))
-                    .dark_grey(),
+                    span(format!(" · {}", view::connect_hint(openrouter::has_key()))).dark_grey(),
                 ]),
                 Some(Kind::Local) => Some(vec![
                     span(format!("● Local model is {doing}")),
