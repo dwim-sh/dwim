@@ -13,7 +13,7 @@
 
 use std::{
     fmt::Display,
-    fs::{self, File},
+    fs::File,
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
@@ -63,11 +63,12 @@ struct Pending {
 }
 
 impl Log {
-    /// A transcript written to `path`, readable by the user alone, with the
-    /// directories it goes in made if they aren't there.
+    /// A transcript written to `path`, with the directories it goes in made
+    /// if they aren't there: the file and its directories are readable by
+    /// the user alone.
     pub fn create(path: &Path) -> io::Result<Self> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+            sys::fs::create_private_dir(dir)?;
         }
         Ok(Self {
             file: Some(sys::fs::create_private(path)?),
@@ -375,7 +376,7 @@ fn round(seconds: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, mem};
+    use std::{env, fs, mem};
 
     use super::*;
 

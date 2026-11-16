@@ -3,7 +3,7 @@
 
 use std::{
     env,
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     path::PathBuf,
     process::{Command, Stdio},
     thread,
@@ -204,7 +204,7 @@ fn spawn(options: &Options) -> Result<()> {
     let log = match log_path() {
         Some(path) => {
             if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
+                let _ = sys::fs::create_private_dir(dir);
             }
             OpenOptions::new()
                 .append(true)

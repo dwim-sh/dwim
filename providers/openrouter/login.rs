@@ -166,11 +166,12 @@ impl Login {
 }
 
 /// Keeps `key` for the runs to come, readable by the user alone, and
-/// returns the file it is in.
+/// returns the file it is in. Its directory is the user's alone too, so
+/// that no one else can see the key's name or replace the file.
 pub fn save(key: &str) -> Result<PathBuf> {
     let path = path().ok_or("there is no directory to keep the key in")?;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        sys::fs::create_private_dir(dir)?;
     }
     let mut file = sys::fs::create_private(&path)?;
     writeln!(file, "{key}")?;
