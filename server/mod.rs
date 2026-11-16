@@ -38,7 +38,6 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     ops::ControlFlow,
-    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process,
     rc::Rc,
@@ -51,11 +50,14 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use crate::server::protocol::{Opened, Piece, Request, Response, Status, Welcome};
-use crate::sys;
 use crate::{
     inference::{LanguageModel, Local, Sampler},
     model::{Chat, Chunk, Format, Generation, Session, Size, State, Turn},
+    server::protocol::{Opened, Piece, Request, Response, Status, Welcome},
+    sys::{
+        self,
+        net::{Listener, Stream},
+    },
 };
 
 /// How long the server goes without a session before it exits, by
@@ -102,7 +104,7 @@ pub struct Hello {
 /// and whether the reply being generated for it is to end early.
 #[derive(Clone)]
 struct Peer {
-    writer: Arc<Mutex<UnixStream>>,
+    writer: Arc<Mutex<Stream>>,
     interrupted: Arc<AtomicBool>,
 }
 
@@ -166,17 +168,17 @@ impl Server {
     /// [`Server::run`] serving them once it is. Fails if another server
     /// has the socket; a socket left by a server that is gone is replaced.
     pub fn bind(path: &Path, hello: Hello) -> io::Result<Self> {
-        let listener = match UnixListener::bind(path) {
+        let listener = match Listener::bind(path) {
             Ok(listener) => listener,
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                if UnixStream::connect(path).is_ok() {
+                if Stream::connect(path).is_ok() {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         format!("another dwim server is listening on {}", path.display()),
                     ));
                 }
                 fs::remove_file(path)?;
-                UnixListener::bind(path)?
+                Listener::bind(path)?
             }
             Err(e) => return Err(e),
         };
@@ -373,7 +375,7 @@ impl Inner {
 }
 
 /// Takes connections as they come, and reads each on a thread of its own.
-fn accept(listener: &UnixListener, inner: &Arc<Inner>, inbox: &Sender<(usize, Message)>) {
+fn accept(listener: &Listener, inner: &Arc<Inner>, inbox: &Sender<(usize, Message)>) {
     for (id, stream) in listener.incoming().enumerate() {
         let Ok(stream) = stream else {
             continue;
@@ -401,13 +403,7 @@ fn accept(listener: &UnixListener, inner: &Arc<Inner>, inbox: &Sender<(usize, Me
 /// Reads a connection's requests until it closes: answers the ones that
 /// need no model, and passes the rest to the model's thread, telling the
 /// client when they must wait for another session's.
-fn read(
-    id: usize,
-    stream: UnixStream,
-    peer: &Peer,
-    inner: &Inner,
-    inbox: &Sender<(usize, Message)>,
-) {
+fn read(id: usize, stream: Stream, peer: &Peer, inner: &Inner, inbox: &Sender<(usize, Message)>) {
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else {
             break;

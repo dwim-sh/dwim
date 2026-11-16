@@ -4,7 +4,6 @@
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::symlink,
     path::Path,
     thread,
     time::Duration,
@@ -16,6 +15,7 @@ use crate::{
         qwen35::{self, File},
     },
     model::hub,
+    sys,
 };
 
 /// How long a partial download can go without being written to before it is
@@ -62,7 +62,7 @@ pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
         if fs::symlink_metadata(&path).is_ok() {
             fs::remove_file(&path)?;
         }
-        symlink(hub::blob_link(file.digest), &path)?;
+        sys::fs::symlink(&hub::blob_link(file.digest), &path)?;
     }
     Ok(())
 }

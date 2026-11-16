@@ -32,9 +32,8 @@
 use std::{
     collections::VecDeque,
     env,
-    fs::{self, DirBuilder, File},
+    fs::{self, File},
     io::{self, ErrorKind, Read, Write},
-    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -438,10 +437,7 @@ impl Stream {
     /// stream was `before` bytes long before `bytes`.
     fn keep(&mut self, before: u64, bytes: &[u8]) -> io::Result<()> {
         if self.file.is_none() {
-            DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(&self.dir)?;
+            sys::fs::create_private_dir(&self.dir)?;
             let mut file = File::create(&self.path)?;
             let kept = self.head.len().min(self.retain as usize);
             file.write_all(&self.head[..kept])?;
@@ -611,7 +607,7 @@ fn report(stdout: &Stream, stderr: &Stream, status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
+    use std::{sync::mpsc, time::Duration};
 
     use super::*;
     use crate::tools::ToolCall;
@@ -656,7 +652,7 @@ mod tests {
     fn runs_through_the_shell_set() {
         let script = env::temp_dir().join(format!("dwim-shell-{}", process::id()));
         fs::write(&script, "#!/bin/sh\necho via; exec sh \"$@\"\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        sys::fs::make_executable(&script).unwrap();
         let mut bash = Bash::default();
         bash.set_shell(script.clone());
         assert_eq!(sh("echo hi", &mut bash), "via\nhi\n[exit code 0]");

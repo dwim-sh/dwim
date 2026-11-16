@@ -6,7 +6,6 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
     ops::ControlFlow,
-    os::unix::net::UnixStream,
     path::Path,
 };
 
@@ -17,18 +16,19 @@ use crate::{
         build,
         protocol::{Opened, Piece, Request, Response, Status, Welcome},
     },
+    sys::net::Stream,
 };
 
 /// A connection to the server, before a session is opened on it.
 pub struct Connection {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
 }
 
 impl Connection {
     /// Connects to the server listening at `path`.
     pub fn connect(path: &Path) -> io::Result<Self> {
-        let writer = UnixStream::connect(path)?;
+        let writer = Stream::connect(path)?;
         let reader = BufReader::new(writer.try_clone()?);
         Ok(Self { reader, writer })
     }

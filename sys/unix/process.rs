@@ -21,6 +21,12 @@ pub fn own_session(command: &mut Command) {
     }
 }
 
+/// Has `command` run in a process group of its own with the command's ID,
+/// which keeps a signal sent to this process's group from reaching it.
+pub fn own_group(command: &mut Command) {
+    command.process_group(0);
+}
+
 /// Kills every process in the process group `pid` leads, at once.
 pub fn kill_group(pid: u32) {
     // SAFETY: kill only sends a signal; a negative ID names a group.
@@ -98,6 +104,25 @@ mod tests {
         out.read_to_string(&mut line).unwrap();
         child.wait().unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_child_in_its_own_group_leaves_this_ones() {
+        let mut command = Command::new("sleep");
+        command.arg("60");
+        own_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        // SAFETY: getpgid only reads what the kernel records of a process,
+        // and 0 names this one.
+        let (group, ours) = unsafe { (libc::getpgid(child.id() as libc::pid_t), libc::getpgid(0)) };
+        assert_eq!(
+            group,
+            child.id() as libc::pid_t,
+            "the child leads its group"
+        );
+        assert_ne!(group, ours, "a signal to this group does not reach it");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
