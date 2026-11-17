@@ -52,6 +52,23 @@ served by mistake. What the server reports goes to
 `~/.local/state/dwim/server.log` (`~/Library/Application Support/dwim/` on
 macOS).
 
+## Architecture
+
+![The modules of dwim and what each imports](.github/assets/architecture.svg)
+
+dwim has two sides that meet in `model`. The agent side is `harness`, the
+`tools` it calls, and the `providers` it asks for a reply. The engine side is
+`server`, `inference`, and `gpu`. Neither side imports the other: a provider
+reaches the dwim server over a Unix socket, so the agent builds and runs
+without the transformer or a GPU. `model` is what both sides know of the
+model (the chat format, the tokenizer, its size), `sys` is what is asked of
+the operating system, and `cli` puts it all together.
+
+Every arrow points down, and a new import should too. A module does not
+import one above it or beside it, and `model` imports nothing but `sys`.
+Tests are the exception: the harness tests run the agent loop against a
+scripted model from `inference`.
+
 ## Verifying a change
 
 ```
