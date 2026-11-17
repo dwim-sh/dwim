@@ -15,9 +15,11 @@ pub struct Opts {
     #[argh(option, default = "Variant::Medium")]
     pub model: Variant,
 
-    /// where the model runs: local, on this machine, or openrouter, with
-    /// the key in OPENROUTER_API_KEY (default: local where the model runs
-    /// here, and openrouter where it does not and there is a key)
+    /// where the model runs: local, on this machine, openrouter, with the
+    /// key in OPENROUTER_API_KEY, or vercel, Vercel's AI Gateway, with the
+    /// key in AI_GATEWAY_API_KEY (default: local where the model runs
+    /// here, and openrouter or vercel where it does not and there is a
+    /// key)
     #[argh(option)]
     pub provider: Option<Kind>,
 

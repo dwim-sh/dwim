@@ -28,8 +28,10 @@ program. One package: `lib.rs` is the library, `cli/` and
   asked with the whole conversation each time, as a chat API is, and
   `conversation` the `Session` the harness holds on one. A directory
   each: `dwim` is the dwim server over its Unix socket (`remote`), and
-  reaching or starting that server (`launch`); `openrouter` is a model
-  at OpenRouter over its chat completions API
+  reaching or starting that server (`launch`); `hosted` is a model at a
+  host over its chat completions API, and `openrouter` and `vercel`
+  (Vercel's AI Gateway) the hosts: where each is asked, what it is asked
+  in its own way, and the key to it
 - `server/` - the process that has the model, and the `protocol` it is
   asked in: a request carries the whole conversation, and the server
   reads only what it has not read of it

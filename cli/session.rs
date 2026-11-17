@@ -16,7 +16,7 @@ use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
     Any, Conversation, Kind,
     dwim::{self as server},
-    openrouter::{self, OpenRouter},
+    openrouter, vercel,
 };
 use dwim::sys::memory;
 
@@ -76,40 +76,49 @@ pub struct Loaded {
 }
 
 /// Where `model` runs: at `provider` if the command line named one, and
-/// otherwise on this machine if it can, or at OpenRouter if there is a key
-/// to it. The large model takes more memory than a machine has, and runs
-/// only at a provider. Nowhere, if the command line named no provider and
-/// the model can run neither here nor at OpenRouter without a key: the
-/// shell starts without a model then, for `/provider` to sign in.
+/// otherwise on this machine if it can, or at a host there is a key to:
+/// OpenRouter, or else Vercel's AI Gateway. The large model takes more
+/// memory than a machine has, and runs only at a host. Nowhere, if the
+/// command line named no provider and the model can run neither here nor
+/// at a host without a key: the shell starts without a model then, for
+/// `/provider` to sign in.
 pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
-    let key = openrouter::key().is_some();
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
-            "{} does not run on this machine: it runs with --provider openrouter",
+            "{} does not run on this machine: it runs with --provider openrouter, or vercel",
             Variant::Large
         )
         .into()),
         (Some(kind), _) => Ok(Some(kind)),
-        (None, Variant::Large) if key => Ok(Some(Kind::OpenRouter)),
-        (None, Variant::Large) => Ok(None),
         (None, Variant::Medium) if memory::check().is_ok() => Ok(Some(Kind::Local)),
-        (None, Variant::Medium) if key => Ok(Some(Kind::OpenRouter)),
-        (None, Variant::Medium) => Ok(None),
+        (None, _) => Ok(keyed()),
+    }
+}
+
+/// The host there is a key to, if there is one: OpenRouter ahead of
+/// Vercel's AI Gateway.
+fn keyed() -> Option<Kind> {
+    if openrouter::key().is_some() {
+        Some(Kind::OpenRouter)
+    } else if vercel::key().is_some() {
+        Some(Kind::Vercel)
+    } else {
+        None
     }
 }
 
 /// Why `model` has nowhere to run, when [`provider`] finds none: why it
-/// does not run on this machine, which leaves OpenRouter, without a key.
+/// does not run on this machine, which leaves the hosts, without a key.
 pub fn nowhere(model: Variant) -> String {
     match (model, memory::check()) {
         (Variant::Medium, Err(e)) => e.to_string(),
-        _ => format!("{model} runs only at OpenRouter"),
+        _ => format!("{model} runs only at OpenRouter or Vercel AI Gateway"),
     }
 }
 
 /// The providers, each with the models it runs, for the model picker: the
-/// large model only at OpenRouter. This machine cannot be used without
-/// the memory for a model, nor OpenRouter without a key to it.
+/// large model only at a host. This machine cannot be used without the
+/// memory for a model, nor a host without a key to it.
 pub fn providers() -> Vec<Group> {
     vec![
         Group {
@@ -124,6 +133,11 @@ pub fn providers() -> Vec<Group> {
                 .is_none()
                 .then(|| "/provider signs in".to_string()),
         },
+        Group {
+            provider: Kind::Vercel,
+            models: vec![Variant::Medium, Variant::Large],
+            unavailable: vercel::key().is_none().then(no_vercel_key),
+        },
     ]
 }
 
@@ -131,7 +145,8 @@ pub fn providers() -> Vec<Group> {
 /// picker, where the session's model runs at `current`. This machine
 /// cannot be picked without the memory for a model; OpenRouter can be
 /// without a key to it, which picking it signs in for, and picking it
-/// while on it signs in again.
+/// while on it signs in again. Vercel's AI Gateway has no signing in, and
+/// cannot be picked without a key in the environment.
 pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
     vec![
         Choice {
@@ -152,7 +167,18 @@ pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
             },
             unavailable: None,
         },
+        Choice {
+            provider: Kind::Vercel,
+            name: vercel::HOST.name,
+            note: format!("key in {}", vercel::KEY),
+            unavailable: vercel::key().is_none().then(no_vercel_key),
+        },
     ]
+}
+
+/// What to do to use Vercel's AI Gateway where there is no key to it.
+fn no_vercel_key() -> String {
+    format!("set {} to a key from the Vercel dashboard", vercel::KEY)
 }
 
 /// Fetches the model's files if they are not yet there, reporting the
@@ -270,7 +296,7 @@ pub fn switch(
 fn device(session: &mut Session) -> String {
     match session.provider() {
         Any::Dwim(remote) => remote.device().to_string(),
-        Any::OpenRouter(provider) => format!("OpenRouter · {}", provider.model()),
+        Any::Hosted(hosted) => format!("{} · {}", hosted.host().name, hosted.model()),
     }
 }
 
@@ -278,8 +304,7 @@ fn device(session: &mut Session) -> String {
 /// working directory, which it returns with the session: on the server,
 /// reached, or started if none is running, with `on_status` told what the
 /// server is doing meanwhile, and after, when the session waits for
-/// another's request; or at OpenRouter, where there is nothing to wait
-/// for.
+/// another's request; or at a host, where there is nothing to wait for.
 pub fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + Send + 'static,
@@ -287,15 +312,21 @@ pub fn open(
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
-            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}",
+            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}, or at Vercel AI Gateway by setting {}",
             nowhere(settings.model),
-            openrouter::KEY
+            openrouter::KEY,
+            vercel::KEY
         )
         .into());
     };
-    if kind == Kind::OpenRouter {
-        let provider = OpenRouter::new(settings.model, settings.context, settings.temperature)?;
-        let mut session = Conversation::new(Any::OpenRouter(provider));
+    let (model, context, temperature) = (settings.model, settings.context, settings.temperature);
+    let hosted = match kind {
+        Kind::Local => None,
+        Kind::OpenRouter => Some(openrouter::open(model, context, temperature)?),
+        Kind::Vercel => Some(vercel::open(model, context, temperature)?),
+    };
+    if let Some(hosted) = hosted {
+        let mut session = Conversation::new(Any::Hosted(hosted));
         session.start(&system, |_, _| {})?;
         return Ok((session, system));
     }

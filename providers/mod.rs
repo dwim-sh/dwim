@@ -6,15 +6,20 @@
 //! own to reuse. A [`Conversation`] is the session the harness holds on
 //! one.
 //!
-//! There are two: the dwim server on this machine, and OpenRouter.
+//! There are two kinds: the dwim server on this machine, and a host of the
+//! model, which is OpenRouter or Vercel's AI Gateway.
 
 mod conversation;
 pub mod dwim;
+pub mod hosted;
 pub mod openrouter;
+pub mod vercel;
 
 use std::{fmt, ops::ControlFlow, str::FromStr};
 
 use crate::model::{Answer, Chat, Chunk, Generation, Reply, Result, Sampling, State, Turn};
+
+use hosted::{Host, Hosted};
 
 pub use conversation::Conversation;
 
@@ -78,6 +83,19 @@ pub enum Kind {
     /// The dwim server, on this machine.
     Local,
     OpenRouter,
+    /// Vercel's AI Gateway.
+    Vercel,
+}
+
+impl Kind {
+    /// Who hosts a model that runs at this provider, if it is hosted.
+    pub fn host(self) -> Option<&'static Host> {
+        match self {
+            Kind::Local => None,
+            Kind::OpenRouter => Some(&openrouter::HOST),
+            Kind::Vercel => Some(&vercel::HOST),
+        }
+    }
 }
 
 impl fmt::Display for Kind {
@@ -85,6 +103,7 @@ impl fmt::Display for Kind {
         f.write_str(match self {
             Kind::Local => "local",
             Kind::OpenRouter => "openrouter",
+            Kind::Vercel => "vercel",
         })
     }
 }
@@ -96,8 +115,9 @@ impl FromStr for Kind {
         match value {
             "local" => Ok(Kind::Local),
             "openrouter" => Ok(Kind::OpenRouter),
+            "vercel" => Ok(Kind::Vercel),
             _ => Err(format!(
-                "unknown provider '{value}' (expected local or openrouter)"
+                "unknown provider '{value}' (expected local, openrouter or vercel)"
             )),
         }
     }
@@ -107,15 +127,15 @@ impl FromStr for Kind {
 /// asked for holds one.
 pub enum Any {
     Dwim(dwim::Remote),
-    OpenRouter(openrouter::OpenRouter),
+    Hosted(Hosted),
 }
 
 impl Any {
-    /// Which kind of provider this is.
+    /// Which provider this is.
     pub fn kind(&self) -> Kind {
         match self {
             Any::Dwim(_) => Kind::Local,
-            Any::OpenRouter(_) => Kind::OpenRouter,
+            Any::Hosted(hosted) => hosted.host().kind,
         }
     }
 
@@ -123,7 +143,7 @@ impl Any {
     pub fn dwim(&mut self) -> Option<&mut dwim::Remote> {
         match self {
             Any::Dwim(remote) => Some(remote),
-            Any::OpenRouter(_) => None,
+            Any::Hosted(_) => None,
         }
     }
 }
@@ -132,35 +152,35 @@ impl Provider for Any {
     fn capacity(&self) -> usize {
         match self {
             Any::Dwim(provider) => provider.capacity(),
-            Any::OpenRouter(provider) => provider.capacity(),
+            Any::Hosted(provider) => provider.capacity(),
         }
     }
 
     fn sampling(&self) -> Sampling {
         match self {
             Any::Dwim(provider) => provider.sampling(),
-            Any::OpenRouter(provider) => provider.sampling(),
+            Any::Hosted(provider) => provider.sampling(),
         }
     }
 
     fn measure(&mut self, turn: &Turn) -> Result<usize> {
         match self {
             Any::Dwim(provider) => provider.measure(turn),
-            Any::OpenRouter(provider) => provider.measure(turn),
+            Any::Hosted(provider) => provider.measure(turn),
         }
     }
 
     fn answer_tokens(&mut self, message: &str, limit: usize) -> Result<usize> {
         match self {
             Any::Dwim(provider) => provider.answer_tokens(message, limit),
-            Any::OpenRouter(provider) => provider.answer_tokens(message, limit),
+            Any::Hosted(provider) => provider.answer_tokens(message, limit),
         }
     }
 
     fn read(&mut self, chat: &Chat, on_progress: impl FnMut(usize, usize)) -> Result<State> {
         match self {
             Any::Dwim(provider) => provider.read(chat, on_progress),
-            Any::OpenRouter(provider) => provider.read(chat, on_progress),
+            Any::Hosted(provider) => provider.read(chat, on_progress),
         }
     }
 
@@ -172,7 +192,7 @@ impl Provider for Any {
     ) -> Result<Completion> {
         match self {
             Any::Dwim(provider) => provider.reply(chat, generation, on_chunk),
-            Any::OpenRouter(provider) => provider.reply(chat, generation, on_chunk),
+            Any::Hosted(provider) => provider.reply(chat, generation, on_chunk),
         }
     }
 
@@ -186,7 +206,7 @@ impl Provider for Any {
     ) -> Result<(Answer, State)> {
         match self {
             Any::Dwim(provider) => provider.answer(chat, heads, limit, generation, on_text),
-            Any::OpenRouter(provider) => provider.answer(chat, heads, limit, generation, on_text),
+            Any::Hosted(provider) => provider.answer(chat, heads, limit, generation, on_text),
         }
     }
 }

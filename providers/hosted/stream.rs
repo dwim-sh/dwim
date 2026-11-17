@@ -1,4 +1,4 @@
-//! A reply as OpenRouter streams it: server-sent events, each a piece of
+//! A reply as a host streams it: server-sent events, each a piece of
 //! the reply as JSON, read into the thought, the text and the tool calls
 //! the harness is given.
 //!
@@ -48,10 +48,11 @@ pub struct Usage {
     pub cost: f64,
 }
 
-/// Reads a reply from the events in `body`, streaming it to `on_chunk`,
-/// which ends it early by breaking.
+/// Reads a reply from the events in `body`, which `host` sends, streaming
+/// it to `on_chunk`, which ends it early by breaking.
 pub fn read(
     body: impl BufRead,
+    host: &str,
     mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
 ) -> Result<Outcome> {
     let mut outcome = Outcome::default();
@@ -70,7 +71,7 @@ pub fn read(
         }
         let event: Value = serde_json::from_str(data)?;
         if let Some(error) = event.get("error") {
-            return Err(error_message(error).into());
+            return Err(error_message(host, error).into());
         }
         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
             outcome.usage = Some(Usage::of(usage));
@@ -133,13 +134,13 @@ pub fn read(
     Ok(outcome)
 }
 
-/// What an error says, as OpenRouter writes one: its message, and the
-/// provider's own where it passes one on.
-pub fn error_message(error: &Value) -> String {
+/// What an error says, as `host` writes one: its message, and the
+/// provider's own where the host passes one on.
+pub fn error_message(host: &str, error: &Value) -> String {
     let message = error["message"].as_str().unwrap_or("the request failed");
     match error["metadata"]["raw"].as_str() {
-        Some(raw) => format!("OpenRouter: {message}: {raw}"),
-        None => format!("OpenRouter: {message}"),
+        Some(raw) => format!("{host}: {message}: {raw}"),
+        None => format!("{host}: {message}"),
     }
 }
 
@@ -151,7 +152,11 @@ impl Usage {
             cached: count(&usage["prompt_tokens_details"]["cached_tokens"]),
             completion: count(&usage["completion_tokens"]),
             reasoning: count(&usage["completion_tokens_details"]["reasoning_tokens"]),
-            cost: usage["cost"].as_f64().unwrap_or(0.0),
+            // A host may write the dollars as a number, or as text.
+            cost: match &usage["cost"] {
+                Value::String(cost) => cost.parse().unwrap_or(0.0),
+                cost => cost.as_f64().unwrap_or(0.0),
+            },
         }
     }
 }
@@ -266,7 +271,7 @@ mod tests {
     /// were streamed.
     fn reply(deltas: &[Value]) -> (Outcome, String, String) {
         let (mut thought, mut text) = (String::new(), String::new());
-        let outcome = read(events(deltas), |chunk| {
+        let outcome = read(events(deltas), "OpenRouter", |chunk| {
             match chunk {
                 Chunk::Thought(piece) => thought.push_str(piece),
                 Chunk::Text(piece) => text.push_str(piece),
@@ -326,6 +331,7 @@ mod tests {
                 json!({ "content": "One." }),
                 json!({ "content": "<tool_call>\n<function=bash>\n</function>\n</tool_call>" }),
             ]),
+            "OpenRouter",
             |chunk| match chunk {
                 Chunk::Text(_) => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
@@ -342,7 +348,7 @@ mod tests {
         let body = Cursor::new(
             "data: {\"error\":{\"message\":\"Provider returned error\",\"metadata\":{\"raw\":\"overloaded\"}}}\n\n",
         );
-        let error = read(body, |_| ControlFlow::Continue(())).unwrap_err();
+        let error = read(body, "OpenRouter", |_| ControlFlow::Continue(())).unwrap_err();
         assert!(error.to_string().contains("overloaded"), "{error}");
     }
 }

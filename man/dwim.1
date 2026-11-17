@@ -82,14 +82,19 @@ has, and runs only at a provider.
 .BI \-\-provider " provider"
 Where the model runs:
 .BR local ,
-in the dwim server on this machine, or
+in the dwim server on this machine,
 .BR openrouter ,
 at OpenRouter, with the key in
 .BR OPENROUTER_API_KEY ,
 or the one kept from signing in with
-.BR /provider .
-Without the option, the model runs on this machine where it can, and at
-OpenRouter where it cannot and there is a key. A session at OpenRouter
+.BR /provider ,
+or
+.BR vercel ,
+at Vercel's AI Gateway, with the key in
+.BR AI_GATEWAY_API_KEY .
+Without the option, the model runs on this machine where it can, and
+where it cannot, at OpenRouter if there is a key to it, or else at
+Vercel's AI Gateway if there is a key to that. A session at either
 loads no model, has room for 131072 tokens of conversation unless
 .B \-\-context
 says, and sends the conversation there: what the agent reads of the
@@ -248,7 +253,8 @@ where its weights are kept, and how many tokens of conversation it has
 room for.
 .TP
 .B /provider
-Open a picker of the providers, this machine and OpenRouter:
+Open a picker of the providers, this machine, OpenRouter and Vercel's AI
+Gateway:
 up and down move over them, enter picks, esc cancels.
 Picking another provider moves the conversation there.
 Picking OpenRouter without a key to it signs in first: the browser opens
@@ -256,6 +262,9 @@ at OpenRouter, which asks whether to make a key for
 .BR dwim ,
 and the key it makes is kept for the sessions to come.
 Where the browser does not open, the address to go to is shown.
+Vercel's AI Gateway has no signing in, and can be picked only with a key
+in
+.BR AI_GATEWAY_API_KEY .
 Picking the provider the session is on shows where the model runs.
 .TP
 .B /stats
@@ -451,6 +460,10 @@ that is no longer running are removed by the next one to start.
 The key to OpenRouter, for a model that runs there, used instead of the
 one kept from signing in with
 .BR /provider .
+.TP
+.B AI_GATEWAY_API_KEY
+The key to Vercel's AI Gateway, for a model that runs there. The Vercel
+dashboard makes one.
 .TP
 .B HF_HUB_CACHE
 Where the Hugging Face cache is, instead of
