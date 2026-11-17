@@ -15,6 +15,9 @@ pub enum Command {
     /// Ask whether auto mode is on, or set it.
     Auto,
     SetAuto(bool),
+    /// Ask whether feedforward is on, or set it.
+    Feedforward,
+    SetFeedforward(bool),
     Server(ServerAction),
     Help,
 }
@@ -46,6 +49,10 @@ impl Command {
             ("auto", Some("on")) => Ok(Command::SetAuto(true)),
             ("auto", Some("off")) => Ok(Command::SetAuto(false)),
             ("auto", Some(_)) => Err("/auto takes on or off".to_string()),
+            ("feedforward", None) => Ok(Command::Feedforward),
+            ("feedforward", Some("on")) => Ok(Command::SetFeedforward(true)),
+            ("feedforward", Some("off")) => Ok(Command::SetFeedforward(false)),
+            ("feedforward", Some(_)) => Err("/feedforward takes on or off".to_string()),
             ("server", None) => Ok(Command::Server(ServerAction::Show)),
             ("server", Some("stop")) => Ok(Command::Server(ServerAction::Stop)),
             ("server", Some("start")) => Ok(Command::Server(ServerAction::Start)),
@@ -67,7 +74,7 @@ pub enum ServerAction {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-pub const COMMANDS: [(&str, &str); 9] = [
+pub const COMMANDS: [(&str, &str); 10] = [
     ("/model", "pick the model, medium or large"),
     ("/provider", "pick where the model runs, and sign in to it"),
     ("/stats", "where this session's time has gone"),
@@ -80,6 +87,10 @@ pub const COMMANDS: [(&str, &str); 9] = [
     (
         "/auto on|off",
         "go on by itself until it says it is done, or ask",
+    ),
+    (
+        "/feedforward on|off",
+        "show how the model reads a message as it is typed",
     ),
     (
         "/server stop|start|restart",
@@ -115,6 +126,15 @@ mod tests {
         ));
         assert!(matches!(Command::parse("auto"), Ok(Command::Auto)));
         assert!(Command::parse("auto maybe").is_err());
+        assert!(matches!(
+            Command::parse("feedforward off"),
+            Ok(Command::SetFeedforward(false))
+        ));
+        assert!(matches!(
+            Command::parse("feedforward"),
+            Ok(Command::Feedforward)
+        ));
+        assert!(Command::parse("feedforward maybe").is_err());
         assert!(Command::parse("model now").is_err());
         assert!(
             Command::parse("nothing").is_err_and(|e| e.starts_with("Unknown command /nothing"))

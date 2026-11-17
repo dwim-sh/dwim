@@ -275,6 +275,19 @@ Set the most tokens the model may think before it is made to act, as
 .B \-\-thinking\-budget
 does, with 0 for no limit; alone, show it.
 .TP
+.BR /feedforward " on | off"
+Turn feedforward on or off; alone, show which it is.
+It is on unless turned off.
+While it is on, and the model is idle, a pause in typing has the model
+say under the input box, before anything is sent, what it would do with
+the message so far, and the files it would touch, after an arrow; what
+the message leaves open, after a question mark; and what is risky in it,
+after an exclamation mark.
+A spinner beside it shows from the first key typed until it has read
+what is typed.
+It reads the message on a session of its own, without thinking, and
+the conversation is not touched.
+.TP
 .BR /auto " on | off"
 Turn auto mode on or off; alone, show which it is.
 In it, the model goes on by itself as it does when answering a prompt

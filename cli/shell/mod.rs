@@ -3,6 +3,7 @@
 //! stays responsive while it downloads, loads, and generates.
 
 mod cmd;
+mod ideas;
 pub mod picker;
 mod view;
 mod worker;
@@ -39,9 +40,19 @@ use crate::{
 };
 
 use cmd::Command;
+use ideas::{Idea, Ideas};
 use picker::{Picker, Providers};
 use view::Segment;
 use worker::{Reply, Request, Worker};
+
+/// How long the user pauses typing before the model reads a draft that
+/// stops mid-sentence, and one that ends a sentence, which is likelier to
+/// be all they meant to say.
+const PAUSE: Duration = Duration::from_millis(1500);
+const SETTLED: Duration = Duration::from_millis(700);
+
+/// Fewest bytes of a draft the model reads: fewer say too little.
+const MIN_DRAFT: usize = 12;
 
 /// How often the screen is redrawn while the model is busy, to animate the
 /// spinner.
@@ -58,6 +69,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let model = variant.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
+    let ideas = Ideas::spawn(settings.clone());
     let worker = Worker::spawn(settings, log);
 
     let mut app = App {
@@ -98,6 +110,13 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         doing: None,
         redirect: None,
         unheeded: false,
+        feedforward: true,
+        ideas,
+        draft: 0,
+        edited: None,
+        idea: None,
+        read: String::new(),
+        pondering: None,
         lines: Vec::new(),
         blank: false,
         worker,
@@ -300,6 +319,21 @@ struct App {
     /// whether the message was taken in: the model may go on with the step
     /// it was at as if there were none.
     unheeded: bool,
+    /// Whether the model reads the message being typed, as `/feedforward`
+    /// has it.
+    feedforward: bool,
+    /// What the model makes of the message being typed: the thread that
+    /// reads it, the number of the last draft given it, when the input
+    /// last changed, if it has not been given since, the idea for the
+    /// latest draft that has one, the text of the last draft given, and
+    /// since when an idea has been awaited, from the first key typed until
+    /// the idea for what is typed is whole.
+    ideas: Ideas,
+    draft: u64,
+    edited: Option<Instant>,
+    idea: Option<Idea>,
+    read: String,
+    pondering: Option<Instant>,
     /// Lines waiting to be printed above the live region, and whether the
     /// last line printed there was blank.
     lines: Vec<Line>,
@@ -316,11 +350,16 @@ impl App {
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let mut dirty = true;
         loop {
-            if dirty || !matches!(self.status, Status::Idle) || self.signin.is_some() {
+            if dirty
+                || !matches!(self.status, Status::Idle)
+                || self.signin.is_some()
+                || self.pondering.is_some()
+            {
                 self.draw()?;
                 dirty = false;
             }
             if event::poll(TICK)? {
+                let before = self.input.text().to_string();
                 match event::read()? {
                     Key::Key(key) if key.kind != KeyEventKind::Release => {
                         if self.key(key) {
@@ -330,8 +369,17 @@ impl App {
                     Key::Paste(text) => self.input.insert(&tui::sanitize(&text)),
                     _ => {}
                 }
+                if self.input.text() != before {
+                    self.edited = Some(Instant::now());
+                    if self.readable().is_some() {
+                        self.pondering.get_or_insert_with(Instant::now);
+                    } else {
+                        self.pondering = None;
+                    }
+                }
                 dirty = true;
             }
+            dirty |= self.ideate();
             loop {
                 match self.worker.try_recv() {
                     Ok(reply) => self.reply(reply)?,
@@ -344,6 +392,64 @@ impl App {
             }
             dirty |= self.signed_in();
         }
+    }
+
+    /// Gives the model the message being typed once the user pauses, and
+    /// takes what it makes of it: returns whether there is anything new to
+    /// show. The pause is longer while a sentence is unfinished, and a
+    /// draft that is what was last read is not read again.
+    fn ideate(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(idea) = self.ideas.try_recv() {
+            if idea.draft == self.draft {
+                if idea.done && self.edited.is_none() {
+                    self.pondering = None;
+                }
+                self.idea = Some(idea);
+                changed = true;
+            }
+        }
+        let Some(edited) = self.edited else {
+            return changed;
+        };
+        let pause = if self.input.text().trim_end().ends_with(['.', '?', '!']) {
+            SETTLED
+        } else {
+            PAUSE
+        };
+        if edited.elapsed() < pause {
+            return changed;
+        }
+        self.edited = None;
+        match self.readable() {
+            Some(text) if text.len() >= MIN_DRAFT => {
+                if text == self.read && self.idea.as_ref().is_some_and(|idea| idea.done) {
+                    self.pondering = None;
+                } else if text != self.read {
+                    self.draft += 1;
+                    self.ideas.read(self.draft, &text);
+                    self.read = text;
+                }
+            }
+            _ => {
+                self.pondering = None;
+                self.idea = None;
+                self.read.clear();
+            }
+        }
+        true
+    }
+
+    /// The message being typed, if the model may read it: only while
+    /// nothing else is asked of the model, and not a command.
+    fn readable(&self) -> Option<String> {
+        let text = self.input.text().trim();
+        (self.feedforward
+            && self.ready
+            && matches!(self.status, Status::Idle)
+            && !text.is_empty()
+            && !text.starts_with('/'))
+        .then(|| text.to_string())
     }
 
     /// Handles a key press, returning whether to quit.
@@ -680,6 +786,10 @@ impl App {
         }
         self.input.take();
         self.recalled = None;
+        self.idea = None;
+        self.edited = None;
+        self.read.clear();
+        self.pondering = None;
         if self.history.last() != Some(&message) {
             self.history.push(message.clone());
         }
@@ -1107,6 +1217,16 @@ impl App {
             Command::Help => view::help(columns),
             Command::ThinkingBudget => view::notice(view::budget_notice(self.thinking_budget)),
             Command::Auto => view::notice(view::auto_notice(self.auto)),
+            Command::Feedforward => view::notice(view::feedforward_notice(self.feedforward)),
+            Command::SetFeedforward(on) => {
+                self.feedforward = on;
+                if !on {
+                    self.idea = None;
+                    self.read.clear();
+                    self.pondering = None;
+                }
+                view::notice(view::feedforward_notice(on))
+            }
             Command::Model
             | Command::Provider
             | Command::Compact
@@ -1275,6 +1395,12 @@ impl App {
             live.push(tui::boxed(vec![prompt, content], columns));
         }
         live.push(border("╰", "╯"));
+        // What the model makes of the message being typed: dimmed while
+        // it is not of what is typed, with a spinner in the gutter while
+        // the next is awaited.
+        if !self.input.is_empty() && matches!(self.status, Status::Idle) {
+            live.extend(self.idea_lines(columns));
+        }
         live.push(self.footer());
 
         let lines = std::mem::take(&mut self.lines);
@@ -1283,6 +1409,49 @@ impl App {
         }
         self.screen.draw(&lines, &live, cursor)?;
         Ok(())
+    }
+
+    /// The lines under the input box of what the model makes of the
+    /// message being typed: what it would do, what is open, marked `?`, and
+    /// what is risky, marked `!`.
+    fn idea_lines(&self, columns: usize) -> Vec<Line> {
+        const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+        let stale = self.pondering.is_some();
+        let text = match &self.idea {
+            Some(idea) if !idea.text.is_empty() => idea.text.as_str(),
+            _ if stale => "",
+            _ => return Vec::new(),
+        };
+        let mut lines = Vec::new();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            for (i, wrapped) in tui::wrap(line, columns.saturating_sub(6).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let indent = if i == 0 { "" } else { "  " };
+                let text = span(format!("{indent}{wrapped}"));
+                let text = if stale {
+                    text.dark_grey()
+                } else if line.starts_with('?') {
+                    text.yellow()
+                } else if line.starts_with('!') {
+                    text.red()
+                } else {
+                    text
+                };
+                lines.push(vec![span("  ┊ ").cyan(), text]);
+            }
+        }
+        if let Some(since) = self.pondering {
+            let frame = SPINNER[(since.elapsed().as_millis() / 150) as usize % SPINNER.len()];
+            let gutter = span(format!("  {frame} ")).cyan();
+            match lines.first_mut() {
+                Some(first) => first[0] = gutter,
+                None => lines.push(vec![gutter, span("…").dark_grey()]),
+            }
+        }
+        lines.push(Line::new());
+        lines
     }
 
     /// The line over the input box: what the model is doing, with a
