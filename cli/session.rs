@@ -14,7 +14,7 @@ use dwim::harness::{self, Harness, Log};
 use dwim::inference::{Model, Progress};
 use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
-    Any, Conversation, Kind,
+    Any, Conversation, Kind, cerebras,
     dwim::{self as server},
     openrouter, vercel,
 };
@@ -77,8 +77,9 @@ pub struct Loaded {
 
 /// Where `model` runs: at `provider` if the command line named one, and
 /// otherwise on this machine if it can, or at a host there is a key to:
-/// OpenRouter, or else Vercel's AI Gateway. The large model takes more
-/// memory than a machine has, and runs only at a host. Nowhere, if the
+/// OpenRouter, or else Vercel's AI Gateway, or else Cerebras. The large
+/// model takes more memory than a machine has, and runs only at
+/// OpenRouter or Vercel's AI Gateway. Nowhere, if the
 /// command line named no provider and the model can run neither here nor
 /// at a host without a key: the shell starts without a model then, for
 /// `/provider` to sign in.
@@ -89,19 +90,27 @@ pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, 
             Variant::Large
         )
         .into()),
+        (Some(Kind::Cerebras), Variant::Large) => Err(format!(
+            "{} does not run at Cerebras: it runs with --provider openrouter, or vercel",
+            Variant::Large
+        )
+        .into()),
         (Some(kind), _) => Ok(Some(kind)),
         (None, Variant::Medium) if memory::check().is_ok() => Ok(Some(Kind::Local)),
-        (None, _) => Ok(keyed()),
+        (None, model) => Ok(keyed(model)),
     }
 }
 
-/// The host there is a key to, if there is one: OpenRouter ahead of
-/// Vercel's AI Gateway.
-fn keyed() -> Option<Kind> {
+/// The host of `model` there is a key to, if there is one: OpenRouter
+/// ahead of Vercel's AI Gateway, and both ahead of Cerebras, which runs
+/// the medium model only.
+fn keyed(model: Variant) -> Option<Kind> {
     if openrouter::key().is_some() {
         Some(Kind::OpenRouter)
     } else if vercel::key().is_some() {
         Some(Kind::Vercel)
+    } else if model == Variant::Medium && cerebras::key().is_some() {
+        Some(Kind::Cerebras)
     } else {
         None
     }
@@ -112,12 +121,15 @@ fn keyed() -> Option<Kind> {
 pub fn nowhere(model: Variant) -> String {
     match (model, memory::check()) {
         (Variant::Medium, Err(e)) => e.to_string(),
+        (Variant::Medium, Ok(())) => {
+            format!("{model} runs only at OpenRouter, Vercel AI Gateway or Cerebras")
+        }
         _ => format!("{model} runs only at OpenRouter or Vercel AI Gateway"),
     }
 }
 
 /// The providers, each with the models it runs, for the model picker: the
-/// large model only at a host. This machine cannot be used without the
+/// large model only at OpenRouter and Vercel's AI Gateway. This machine cannot be used without the
 /// memory for a model, nor a host without a key to it.
 pub fn providers() -> Vec<Group> {
     vec![
@@ -138,6 +150,11 @@ pub fn providers() -> Vec<Group> {
             models: vec![Variant::Medium, Variant::Large],
             unavailable: vercel::key().is_none().then(no_vercel_key),
         },
+        Group {
+            provider: Kind::Cerebras,
+            models: vec![Variant::Medium],
+            unavailable: cerebras::key().is_none().then(no_cerebras_key),
+        },
     ]
 }
 
@@ -145,8 +162,8 @@ pub fn providers() -> Vec<Group> {
 /// picker, where the session's model runs at `current`. This machine
 /// cannot be picked without the memory for a model; OpenRouter can be
 /// without a key to it, which picking it signs in for, and picking it
-/// while on it signs in again. Vercel's AI Gateway has no signing in, and
-/// cannot be picked without a key in the environment.
+/// while on it signs in again. Vercel's AI Gateway and Cerebras have no
+/// signing in, and cannot be picked without a key in the environment.
 pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
     vec![
         Choice {
@@ -173,12 +190,26 @@ pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
             note: format!("key in {}", vercel::KEY),
             unavailable: vercel::key().is_none().then(no_vercel_key),
         },
+        Choice {
+            provider: Kind::Cerebras,
+            name: cerebras::HOST.name,
+            note: format!("{} only · key in {}", Variant::Medium, cerebras::KEY),
+            unavailable: cerebras::key().is_none().then(no_cerebras_key),
+        },
     ]
 }
 
 /// What to do to use Vercel's AI Gateway where there is no key to it.
 fn no_vercel_key() -> String {
     format!("set {} to a key from the Vercel dashboard", vercel::KEY)
+}
+
+/// What to do to use Cerebras where there is no key to it.
+fn no_cerebras_key() -> String {
+    format!(
+        "set {} to a key from the Cerebras cloud console",
+        cerebras::KEY
+    )
 }
 
 /// Fetches the model's files if they are not yet there, reporting the
@@ -312,10 +343,14 @@ pub fn open(
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
-            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}, or at Vercel AI Gateway by setting {}",
+            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}, or at Vercel AI Gateway by setting {}{}",
             nowhere(settings.model),
             openrouter::KEY,
-            vercel::KEY
+            vercel::KEY,
+            match settings.model {
+                Variant::Medium => format!(", or at Cerebras by setting {}", cerebras::KEY),
+                Variant::Large => String::new(),
+            }
         )
         .into());
     };
@@ -324,6 +359,7 @@ pub fn open(
         Kind::Local => None,
         Kind::OpenRouter => Some(openrouter::open(model, context, temperature)?),
         Kind::Vercel => Some(vercel::open(model, context, temperature)?),
+        Kind::Cerebras => Some(cerebras::open(model, context, temperature)?),
     };
     if let Some(hosted) = hosted {
         let mut session = Conversation::new(Any::Hosted(hosted));

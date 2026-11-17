@@ -516,10 +516,11 @@ impl App {
     }
 
     /// The model the session goes on with at `provider`: the one it is on,
-    /// but for the large one, which does not run on this machine.
+    /// but for the large one, which does not run on this machine or at
+    /// Cerebras.
     fn variant_at(&self, provider: Kind) -> Variant {
         match provider {
-            Kind::Local => Variant::Medium,
+            Kind::Local | Kind::Cerebras => Variant::Medium,
             Kind::OpenRouter | Kind::Vercel => self.variant,
         }
     }
@@ -1309,7 +1310,7 @@ impl App {
                     span(format!("● Local model is {doing}")),
                     span(" · /model picks another model or provider").dark_grey(),
                 ]),
-                Some(Kind::OpenRouter | Kind::Vercel) => None,
+                Some(Kind::OpenRouter | Kind::Vercel | Kind::Cerebras) => None,
             };
         }
         let (frame, verb, details) = self.doing()?;
