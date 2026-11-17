@@ -118,8 +118,8 @@ const NUDGE: &str = "<system-reminder>You have made many tool calls since you la
 pub const AUTO_ROUNDS: usize = 10;
 
 /// What the model is told when, in auto mode, it replies without calling
-/// a tool and without saying it is done, or gives its account at the call
-/// cap. On SWE-bench's django-11797 runs ended with the fix found, or made
+/// a tool and without saying it is done, in a turn in which it has called
+/// one, or gives its account at the call cap. On SWE-bench's django-11797 runs ended with the fix found, or made
 /// and not yet checked, on a reply saying what remained, with no one to
 /// answer it.
 const GO_ON: &str = "Go on with the work: no one will read this until you are done, and the tools are on. Do the next thing that remains, such as making the change you have found with edit, or running your reproduction or the tests to check one you have made. Only when nothing remains, with the change made and checked, reply with what you did and end the reply with DONE on a line of its own.";
@@ -498,6 +498,9 @@ pub struct Harness<S: Session> {
     /// been this turn.
     auto: bool,
     went_on: usize,
+    /// Whether the model has called a tool this turn: a turn without a
+    /// call has no work to go on with.
+    called: bool,
     /// The plan as last reported, to report it when it changes.
     shown: Plan,
     /// Whether the model has laid out the plan or finished a step of it
@@ -548,6 +551,7 @@ impl<S: Session> Harness<S> {
             nudge_after: NUDGE_AFTER,
             auto: false,
             went_on: 0,
+            called: false,
             shown: Plan::default(),
             planned: false,
             asked: false,
@@ -599,8 +603,9 @@ impl<S: Session> Harness<S> {
     /// Turns auto mode on or off, for when the model runs with no one to
     /// answer it: in it, a reply with no call that doesn't end with DONE,
     /// and the account it gives at the call cap, are answered with word to
-    /// go on, with the tools on, up to [`AUTO_ROUNDS`] times a turn. It is
-    /// off unless set.
+    /// go on, with the tools on, up to [`AUTO_ROUNDS`] times a turn. A
+    /// turn in which the model has called no tool ends at its reply, as
+    /// the answer to a question does. It is off unless set.
     pub fn set_auto(&mut self, auto: bool) {
         self.auto = auto;
     }
@@ -745,6 +750,7 @@ impl<S: Session> Harness<S> {
         self.steps = 0;
         self.unchanged = 0;
         self.went_on = 0;
+        self.called = false;
         self.planned = false;
         self.asked = false;
         let turn = Turn::User(message.to_string());
@@ -947,6 +953,7 @@ impl<S: Session> Harness<S> {
                 let mut seconds = None;
                 let mut changed = false;
                 self.steps += 1;
+                self.called = true;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = crate::tools::describe(&call);
@@ -1039,14 +1046,16 @@ impl<S: Session> Harness<S> {
     }
 
     /// Whether the model, in auto mode, is to be told to go on after the
-    /// reply it just gave: not if it said it is done, nor once it has been
-    /// told [`AUTO_ROUNDS`] times this turn. Counts it if so.
+    /// reply it just gave: not if it said it is done, nor if it has called
+    /// no tool this turn, which is how it answers a question and leaves
+    /// no work to go on with, nor once it has been told [`AUTO_ROUNDS`]
+    /// times this turn. Counts it if so.
     fn go_on(&mut self) -> bool {
         let done = matches!(
             self.transcript.last(),
             Some(Entry { turn: Turn::Reply { text, .. }, .. }) if said_done(text)
         );
-        if !self.auto || done || self.went_on >= AUTO_ROUNDS {
+        if !self.auto || done || !self.called || self.went_on >= AUTO_ROUNDS {
             return false;
         }
         self.went_on += 1;
@@ -1158,6 +1167,8 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
+
     use crate::{
         inference::{Local, Sampler, testing::Scripted},
         model::{Format, Tokenizer},
@@ -1907,10 +1918,12 @@ mod tests {
 
     #[test]
     fn goes_on_in_auto_mode_until_the_model_says_it_is_done() {
-        // In auto mode, a reply of text alone is answered with word to go
-        // on, and the turn goes on to the calls after it, until a reply
-        // ends with DONE; out of it, the turn ends at the first reply.
+        // In auto mode, a reply of text alone after a call is answered
+        // with word to go on, and the turn goes on to the calls after it,
+        // until a reply ends with DONE; out of it, the turn ends at the
+        // first reply of text alone.
         let scripts = [
+            reply_calling(10, "bash", "command", "echo 0"),
             reply(10, false),
             reply_calling(10, "bash", "command", "echo 1"),
             reply(10, false),
@@ -1934,11 +1947,13 @@ mod tests {
 
         let mut plain = harness(&scripts, 100_000, "");
         send(&mut plain, "go");
-        assert_eq!(plain.transcript().count(), 2);
+        assert_eq!(plain.transcript().count(), 4);
 
         // A model that never says it is done is told to go on no more
         // than AUTO_ROUNDS times.
-        let scripts: Vec<String> = (0..AUTO_ROUNDS + 3).map(|_| reply(10, false)).collect();
+        let scripts: Vec<String> = iter::once(reply_calling(10, "bash", "command", "echo 0"))
+            .chain((0..AUTO_ROUNDS + 3).map(|_| reply(10, false)))
+            .collect();
         let mut endless = harness(&scripts, 100_000, "");
         endless.set_auto(true);
         send(&mut endless, "go");
@@ -1947,6 +1962,30 @@ mod tests {
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
             .count();
         assert_eq!(told, AUTO_ROUNDS);
+    }
+
+    #[test]
+    fn ends_at_an_answer_without_a_call_in_auto_mode() {
+        // A question answered without a tool leaves no work to go on
+        // with: the turn ends at the answer, though it doesn't say DONE.
+        // The next message starts over, and is gone on with once it has
+        // made a call.
+        let scripts = [
+            reply(10, false),
+            reply_calling(10, "bash", "command", "echo 1"),
+            reply(10, false),
+            format!("{}\n</think>\n\nChecked.\nDONE", filler(10)),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        harness.set_auto(true);
+        send(&mut harness, "say hello");
+        assert_eq!(harness.transcript().count(), 2);
+        send(&mut harness, "go");
+        let told = harness
+            .transcript()
+            .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
+            .count();
+        assert_eq!(told, 1);
     }
 
     #[test]
