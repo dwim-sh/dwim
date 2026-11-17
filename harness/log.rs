@@ -12,6 +12,7 @@
 //! unrecorded rather than stopping the agent.
 
 use std::{
+    env,
     fmt::Display,
     fs::File,
     io::{self, Seek, SeekFrom, Write},
@@ -63,6 +64,39 @@ struct Pending {
 }
 
 impl Log {
+    /// The session's transcript, opened before anything else so that a file
+    /// it cannot be written to is found out at once: in `path`, if the
+    /// options name one, or in a new file in the working directory's folder
+    /// of the user's state directory (`~/.local/state`, or on macOS, where
+    /// there is none, `~/Library/Application Support`), out of the agent's
+    /// sight. Where that cannot be written, the session goes on without one,
+    /// with a warning.
+    pub fn open(path: Option<&Path>) -> io::Result<Self> {
+        if let Some(path) = path {
+            return Self::create(path).map_err(|e| {
+                io::Error::other(format!(
+                    "cannot write the transcript to {}: {e}",
+                    path.display()
+                ))
+            });
+        }
+        let Some(dir) = sys::dirs::state() else {
+            return Ok(Self::none());
+        };
+        let path = dir
+            .join("dwim")
+            .join("projects")
+            .join(project(&env::current_dir()?))
+            .join(Self::name());
+        Ok(Self::create(&path).unwrap_or_else(|e| {
+            eprintln!(
+                "warning: keeping no transcript: cannot write {}: {e}",
+                path.display()
+            );
+            Self::none()
+        }))
+    }
+
     /// A transcript written to `path`, with the directories it goes in made
     /// if they aren't there: the file and its directories are readable by
     /// the user alone.
@@ -88,17 +122,17 @@ impl Log {
         }
     }
 
-    /// The file the transcript is written to, if there is one.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
     /// A file name for the transcript of a session starting now in this
     /// process: the time in UTC and the process ID, such as
     /// `2026-10-01T093012-4242.jsonl`.
-    pub fn name() -> String {
+    fn name() -> String {
         let (date, time) = now();
         format!("{date}T{}-{}.jsonl", time.replace(':', ""), process::id())
+    }
+
+    /// The file the transcript is written to, if there is one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Records what the model is given before the first message: which
@@ -372,6 +406,16 @@ fn decimal(x: f32) -> f64 {
 /// Seconds to the millisecond.
 fn round(seconds: f64) -> f64 {
     (seconds * 1000.0).round() / 1000.0
+}
+
+/// The name of the folder for the transcripts of sessions in `dir`: its
+/// path with everything but letters and digits made a dash, such as
+/// `-home-penberg-src-dwim`.
+fn project(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 #[cfg(test)]
