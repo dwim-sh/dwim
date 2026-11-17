@@ -7,17 +7,13 @@ mod session;
 mod shell;
 mod tui;
 
-use std::{
-    env,
-    error::Error,
-    path::{Path, PathBuf},
-};
+use std::env;
 
 use argh::{EarlyExit, FromArgs};
 use dwim::harness::Log;
 use dwim::inference::Model;
 use dwim::providers::Kind;
-use dwim::sys::{self, memory};
+use dwim::sys::memory;
 
 use opts::Opts;
 use session::Stderr;
@@ -62,7 +58,7 @@ fn main() {
         if opts.serve {
             return serve::serve(&settings);
         }
-        let log = log(opts.transcript)?;
+        let log = Log::open(opts.transcript.as_deref())?;
         match prompt.trim() {
             "" => shell::run(settings, opts.thinking, log),
             prompt => once::once(&settings, prompt, opts.stats, log),
@@ -72,43 +68,4 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
-}
-
-/// The session's transcript, opened before anything else so that a file
-/// it cannot be written to is found out at once: in `path`, if the
-/// options name one, or in a new file in the working directory's folder of
-/// the user's state directory (`~/.local/state`, or on macOS, where there
-/// is none, `~/Library/Application Support`), out of the agent's sight.
-/// Where that cannot be written, the session goes on without one, with a
-/// warning.
-fn log(path: Option<PathBuf>) -> Result<Log, Box<dyn Error>> {
-    if let Some(path) = path {
-        return Log::create(&path)
-            .map_err(|e| format!("cannot write the transcript to {}: {e}", path.display()).into());
-    }
-    let Some(dir) = sys::dirs::state() else {
-        return Ok(Log::none());
-    };
-    let path = dir
-        .join("dwim")
-        .join("projects")
-        .join(project(&env::current_dir()?))
-        .join(Log::name());
-    Ok(Log::create(&path).unwrap_or_else(|e| {
-        eprintln!(
-            "warning: keeping no transcript: cannot write {}: {e}",
-            path.display()
-        );
-        Log::none()
-    }))
-}
-
-/// The name of the folder for the transcripts of sessions in `dir`: its
-/// path with everything but letters and digits made a dash, such as
-/// `-home-penberg-src-dwim`.
-fn project(dir: &Path) -> String {
-    dir.to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
 }
