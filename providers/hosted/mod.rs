@@ -1,6 +1,7 @@
-//! A model at a host, asked over its chat completions API: OpenRouter, or
-//! Vercel's AI Gateway. Each passes the request on to a provider of the
-//! model, and what is asked of each in its own way is its [`Host`]'s.
+//! A model at a host, asked over its chat completions API: OpenRouter,
+//! Vercel's AI Gateway, or Cerebras. The first two pass the request on to
+//! a provider of the model, and Cerebras runs it itself. What is asked of
+//! each in its own way is its [`Host`]'s.
 //!
 //! The conversation goes as messages, and the provider writes the prompt
 //! the model reads from them. The harness declares the tools in the

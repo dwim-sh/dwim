@@ -88,13 +88,17 @@ at OpenRouter, with the key in
 .BR OPENROUTER_API_KEY ,
 or the one kept from signing in with
 .BR /provider ,
-or
 .BR vercel ,
 at Vercel's AI Gateway, with the key in
-.BR AI_GATEWAY_API_KEY .
+.BR AI_GATEWAY_API_KEY ,
+or
+.BR cerebras ,
+at Cerebras, which runs the medium model only, with the key in
+.BR CEREBRAS_API_KEY .
 Without the option, the model runs on this machine where it can, and
 where it cannot, at OpenRouter if there is a key to it, or else at
-Vercel's AI Gateway if there is a key to that. A session at either
+Vercel's AI Gateway if there is a key to that, or else, for the medium
+model, at Cerebras if there is a key to that. A session at any of them
 loads no model, has room for 131072 tokens of conversation unless
 .B \-\-context
 says, and sends the conversation there: what the agent reads of the
@@ -253,8 +257,8 @@ where its weights are kept, and how many tokens of conversation it has
 room for.
 .TP
 .B /provider
-Open a picker of the providers, this machine, OpenRouter and Vercel's AI
-Gateway:
+Open a picker of the providers, this machine, OpenRouter, Vercel's AI
+Gateway and Cerebras:
 up and down move over them, enter picks, esc cancels.
 Picking another provider moves the conversation there.
 Picking OpenRouter without a key to it signs in first: the browser opens
@@ -264,7 +268,9 @@ and the key it makes is kept for the sessions to come.
 Where the browser does not open, the address to go to is shown.
 Vercel's AI Gateway has no signing in, and can be picked only with a key
 in
-.BR AI_GATEWAY_API_KEY .
+.BR AI_GATEWAY_API_KEY ,
+nor Cerebras, but with a key in
+.BR CEREBRAS_API_KEY .
 Picking the provider the session is on shows where the model runs.
 .TP
 .B /stats
@@ -464,6 +470,13 @@ one kept from signing in with
 .B AI_GATEWAY_API_KEY
 The key to Vercel's AI Gateway, for a model that runs there. The Vercel
 dashboard makes one.
+.TP
+.B CEREBRAS_API_KEY
+The key to Cerebras, for the medium model to run there. The Cerebras
+cloud console makes one. Its free tier has room for 65536 tokens of
+conversation, which
+.B \-\-context
+says.
 .TP
 .B HF_HUB_CACHE
 Where the Hugging Face cache is, instead of

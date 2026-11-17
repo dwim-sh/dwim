@@ -16,10 +16,10 @@ pub struct Opts {
     pub model: Variant,
 
     /// where the model runs: local, on this machine, openrouter, with the
-    /// key in OPENROUTER_API_KEY, or vercel, Vercel's AI Gateway, with the
-    /// key in AI_GATEWAY_API_KEY (default: local where the model runs
-    /// here, and openrouter or vercel where it does not and there is a
-    /// key)
+    /// key in OPENROUTER_API_KEY, vercel, Vercel's AI Gateway, with the
+    /// key in AI_GATEWAY_API_KEY, or cerebras, the medium model only, with
+    /// the key in CEREBRAS_API_KEY (default: local where the model runs
+    /// here, and a host there is a key to where it does not)
     #[argh(option)]
     pub provider: Option<Kind>,
 
