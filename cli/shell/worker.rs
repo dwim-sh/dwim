@@ -344,8 +344,11 @@ fn server<F: FnMut(session::Status) + Send + 'static>(
     action: ServerAction,
     on_status: impl Fn() -> F,
 ) -> Result<String, Box<dyn Error>> {
-    if harness.session().provider().dwim().is_none() {
-        return Ok("This session's model runs at OpenRouter · it has no dwim server".to_string());
+    if let Some(host) = harness.session().provider().kind().host() {
+        return Ok(format!(
+            "This session's model runs at {} · it has no dwim server",
+            host.name
+        ));
     }
     match action {
         ServerAction::Show => Ok(match running() {

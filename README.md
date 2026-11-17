@@ -54,7 +54,8 @@ ahead of time.
   going, all on your machine.
 - **A bigger model when you need it.** `/provider` signs in to OpenRouter
   in your browser, and `/model` moves the session to Qwen3.8 Max there,
-  and back. The conversation goes with it.
+  and back. The conversation goes with it. With a key in
+  `AI_GATEWAY_API_KEY`, Vercel's AI Gateway runs the models too.
 - **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
   or more, decoding several tokens at a time with the drafter its file
   ships.

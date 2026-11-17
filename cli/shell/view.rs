@@ -7,7 +7,7 @@ use crossterm::style::Stylize;
 use dwim::gpu;
 use dwim::inference::{Model, OnDisk};
 use dwim::model::{Device, Size, Variant};
-use dwim::providers::{Kind, openrouter};
+use dwim::providers::{Kind, hosted::Host};
 use dwim::sys;
 use dwim::tools::plan::{Plan, Step};
 
@@ -92,14 +92,14 @@ pub fn model_listing(
     report(header, table(rows), columns)
 }
 
-/// The model at OpenRouter, for the `/model` command: what OpenRouter
-/// calls it, and how much conversation the session has room for, as a
-/// table of labels and values.
-pub fn hosted_listing(variant: Variant, context: usize, columns: usize) -> Vec<Line> {
+/// The model at `host`, for the `/model` command: what the host calls
+/// it, and how much conversation the session has room for, as a table of
+/// labels and values.
+pub fn hosted_listing(host: &Host, variant: Variant, context: usize, columns: usize) -> Vec<Line> {
     let header = vec![span("● "), span(variant.name().to_string()).bold()];
     let rows = vec![
-        ("provider", "OpenRouter".to_string()),
-        ("model", openrouter::model(variant).to_string()),
+        ("provider", host.name.to_string()),
+        ("model", (host.model)(variant).to_string()),
         ("context", format!("{context} tokens")),
     ];
     report(header, table(rows), columns)
@@ -107,15 +107,16 @@ pub fn hosted_listing(variant: Variant, context: usize, columns: usize) -> Vec<L
 
 /// Where the model runs, for the provider picked that the session is on.
 pub fn provider_notice(provider: Kind, variant: Variant) -> String {
-    match provider {
-        Kind::Local => format!(
+    match provider.host() {
+        None => format!(
             "{} runs on this machine, in the dwim server · /server shows it",
             variant.size()
         ),
-        Kind::OpenRouter => format!(
-            "{} runs at OpenRouter, as {}",
+        Some(host) => format!(
+            "{} runs at {}, as {}",
             variant.size(),
-            openrouter::model(variant)
+            host.name,
+            (host.model)(variant)
         ),
     }
 }
@@ -153,9 +154,9 @@ pub fn no_provider(key: bool) -> String {
 
 /// How moving the conversation to another model is acknowledged.
 pub fn switched(variant: Variant, provider: Kind) -> String {
-    match provider {
-        Kind::Local => format!("Switched to {variant}, on this machine"),
-        Kind::OpenRouter => format!("Switched to {variant}, at OpenRouter"),
+    match provider.host() {
+        None => format!("Switched to {variant}, on this machine"),
+        Some(host) => format!("Switched to {variant}, at {}", host.name),
     }
 }
 

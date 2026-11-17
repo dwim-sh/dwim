@@ -27,7 +27,7 @@ use crossterm::{
 use dwim::harness::{self, Event, Log};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{
-    Kind,
+    Kind, hosted,
     openrouter::{self, login::Login},
 };
 use dwim::sys::browser;
@@ -54,7 +54,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let transcript = log.path().map(Path::to_path_buf);
     let variant = settings.model;
     let provider = session::provider(settings.provider, variant)?;
-    let context = settings.context.unwrap_or(openrouter::CONTEXT);
+    let context = settings.context.unwrap_or(hosted::CONTEXT);
     let model = variant.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
@@ -520,7 +520,7 @@ impl App {
     fn variant_at(&self, provider: Kind) -> Variant {
         match provider {
             Kind::Local => Variant::Medium,
-            Kind::OpenRouter => self.variant,
+            Kind::OpenRouter | Kind::Vercel => self.variant,
         }
     }
 
@@ -1122,10 +1122,12 @@ impl App {
     /// The model the session is on: where it runs, and the room it has.
     fn model_listing(&self) -> Vec<Line> {
         let (columns, _) = self.screen.size();
-        match self.provider {
-            None => view::notice(view::no_provider(openrouter::key().is_some())),
-            Some(Kind::OpenRouter) => view::hosted_listing(self.variant, self.context, columns),
-            Some(Kind::Local) => view::model_listing(
+        let Some(provider) = self.provider else {
+            return view::notice(view::no_provider(openrouter::key().is_some()));
+        };
+        match provider.host() {
+            Some(host) => view::hosted_listing(host, self.variant, self.context, columns),
+            None => view::model_listing(
                 &self.model,
                 self.device,
                 self.device_name.as_deref(),
@@ -1307,7 +1309,7 @@ impl App {
                     span(format!("● Local model is {doing}")),
                     span(" · /model picks another model or provider").dark_grey(),
                 ]),
-                Some(Kind::OpenRouter) => None,
+                Some(Kind::OpenRouter | Kind::Vercel) => None,
             };
         }
         let (frame, verb, details) = self.doing()?;
