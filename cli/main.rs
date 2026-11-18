@@ -8,28 +8,13 @@ mod session;
 mod shell;
 mod tui;
 
-use std::env;
-
-use argh::{EarlyExit, FromArgs};
 use dwim::{harness::Log, inference::Model, providers::Kind, sys::memory};
 
 use opts::Opts;
 use session::Stderr;
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = args[0].rsplit('/').next().unwrap_or(&args[0]);
-    let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-    let opts = match Opts::from_args(&[command], &rest) {
-        Ok(opts) => opts,
-        Err(EarlyExit { output, status }) => {
-            match status {
-                Ok(()) => print!("{}", opts::help(&output, &rest)),
-                Err(()) => eprint!("{output}"),
-            }
-            std::process::exit(status.map_or(1, |()| 0));
-        }
-    };
+    let opts = Opts::parse();
     if opts.version {
         println!("dwim {}", env!("CARGO_PKG_VERSION"));
         return;
