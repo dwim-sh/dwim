@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
-use argh::FromArgs;
+use argh::{EarlyExit, FromArgs};
 use dwim::inference::Model;
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::Kind;
@@ -105,6 +105,24 @@ pub struct Opts {
 }
 
 impl Opts {
+    /// The options as the command line gives them: a parse error prints
+    /// the help, or the error, and exits.
+    pub fn parse() -> Opts {
+        let args: Vec<String> = env::args().collect();
+        let command = args[0].rsplit('/').next().unwrap_or(&args[0]);
+        let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        match Opts::from_args(&[command], &rest) {
+            Ok(opts) => opts,
+            Err(EarlyExit { output, status }) => {
+                match status {
+                    Ok(()) => print!("{}", help(&output, &rest)),
+                    Err(()) => eprint!("{output}"),
+                }
+                std::process::exit(status.map_or(1, |()| 0));
+            }
+        }
+    }
+
     /// How the model runs, as the options set it.
     pub fn settings(&self) -> Settings {
         Settings {
