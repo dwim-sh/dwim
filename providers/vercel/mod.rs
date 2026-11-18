@@ -22,7 +22,7 @@ pub const KEY: &str = "AI_GATEWAY_API_KEY";
 /// Vercel's AI Gateway, as the host of a model.
 pub const HOST: Host = Host {
     kind: Kind::Vercel,
-    name: "Vercel AI Gateway",
+    name: "Vercel",
     url: "https://ai-gateway.vercel.sh/v1/chat/completions",
     model,
     ask,
@@ -35,9 +35,8 @@ pub const HOST: Host = Host {
 /// at a host has unless told, sampled at `temperature`, or as the model's
 /// makers recommend.
 pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
-    let key = key().ok_or_else(|| {
-        format!("there is no key to Vercel AI Gateway: /login takes one, or set {KEY}")
-    })?;
+    let key = key()
+        .ok_or_else(|| format!("there is no key to Vercel: /login takes one, or set {KEY}"))?;
     Ok(Hosted::new(&HOST, key, variant, context, temperature))
 }
 

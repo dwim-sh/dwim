@@ -150,9 +150,9 @@ pub fn nowhere(model: Variant, config: &Config) -> String {
     match (model, memory::check()) {
         (Variant::Medium, Err(e)) => e.to_string(),
         (Variant::Medium, Ok(())) => {
-            format!("{model} runs only at OpenRouter, Vercel AI Gateway or Cerebras")
+            format!("{model} runs only at OpenRouter, Vercel or Cerebras")
         }
-        _ => format!("{model} runs only at OpenRouter or Vercel AI Gateway"),
+        _ => format!("{model} runs only at OpenRouter or Vercel"),
     }
 }
 
@@ -374,7 +374,7 @@ pub fn open(
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
-            "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}, or at Vercel AI Gateway by setting {}{}",
+            "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}, or at Vercel by setting {}{}",
             nowhere(settings.model, &Config::load()?),
             openrouter::KEY,
             vercel::KEY,
