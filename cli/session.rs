@@ -84,7 +84,9 @@ pub struct Loaded {
 /// memory than a machine has, and runs only at OpenRouter or Vercel's AI
 /// Gateway. Nowhere, if the command line named no provider and the model
 /// can run neither here nor at a host without a key: the shell starts
-/// without a model then, for `/login` to sign in.
+/// without a model then, for `/login` to sign in. A provider the command
+/// line names is only returned if the model can run there: a local one
+/// needs this machine to have the memory for it.
 pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
@@ -97,6 +99,10 @@ pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, 
             Variant::Large
         )
         .into()),
+        (Some(Kind::Local), _) => {
+            memory::check()?;
+            Ok(Some(Kind::Local))
+        }
         (Some(kind), _) => Ok(Some(kind)),
         (None, model) => {
             let config = Config::load()?;
@@ -244,11 +250,15 @@ pub fn accounts() -> Vec<Account> {
 }
 
 /// Fetches the model's files if they are not yet there, reporting the
-/// download to `on_status`, and returns the directory they are in.
+/// download to `on_status`, and returns the directory they are in. Checks
+/// first that this machine has the memory to run the model, so an
+/// undersized machine fails before the weights are downloaded: every
+/// caller means to run the model here.
 pub fn fetch_model(
     settings: &Settings,
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
+    memory::check()?;
     let dir = Model::dir(settings.model.name())?;
     Model::fetch(&dir, |progress| {
         on_status(Status::Downloading {
