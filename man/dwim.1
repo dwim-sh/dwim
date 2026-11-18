@@ -255,8 +255,12 @@ up and down move over the models, left and right change the provider,
 enter picks, esc cancels.
 Picking another model, or another provider, moves the conversation
 there.
-A model the provider does not run is shown, but cannot be picked, and
-neither can a provider that cannot be used.
+A model the provider does not run is shown, but cannot be picked.
+Only the providers a model can run at are shown, this machine first and
+then the others by name: one that is disabled, or has no key, or this
+machine without the memory for a model, is left out, and
+.B /provider
+is where to enable more.
 Picking the model the session is on shows it: the device it runs on,
 where its weights are kept, and how many tokens of conversation it has
 room for.

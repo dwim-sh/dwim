@@ -84,7 +84,7 @@ pub struct Loaded {
 /// memory than a machine has, and runs only at OpenRouter or Vercel's AI
 /// Gateway. Nowhere, if the command line named no provider and the model
 /// can run neither here nor at a host without a key: the shell starts
-/// without a model then, for `/provider` to sign in.
+/// without a model then, for `/login` to sign in.
 pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
@@ -161,42 +161,30 @@ fn name(kind: Kind) -> &'static str {
     kind.host().map_or("Local", |host| host.name)
 }
 
-/// The providers, each with the models it runs, for the model picker: the
-/// large model only at OpenRouter and Vercel's AI Gateway. A provider
-/// disabled in `config` cannot be used, nor this machine without the
-/// memory for a model, nor a host without a key to it.
-pub fn providers(config: &Config) -> Vec<Group> {
-    let unavailable = |kind, why| unless_disabled(config, kind, why);
-    vec![
-        Group {
-            provider: Kind::Local,
-            models: vec![Variant::Medium],
-            unavailable: unavailable(Kind::Local, memory::check().err().map(|e| e.to_string())),
-        },
-        Group {
-            provider: Kind::OpenRouter,
-            models: vec![Variant::Medium, Variant::Large],
-            unavailable: unavailable(
-                Kind::OpenRouter,
-                openrouter::key()
-                    .is_none()
-                    .then(|| "/login signs in".to_string()),
-            ),
-        },
-        Group {
-            provider: Kind::Vercel,
-            models: vec![Variant::Medium, Variant::Large],
-            unavailable: unavailable(Kind::Vercel, vercel::key().is_none().then(no_vercel_key)),
-        },
-        Group {
-            provider: Kind::Cerebras,
-            models: vec![Variant::Medium],
-            unavailable: unavailable(
-                Kind::Cerebras,
-                cerebras::key().is_none().then(no_cerebras_key),
-            ),
-        },
-    ]
+/// The providers a model can run at, each with the models it runs, for
+/// the model picker, and whether there are more that it cannot: one that
+/// is disabled in `config`, this machine without the memory for a model,
+/// a host without a key to it. They are this machine first, then the
+/// hosts by name. Where the session's model runs, `current`, is among
+/// them whatever is said of it, since the model does run there.
+pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
+    let usable = |&kind: &Kind| {
+        Some(kind) == current || (!config.disabled(kind) && ready(kind, Variant::Medium))
+    };
+    let groups: Vec<Group> = SHOWN
+        .into_iter()
+        .filter(usable)
+        .map(|kind| Group {
+            provider: kind,
+            name: label(kind),
+            models: [Variant::Medium, Variant::Large]
+                .into_iter()
+                .filter(|&model| runs(kind, model))
+                .collect(),
+        })
+        .collect();
+    let more = groups.len() < SHOWN.len();
+    (groups, more)
 }
 
 /// The providers, for the provider picker: this machine first, then the
@@ -229,16 +217,6 @@ fn label(kind: Kind) -> &'static str {
     kind.host().map_or("Local 🏠", |host| host.name)
 }
 
-/// Why `kind` cannot be used: it is disabled in `config`, or else `why`,
-/// if there is a reason.
-fn unless_disabled(config: &Config, kind: Kind, why: Option<String>) -> Option<String> {
-    if config.disabled(kind) {
-        Some("disabled · /provider enables it".to_string())
-    } else {
-        why
-    }
-}
-
 /// The hosts, each with what there is of a key to it, for the sign-in
 /// picker: the environment's, which is used ahead of one kept and is not
 /// the shell's to change, or one kept from signing in, or none.
@@ -263,16 +241,6 @@ pub fn accounts() -> Vec<Account> {
             Account { host, note, kept }
         })
         .collect()
-}
-
-/// What to do to use Vercel's AI Gateway where there is no key to it.
-fn no_vercel_key() -> String {
-    "/login takes a key from the Vercel dashboard".to_string()
-}
-
-/// What to do to use Cerebras where there is no key to it.
-fn no_cerebras_key() -> String {
-    "/login takes a key from the Cerebras cloud console".to_string()
 }
 
 /// Fetches the model's files if they are not yet there, reporting the

@@ -928,11 +928,13 @@ impl App {
                 let Some(config) = self.config() else {
                     return;
                 };
-                let groups = session::providers(&config);
-                if groups.iter().all(|group| group.unavailable.is_some()) {
-                    self.say(&view::notice(view::no_provider(false)));
+                let (groups, more) = session::providers(&config, self.provider);
+                if groups.is_empty() {
+                    self.say(&view::notice(
+                        "No provider a model can run at · /login signs in to one, /provider enables one",
+                    ));
                 } else {
-                    self.picker = Some(Picker::new(groups, self.provider, self.variant));
+                    self.picker = Some(Picker::new(groups, more, self.provider, self.variant));
                 }
                 return;
             }
