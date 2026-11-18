@@ -10,7 +10,7 @@ mod tui;
 
 use std::error::Error;
 
-use dwim::{harness::Log, inference::Model, providers::Kind, sys::memory};
+use dwim::{harness::Log, inference::Model};
 
 use opts::Opts;
 use session::Stderr;
@@ -32,13 +32,6 @@ fn main() {
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
-    // Running the model here takes the memory for it; a session at a
-    // provider takes none, and one with nowhere to run starts without
-    // a model, for the shell's `/login` to sign in.
-    let local = opts.download || opts.bench || opts.serve;
-    if local || session::provider(settings.provider, settings.model)? == Some(Kind::Local) {
-        memory::check()?;
-    }
     if opts.download {
         let mut stderr = Stderr::new();
         let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
