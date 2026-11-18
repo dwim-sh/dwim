@@ -42,7 +42,7 @@ fn main() {
     let result = (|| {
         // Running the model here takes the memory for it; a session at a
         // provider takes none, and one with nowhere to run starts without
-        // a model, for the shell's `/provider` to sign in.
+        // a model, for the shell's `/login` to sign in.
         let local = opts.download || opts.bench || opts.serve;
         if local || session::provider(settings.provider, settings.model)? == Some(Kind::Local) {
             memory::check()?;

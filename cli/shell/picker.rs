@@ -6,10 +6,13 @@
 //! And the provider picker the `/provider` command opens: the providers,
 //! each with what picking it comes to, and a box that is ticked unless it
 //! is disabled.
+//!
+//! And the sign-in picker the `/login` command opens: the hosts, each with
+//! whether there is a key to it.
 
 use crossterm::style::Stylize;
 use dwim::model::Variant;
-use dwim::providers::Kind;
+use dwim::providers::{Kind, hosted::Host};
 
 use crate::tui::{Line, span};
 
@@ -283,6 +286,61 @@ impl Providers {
                     span(note).dark_grey(),
                     span(tick),
                 ],
+            });
+        }
+        (rows, cursor)
+    }
+}
+
+/// The hosts to sign in to, and which the cursor is on.
+pub struct Logins {
+    accounts: Vec<Account>,
+    at: usize,
+}
+
+/// A host to sign in to: what there is of a key to it, and whether one is
+/// kept from signing in, which signing out forgets.
+pub struct Account {
+    pub host: &'static Host,
+    pub note: String,
+    pub kept: bool,
+}
+
+impl Logins {
+    /// A picker of `accounts`, on the first of them.
+    pub fn new(accounts: Vec<Account>) -> Self {
+        Self { accounts, at: 0 }
+    }
+
+    /// Moves the cursor down, or up, to the next host, if there is one
+    /// that way.
+    pub fn step(&mut self, down: bool) {
+        if down {
+            self.at = (self.at + 1).min(self.accounts.len() - 1);
+        } else {
+            self.at = self.at.saturating_sub(1);
+        }
+    }
+
+    /// The host the cursor is on.
+    pub fn account(&self) -> &Account {
+        &self.accounts[self.at]
+    }
+
+    /// The picker as rows, and which of them the cursor is on: the hosts,
+    /// each with what there is of a key to it.
+    pub fn rows(&self) -> (Vec<Line>, usize) {
+        let names = self.accounts.iter().map(|a| a.host.name.len());
+        let names = names.max().unwrap_or(0);
+        let mut rows = vec![vec![span("  Sign in").bold()], Line::new()];
+        let mut cursor = 0;
+        for (i, account) in self.accounts.iter().enumerate() {
+            let name = format!("{:<names$}  ", account.host.name);
+            rows.push(if i == self.at {
+                cursor = rows.len();
+                vec![span(format!("  › {name}")).bold(), span(&account.note)]
+            } else {
+                vec![span(format!("    {name}")), span(&account.note).dark_grey()]
             });
         }
         (rows, cursor)

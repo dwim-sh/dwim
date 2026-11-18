@@ -16,6 +16,7 @@ use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
     Any, Conversation, Kind, cerebras,
     dwim::{self as server},
+    hosted::{self, Host},
     openrouter, vercel,
 };
 use dwim::sys::memory;
@@ -23,7 +24,7 @@ use dwim::sys::memory;
 use crate::{
     config::Config,
     model,
-    shell::picker::{Choice, Group},
+    shell::picker::{Account, Choice, Group},
 };
 
 pub use dwim::server::protocol::Status;
@@ -179,7 +180,7 @@ pub fn providers(config: &Config) -> Vec<Group> {
                 Kind::OpenRouter,
                 openrouter::key()
                     .is_none()
-                    .then(|| "/provider signs in".to_string()),
+                    .then(|| "/login signs in".to_string()),
             ),
         },
         Group {
@@ -254,17 +255,40 @@ fn unless_disabled(config: &Config, kind: Kind, why: Option<String>) -> Option<S
     }
 }
 
+/// The hosts, each with what there is of a key to it, for the sign-in
+/// picker: the environment's, which is used ahead of one kept and is not
+/// the shell's to change, or one kept from signing in, or none.
+pub fn accounts() -> Vec<Account> {
+    let hosts: [&'static Host; 3] = [&cerebras::HOST, &openrouter::HOST, &vercel::HOST];
+    hosts
+        .into_iter()
+        .map(|host| {
+            let kept = hosted::key::kept(host).is_some();
+            let browser = host.kind == Kind::OpenRouter;
+            let note = if hosted::key::environment(host).is_some() {
+                format!("key in {}", host.key)
+            } else if kept && browser {
+                "signed in · enter signs in again".to_string()
+            } else if kept {
+                "signed in · enter takes another key".to_string()
+            } else if browser {
+                "sign in with your browser".to_string()
+            } else {
+                "paste a key".to_string()
+            };
+            Account { host, note, kept }
+        })
+        .collect()
+}
+
 /// What to do to use Vercel's AI Gateway where there is no key to it.
 fn no_vercel_key() -> String {
-    format!("set {} to a key from the Vercel dashboard", vercel::KEY)
+    "/login takes a key from the Vercel dashboard".to_string()
 }
 
 /// What to do to use Cerebras where there is no key to it.
 fn no_cerebras_key() -> String {
-    format!(
-        "set {} to a key from the Cerebras cloud console",
-        cerebras::KEY
-    )
+    "/login takes a key from the Cerebras cloud console".to_string()
 }
 
 /// Fetches the model's files if they are not yet there, reporting the
@@ -398,7 +422,7 @@ pub fn open(
     let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
-            "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}, or at Vercel AI Gateway by setting {}{}",
+            "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}, or at Vercel AI Gateway by setting {}{}",
             nowhere(settings.model, &Config::load()?),
             openrouter::KEY,
             vercel::KEY,

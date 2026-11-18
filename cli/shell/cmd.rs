@@ -6,6 +6,7 @@ use crate::opts;
 pub enum Command {
     Model,
     Provider,
+    Login,
     Stats,
     Transcript,
     Compact,
@@ -31,6 +32,7 @@ impl Command {
         match (name, argument) {
             ("model", None) => Ok(Command::Model),
             ("provider", None) => Ok(Command::Provider),
+            ("login", None) => Ok(Command::Login),
             ("stats", None) => Ok(Command::Stats),
             ("transcript", None) => Ok(Command::Transcript),
             ("compact", None) => Ok(Command::Compact),
@@ -67,9 +69,13 @@ pub enum ServerAction {
 }
 
 /// The slash commands, each with the line `/help` says of it.
-pub const COMMANDS: [(&str, &str); 9] = [
+pub const COMMANDS: [(&str, &str); 10] = [
     ("/model", "pick the model, medium or large"),
-    ("/provider", "pick where the model runs, and sign in to it"),
+    (
+        "/provider",
+        "pick where the model runs, and disable a provider",
+    ),
+    ("/login", "sign in to a provider, or sign out of it"),
     ("/stats", "where this session's time has gone"),
     ("/transcript", "where this session's transcript is"),
     ("/compact", "compact the conversation now"),
