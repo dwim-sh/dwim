@@ -479,7 +479,9 @@ impl App {
     }
 
     /// Handles a key press while the provider picker is open: up and down
-    /// move over the providers, enter picks, and esc closes the picker.
+    /// move over the providers, space disables the one the cursor is on,
+    /// or enables it again, enter picks, and esc closes the picker. A
+    /// provider that is disabled is not picked, but said to be disabled.
     /// Picking the provider the session is on shows it, but for
     /// OpenRouter, which is signed in to again, for a key that has expired
     /// or been revoked; picking another moves the conversation there, after
@@ -496,6 +498,14 @@ impl App {
             KeyCode::Char('n') if ctrl => providers.step(true),
             KeyCode::Esc => self.providers = None,
             KeyCode::Char('c') if ctrl => self.providers = None,
+            KeyCode::Char(' ') => self.toggle_provider(),
+            KeyCode::Enter if providers.choice().disabled => {
+                let name = providers.choice().name;
+                self.providers = None;
+                self.say(&view::notice(format!(
+                    "{name} is disabled · space in /provider enables it"
+                )));
+            }
             KeyCode::Enter => {
                 let picked = providers.picked();
                 self.providers = None;
@@ -514,6 +524,38 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Disables the provider the cursor of the provider picker is on, or
+    /// enables it again, for this session and the ones to come. A session
+    /// on the provider stays there, which is said, since nothing shows it.
+    /// If the configuration cannot be kept, the picker closes on why.
+    fn toggle_provider(&mut self) {
+        let Some(providers) = &self.providers else {
+            return;
+        };
+        let choice = providers.choice();
+        let (provider, name, disabled) = (choice.provider, choice.name, !choice.disabled);
+        let saved = Config::load().and_then(|mut config| {
+            config.set_disabled(provider, disabled);
+            config.save()
+        });
+        match saved {
+            Ok(()) => {
+                if let Some(providers) = &mut self.providers {
+                    providers.set_disabled(disabled);
+                }
+                if disabled && self.provider == Some(provider) {
+                    self.say(&view::notice(format!(
+                        "{name} is disabled · the session stays on it until another is picked"
+                    )));
+                }
+            }
+            Err(e) => {
+                self.providers = None;
+                self.say(&view::notice(e.to_string()));
+            }
         }
     }
 
@@ -1250,7 +1292,7 @@ impl App {
         } else if let Some(providers) = &self.providers {
             Some((
                 providers.rows(),
-                "  ↑↓ provider · enter to select · esc to cancel",
+                "  ↑↓ provider · space to enable or disable · enter to select · esc to cancel",
             ))
         } else {
             self.signin

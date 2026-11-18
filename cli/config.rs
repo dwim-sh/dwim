@@ -1,6 +1,6 @@
 //! What the `dwim` command keeps from one run to the next: the providers
 //! that are disabled. It is a JSON file in the user's configuration
-//! directory, written by the shell and fit to edit by hand:
+//! directory, written by the shell's `/provider` and fit to edit by hand:
 //!
 //! ```json
 //! { "disabled_providers": ["local"] }
@@ -8,7 +8,8 @@
 
 use std::{
     error::Error,
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -53,6 +54,37 @@ impl Config {
         let name = provider.to_string();
         self.disabled_providers.contains(&name)
     }
+
+    /// Disables `provider`, or enables it again.
+    pub fn set_disabled(&mut self, provider: Kind, disabled: bool) {
+        let name = provider.to_string();
+        self.disabled_providers.retain(|other| *other != name);
+        if disabled {
+            self.disabled_providers.push(name);
+        }
+    }
+
+    /// Keeps the configuration for the runs to come.
+    pub fn save(&self) -> Result<(), Box<dyn Error>> {
+        let path = path().ok_or("there is no directory to keep the configuration in")?;
+        self.write(&path)
+    }
+
+    /// Writes the configuration to the file at `path`, in a directory
+    /// made for it if there is none: to a file beside it first, which
+    /// then takes its place, so that the file is never half written.
+    pub fn write(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let failed = |e: io::Error| format!("{}: {e}", path.display());
+        if let Some(dir) = path.parent() {
+            sys::fs::create_private_dir(dir).map_err(failed)?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        let partial = path.with_extension("json.partial");
+        let mut file = sys::fs::create_private(&partial).map_err(failed)?;
+        writeln!(file, "{text}").map_err(failed)?;
+        fs::rename(&partial, path).map_err(failed)?;
+        Ok(())
+    }
 }
 
 /// Where the configuration is kept: in the user's configuration directory
@@ -81,6 +113,27 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert!(config.disabled(Kind::Local));
         assert!(!config.disabled(Kind::OpenRouter));
+    }
+
+    #[test]
+    fn keeps_what_is_disabled_and_what_else_the_file_has() {
+        let path = file(
+            "keeps",
+            r#"{ "disabled_providers": ["someday"], "theme": "dark" }"#,
+        );
+        let mut config = Config::read(&path).unwrap();
+        config.set_disabled(Kind::Local, true);
+        config.set_disabled(Kind::Vercel, true);
+        config.set_disabled(Kind::Vercel, false);
+        config.write(&path).unwrap();
+        let config = Config::read(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(config.disabled(Kind::Local));
+        assert!(!config.disabled(Kind::Vercel));
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["theme"], "dark");
+        assert_eq!(json["disabled_providers"][0], "someday");
     }
 
     #[test]

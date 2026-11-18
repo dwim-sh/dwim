@@ -4,7 +4,8 @@
 //! be picked, and neither is a provider that cannot be used.
 //!
 //! And the provider picker the `/provider` command opens: the providers,
-//! each with what picking it comes to.
+//! each with what picking it comes to, and a box that is ticked unless it
+//! is disabled.
 
 use crossterm::style::Stylize;
 use dwim::model::Variant;
@@ -181,12 +182,14 @@ pub struct Providers {
 }
 
 /// A provider to pick: what picking it comes to, or why it cannot be
-/// picked.
+/// picked, and whether it is disabled, which keeps it from being picked
+/// until it is enabled again.
 pub struct Choice {
     pub provider: Kind,
     pub name: &'static str,
     pub note: String,
     pub unavailable: Option<String>,
+    pub disabled: bool,
 }
 
 impl Providers {
@@ -218,21 +221,42 @@ impl Providers {
         self.at = next.unwrap_or(self.at);
     }
 
-    /// The provider the cursor is on, if it can be picked.
+    /// The provider the cursor is on, if it can be picked: one that is
+    /// disabled cannot.
     pub fn picked(&self) -> Option<Kind> {
-        let choice = &self.choices[self.at];
-        choice.unavailable.is_none().then_some(choice.provider)
+        let choice = self.choice();
+        (choice.unavailable.is_none() && !choice.disabled).then_some(choice.provider)
+    }
+
+    /// The provider the cursor is on, as it is shown.
+    pub fn choice(&self) -> &Choice {
+        &self.choices[self.at]
+    }
+
+    /// Shows the provider the cursor is on as disabled, or as enabled.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.choices[self.at].disabled = disabled;
     }
 
     /// The picker as rows, and which of them the cursor is on: the
-    /// providers, the one the session is on ticked, each with what picking
+    /// providers, each with a box that is ticked unless it is disabled,
+    /// the one the session is on ticked after it, each with what picking
     /// it comes to, and one that cannot be picked dimmed, with why.
     pub fn rows(&self) -> (Vec<Line>, usize) {
         let names = self.choices.iter().map(|c| c.name.len()).max().unwrap_or(0);
         let mut rows = vec![vec![span("  Select provider").bold()], Line::new()];
         let mut cursor = 0;
         for (i, choice) in self.choices.iter().enumerate() {
-            let name = format!("{:<names$}  ", choice.name);
+            let name = format!(
+                "{} {:<names$}  ",
+                if choice.disabled { "[ ]" } else { "[✓]" },
+                choice.name
+            );
+            let note = if choice.disabled {
+                "disabled"
+            } else {
+                &choice.note
+            };
             let tick = if Some(choice.provider) == self.current {
                 "  ✓"
             } else {
@@ -244,13 +268,13 @@ impl Providers {
                     cursor = rows.len();
                     vec![
                         span(format!("  › {name}")).bold(),
-                        span(&choice.note),
+                        span(note),
                         span(tick).bold(),
                     ]
                 }
                 None => vec![
                     span(format!("    {name}")),
-                    span(&choice.note).dark_grey(),
+                    span(note).dark_grey(),
                     span(tick),
                 ],
             });
@@ -310,6 +334,7 @@ mod tests {
             name: "",
             note: String::new(),
             unavailable: unavailable.map(str::to_string),
+            disabled: false,
         };
         let mut providers = Providers::new(
             vec![
@@ -321,6 +346,23 @@ mod tests {
         assert_eq!(providers.picked(), Some(Kind::OpenRouter));
         providers.step(false);
         assert_eq!(providers.picked(), Some(Kind::OpenRouter));
+    }
+
+    #[test]
+    fn does_not_pick_a_provider_until_it_is_enabled() {
+        let mut providers = Providers::new(
+            vec![Choice {
+                provider: Kind::Local,
+                name: "",
+                note: String::new(),
+                unavailable: None,
+                disabled: true,
+            }],
+            None,
+        );
+        assert_eq!(providers.picked(), None);
+        providers.set_disabled(false);
+        assert_eq!(providers.picked(), Some(Kind::Local));
     }
 
     #[test]

@@ -263,8 +263,15 @@ room for.
 .B /provider
 Open a picker of the providers, this machine, OpenRouter, Vercel's AI
 Gateway and Cerebras:
-up and down move over them, enter picks, esc cancels.
+up and down move over them, space disables one or enables it again,
+enter picks, esc cancels.
 Picking another provider moves the conversation there.
+A provider that is disabled is passed over when
+.B dwim
+starts, and cannot be picked here or in
+.B /model
+until it is enabled again; it stays so in the sessions to come.
+A session that is on it when it is disabled stays on it.
 Picking OpenRouter without a key to it signs in first: the browser opens
 at OpenRouter, which asks whether to make a key for
 .BR dwim ,
@@ -378,8 +385,9 @@ downloads the model again on the next run. The cache is in the same place
 on every system.
 .TP
 .I ~/.config/dwim/config.json
-The configuration, which lists the providers that are disabled by the
-names
+The configuration, which lists the providers disabled with
+.BR /provider ,
+by the names
 .B \-\-provider
 takes, as in
 .BR "{ \(dqdisabled_providers\(dq: [\(dqlocal\(dq] }" .

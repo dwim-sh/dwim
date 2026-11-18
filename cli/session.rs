@@ -199,20 +199,20 @@ pub fn providers(config: &Config) -> Vec<Group> {
 }
 
 /// The providers, each with what picking it comes to, for the provider
-/// picker, where the session's model runs at `current`. A provider
-/// disabled in `config` cannot be picked, nor this machine without the
-/// memory for a model; OpenRouter can be without a key to it, which
-/// picking it signs in for, and picking it while on it signs in again.
-/// Vercel's AI Gateway and Cerebras have no signing in, and cannot be
-/// picked without a key in the environment.
+/// picker, where the session's model runs at `current`, and whether it is
+/// disabled in `config`. This machine cannot be picked without the memory
+/// for a model; OpenRouter can be without a key to it, which picking it
+/// signs in for, and picking it while on it signs in again. Vercel's AI
+/// Gateway and Cerebras have no signing in, and cannot be picked without
+/// a key in the environment.
 pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
-    let unavailable = |kind, why| unless_disabled(config, kind, why);
     vec![
         Choice {
             provider: Kind::Local,
             name: "This machine",
             note: format!("{} in the dwim server", Variant::Medium),
-            unavailable: unavailable(Kind::Local, memory::check().err().map(|e| e.to_string())),
+            unavailable: memory::check().err().map(|e| e.to_string()),
+            disabled: config.disabled(Kind::Local),
         },
         Choice {
             provider: Kind::OpenRouter,
@@ -224,22 +224,22 @@ pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
                 Some(_) => "signed in".to_string(),
                 None => "sign in with your browser to get a key".to_string(),
             },
-            unavailable: unavailable(Kind::OpenRouter, None),
+            unavailable: None,
+            disabled: config.disabled(Kind::OpenRouter),
         },
         Choice {
             provider: Kind::Vercel,
             name: vercel::HOST.name,
             note: format!("key in {}", vercel::KEY),
-            unavailable: unavailable(Kind::Vercel, vercel::key().is_none().then(no_vercel_key)),
+            unavailable: vercel::key().is_none().then(no_vercel_key),
+            disabled: config.disabled(Kind::Vercel),
         },
         Choice {
             provider: Kind::Cerebras,
             name: cerebras::HOST.name,
             note: format!("{} only · key in {}", Variant::Medium, cerebras::KEY),
-            unavailable: unavailable(
-                Kind::Cerebras,
-                cerebras::key().is_none().then(no_cerebras_key),
-            ),
+            unavailable: cerebras::key().is_none().then(no_cerebras_key),
+            disabled: config.disabled(Kind::Cerebras),
         },
     ]
 }
@@ -248,7 +248,7 @@ pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
 /// if there is a reason.
 fn unless_disabled(config: &Config, kind: Kind, why: Option<String>) -> Option<String> {
     if config.disabled(kind) {
-        Some("disabled in the configuration".to_string())
+        Some("disabled · /provider enables it".to_string())
     } else {
         why
     }
