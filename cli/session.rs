@@ -157,7 +157,7 @@ pub fn nowhere(model: Variant, config: &Config) -> String {
 
 /// What `kind` is called in a sentence.
 fn name(kind: Kind) -> &'static str {
-    kind.host().map_or("this machine", |host| host.name)
+    kind.host().map_or("Local", |host| host.name)
 }
 
 /// The providers, each with the models it runs, for the model picker: the
@@ -209,7 +209,7 @@ pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
     vec![
         Choice {
             provider: Kind::Local,
-            name: "This machine",
+            name: "Local",
             note: format!("{} in the dwim server", Variant::Medium),
             unavailable: memory::check().err().map(|e| e.to_string()),
             disabled: config.disabled(Kind::Local),
