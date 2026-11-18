@@ -12,6 +12,7 @@ Local by default: no API key, no cloud, and nothing leaves your machine
 unless you send a session to a bigger model.
 
 [![Model: Qwen3.8-27B](https://img.shields.io/badge/Model-Qwen3.8--27B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-27B)
+[![Model: Qwen3.8-2.4T-A95B](https://img.shields.io/badge/Model-Qwen3.8--2.4T--A95B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
 </div>
