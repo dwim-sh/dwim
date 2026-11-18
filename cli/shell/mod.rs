@@ -1571,12 +1571,16 @@ impl App {
         ])
     }
 
-    /// The line under the input box: the directory the agent works in, at
-    /// the left, and while the model loads, how far along that is, at the
-    /// right.
+    /// The line under the input box: the provider the model runs at and
+    /// the directory the agent works in, at the left, and while the model
+    /// loads, how far along that is, at the right.
     fn footer(&self) -> Line {
         let (columns, _) = self.screen.size();
-        let left = format!("  {}", view::tilde(&self.cwd));
+        let cwd = view::tilde(&self.cwd);
+        let left = match self.provider {
+            Some(provider) => format!("  {provider} · {cwd}"),
+            None => format!("  {cwd}"),
+        };
         let right = match self.doing() {
             Some((frame, verb, details)) if !self.ready => {
                 let details: Vec<&str> = details.split_whitespace().collect();
