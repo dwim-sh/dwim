@@ -1,10 +1,9 @@
 //! Cerebras as the host of a model: where it is asked, what it is asked
-//! in its own way, and the key to it, which is the environment's.
+//! in its own way, and the key to it, which is the environment's or one
+//! kept from signing in.
 //!
 //! Cerebras runs the medium model only. Its keys are made in its cloud
-//! console, so there is no signing in to it from here, and no key kept.
-
-use std::env;
+//! console, so signing in to it from here is giving a key made there.
 
 use serde_json::{Value, json};
 
@@ -12,11 +11,12 @@ use crate::{
     model::{Result, Sampling, Variant},
     providers::{
         Kind,
-        hosted::{Host, Hosted},
+        hosted::{self, Host, Hosted},
     },
 };
 
-/// The environment variable the key to Cerebras is read from.
+/// The environment variable the key to Cerebras is read from, ahead of
+/// the key kept from signing in.
 pub const KEY: &str = "CEREBRAS_API_KEY";
 
 /// Cerebras, as the host of a model.
@@ -26,10 +26,12 @@ pub const HOST: Host = Host {
     url: "https://api.cerebras.ai/v1/chat/completions",
     model,
     ask,
-    refused: "make another in the Cerebras cloud console, and set CEREBRAS_API_KEY to it",
+    key: KEY,
+    refused: "make another in the Cerebras cloud console, and give it with /login",
 };
 
-/// The medium model at Cerebras, with the key in the environment, with
+/// The medium model at Cerebras, with the key in the environment or kept
+/// from signing in, with
 /// room for `context` tokens of conversation, or as many as a model at a
 /// host has unless told, sampled at `temperature`, or as the model's
 /// makers recommend. The large model does not run there.
@@ -37,9 +39,8 @@ pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) 
     if variant == Variant::Large {
         return Err(format!("{variant} does not run at Cerebras").into());
     }
-    let key = key().ok_or_else(|| {
-        format!("there is no key to Cerebras: set {KEY} to one made in the Cerebras cloud console")
-    })?;
+    let key = key()
+        .ok_or_else(|| format!("there is no key to Cerebras: /login takes one, or set {KEY}"))?;
     Ok(Hosted::new(&HOST, key, variant, context, temperature))
 }
 
@@ -52,9 +53,10 @@ pub fn model(variant: Variant) -> &'static str {
     }
 }
 
-/// The key to Cerebras, if the environment has one.
+/// The key to Cerebras, if there is one: the environment's, or else the
+/// one kept from signing in.
 pub fn key() -> Option<String> {
-    env::var(KEY).ok().filter(|key| !key.trim().is_empty())
+    hosted::key::find(&HOST)
 }
 
 /// Adds to a request what Cerebras is asked in its own way. It says what

@@ -86,19 +86,24 @@ in the dwim server on this machine,
 .BR openrouter ,
 at OpenRouter, with the key in
 .BR OPENROUTER_API_KEY ,
-or the one kept from signing in with
-.BR /provider ,
 .BR vercel ,
 at Vercel's AI Gateway, with the key in
 .BR AI_GATEWAY_API_KEY ,
 or
 .BR cerebras ,
 at Cerebras, which runs the medium model only, with the key in
-.BR CEREBRAS_API_KEY .
+.BR CEREBRAS_API_KEY ;
+where the variable is not set, the key is the one kept from signing in
+with
+.BR /login .
 Without the option, the model runs on this machine where it can, and
 where it cannot, at OpenRouter if there is a key to it, or else at
 Vercel's AI Gateway if there is a key to that, or else, for the medium
-model, at Cerebras if there is a key to that. A session at any of them
+model, at Cerebras if there is a key to that, passing over a provider
+that is disabled in
+.IR config.json ,
+which the model runs at only when the option names it. A session at any
+of the hosts
 loads no model, has room for 131072 tokens of conversation unless
 .B \-\-context
 says, and sends the conversation there: what the agent reads of the
@@ -250,28 +255,50 @@ up and down move over the models, left and right change the provider,
 enter picks, esc cancels.
 Picking another model, or another provider, moves the conversation
 there.
-A model the provider does not run is shown, but cannot be picked, and
-neither can a provider that cannot be used.
+A model the provider does not run is shown, but cannot be picked.
+Only the providers a model can run at are shown, this machine first and
+then the others by name: one that is disabled, or has no key, or this
+machine without the memory for a model, is left out, and
+.B /provider
+is where to enable more.
 Picking the model the session is on shows it: the device it runs on,
 where its weights are kept, and how many tokens of conversation it has
 room for.
 .TP
 .B /provider
-Open a picker of the providers, this machine, OpenRouter, Vercel's AI
-Gateway and Cerebras:
-up and down move over them, enter picks, esc cancels.
-Picking another provider moves the conversation there.
-Picking OpenRouter without a key to it signs in first: the browser opens
-at OpenRouter, which asks whether to make a key for
-.BR dwim ,
-and the key it makes is kept for the sessions to come.
-Where the browser does not open, the address to go to is shown.
-Vercel's AI Gateway has no signing in, and can be picked only with a key
-in
-.BR AI_GATEWAY_API_KEY ,
-nor Cerebras, but with a key in
-.BR CEREBRAS_API_KEY .
-Picking the provider the session is on shows where the model runs.
+Open a list of the providers, this machine and then Cerebras, OpenRouter
+and Vercel's AI Gateway, each with a box that is ticked unless the
+provider is disabled, and whether a model can run there: ready, or what
+it wants, the memory for a model on this machine or a key to a host.
+Up and down move over them, space or enter disables one or enables it
+again, esc closes the list.
+A provider that is disabled is passed over when
+.B dwim
+starts, and is not shown in
+.B /model
+until it is enabled again; it stays so in the sessions to come.
+A session that is on it when it is disabled stays on it, and a session
+with no model yet opens at a provider enabled that is ready.
+.TP
+.B /login
+Open a picker of the providers to sign in to, Cerebras, OpenRouter and
+Vercel's AI Gateway: up and down move over them, enter signs in, d signs
+out, esc cancels.
+Signing in to OpenRouter opens the browser at OpenRouter, which asks
+whether to make a key for
+.BR dwim ;
+where the browser does not open, the address to go to is shown.
+Vercel's AI Gateway and Cerebras make their keys in a console of their
+own, and signing in to either is pasting a key made there.
+The key is kept for the sessions to come.
+A session with no model yet opens at the provider signed in to, and one
+that is there already opens again with the new key; one elsewhere stays
+where it is, for
+.B /model
+to move.
+Signing out removes the key kept; a key in the environment is not
+.BR dwim 's
+to remove.
 .TP
 .B /stats
 Show where the session's time has gone, as
@@ -373,10 +400,23 @@ to free the space;
 downloads the model again on the next run. The cache is in the same place
 on every system.
 .TP
-.I ~/.config/dwim/openrouter.key
-The key to OpenRouter kept from signing in with
+.I ~/.config/dwim/config.json
+The configuration, which lists the providers disabled with
 .BR /provider ,
-readable by the user alone. Remove the file to sign out. On macOS it is in
+by the names
+.B \-\-provider
+takes, as in
+.BR "{ \(dqdisabled_providers\(dq: [\(dqlocal\(dq] }" .
+A disabled provider is not where the model runs unless
+.B \-\-provider
+names it, and cannot be picked in the shell. On macOS the file is in
+.IR "~/Library/Application Support/dwim/" .
+.TP
+.IR ~/.config/dwim/openrouter.key ", " vercel.key ", " cerebras.key
+The key to each provider kept from signing in with
+.BR /login ,
+readable by the user alone, and removed by signing out there. On macOS
+they are in
 .IR "~/Library/Application Support/dwim/" .
 .TP
 .I ~/.cache/dwim/states/
@@ -465,15 +505,15 @@ that is no longer running are removed by the next one to start.
 .B OPENROUTER_API_KEY
 The key to OpenRouter, for a model that runs there, used instead of the
 one kept from signing in with
-.BR /provider .
+.BR /login .
 .TP
 .B AI_GATEWAY_API_KEY
-The key to Vercel's AI Gateway, for a model that runs there. The Vercel
-dashboard makes one.
+The key to Vercel's AI Gateway, for a model that runs there, used
+instead of the one kept from signing in. The Vercel dashboard makes one.
 .TP
 .B CEREBRAS_API_KEY
-The key to Cerebras, for the medium model to run there. The Cerebras
-cloud console makes one. Its free tier has room for 65536 tokens of
+The key to Cerebras, for the medium model to run there, used instead of
+the one kept from signing in. The Cerebras cloud console makes one. Its free tier has room for 65536 tokens of
 conversation, which
 .B \-\-context
 says.

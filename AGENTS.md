@@ -21,7 +21,8 @@ program. One package: `lib.rs` is the library, `cli/` and
 
 ## Layout
 
-- `cli/` - the `dwim` command: options, the shell, `serve`, `bench`
+- `cli/` - the `dwim` command: options, the shell, `serve`, `bench`,
+  `config` (what is kept in `config.json`)
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   the plan of the work, compaction, thinking budget, transcript
 - `providers/` - where a session's model runs: `Provider` is a model

@@ -27,19 +27,21 @@ use crossterm::{
 use dwim::harness::{self, Event, Log};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{
-    Kind, hosted,
+    Kind,
+    hosted::{self, Host},
     openrouter::{self, login::Login},
 };
 use dwim::sys::browser;
 use dwim::tools::plan::Plan;
 
 use crate::{
+    config::Config,
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
 
 use cmd::Command;
-use picker::{Picker, Providers};
+use picker::{Logins, Picker, Providers};
 use view::Segment;
 use worker::{Reply, Request, Worker};
 
@@ -74,6 +76,8 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         input: Input::default(),
         picker: None,
         providers: None,
+        logins: None,
+        key_entry: None,
         signin: None,
         history: Vec::new(),
         recalled: None,
@@ -103,9 +107,10 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         worker,
     };
     if provider.is_none() {
+        let config = Config::load()?;
         let (columns, _) = app.screen.size();
         let lines = view::nowhere(
-            &session::nowhere(variant),
+            &session::nowhere(variant, &config),
             openrouter::key().is_some(),
             columns,
         );
@@ -128,6 +133,70 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let ready = app.ready;
     app.into_worker().finish(ready);
     result
+}
+
+/// A key to a host that makes its keys in a console of its own, being
+/// typed or pasted in.
+struct KeyEntry {
+    host: &'static Host,
+    key: String,
+    /// What was wrong with the last thing pasted, if it was not taken.
+    refused: Option<String>,
+}
+
+impl KeyEntry {
+    /// Adds `text`, as pasted, to the key, unless it is not a key or part
+    /// of one: a key has no spaces in it, and what does is something
+    /// else the clipboard had, which is said instead, since the key is
+    /// shown mostly hidden and would be kept unseen.
+    fn paste(&mut self, text: &str) {
+        let text = text.trim();
+        if text.contains(char::is_whitespace) {
+            self.refused = Some(format!(
+                "That was not a key: the {} characters pasted have spaces in them",
+                text.chars().count()
+            ));
+        } else {
+            self.key.push_str(text);
+            self.refused = None;
+        }
+    }
+
+    /// The entry as rows, and which of them the cursor is on: whose key
+    /// it is, where one is made, and the key so far, hidden but for how
+    /// it starts and ends, with how long it is, and what was wrong with
+    /// the last thing pasted if it was not taken.
+    fn rows(&self) -> (Vec<Line>, usize) {
+        const SHOWN: usize = 4;
+        let where_made = match self.host.kind {
+            Kind::Vercel => "the Vercel dashboard, under AI Gateway",
+            Kind::Cerebras => "the Cerebras cloud console",
+            Kind::OpenRouter | Kind::Local => "its settings",
+        };
+        // A key long enough to hide most of shows how it starts as well,
+        // which is where a host's keys are alike.
+        let length = self.key.chars().count();
+        let start = if length >= 4 * SHOWN { SHOWN } else { 0 };
+        let hidden = length.saturating_sub(start + SHOWN);
+        let first: String = self.key.chars().take(start).collect();
+        let last: String = self.key.chars().skip(start + hidden).collect();
+        let mut key = vec![span(format!("  › {first}{}{last}", "•".repeat(hidden)))];
+        if length > 0 {
+            key.push(span(format!("  {length} characters")).dark_grey());
+        }
+        let mut rows = vec![
+            vec![span(format!("  Key to {}", self.host.name)).bold()],
+            Line::new(),
+            vec![span(format!("  Paste a key made in {where_made}")).dark_grey()],
+            Line::new(),
+            key,
+        ];
+        if let Some(refused) = &self.refused {
+            rows.push(Line::new());
+            rows.push(vec![span(format!("  {refused}")).dark_yellow()]);
+        }
+        (rows, 4)
+    }
 }
 
 /// A sign-in to OpenRouter under way.
@@ -251,6 +320,10 @@ struct App {
     picker: Option<Picker>,
     /// The provider picker, while it is open in place of the input box.
     providers: Option<Providers>,
+    /// The sign-in picker, while it is open in place of the input box.
+    logins: Option<Logins>,
+    /// A key being entered, while it is in place of the input box.
+    key_entry: Option<KeyEntry>,
     /// The sign-in to OpenRouter under way, shown in place of the input
     /// box.
     signin: Option<Signin>,
@@ -327,7 +400,10 @@ impl App {
                             return Ok(());
                         }
                     }
-                    Key::Paste(text) => self.input.insert(&tui::sanitize(&text)),
+                    Key::Paste(text) => match &mut self.key_entry {
+                        Some(entry) => entry.paste(&tui::sanitize(&text)),
+                        None => self.input.insert(&tui::sanitize(&text)),
+                    },
                     _ => {}
                 }
                 dirty = true;
@@ -356,6 +432,14 @@ impl App {
         }
         if self.providers.is_some() {
             self.pick_provider(key);
+            return false;
+        }
+        if self.logins.is_some() {
+            self.pick_login(key);
+            return false;
+        }
+        if self.key_entry.is_some() {
+            self.enter_key(key);
             return false;
         }
         if self.signin.is_some() {
@@ -477,11 +561,8 @@ impl App {
     }
 
     /// Handles a key press while the provider picker is open: up and down
-    /// move over the providers, enter picks, and esc closes the picker.
-    /// Picking the provider the session is on shows it, but for
-    /// OpenRouter, which is signed in to again, for a key that has expired
-    /// or been revoked; picking another moves the conversation there, after
-    /// signing in to it if there is no key to it.
+    /// move over the providers, space or enter disables the one the
+    /// cursor is on, or enables it again, and esc closes the picker.
     fn pick_provider(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(providers) = &mut self.providers else {
@@ -494,24 +575,58 @@ impl App {
             KeyCode::Char('n') if ctrl => providers.step(true),
             KeyCode::Esc => self.providers = None,
             KeyCode::Char('c') if ctrl => self.providers = None,
-            KeyCode::Enter => {
-                let picked = providers.picked();
-                self.providers = None;
-                match picked {
-                    Some(Kind::OpenRouter)
-                        if openrouter::key().is_none()
-                            || self.provider == Some(Kind::OpenRouter) =>
-                    {
-                        self.sign_in()
-                    }
-                    Some(provider) if Some(provider) == self.provider => {
-                        self.say(&view::notice(view::provider_notice(provider, self.variant)));
-                    }
-                    Some(provider) => self.switch(provider, self.variant_at(provider)),
-                    None => {}
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_provider(),
+            _ => {}
+        }
+    }
+
+    /// Disables the provider the cursor of the provider picker is on, or
+    /// enables it again, for this session and the ones to come. A session
+    /// on the provider stays there, which is said, and one with no model
+    /// yet opens at a provider enabled that a model can run at. If the
+    /// configuration cannot be kept, the picker closes on why.
+    fn toggle_provider(&mut self) {
+        let Some(providers) = &self.providers else {
+            return;
+        };
+        let choice = providers.choice();
+        let (provider, name, disabled) = (choice.provider, choice.name, !choice.disabled);
+        let ready = choice.problem.is_none();
+        let saved = Config::load().and_then(|mut config| {
+            config.set_disabled(provider, disabled);
+            config.save()
+        });
+        match saved {
+            Ok(()) => {
+                if let Some(providers) = &mut self.providers {
+                    providers.set_disabled(disabled);
+                }
+                if disabled && self.provider == Some(provider) {
+                    self.say(&view::notice(format!(
+                        "{name} is disabled · the session stays on it until /model picks another"
+                    )));
+                }
+                if !disabled && ready && self.provider.is_none() {
+                    self.providers = None;
+                    self.switch(provider, self.variant_at(provider));
                 }
             }
-            _ => {}
+            Err(e) => {
+                self.providers = None;
+                self.say(&view::notice(e.to_string()));
+            }
+        }
+    }
+
+    /// The user's configuration, as its file now has it, or nothing, after
+    /// saying why, if the file cannot be read.
+    fn config(&mut self) -> Option<Config> {
+        match Config::load() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                self.say(&view::notice(e.to_string()));
+                None
+            }
         }
     }
 
@@ -532,6 +647,134 @@ impl App {
         self.interrupted = false;
         self.status = Status::Switching(Instant::now());
         self.worker.send(Request::Model(provider, variant));
+    }
+
+    /// Handles a key press while the sign-in picker is open: up and down
+    /// move over the hosts, enter signs in to the one the cursor is on,
+    /// in the browser for OpenRouter and with a key made there for the
+    /// others, d signs out of it, and esc closes the picker.
+    fn pick_login(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(logins) = &mut self.logins else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => logins.step(false),
+            KeyCode::Down => logins.step(true),
+            KeyCode::Char('p') if ctrl => logins.step(false),
+            KeyCode::Char('n') if ctrl => logins.step(true),
+            KeyCode::Esc => self.logins = None,
+            KeyCode::Char('c') if ctrl => self.logins = None,
+            KeyCode::Char('d') => {
+                let (host, kept) = (logins.account().host, logins.account().kept);
+                self.logins = None;
+                self.sign_out(host, kept);
+            }
+            KeyCode::Enter => {
+                let host = logins.account().host;
+                self.logins = None;
+                if host.kind == Kind::OpenRouter {
+                    self.sign_in();
+                } else {
+                    self.key_entry = Some(KeyEntry {
+                        host,
+                        key: String::new(),
+                        refused: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forgets the key to `host` kept from signing in, if one is `kept`,
+    /// and says what is left: a session on the host goes on with the key
+    /// it has, and a key in the environment is still there.
+    fn sign_out(&mut self, host: &'static Host, kept: bool) {
+        let name = host.name;
+        let environment = hosted::key::environment(host).is_some();
+        if !kept {
+            self.say(&view::notice(if environment {
+                format!("The key to {name} is in {}: unset it to sign out", host.key)
+            } else {
+                format!("Not signed in to {name}")
+            }));
+            return;
+        }
+        match hosted::key::forget(host) {
+            Ok(_) => {
+                self.say(&view::notice(format!("Signed out of {name}")));
+                if environment {
+                    self.say(&view::notice(format!(
+                        "{} is set, and is still the key to {name}",
+                        host.key
+                    )));
+                }
+            }
+            Err(e) => self.say(&view::notice(format!("Cannot sign out of {name}: {e}"))),
+        }
+    }
+
+    /// Handles a key press while a key is being entered: enter keeps it,
+    /// esc calls it off.
+    fn enter_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(entry) = &mut self.key_entry else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.key_entry = None,
+            KeyCode::Char('c') if ctrl => self.key_entry = None,
+            KeyCode::Char('u') if ctrl => entry.key.clear(),
+            KeyCode::Char(c) if !ctrl && !c.is_whitespace() => entry.key.push(c),
+            KeyCode::Backspace => {
+                entry.key.pop();
+            }
+            KeyCode::Enter if !entry.key.is_empty() => {
+                let (host, key) = (entry.host, std::mem::take(&mut entry.key));
+                self.key_entry = None;
+                match hosted::key::keep(host, &key) {
+                    Ok(path) => self.signed_in_to(host, &path),
+                    Err(e) => self.say(&view::notice(format!("Cannot keep the key: {e}"))),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Goes on from signing in to `host`, with the key kept at `path`:
+    /// says so, and opens the session there if it has no model yet, or
+    /// again with the new key if it is there already. A session
+    /// elsewhere stays where it is, for `/model` to move.
+    fn signed_in_to(&mut self, host: &'static Host, path: &Path) {
+        let name = host.name;
+        self.say(&view::notice(format!(
+            "Signed in to {name} · key kept in {}",
+            view::tilde(path)
+        )));
+        if hosted::key::environment(host).is_some() {
+            self.say(&view::notice(format!(
+                "{} is set, and is used ahead of the key kept: unset it to use this one",
+                host.key
+            )));
+        }
+        if self.provider.is_some_and(|provider| provider != host.kind) {
+            self.say(&view::notice(format!(
+                "/model moves the conversation to {name}"
+            )));
+            return;
+        }
+        let disabled = self.provider.is_none()
+            && self
+                .config()
+                .is_none_or(|config| config.disabled(host.kind));
+        if disabled {
+            self.say(&view::notice(format!(
+                "{name} is disabled · /provider enables it"
+            )));
+        } else {
+            self.switch(host.kind, self.variant_at(host.kind));
+        }
     }
 
     /// Starts signing in to OpenRouter: opens the browser, and waits for
@@ -563,9 +806,9 @@ impl App {
         });
     }
 
-    /// Goes on from a sign-in that is over, if it is: keeps the key, and
-    /// moves the conversation to OpenRouter, or opens it there again with
-    /// the new key. Returns whether it was over.
+    /// Goes on from a sign-in to OpenRouter that is over, if it is: keeps
+    /// the key, and goes on as from signing in to any host. Returns
+    /// whether it was over.
     fn signed_in(&mut self) -> bool {
         let Some(signin) = &self.signin else {
             return false;
@@ -577,24 +820,12 @@ impl App {
         };
         self.signin = None;
         match key.and_then(|key| match key {
-            Some(key) => openrouter::login::save(&key)
+            Some(key) => hosted::key::keep(&openrouter::HOST, &key)
                 .map(Some)
                 .map_err(|e| format!("cannot keep the key: {e}")),
             None => Ok(None),
         }) {
-            Ok(Some(path)) => {
-                self.say(&view::notice(format!(
-                    "Signed in to OpenRouter · key kept in {}",
-                    view::tilde(&path)
-                )));
-                if env::var(openrouter::KEY).is_ok_and(|key| !key.trim().is_empty()) {
-                    self.say(&view::notice(format!(
-                        "{} is set, and is used ahead of the key kept: unset it to use this one",
-                        openrouter::KEY
-                    )));
-                }
-                self.switch(Kind::OpenRouter, self.variant);
-            }
+            Ok(Some(path)) => self.signed_in_to(&openrouter::HOST, &path),
             Ok(None) => {}
             Err(e) => {
                 self.lines.push(vec![
@@ -694,19 +925,31 @@ impl App {
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
             Some(Ok(Command::Server(action))) => Request::Server(action),
             Some(Ok(Command::Model)) => {
-                let groups = session::providers();
-                if groups.iter().all(|group| group.unavailable.is_some()) {
-                    self.say(&view::notice(view::no_provider(false)));
+                let Some(config) = self.config() else {
+                    return;
+                };
+                let (groups, more) = session::providers(&config, self.provider);
+                if groups.is_empty() {
+                    self.say(&view::notice(
+                        "No provider a model can run at · /login signs in to one, /provider enables one",
+                    ));
                 } else {
-                    self.picker = Some(Picker::new(groups, self.provider, self.variant));
+                    self.picker = Some(Picker::new(groups, more, self.provider, self.variant));
                 }
                 return;
             }
             Some(Ok(Command::Provider)) => {
+                let Some(config) = self.config() else {
+                    return;
+                };
                 self.providers = Some(Providers::new(
-                    session::provider_choices(self.provider),
+                    session::provider_choices(&config),
                     self.provider,
                 ));
+                return;
+            }
+            Some(Ok(Command::Login)) => {
+                self.logins = Some(Logins::new(session::accounts()));
                 return;
             }
             Some(Ok(command)) => {
@@ -1110,6 +1353,7 @@ impl App {
             Command::Auto => view::notice(view::auto_notice(self.auto)),
             Command::Model
             | Command::Provider
+            | Command::Login
             | Command::Compact
             | Command::SetThinkingBudget(_)
             | Command::SetAuto(_)
@@ -1230,8 +1474,15 @@ impl App {
         } else if let Some(providers) = &self.providers {
             Some((
                 providers.rows(),
-                "  ↑↓ provider · enter to select · esc to cancel",
+                "  ↑↓ provider · space to enable or disable · esc to close",
             ))
+        } else if let Some(logins) = &self.logins {
+            Some((
+                logins.rows(),
+                "  ↑↓ provider · enter to sign in · d to sign out · esc to cancel",
+            ))
+        } else if let Some(entry) = &self.key_entry {
+            Some((entry.rows(), "  enter to keep the key · esc to cancel"))
         } else {
             self.signin
                 .as_ref()
@@ -1265,7 +1516,7 @@ impl App {
                 _ => span("  "),
             };
             let content = if self.input.is_empty() && self.provider.is_none() {
-                span("Type /provider to connect a model").dark_grey()
+                span("Type /login to connect a model").dark_grey()
             } else if self.input.is_empty() && working {
                 span("Say what to change, and it changes course · esc stops it").dark_grey()
             } else if self.input.is_empty() && self.waiting() {
@@ -1422,5 +1673,25 @@ impl App {
             ),
         };
         Some((frame(since), verb.to_string(), details))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn does_not_take_pasted_prose_for_a_key() {
+        let mut entry = KeyEntry {
+            host: &openrouter::HOST,
+            key: String::new(),
+            refused: None,
+        };
+        entry.paste("Model picker: runs at the gateway, not a key\n");
+        assert!(entry.key.is_empty());
+        assert!(entry.refused.is_some());
+        entry.paste(" vck_0123456789abcdef\n");
+        assert_eq!(entry.key, "vck_0123456789abcdef");
+        assert!(entry.refused.is_none());
     }
 }

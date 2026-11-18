@@ -4,15 +4,13 @@
 
 pub mod login;
 
-use std::env;
-
 use serde_json::{Value, json};
 
 use crate::{
     model::{Result, Sampling, Variant},
     providers::{
         Kind,
-        hosted::{Host, Hosted},
+        hosted::{self, Host, Hosted},
     },
 };
 
@@ -27,7 +25,8 @@ pub const HOST: Host = Host {
     url: "https://openrouter.ai/api/v1/chat/completions",
     model,
     ask,
-    refused: "/provider signs in again",
+    key: KEY,
+    refused: "/login signs in again",
 };
 
 /// The model `variant` at OpenRouter, with the key in the environment or
@@ -35,9 +34,8 @@ pub const HOST: Host = Host {
 /// or as many as a model at a host has unless told, sampled at
 /// `temperature`, or as the model's makers recommend.
 pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
-    let key = key().ok_or_else(|| {
-        format!("there is no key to OpenRouter: /provider signs in, or set {KEY}")
-    })?;
+    let key = key()
+        .ok_or_else(|| format!("there is no key to OpenRouter: /login signs in, or set {KEY}"))?;
     Ok(Hosted::new(&HOST, key, variant, context, temperature))
 }
 
@@ -52,10 +50,7 @@ pub fn model(variant: Variant) -> &'static str {
 /// The key to OpenRouter, if there is one: the environment's, or else the
 /// one kept from a sign-in.
 pub fn key() -> Option<String> {
-    env::var(KEY)
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(login::saved)
+    hosted::key::find(&HOST)
 }
 
 /// Adds to a request what OpenRouter is asked in its own way: to say what
