@@ -481,7 +481,8 @@ impl App {
     /// Handles a key press while the provider picker is open: up and down
     /// move over the providers, space disables the one the cursor is on,
     /// or enables it again, enter picks, and esc closes the picker. A
-    /// provider that is disabled is not picked, but said to be disabled.
+    /// provider that is disabled is not picked, but said to be disabled,
+    /// and one that cannot be picked is said why.
     /// Picking the provider the session is on shows it, but for
     /// OpenRouter, which is signed in to again, for a key that has expired
     /// or been revoked; picking another moves the conversation there, after
@@ -505,6 +506,16 @@ impl App {
                 self.say(&view::notice(format!(
                     "{name} is disabled · space in /provider enables it"
                 )));
+            }
+            KeyCode::Enter if providers.choice().unavailable.is_some() => {
+                let choice = providers.choice();
+                let why = format!(
+                    "{} cannot be picked: {}",
+                    choice.name,
+                    choice.unavailable.as_deref().unwrap_or_default()
+                );
+                self.providers = None;
+                self.say(&view::notice(why));
             }
             KeyCode::Enter => {
                 let picked = providers.picked();

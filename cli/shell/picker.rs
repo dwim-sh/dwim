@@ -194,7 +194,7 @@ pub struct Choice {
 
 impl Providers {
     /// A picker of `choices`, on the provider the session's model runs at,
-    /// `current`, if it can be picked.
+    /// `current`, if it can be picked, or else the first that can be.
     pub fn new(choices: Vec<Choice>, current: Option<Kind>) -> Self {
         let usable = |choice: &Choice| choice.unavailable.is_none();
         let at = choices
@@ -209,16 +209,14 @@ impl Providers {
         }
     }
 
-    /// Moves the cursor down, or up, to the next provider that can be
-    /// picked, if there is one that way.
+    /// Moves the cursor down, or up, to the next provider, if there is
+    /// one that way: one that cannot be picked can still be disabled.
     pub fn step(&mut self, down: bool) {
-        let usable = |&i: &usize| self.choices[i].unavailable.is_none();
-        let next = if down {
-            (self.at + 1..self.choices.len()).find(usable)
+        if down {
+            self.at = (self.at + 1).min(self.choices.len() - 1);
         } else {
-            (0..self.at).rfind(usable)
-        };
-        self.at = next.unwrap_or(self.at);
+            self.at = self.at.saturating_sub(1);
+        }
     }
 
     /// The provider the cursor is on, if it can be picked: one that is
@@ -263,7 +261,15 @@ impl Providers {
                 ""
             };
             rows.push(match &choice.unavailable {
-                Some(why) => vec![span(format!("    {name}{why}")).dark_grey()],
+                Some(why) if i == self.at => {
+                    cursor = rows.len();
+                    let why = if choice.disabled { note } else { why };
+                    vec![span(format!("  › {name}")).bold(), span(why).dark_grey()]
+                }
+                Some(why) => {
+                    let why = if choice.disabled { note } else { why };
+                    vec![span(format!("    {name}{why}")).dark_grey()]
+                }
                 None if i == self.at => {
                     cursor = rows.len();
                     vec![
@@ -328,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_step_to_a_provider_that_cannot_be_picked() {
+    fn steps_to_a_provider_that_cannot_be_picked_without_picking_it() {
         let choice = |provider, unavailable: Option<&str>| Choice {
             provider,
             name: "",
@@ -345,7 +351,8 @@ mod tests {
         );
         assert_eq!(providers.picked(), Some(Kind::OpenRouter));
         providers.step(false);
-        assert_eq!(providers.picked(), Some(Kind::OpenRouter));
+        assert_eq!(providers.picked(), None);
+        assert_eq!(providers.choice().provider, Kind::Local);
     }
 
     #[test]
