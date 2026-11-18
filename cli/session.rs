@@ -21,6 +21,7 @@ use dwim::providers::{
 use dwim::sys::memory;
 
 use crate::{
+    config::Config,
     model,
     shell::picker::{Choice, Group},
 };
@@ -77,12 +78,12 @@ pub struct Loaded {
 
 /// Where `model` runs: at `provider` if the command line named one, and
 /// otherwise on this machine if it can, or at a host there is a key to:
-/// OpenRouter, or else Vercel's AI Gateway, or else Cerebras. The large
-/// model takes more memory than a machine has, and runs only at
-/// OpenRouter or Vercel's AI Gateway. Nowhere, if the
-/// command line named no provider and the model can run neither here nor
-/// at a host without a key: the shell starts without a model then, for
-/// `/provider` to sign in.
+/// OpenRouter, or else Vercel's AI Gateway, or else Cerebras, leaving out
+/// the providers the configuration disables. The large model takes more
+/// memory than a machine has, and runs only at OpenRouter or Vercel's AI
+/// Gateway. Nowhere, if the command line named no provider and the model
+/// can run neither here nor at a host without a key: the shell starts
+/// without a model then, for `/provider` to sign in.
 pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
     match (provider, model) {
         (Some(Kind::Local), Variant::Large) => Err(format!(
@@ -96,29 +97,55 @@ pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, 
         )
         .into()),
         (Some(kind), _) => Ok(Some(kind)),
-        (None, Variant::Medium) if memory::check().is_ok() => Ok(Some(Kind::Local)),
-        (None, model) => Ok(keyed(model)),
+        (None, model) => {
+            let config = Config::load()?;
+            Ok(KINDS
+                .into_iter()
+                .find(|&kind| !config.disabled(kind) && ready(kind, model)))
+        }
     }
 }
 
-/// The host of `model` there is a key to, if there is one: OpenRouter
-/// ahead of Vercel's AI Gateway, and both ahead of Cerebras, which runs
-/// the medium model only.
-fn keyed(model: Variant) -> Option<Kind> {
-    if openrouter::key().is_some() {
-        Some(Kind::OpenRouter)
-    } else if vercel::key().is_some() {
-        Some(Kind::Vercel)
-    } else if model == Variant::Medium && cerebras::key().is_some() {
-        Some(Kind::Cerebras)
-    } else {
-        None
+/// The providers, in the order a model is run at the first that can run
+/// it, and in which the pickers show them.
+const KINDS: [Kind; 4] = [Kind::Local, Kind::OpenRouter, Kind::Vercel, Kind::Cerebras];
+
+/// Whether `model` can run at `kind` as things are: on this machine with
+/// the memory for it, at a host that runs it with a key to the host.
+fn ready(kind: Kind, model: Variant) -> bool {
+    runs(kind, model)
+        && match kind {
+            Kind::Local => memory::check().is_ok(),
+            Kind::OpenRouter => openrouter::key().is_some(),
+            Kind::Vercel => vercel::key().is_some(),
+            Kind::Cerebras => cerebras::key().is_some(),
+        }
+}
+
+/// Whether `kind` is a provider of `model`: all are of the medium model,
+/// OpenRouter and Vercel's AI Gateway of the large one.
+fn runs(kind: Kind, model: Variant) -> bool {
+    match kind {
+        Kind::Local | Kind::Cerebras => model == Variant::Medium,
+        Kind::OpenRouter | Kind::Vercel => true,
     }
 }
 
-/// Why `model` has nowhere to run, when [`provider`] finds none: why it
-/// does not run on this machine, which leaves the hosts, without a key.
-pub fn nowhere(model: Variant) -> String {
+/// Why `model` has nowhere to run, when [`provider`] finds none: providers
+/// of it are disabled in `config`, or else it does not run on this
+/// machine, which leaves the hosts, without a key.
+pub fn nowhere(model: Variant, config: &Config) -> String {
+    let disabled: Vec<&str> = KINDS
+        .into_iter()
+        .filter(|&kind| runs(kind, model) && config.disabled(kind))
+        .map(name)
+        .collect();
+    if !disabled.is_empty() {
+        return format!(
+            "{model} has nowhere to run with {} disabled",
+            disabled.join(" and ")
+        );
+    }
     match (model, memory::check()) {
         (Variant::Medium, Err(e)) => e.to_string(),
         (Variant::Medium, Ok(())) => {
@@ -128,49 +155,64 @@ pub fn nowhere(model: Variant) -> String {
     }
 }
 
+/// What `kind` is called in a sentence.
+fn name(kind: Kind) -> &'static str {
+    kind.host().map_or("this machine", |host| host.name)
+}
+
 /// The providers, each with the models it runs, for the model picker: the
-/// large model only at OpenRouter and Vercel's AI Gateway. This machine cannot be used without the
+/// large model only at OpenRouter and Vercel's AI Gateway. A provider
+/// disabled in `config` cannot be used, nor this machine without the
 /// memory for a model, nor a host without a key to it.
-pub fn providers() -> Vec<Group> {
+pub fn providers(config: &Config) -> Vec<Group> {
+    let unavailable = |kind, why| unless_disabled(config, kind, why);
     vec![
         Group {
             provider: Kind::Local,
             models: vec![Variant::Medium],
-            unavailable: memory::check().err().map(|e| e.to_string()),
+            unavailable: unavailable(Kind::Local, memory::check().err().map(|e| e.to_string())),
         },
         Group {
             provider: Kind::OpenRouter,
             models: vec![Variant::Medium, Variant::Large],
-            unavailable: openrouter::key()
-                .is_none()
-                .then(|| "/provider signs in".to_string()),
+            unavailable: unavailable(
+                Kind::OpenRouter,
+                openrouter::key()
+                    .is_none()
+                    .then(|| "/provider signs in".to_string()),
+            ),
         },
         Group {
             provider: Kind::Vercel,
             models: vec![Variant::Medium, Variant::Large],
-            unavailable: vercel::key().is_none().then(no_vercel_key),
+            unavailable: unavailable(Kind::Vercel, vercel::key().is_none().then(no_vercel_key)),
         },
         Group {
             provider: Kind::Cerebras,
             models: vec![Variant::Medium],
-            unavailable: cerebras::key().is_none().then(no_cerebras_key),
+            unavailable: unavailable(
+                Kind::Cerebras,
+                cerebras::key().is_none().then(no_cerebras_key),
+            ),
         },
     ]
 }
 
 /// The providers, each with what picking it comes to, for the provider
-/// picker, where the session's model runs at `current`. This machine
-/// cannot be picked without the memory for a model; OpenRouter can be
-/// without a key to it, which picking it signs in for, and picking it
-/// while on it signs in again. Vercel's AI Gateway and Cerebras have no
-/// signing in, and cannot be picked without a key in the environment.
-pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
+/// picker, where the session's model runs at `current`. A provider
+/// disabled in `config` cannot be picked, nor this machine without the
+/// memory for a model; OpenRouter can be without a key to it, which
+/// picking it signs in for, and picking it while on it signs in again.
+/// Vercel's AI Gateway and Cerebras have no signing in, and cannot be
+/// picked without a key in the environment.
+pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
+    let unavailable = |kind, why| unless_disabled(config, kind, why);
     vec![
         Choice {
             provider: Kind::Local,
             name: "This machine",
             note: format!("{} in the dwim server", Variant::Medium),
-            unavailable: memory::check().err().map(|e| e.to_string()),
+            unavailable: unavailable(Kind::Local, memory::check().err().map(|e| e.to_string())),
         },
         Choice {
             provider: Kind::OpenRouter,
@@ -182,21 +224,34 @@ pub fn provider_choices(current: Option<Kind>) -> Vec<Choice> {
                 Some(_) => "signed in".to_string(),
                 None => "sign in with your browser to get a key".to_string(),
             },
-            unavailable: None,
+            unavailable: unavailable(Kind::OpenRouter, None),
         },
         Choice {
             provider: Kind::Vercel,
             name: vercel::HOST.name,
             note: format!("key in {}", vercel::KEY),
-            unavailable: vercel::key().is_none().then(no_vercel_key),
+            unavailable: unavailable(Kind::Vercel, vercel::key().is_none().then(no_vercel_key)),
         },
         Choice {
             provider: Kind::Cerebras,
             name: cerebras::HOST.name,
             note: format!("{} only · key in {}", Variant::Medium, cerebras::KEY),
-            unavailable: cerebras::key().is_none().then(no_cerebras_key),
+            unavailable: unavailable(
+                Kind::Cerebras,
+                cerebras::key().is_none().then(no_cerebras_key),
+            ),
         },
     ]
+}
+
+/// Why `kind` cannot be used: it is disabled in `config`, or else `why`,
+/// if there is a reason.
+fn unless_disabled(config: &Config, kind: Kind, why: Option<String>) -> Option<String> {
+    if config.disabled(kind) {
+        Some("disabled in the configuration".to_string())
+    } else {
+        why
+    }
 }
 
 /// What to do to use Vercel's AI Gateway where there is no key to it.
@@ -344,7 +399,7 @@ pub fn open(
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
             "{}: run it at OpenRouter by signing in with /provider in dwim, or by setting {}, or at Vercel AI Gateway by setting {}{}",
-            nowhere(settings.model),
+            nowhere(settings.model, &Config::load()?),
             openrouter::KEY,
             vercel::KEY,
             match settings.model {

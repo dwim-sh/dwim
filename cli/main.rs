@@ -1,4 +1,5 @@
 mod bench;
+mod config;
 mod model;
 mod once;
 mod opts;

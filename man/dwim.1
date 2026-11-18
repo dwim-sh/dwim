@@ -98,7 +98,11 @@ at Cerebras, which runs the medium model only, with the key in
 Without the option, the model runs on this machine where it can, and
 where it cannot, at OpenRouter if there is a key to it, or else at
 Vercel's AI Gateway if there is a key to that, or else, for the medium
-model, at Cerebras if there is a key to that. A session at any of them
+model, at Cerebras if there is a key to that, passing over a provider
+that is disabled in
+.IR config.json ,
+which the model runs at only when the option names it. A session at any
+of the hosts
 loads no model, has room for 131072 tokens of conversation unless
 .B \-\-context
 says, and sends the conversation there: what the agent reads of the
@@ -372,6 +376,17 @@ to free the space;
 .B dwim
 downloads the model again on the next run. The cache is in the same place
 on every system.
+.TP
+.I ~/.config/dwim/config.json
+The configuration, which lists the providers that are disabled by the
+names
+.B \-\-provider
+takes, as in
+.BR "{ \(dqdisabled_providers\(dq: [\(dqlocal\(dq] }" .
+A disabled provider is not where the model runs unless
+.B \-\-provider
+names it, and cannot be picked in the shell. On macOS the file is in
+.IR "~/Library/Application Support/dwim/" .
 .TP
 .I ~/.config/dwim/openrouter.key
 The key to OpenRouter kept from signing in with

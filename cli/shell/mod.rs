@@ -34,6 +34,7 @@ use dwim::sys::browser;
 use dwim::tools::plan::Plan;
 
 use crate::{
+    config::Config,
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
@@ -103,9 +104,10 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         worker,
     };
     if provider.is_none() {
+        let config = Config::load()?;
         let (columns, _) = app.screen.size();
         let lines = view::nowhere(
-            &session::nowhere(variant),
+            &session::nowhere(variant, &config),
             openrouter::key().is_some(),
             columns,
         );
@@ -515,6 +517,18 @@ impl App {
         }
     }
 
+    /// The user's configuration, as its file now has it, or nothing, after
+    /// saying why, if the file cannot be read.
+    fn config(&mut self) -> Option<Config> {
+        match Config::load() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                self.say(&view::notice(e.to_string()));
+                None
+            }
+        }
+    }
+
     /// The model the session goes on with at `provider`: the one it is on,
     /// but for the large one, which does not run on this machine or at
     /// Cerebras.
@@ -694,7 +708,10 @@ impl App {
             Some(Ok(Command::SetAuto(auto))) => Request::Auto(auto),
             Some(Ok(Command::Server(action))) => Request::Server(action),
             Some(Ok(Command::Model)) => {
-                let groups = session::providers();
+                let Some(config) = self.config() else {
+                    return;
+                };
+                let groups = session::providers(&config);
                 if groups.iter().all(|group| group.unavailable.is_some()) {
                     self.say(&view::notice(view::no_provider(false)));
                 } else {
@@ -703,8 +720,11 @@ impl App {
                 return;
             }
             Some(Ok(Command::Provider)) => {
+                let Some(config) = self.config() else {
+                    return;
+                };
                 self.providers = Some(Providers::new(
-                    session::provider_choices(self.provider),
+                    session::provider_choices(&config, self.provider),
                     self.provider,
                 ));
                 return;
