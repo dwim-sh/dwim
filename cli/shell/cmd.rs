@@ -71,10 +71,7 @@ pub enum ServerAction {
 /// The slash commands, each with the line `/help` says of it.
 pub const COMMANDS: [(&str, &str); 10] = [
     ("/model", "pick the model, medium or large"),
-    (
-        "/provider",
-        "pick where the model runs, and disable a provider",
-    ),
+    ("/provider", "enable or disable the providers of the model"),
     ("/login", "sign in to a provider, or sign out of it"),
     ("/stats", "where this session's time has gone"),
     ("/transcript", "where this session's transcript is"),

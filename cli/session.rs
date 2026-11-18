@@ -199,50 +199,34 @@ pub fn providers(config: &Config) -> Vec<Group> {
     ]
 }
 
-/// The providers, each with what picking it comes to, for the provider
-/// picker, where the session's model runs at `current`, and whether it is
-/// disabled in `config`. This machine cannot be picked without the memory
-/// for a model; OpenRouter can be without a key to it, which picking it
-/// signs in for, and picking it while on it signs in again. Vercel's AI
-/// Gateway and Cerebras have no signing in, and cannot be picked without
-/// a key in the environment.
-pub fn provider_choices(config: &Config, current: Option<Kind>) -> Vec<Choice> {
-    vec![
-        Choice {
-            provider: Kind::Local,
-            name: "Local",
-            note: format!("{} in the dwim server", Variant::Medium),
-            unavailable: memory::check().err().map(|e| e.to_string()),
-            disabled: config.disabled(Kind::Local),
-        },
-        Choice {
-            provider: Kind::OpenRouter,
-            name: "OpenRouter",
-            note: match openrouter::key() {
-                Some(_) if current == Some(Kind::OpenRouter) => {
-                    "signed in · pick to sign in again".to_string()
-                }
-                Some(_) => "signed in".to_string(),
-                None => "sign in with your browser to get a key".to_string(),
+/// The providers, for the provider picker: this machine first, then the
+/// hosts by name, each with whether it is disabled in `config`, and what
+/// keeps a model from running there if anything does: this machine wants
+/// the memory for a model, and a host a key to it.
+pub fn provider_choices(config: &Config) -> Vec<Choice> {
+    SHOWN
+        .into_iter()
+        .map(|kind| Choice {
+            provider: kind,
+            name: label(kind),
+            problem: match kind.host() {
+                None => memory::check().err().map(|e| e.to_string()),
+                Some(host) => hosted::key::find(host)
+                    .is_none()
+                    .then(|| "no key · /login signs in".to_string()),
             },
-            unavailable: None,
-            disabled: config.disabled(Kind::OpenRouter),
-        },
-        Choice {
-            provider: Kind::Vercel,
-            name: vercel::HOST.name,
-            note: format!("key in {}", vercel::KEY),
-            unavailable: vercel::key().is_none().then(no_vercel_key),
-            disabled: config.disabled(Kind::Vercel),
-        },
-        Choice {
-            provider: Kind::Cerebras,
-            name: cerebras::HOST.name,
-            note: format!("{} only · key in {}", Variant::Medium, cerebras::KEY),
-            unavailable: cerebras::key().is_none().then(no_cerebras_key),
-            disabled: config.disabled(Kind::Cerebras),
-        },
-    ]
+            disabled: config.disabled(kind),
+        })
+        .collect()
+}
+
+/// The providers in the order the pickers show them: this machine, then
+/// the hosts by name.
+const SHOWN: [Kind; 4] = [Kind::Local, Kind::Cerebras, Kind::OpenRouter, Kind::Vercel];
+
+/// What `kind` is called in a picker: this machine with a house by it.
+fn label(kind: Kind) -> &'static str {
+    kind.host().map_or("Local 🏠", |host| host.name)
 }
 
 /// Why `kind` cannot be used: it is disabled in `config`, or else `why`,

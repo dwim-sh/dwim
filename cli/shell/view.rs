@@ -140,7 +140,7 @@ pub fn nowhere(reason: &str, key: bool, columns: usize) -> Vec<Line> {
 /// key to OpenRouter.
 pub fn connect_hint(key: bool) -> String {
     if key {
-        "/provider picks where the model runs".to_string()
+        "/model picks where the model runs · /provider enables more providers".to_string()
     } else {
         "/login signs in to OpenRouter, which runs the model for you".to_string()
     }

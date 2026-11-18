@@ -561,14 +561,8 @@ impl App {
     }
 
     /// Handles a key press while the provider picker is open: up and down
-    /// move over the providers, space disables the one the cursor is on,
-    /// or enables it again, enter picks, and esc closes the picker. A
-    /// provider that is disabled is not picked, but said to be disabled,
-    /// and one that cannot be picked is said why.
-    /// Picking the provider the session is on shows it, but for
-    /// OpenRouter, which is signed in to again, for a key that has expired
-    /// or been revoked; picking another moves the conversation there, after
-    /// signing in to it if there is no key to it.
+    /// move over the providers, space or enter disables the one the
+    /// cursor is on, or enables it again, and esc closes the picker.
     fn pick_provider(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(providers) = &mut self.providers else {
@@ -581,55 +575,23 @@ impl App {
             KeyCode::Char('n') if ctrl => providers.step(true),
             KeyCode::Esc => self.providers = None,
             KeyCode::Char('c') if ctrl => self.providers = None,
-            KeyCode::Char(' ') => self.toggle_provider(),
-            KeyCode::Enter if providers.choice().disabled => {
-                let name = providers.choice().name;
-                self.providers = None;
-                self.say(&view::notice(format!(
-                    "{name} is disabled · space in /provider enables it"
-                )));
-            }
-            KeyCode::Enter if providers.choice().unavailable.is_some() => {
-                let choice = providers.choice();
-                let why = format!(
-                    "{} cannot be picked: {}",
-                    choice.name,
-                    choice.unavailable.as_deref().unwrap_or_default()
-                );
-                self.providers = None;
-                self.say(&view::notice(why));
-            }
-            KeyCode::Enter => {
-                let picked = providers.picked();
-                self.providers = None;
-                match picked {
-                    Some(Kind::OpenRouter)
-                        if openrouter::key().is_none()
-                            || self.provider == Some(Kind::OpenRouter) =>
-                    {
-                        self.sign_in()
-                    }
-                    Some(provider) if Some(provider) == self.provider => {
-                        self.say(&view::notice(view::provider_notice(provider, self.variant)));
-                    }
-                    Some(provider) => self.switch(provider, self.variant_at(provider)),
-                    None => {}
-                }
-            }
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_provider(),
             _ => {}
         }
     }
 
     /// Disables the provider the cursor of the provider picker is on, or
     /// enables it again, for this session and the ones to come. A session
-    /// on the provider stays there, which is said, since nothing shows it.
-    /// If the configuration cannot be kept, the picker closes on why.
+    /// on the provider stays there, which is said, and one with no model
+    /// yet opens at a provider enabled that a model can run at. If the
+    /// configuration cannot be kept, the picker closes on why.
     fn toggle_provider(&mut self) {
         let Some(providers) = &self.providers else {
             return;
         };
         let choice = providers.choice();
         let (provider, name, disabled) = (choice.provider, choice.name, !choice.disabled);
+        let ready = choice.problem.is_none();
         let saved = Config::load().and_then(|mut config| {
             config.set_disabled(provider, disabled);
             config.save()
@@ -641,8 +603,12 @@ impl App {
                 }
                 if disabled && self.provider == Some(provider) {
                     self.say(&view::notice(format!(
-                        "{name} is disabled · the session stays on it until another is picked"
+                        "{name} is disabled · the session stays on it until /model picks another"
                     )));
+                }
+                if !disabled && ready && self.provider.is_none() {
+                    self.providers = None;
+                    self.switch(provider, self.variant_at(provider));
                 }
             }
             Err(e) => {
@@ -975,7 +941,7 @@ impl App {
                     return;
                 };
                 self.providers = Some(Providers::new(
-                    session::provider_choices(&config, self.provider),
+                    session::provider_choices(&config),
                     self.provider,
                 ));
                 return;
@@ -1506,7 +1472,7 @@ impl App {
         } else if let Some(providers) = &self.providers {
             Some((
                 providers.rows(),
-                "  ↑↓ provider · space to enable or disable · enter to select · esc to cancel",
+                "  ↑↓ provider · space to enable or disable · esc to close",
             ))
         } else if let Some(logins) = &self.logins {
             Some((

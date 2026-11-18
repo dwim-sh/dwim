@@ -4,8 +4,8 @@
 //! be picked, and neither is a provider that cannot be used.
 //!
 //! And the provider picker the `/provider` command opens: the providers,
-//! each with what picking it comes to, and a box that is ticked unless it
-//! is disabled.
+//! each with a box that is ticked unless it is disabled, and whether a
+//! model can run there.
 //!
 //! And the sign-in picker the `/login` command opens: the hosts, each with
 //! whether there is a key to it.
@@ -13,6 +13,7 @@
 use crossterm::style::Stylize;
 use dwim::model::Variant;
 use dwim::providers::{Kind, hosted::Host};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::{Line, span};
 
@@ -176,7 +177,7 @@ impl Picker {
     }
 }
 
-/// The providers to pick from, and which the cursor is on.
+/// The providers, and which the cursor is on.
 pub struct Providers {
     choices: Vec<Choice>,
     /// Where the session's model runs, if anywhere.
@@ -184,26 +185,23 @@ pub struct Providers {
     at: usize,
 }
 
-/// A provider to pick: what picking it comes to, or why it cannot be
-/// picked, and whether it is disabled, which keeps it from being picked
-/// until it is enabled again.
+/// A provider: whether it is disabled, which keeps a model from running
+/// there unless the command line names it, and what else keeps one from
+/// running there, if anything does.
 pub struct Choice {
     pub provider: Kind,
     pub name: &'static str,
-    pub note: String,
-    pub unavailable: Option<String>,
+    pub problem: Option<String>,
     pub disabled: bool,
 }
 
 impl Providers {
-    /// A picker of `choices`, on the provider the session's model runs at,
-    /// `current`, if it can be picked, or else the first that can be.
+    /// A picker of `choices`, on the provider the session's model runs
+    /// at, `current`, or on the first of them.
     pub fn new(choices: Vec<Choice>, current: Option<Kind>) -> Self {
-        let usable = |choice: &Choice| choice.unavailable.is_none();
         let at = choices
             .iter()
-            .position(|choice| Some(choice.provider) == current && usable(choice))
-            .or_else(|| choices.iter().position(usable))
+            .position(|choice| Some(choice.provider) == current)
             .unwrap_or(0);
         Self {
             choices,
@@ -213,20 +211,13 @@ impl Providers {
     }
 
     /// Moves the cursor down, or up, to the next provider, if there is
-    /// one that way: one that cannot be picked can still be disabled.
+    /// one that way.
     pub fn step(&mut self, down: bool) {
         if down {
             self.at = (self.at + 1).min(self.choices.len() - 1);
         } else {
             self.at = self.at.saturating_sub(1);
         }
-    }
-
-    /// The provider the cursor is on, if it can be picked: one that is
-    /// disabled cannot.
-    pub fn picked(&self) -> Option<Kind> {
-        let choice = self.choice();
-        (choice.unavailable.is_none() && !choice.disabled).then_some(choice.provider)
     }
 
     /// The provider the cursor is on, as it is shown.
@@ -241,51 +232,35 @@ impl Providers {
 
     /// The picker as rows, and which of them the cursor is on: the
     /// providers, each with a box that is ticked unless it is disabled,
-    /// the one the session is on ticked after it, each with what picking
-    /// it comes to, and one that cannot be picked dimmed, with why.
+    /// and whether a model can run there: off if it is disabled, ready,
+    /// or what it wants. The one the session is on is said to be in use.
     pub fn rows(&self) -> (Vec<Line>, usize) {
-        let names = self.choices.iter().map(|c| c.name.len()).max().unwrap_or(0);
-        let mut rows = vec![vec![span("  Select provider").bold()], Line::new()];
+        let names = self.choices.iter().map(|c| c.name.width());
+        let names = names.max().unwrap_or(0);
+        let mut rows = vec![vec![span("  Providers").bold()], Line::new()];
         let mut cursor = 0;
         for (i, choice) in self.choices.iter().enumerate() {
             let name = format!(
-                "{} {:<names$}  ",
+                "{} {}{}  ",
                 if choice.disabled { "[ ]" } else { "[✓]" },
-                choice.name
+                choice.name,
+                " ".repeat(names - choice.name.width())
             );
-            let note = if choice.disabled {
-                "disabled"
-            } else {
-                &choice.note
+            let status = match &choice.problem {
+                _ if choice.disabled => span("off").dark_grey(),
+                Some(problem) => span(problem).dark_yellow(),
+                None => span("ready").dark_green(),
             };
-            let tick = if Some(choice.provider) == self.current {
-                "  ✓"
+            let used = if Some(choice.provider) == self.current {
+                " · in use"
             } else {
                 ""
             };
-            rows.push(match &choice.unavailable {
-                Some(why) if i == self.at => {
-                    cursor = rows.len();
-                    let why = if choice.disabled { note } else { why };
-                    vec![span(format!("  › {name}")).bold(), span(why).dark_grey()]
-                }
-                Some(why) => {
-                    let why = if choice.disabled { note } else { why };
-                    vec![span(format!("    {name}{why}")).dark_grey()]
-                }
-                None if i == self.at => {
-                    cursor = rows.len();
-                    vec![
-                        span(format!("  › {name}")).bold(),
-                        span(note),
-                        span(tick).bold(),
-                    ]
-                }
-                None => vec![
-                    span(format!("    {name}")),
-                    span(note).dark_grey(),
-                    span(tick),
-                ],
+            rows.push(if i == self.at {
+                cursor = rows.len();
+                vec![span(format!("  › {name}")).bold(), status, span(used)]
+            } else {
+                vec![span(format!("    {name}")), status, span(used).dark_grey()]
             });
         }
         (rows, cursor)
@@ -389,45 +364,6 @@ mod tests {
         picker.step(true);
         picker.turn(false);
         assert_eq!(picker.picked(), Some((Kind::Local, Variant::Medium)));
-    }
-
-    #[test]
-    fn steps_to_a_provider_that_cannot_be_picked_without_picking_it() {
-        let choice = |provider, unavailable: Option<&str>| Choice {
-            provider,
-            name: "",
-            note: String::new(),
-            unavailable: unavailable.map(str::to_string),
-            disabled: false,
-        };
-        let mut providers = Providers::new(
-            vec![
-                choice(Kind::Local, Some("too little memory")),
-                choice(Kind::OpenRouter, None),
-            ],
-            None,
-        );
-        assert_eq!(providers.picked(), Some(Kind::OpenRouter));
-        providers.step(false);
-        assert_eq!(providers.picked(), None);
-        assert_eq!(providers.choice().provider, Kind::Local);
-    }
-
-    #[test]
-    fn does_not_pick_a_provider_until_it_is_enabled() {
-        let mut providers = Providers::new(
-            vec![Choice {
-                provider: Kind::Local,
-                name: "",
-                note: String::new(),
-                unavailable: None,
-                disabled: true,
-            }],
-            None,
-        );
-        assert_eq!(providers.picked(), None);
-        providers.set_disabled(false);
-        assert_eq!(providers.picked(), Some(Kind::Local));
     }
 
     #[test]

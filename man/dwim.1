@@ -262,21 +262,19 @@ where its weights are kept, and how many tokens of conversation it has
 room for.
 .TP
 .B /provider
-Open a picker of the providers, this machine, OpenRouter, Vercel's AI
-Gateway and Cerebras:
-up and down move over them, space disables one or enables it again,
-enter picks, esc cancels.
-Picking another provider moves the conversation there.
+Open a list of the providers, this machine and then Cerebras, OpenRouter
+and Vercel's AI Gateway, each with a box that is ticked unless the
+provider is disabled, and whether a model can run there: ready, or what
+it wants, the memory for a model on this machine or a key to a host.
+Up and down move over them, space or enter disables one or enables it
+again, esc closes the list.
 A provider that is disabled is passed over when
 .B dwim
-starts, and cannot be picked here or in
+starts, and is not shown in
 .B /model
 until it is enabled again; it stays so in the sessions to come.
-A session that is on it when it is disabled stays on it.
-Picking OpenRouter without a key to it signs in first, as
-.B /login
-does.
-Picking the provider the session is on shows where the model runs.
+A session that is on it when it is disabled stays on it, and a session
+with no model yet opens at a provider enabled that is ready.
 .TP
 .B /login
 Open a picker of the providers to sign in to, Cerebras, OpenRouter and
