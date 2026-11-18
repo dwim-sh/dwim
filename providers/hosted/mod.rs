@@ -27,6 +27,7 @@
 //! what the provider said the last request took, with an estimate of what
 //! was added since.
 
+pub mod key;
 mod stream;
 
 use std::{
@@ -66,6 +67,9 @@ pub struct Host {
     /// tokens, if they are limited, which is said to be `ended` here or
     /// not when the thought runs to them regardless.
     pub ask: fn(body: &mut Value, sampling: &Sampling, thought: Option<usize>, ended: bool),
+    /// The environment variable the key to the host is read from, ahead
+    /// of the key kept from signing in.
+    pub key: &'static str,
     /// What to do about a key the host refuses.
     pub refused: &'static str,
 }

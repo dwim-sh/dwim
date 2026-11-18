@@ -644,7 +644,7 @@ impl App {
         };
         self.signin = None;
         match key.and_then(|key| match key {
-            Some(key) => openrouter::login::save(&key)
+            Some(key) => hosted::key::keep(&openrouter::HOST, &key)
                 .map(Some)
                 .map_err(|e| format!("cannot keep the key: {e}")),
             None => Ok(None),
