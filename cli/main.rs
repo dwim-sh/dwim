@@ -11,10 +11,7 @@ mod tui;
 use std::env;
 
 use argh::{EarlyExit, FromArgs};
-use dwim::harness::Log;
-use dwim::inference::Model;
-use dwim::providers::Kind;
-use dwim::sys::memory;
+use dwim::{harness::Log, inference::Model, providers::Kind, sys::memory};
 
 use opts::Opts;
 use session::Stderr;
