@@ -17,11 +17,10 @@ unless you send a session to a bigger model.
 
 </div>
 
-> [!WARNING]
-> **dwim is experimental software.** Expect bugs, rough edges, and changes that
-> break things from one commit to the next. The model runs shell commands on
-> your machine without asking first, so use it on code you have committed or
-> backed up.
+> [!NOTE]
+> dwim runs shell commands on your machine as part of its work, so please
+> run it in a secure environment such as a sandbox, and keep the code you
+> ask it to work on committed or backed up.
 
 ## Installation
 
