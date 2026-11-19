@@ -64,8 +64,8 @@ pub fn reserve<S: Session>(session: &mut S) -> Result<usize, Box<dyn Error>> {
 /// Makes room for `input`, and for `more` tokens after it, compacting
 /// the conversation first if they would take the context past the
 /// high-water mark. Returns whether the input may go in: not if the
-/// compaction was interrupted, and an error if the input cannot fit
-/// even so.
+/// compaction was interrupted. Whether it fits even so is the caller's
+/// to see to.
 pub fn make_room<S: Session>(
     harness: &mut Harness<S>,
     input: &Turn,
@@ -74,18 +74,11 @@ pub fn make_room<S: Session>(
 ) -> Result<bool, Box<dyn Error>> {
     let needed = harness.session.measure(input)? + more;
     let capacity = harness.session.capacity();
-    if harness.session.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
-        && !harness.transcript.is_empty()
-        && !compact(harness, on_event)?
-    {
-        return Ok(false);
-    }
-    if needed > harness.session.free() {
-        return Err(
-            format!("a message of {needed} tokens does not fit in the context window").into(),
-        );
-    }
-    Ok(true)
+    Ok(
+        harness.session.tokens() + needed <= capacity * HIGH_WATER.0 / HIGH_WATER.1
+            || harness.transcript.is_empty()
+            || compact(harness, on_event)?,
+    )
 }
 
 /// Compacts the conversation, as [`Harness::compact`] does.

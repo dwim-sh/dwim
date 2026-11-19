@@ -40,6 +40,7 @@ pub mod compaction;
 mod log;
 
 use std::{
+    cmp::Reverse,
     error::Error,
     fs,
     ops::ControlFlow,
@@ -868,6 +869,27 @@ impl<S: Session> Harness<S> {
                 }
                 return Ok(Outcome::Done);
             }
+            // Results go in whatever they take, since they answer the
+            // reply before them: if they do not fit even after the
+            // compaction, the largest outputs give way to word of how
+            // large they were. A message that does not fit cannot go in.
+            let fed = match fed {
+                Turn::Results(outputs) => {
+                    let outputs = self.fit(outputs, more)?;
+                    input = Turn::Results(outputs.clone());
+                    Turn::Results(outputs)
+                }
+                fed => {
+                    let needed = self.session.measure(&fed)? + more;
+                    if needed > self.session.free() {
+                        return Err(format!(
+                            "a message of {needed} tokens does not fit in the context window"
+                        )
+                        .into());
+                    }
+                    fed
+                }
+            };
             if capped {
                 let Turn::Results(outputs) = &fed else {
                     return Err("the cap is reached by tool results".into());
@@ -1045,6 +1067,42 @@ impl<S: Session> Harness<S> {
         self.record(turn, false)
     }
 
+    /// `outputs` as they fit in the context with `more` tokens after them:
+    /// as they are, if they fit; otherwise with the largest replaced by
+    /// word of how many tokens it took, then the next largest, one at a
+    /// time, until they fit. Fails if they do not fit even with every
+    /// output replaced.
+    fn fit(
+        &mut self,
+        mut outputs: Vec<String>,
+        more: usize,
+    ) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut sizes = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            sizes.push(Some(
+                self.session.measure(&Turn::Results(vec![output.clone()]))?,
+            ));
+        }
+        loop {
+            let needed = self.session.measure(&Turn::Results(outputs.clone()))? + more;
+            if needed <= self.session.free() {
+                return Ok(outputs);
+            }
+            // The largest output not yet replaced, the first of those as
+            // large.
+            let Some(i) = (0..outputs.len())
+                .filter(|&i| sizes[i].is_some())
+                .max_by_key(|&i| (sizes[i], Reverse(i)))
+            else {
+                return Err(
+                    format!("results of {needed} tokens do not fit in the context window").into(),
+                );
+            };
+            outputs[i] = too_large(sizes[i].take().unwrap_or(0));
+            self.log.nudge(&outputs[i]);
+        }
+    }
+
     /// Whether the model, in auto mode, is to be told to go on after the
     /// reply it just gave: not if it said it is done, nor if it has called
     /// no tool this turn, which is how it answers a question and leaves
@@ -1129,6 +1187,14 @@ impl<S: Session> Drop for Harness<S> {
         let stats = self.stats();
         self.log.finish(self.session.tokens(), &stats);
     }
+}
+
+/// What the model gets back in place of an output of `tokens` tokens
+/// that does not fit in the context window.
+fn too_large(tokens: usize) -> String {
+    format!(
+        "not shown: this output took {tokens} tokens, more than there is room for in the context window. Ask for less of it at a time, such as a range of lines or a filtered command."
+    )
 }
 
 /// Whether a reply says the work is done: its last line is [`DONE`], with
@@ -1585,6 +1651,33 @@ mod tests {
         assert_eq!(fed.matches("<tool_response>").count(), 2, "{fed}");
         assert!(results < fed.find("what happened?").unwrap(), "{fed}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn answers_a_call_whose_output_is_larger_than_the_context() {
+        // A call prints more than the whole context holds. Its result is
+        // recorded all the same, with word of how large the output was in
+        // its place, and the model replies to that: the call is answered,
+        // and the turn goes on.
+        let scripts = [
+            calling(
+                "bash",
+                &[("command", "head -c 6000 /dev/zero | tr '\\0' a")],
+            ),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 4000, " go on.");
+        send(&mut harness, "go");
+        assert_eq!(shape(&harness), "urtr");
+        let turns: Vec<&Turn> = harness.transcript().collect();
+        let Turn::Results(outputs) = turns[2] else {
+            panic!("{:?}", turns[2])
+        };
+        assert!(
+            outputs[0].starts_with("not shown: this output took "),
+            "{outputs:?}"
+        );
+        assert!(matches!(turns[3], Turn::Reply { text, .. } if text.trim() == "Ok."));
     }
 
     #[test]
