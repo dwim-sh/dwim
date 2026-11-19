@@ -689,8 +689,7 @@ impl<S: Session> Harness<S> {
 
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
-    #[cfg(test)]
-    fn transcript(&self) -> impl Iterator<Item = &Turn> {
+    pub fn transcript(&self) -> impl Iterator<Item = &Turn> {
         self.transcript.iter().map(|entry| &entry.turn)
     }
 

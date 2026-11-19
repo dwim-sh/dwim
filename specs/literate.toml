@@ -1,6 +1,7 @@
 docstrings_as_text = true
 extra_css = ["style.css"]
-exclude = ["CompactionOracle"]
+exclude = ["CompactionOracle", "TurnOracle"]
+landing_page = "Dwim"
 
 [metadata]
 title = "dwim specs"

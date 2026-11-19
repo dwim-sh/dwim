@@ -10,17 +10,13 @@
 //! suffixes take, where an off-by-one would show. The conversations are
 //! made from seeds, so a disagreement is the same on every run.
 
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-};
-
 use dwim::harness::{Entry, compaction::select};
 use dwim::model::Turn;
 
-use crate::Result;
+use crate::{
+    Result,
+    spec::{Rng, ask},
+};
 
 /// Conversations the code is compared with the spec on.
 const CASES: u64 = 10_000;
@@ -32,7 +28,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<bool> {
         return Err(format!("compaction takes no arguments, not '{arg}'").into());
     }
     let cases: Vec<Case> = (0..CASES).map(Case::new).collect();
-    let spec = oracle(&cases.iter().map(Case::written).collect::<String>())?;
+    let spec = ask(
+        "compaction-oracle",
+        &cases.iter().map(Case::written).collect::<String>(),
+    )?;
     let mut answers = spec.lines();
     for (seed, case) in cases.iter().enumerate() {
         let spec = answers
@@ -69,7 +68,7 @@ impl Case {
     /// says its index in what the user has sent, so that the messages
     /// kept say which they were.
     fn new(seed: u64) -> Case {
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut rng = Rng::seeded(seed);
         let mut said = Vec::new();
         for _ in 0..rng.below(4) {
             let message = said.len().to_string();
@@ -163,38 +162,6 @@ fn notation(entry: &Entry) -> String {
     format!("{kind} {}", entry.tokens)
 }
 
-/// What the spec's oracle answers to `input`, a transcript a line.
-fn oracle(input: &str) -> Result<String> {
-    let specs = Path::new(env!("CARGO_MANIFEST_DIR")).join("specs");
-    let mut child = Command::new(lake()?)
-        .args(["exe", "compaction-oracle"])
-        .current_dir(specs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    // The oracle answers as it reads, so it is fed from another thread
-    // while its answers are read here, or both pipes could fill.
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("the oracle's input is not piped")?;
-    let input = input.to_string();
-    let feeder = thread::spawn(move || stdin.write_all(input.as_bytes()));
-    let output = child.wait_with_output()?;
-    feeder
-        .join()
-        .map_err(|_| "the oracle's feeder panicked")??;
-    if !output.status.success() {
-        return Err(format!(
-            "the oracle failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
 /// Adds a turn of `tokens` taken from `rng` to `entries`.
 fn add(entries: &mut Vec<Entry>, turn: Turn, prompt: bool, rng: &mut Rng) {
     entries.push(Entry {
@@ -224,40 +191,4 @@ fn suffixes<'a>(entries: impl DoubleEndedIterator<Item = &'a Entry>) -> Vec<usiz
         sizes.push(sizes[sizes.len() - 1] + entry.tokens);
     }
     sizes
-}
-
-/// Where `lake` is: on the path, or where elan installs it.
-fn lake() -> Result<PathBuf> {
-    let elan = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elan/bin/lake"));
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join("lake"))
-        .chain(elan)
-        .find(|path| path.is_file())
-        .ok_or_else(|| "no lake: install a Lean toolchain with elan".into())
-}
-
-/// A xorshift generator, so that a case is the same on every run.
-struct Rng(u64);
-
-impl Rng {
-    /// A number below `n`, or 0 if `n` is.
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n.max(1) as u64) as usize
-    }
-
-    /// A budget: one of `sizes`, or a token either side of it, two times
-    /// in three; any up to past the largest the third time.
-    fn around(&mut self, sizes: &[usize]) -> usize {
-        let largest = sizes.iter().max().copied().unwrap_or(0);
-        if self.below(3) == 0 {
-            return self.below(largest + 10);
-        }
-        let size = sizes[self.below(sizes.len())];
-        (size + self.below(3)).saturating_sub(1)
-    }
 }

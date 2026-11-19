@@ -33,4 +33,23 @@ answered can come only last: its results are still to be fed. -/
 def WellFormed (ts : List Turn) : Prop :=
   ts.head? ≠ some .results ∧ Paired ts
 
+instance (a b : Turn) : Decidable (Follows a b) :=
+  inferInstanceAs (Decidable (_ ↔ _))
+
+instance decidablePaired : (ts : List Turn) → Decidable (Paired ts)
+  | [] => isTrue trivial
+  | [_] => isTrue trivial
+  | a :: b :: rest =>
+    have := decidablePaired (b :: rest)
+    inferInstanceAs (Decidable (Follows a b ∧ Paired (b :: rest)))
+
+instance (ts : List Turn) : Decidable (WellFormed ts) :=
+  inferInstanceAs (Decidable (_ ∧ _))
+
+#guard decide (WellFormed [.user, .reply true, .results, .reply false])
+-- A reply's results after a message, not after the reply.
+#guard !decide (WellFormed [.user, .results, .reply false])
+-- A call left unanswered, followed by the next message.
+#guard !decide (WellFormed [.user, .reply true, .user])
+
 end Dwim.Model

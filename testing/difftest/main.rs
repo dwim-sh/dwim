@@ -9,23 +9,28 @@
 //! - `difftest model [PROMPT...] [--repeat N]`: the model on the GPU
 //!   against the model on the CPU, with the real weights.
 //! - `difftest compaction`: the harness's compaction against its Lean
-//!   spec in `specs/`, on generated transcripts.
+//!   spec in `specs/`, on generated conversations.
+//! - `difftest harness`: the harness's turns against the Lean spec of a
+//!   turn, which says every call is answered however a turn ends.
 
 mod compaction;
+mod harness;
 mod model;
+mod spec;
 
 use std::{error::Error, process::ExitCode};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// How the subjects are asked for.
-const USAGE: &str = "usage: difftest model [PROMPT...] [--repeat N]\n       difftest compaction";
+const USAGE: &str = "usage: difftest model [PROMPT...] [--repeat N]\n       difftest compaction\n       difftest harness";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let agreed = match args.next().as_deref() {
         Some("model") => model::run(args),
         Some("compaction") => compaction::run(args),
+        Some("harness") => harness::run(args),
         _ => Err(USAGE.into()),
     };
     match agreed {

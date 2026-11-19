@@ -63,7 +63,7 @@ test:
 	$(call msg,TEST,dwim)
 	$(Q)cargo test
 
-check: difftest-compaction
+check: difftest-compaction difftest-harness
 	$(call msg,LAKE,specs/.lake/build/literate-html/index.html)
 	@# Verso does not notice changes to images and style.css: without its
 	@# trace, it makes the pages again, which takes a second.

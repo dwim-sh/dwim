@@ -170,7 +170,6 @@ impl Tokenizer {
 
     /// A tokenizer over a tiny vocabulary for tests: a token per byte, one
     /// merge, and the special tokens of the chat format.
-    #[cfg(test)]
     pub fn tiny() -> Self {
         use crate::model::gguf::Value;
 

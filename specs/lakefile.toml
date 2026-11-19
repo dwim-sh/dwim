@@ -12,3 +12,7 @@ name = "Dwim"
 [[lean_exe]]
 name = "compaction-oracle"
 root = "CompactionOracle"
+
+[[lean_exe]]
+name = "turn-oracle"
+root = "TurnOracle"
