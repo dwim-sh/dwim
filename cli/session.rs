@@ -12,7 +12,7 @@ use std::{
 
 use dwim::harness::{self, Harness, Log};
 use dwim::inference::{self, Loaded, Progress};
-use dwim::model::{Device, Model, Tally};
+use dwim::model::{Device, Effort, Model, Tally};
 use dwim::providers::{
     Any, Conversation, Kind, cerebras,
     dwim::{self as server},
@@ -44,7 +44,7 @@ pub struct Settings {
     pub sessions: Option<usize>,
     /// Most tokens of a thought, if they are limited.
     pub thinking_budget: Option<usize>,
-    pub effort: harness::Effort,
+    pub effort: Effort,
     /// The sampling temperature, or the model file's.
     pub temperature: Option<f32>,
     /// Tokens the model drafts after each token picked, or none.

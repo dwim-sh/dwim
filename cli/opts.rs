@@ -77,8 +77,8 @@ pub struct Opts {
 
     /// how much the model reasons before it replies, as its chat template
     /// asks it to: xhigh, medium or low (default: medium)
-    #[argh(option, arg_name = "effort", default = "dwim::harness::Effort::Medium")]
-    pub reasoning_effort: dwim::harness::Effort,
+    #[argh(option, arg_name = "effort", default = "dwim::model::Effort::Medium")]
+    pub reasoning_effort: dwim::model::Effort,
 
     /// sampling temperature (default: what the model file recommends; 0
     /// always picks the likeliest token)
