@@ -1,0 +1,6 @@
+docstrings_as_text = true
+extra_css = ["style.css"]
+exclude = ["CompactionOracle"]
+
+[metadata]
+title = "dwim specs"

@@ -1,0 +1,20 @@
+/* Verso styles every code element in the prose as inline code, those in
+   code blocks too, which pads and shades each line of a diagram apart. */
+.code-content > :is(.md-text, .verso-text).mod-doc pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+}
+
+/* Prose that has a diagram in it may be as wide as the code, so that the
+   diagram is not cut off at the width of a paragraph. */
+.code-content > :is(.md-text, .verso-text).mod-doc:has(> pre) {
+    max-width: none;
+}
+
+/* Diagrams scale down to the width of the column. */
+.code-content img {
+    max-width: 100%;
+    height: auto;
+}
