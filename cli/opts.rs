@@ -76,8 +76,8 @@ pub struct Opts {
     pub thinking_budget: usize,
 
     /// how much the model reasons before it replies, as its chat template
-    /// asks it to: xhigh, medium or low (default: medium)
-    #[argh(option, arg_name = "effort", default = "dwim::model::Effort::Medium")]
+    /// asks it to: xhigh, medium or low (default: low)
+    #[argh(option, arg_name = "effort", default = "dwim::model::Effort::Low")]
     pub reasoning_effort: dwim::model::Effort,
 
     /// sampling temperature (default: what the model file recommends; 0

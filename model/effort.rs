@@ -5,17 +5,19 @@ use std::str::FromStr;
 /// How much the model reasons before it replies, as its chat template
 /// asks for it: the template opens the system prompt with a line for an
 /// effort of `xhigh`, its default, or `low`, and with none for `medium`.
-/// Medium unless set: PrismML's known issues for Bonsai, its ternary
-/// build of the model, which these figures are from and are carried over
-/// unmeasured (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf,
-/// KNOWN_ISSUES.md), advise it for the model's long reasoning, as "about as accurate" as
-/// `xhigh` when the output is limited and thinking "noticeably less", and
-/// find that `low` "used about as many tokens as the default `xhigh`".
+/// Low unless set, for the briefest thoughts the template asks for, which
+/// a thought ended at the thinking budget cuts short the least. PrismML's
+/// known issues for Bonsai, its ternary build of the model, advise
+/// `medium` instead, as "about as accurate" as `xhigh` when the output is
+/// limited and thinking "noticeably less", and find that `low` "used
+/// about as many tokens as the default `xhigh`"; those figures are not
+/// measured here (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf,
+/// KNOWN_ISSUES.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Effort {
     Xhigh,
-    #[default]
     Medium,
+    #[default]
     Low,
 }
 
