@@ -52,7 +52,11 @@ program. One package: `lib.rs` is the library, `cli/` and
 - `sys/` - what is asked of the operating system: `darwin/` and `linux/`
   with the same modules, `unix/` for what both do the same way, all
   re-exported as `sys::memory` and so on
-- `scripts/` - `swebench.py`, `release`
+- `evals/` - the benchmarks `dwim` is run over, a directory each with its
+  `run.py`: `swebench` (Lite, Verified, Verified Mini); `results/` is
+  the report of each run over a whole dataset, and `runs/` what the runs
+  leave, which is not kept in git
+- `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built
 
@@ -93,4 +97,4 @@ do not write it.
 - The body says why, and what was and was not verified.
 - A pull request's title is a subject too, written the same way.
 
-`CONTRIBUTING.md` has the longer version, and how to run SWE-bench Lite.
+`CONTRIBUTING.md` has the longer version, and how to run SWE-bench.

@@ -104,28 +104,69 @@ in the imperative, with the reasoning in the body. A commit whose change
 `dwim` made ends with the line `Generated-by: dwim`. The person who commits
 it has read the change and stands behind it, and the message is theirs.
 
-## SWE-bench Lite
+## SWE-bench
 
 [SWE-bench](https://www.swebench.com) gives an agent a real GitHub issue and
 a repository at the commit before the fix, and checks the agent's patch by
-running the project's tests. Lite is 300 instances from 12 Python projects.
+running the project's tests. `evals/swebench/run.py` runs `dwim` over one of
+its datasets: `verified-mini`, 50 instances of Verified chosen to be as hard
+on the whole, which is the default; `verified`, the 500 that people checked
+can be solved from the issue; or `lite`, 300 from 12 Python projects.
 
 ```
-scripts/swebench.py --instance pallets__flask-4045     # one instance
-scripts/swebench.py --limit 10                         # the first ten
-scripts/swebench.py                                    # all 300
+evals/swebench/run.py --instance django__django-11790  # one instance
+evals/swebench/run.py --limit 10                       # the first ten
+evals/swebench/run.py                                  # all 50
+evals/swebench/run.py --dataset lite -- --temperature 0
+evals/swebench/run.py --agent opencode                 # another agent
+evals/swebench/run.py --pull                           # fetch the images
+evals/swebench/run.py --gold                           # check the scoring
 ```
 
 The script builds `dwim`, and for each instance takes the repository as the
 instance's SWE-bench image has it, with the project and what it needs
 installed, gives `dwim` the issue with its shell commands running in a
-container of that image (`dwim --shell`), takes what it changed as the
-patch, and scores the patch with the official harness, which runs the
-project's tests in the same image. It tells you what to install if Docker
-or the harness is missing; the harness needs Python 3.10, and on Apple
-Silicon a Docker that runs x86_64 images, such as Colima started with
-`--vz-rosetta`. `--no-score` writes `predictions.jsonl` without scoring,
-`--score-only` scores what an earlier run wrote, and `--help` lists the rest.
+container of that image without a network (`dwim --shell`), takes what it
+changed as the patch, and scores the patch with the official harness, which
+runs the project's tests in a fresh container of the same image. What
+follows `--` is given to `dwim`. It needs Docker and
+[uv](https://docs.astral.sh/uv/), which runs the script and installs the
+harness for it; on Apple Silicon it needs a Docker that runs x86_64 images,
+such as Colima started with `--vz-rosetta`. `--help` lists the rest.
+
+A run is a directory under `evals/runs/`, named for the dataset, the agent,
+and the commit of `dwim`. Its `manifest.json` says what was run, its
+`report.md` what came of it, and each instance has a directory with its
+`result.json`, its `patch.diff`, the transcript and the logs. A run over a
+whole dataset also writes its report to `evals/results/`, which is kept in
+git: commit it with the change it measures. The commit a run is named for
+is the last to change anything but `evals/`, so that a change to the script
+is not taken for a change to `dwim`. The same command again takes the run
+up where it stopped: it leaves the instances that are done, tries again
+those that could not be run for a reason that was not the agent's, such as
+a pull that failed, and scores the patches that are not scored. A run is of one dataset by one
+`dwim` asked one way, so a change to any of them wants a run of its own.
+
+`--agent opencode` runs [opencode](https://opencode.ai) in place of `dwim`,
+on the same model through the Vercel AI Gateway unless `--model` names
+another, with its shell commands in the same container and its tools that
+reach the web turned off. It has to be installed and signed in (`opencode
+auth login`); its own configuration and instructions in your home are kept
+out of the run. `dwim` goes to whichever provider it would for you, which
+the report names: say `-- --provider vercel` to hold it to one.
+
+Before trusting the numbers on a machine, run `--gold` once: it scores the
+dataset's own fixes in place of the agent's, and they all resolve where the
+images and the harness work. The model's sampling is not seeded, so run the
+same `dwim` a few times, each with a `--run-id` of its own, to see how much
+the count moves by itself before reading anything into a difference.
+
+Each instance has an image of its own, a few gigabytes that take minutes
+to pull and unpack, where its tests run in seconds. `--pull` pulls them
+all and stops, so that the wait is had once and out of the way of a run;
+`--workers` is how many at once. The images stay in Docker for the next
+run, and nothing here removes them: `docker image rm` does, when you are
+done with a dataset.
 
 **The agent's commands run in the container, but the model runs here, and
 its read and edit tools work on the checkout as you, on an untrusted
