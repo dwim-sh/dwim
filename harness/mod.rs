@@ -224,14 +224,14 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// The system prompt for an agent working in `dir`, reasoning at
-/// `effort`: the template's line for the effort, if it has one, the tools,
-/// then how to behave, and the project's own instructions from its
-/// `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
+/// The system prompt for an agent working in `dir`: the template's line
+/// for `effort`, if the prompt is to carry one and the effort has one,
+/// the tools, then how to behave, and the project's own instructions
+/// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
 /// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, effort: Effort) -> String {
+pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
     let mut prompt = String::new();
-    if let Some(line) = effort.instruction() {
+    if let Some(line) = effort.and_then(Effort::instruction) {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
@@ -2121,9 +2121,11 @@ mod tests {
         // the tools, and none for medium, the default.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(Effort::default(), Effort::Medium);
-        assert!(system_prompt(dir, Effort::Medium).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Some(Effort::Medium)).starts_with("# Tools\n"));
+        // A host writes the line itself, so its prompt is given none.
+        assert!(system_prompt(dir, None).starts_with("# Tools\n"));
         for (effort, word) in [(Effort::Xhigh, "xhigh"), (Effort::Low, "low")] {
-            let prompt = system_prompt(dir, effort);
+            let prompt = system_prompt(dir, Some(effort));
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2136,7 +2138,7 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Effort::Medium);
+        let prompt = system_prompt(dir, Some(Effort::Medium));
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")

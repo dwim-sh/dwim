@@ -386,7 +386,6 @@ pub fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
-    let system = harness::system_prompt(&env::current_dir()?, settings.effort);
     let Some(kind) = provider(settings.provider, settings.model)? else {
         return Err(format!(
             "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}, or at Vercel by setting {}{}",
@@ -400,12 +399,20 @@ pub fn open(
         )
         .into());
     };
+    // A host writes the effort's line into the prompt itself, as the
+    // model's chat template does, so the line is written here only for
+    // the model run here.
+    let effort = settings.effort;
+    let system = harness::system_prompt(
+        &env::current_dir()?,
+        (kind == Kind::Local).then_some(effort),
+    );
     let (model, context, temperature) = (settings.model, settings.context, settings.temperature);
     let hosted = match kind {
         Kind::Local => None,
-        Kind::OpenRouter => Some(openrouter::open(model, context, temperature)?),
-        Kind::Vercel => Some(vercel::open(model, context, temperature)?),
-        Kind::Cerebras => Some(cerebras::open(model, context, temperature)?),
+        Kind::OpenRouter => Some(openrouter::open(model, effort, context, temperature)?),
+        Kind::Vercel => Some(vercel::open(model, effort, context, temperature)?),
+        Kind::Cerebras => Some(cerebras::open(model, effort, context, temperature)?),
     };
     if let Some(hosted) = hosted {
         let mut session = Conversation::new(Any::Hosted(hosted));

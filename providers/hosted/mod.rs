@@ -19,8 +19,9 @@
 //! in place of acting on it.
 //!
 //! What only a server of dwim's own can do is done without. A closing
-//! cannot be written into a thought, and a provider asked to limit one
-//! may not, so a thought that runs to its limit is ended here: the reply
+//! cannot be written into a thought, and a host is asked how much the
+//! model reasons as an effort, not as a number of tokens, so a thought
+//! that runs to its limit is ended here: the reply
 //! is dropped where it is, and asked for again, with the thought so far
 //! and the closing put to the model as a reminder to act on. A plain
 //! answer is asked to write its headings itself, and tokens are counted by
@@ -41,7 +42,9 @@ use serde_json::{Value, json};
 use ureq::Agent;
 
 use crate::{
-    model::{Answer, Chat, Chunk, Generation, Model, Reply, Result, Sampling, State, Stats, Turn},
+    model::{
+        Answer, Chat, Chunk, Effort, Generation, Model, Reply, Result, Sampling, State, Stats, Turn,
+    },
     providers::{Completion, Kind, Provider},
     tools::ToolCall,
 };
@@ -61,10 +64,11 @@ pub struct Host {
     pub model: fn(Model) -> &'static str,
     /// Adds to a request for a reply what the host is asked in its own
     /// way: to say what the reply used, how the tokens are sampled beyond
-    /// what every host takes, and to limit the thought to a number of
-    /// tokens, if they are limited, which is said to be `ended` here or
-    /// not when the thought runs to them regardless.
-    pub ask: fn(body: &mut Value, sampling: &Sampling, thought: Option<usize>, ended: bool),
+    /// what every host takes, and the `effort` the model reasons at. The
+    /// host writes the effort's line into the system prompt as the
+    /// model's chat template does, and the line for `xhigh` when it is
+    /// asked for none, so it is always asked.
+    pub ask: fn(body: &mut Value, sampling: &Sampling, effort: Effort),
     /// The environment variable the key to the host is read from, ahead
     /// of the key kept from signing in.
     pub key: &'static str,
@@ -102,6 +106,8 @@ pub struct Hosted {
     url: String,
     key: String,
     model: Model,
+    /// How much the model reasons before it replies.
+    effort: Effort,
     capacity: usize,
     sampling: Sampling,
     stats: Stats,
@@ -110,13 +116,15 @@ pub struct Hosted {
 }
 
 impl Hosted {
-    /// `model` at `host`, asked with `key`, with room for
-    /// `context` tokens of conversation, or [`CONTEXT`], sampled at
-    /// `temperature`, or as the model's makers recommend.
+    /// `model` at `host`, asked with `key`, reasoning at
+    /// `effort`, with room for `context` tokens of conversation, or
+    /// [`CONTEXT`], sampled at `temperature`, or as the model's makers
+    /// recommend.
     pub fn new(
         host: &'static Host,
         key: String,
         model: Model,
+        effort: Effort,
         context: Option<usize>,
         temperature: Option<f32>,
     ) -> Self {
@@ -131,6 +139,7 @@ impl Hosted {
             url: host.url.to_string(),
             key,
             model,
+            effort,
             capacity: context.unwrap_or(CONTEXT),
             sampling: Sampling {
                 temperature: temperature.unwrap_or(0.6),
@@ -172,17 +181,17 @@ impl Hosted {
     }
 
     /// Asks for a reply to `messages`, with the tools they declare, of at
-    /// most `limit` tokens, streaming it to `on_chunk`, and counts what it
-    /// took. A thought is asked to run to at most `thought` tokens, if
-    /// they are limited, and one that runs to them regardless is ended
-    /// with `closing`, if there is one, as the model's own: the reply is
-    /// asked for again, to go on from the thought so far and the closing.
+    /// most `limit` tokens, reasoned at `effort`, streaming it to
+    /// `on_chunk`, and counts what it took. A thought that runs to the
+    /// tokens of `ending`, if it has an ending, is ended with the closing
+    /// there, as the model's own: the reply is asked for again, to go on
+    /// from the thought so far and the closing.
     fn complete(
         &mut self,
         messages: (Vec<Value>, Vec<Value>),
         limit: usize,
-        thought: Option<usize>,
-        closing: Option<&str>,
+        effort: Effort,
+        ending: Option<(usize, &str)>,
         mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Outcome> {
         let (mut messages, tools) = messages;
@@ -197,10 +206,8 @@ impl Hosted {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        (self.host.ask)(&mut body, &self.sampling, thought, closing.is_some());
-        let most = thought
-            .filter(|_| closing.is_some())
-            .map(|tokens| tokens * THOUGHT_BYTES);
+        (self.host.ask)(&mut body, &self.sampling, effort);
+        let most = ending.map(|(tokens, _)| tokens * THOUGHT_BYTES);
         let mut bytes = 0;
         let mut over = false;
         let mut outcome = self.ask(&body, |chunk| {
@@ -215,7 +222,7 @@ impl Hosted {
             }
             ControlFlow::Continue(())
         })?;
-        let Some(closing) = closing.filter(|_| over) else {
+        let Some((_, closing)) = ending.filter(|_| over) else {
             return Ok(outcome);
         };
         outcome.thought = format!("{}\n\n{closing}", outcome.thought.trim_end());
@@ -400,8 +407,8 @@ impl Provider for Hosted {
         let outcome = self.complete(
             messages(chat),
             room,
-            generation.thought_limit,
-            generation.closing.as_deref(),
+            self.effort,
+            generation.thought_limit.zip(generation.closing.as_deref()),
             on_chunk,
         )?;
         let reply = Turn::Reply {
@@ -445,10 +452,13 @@ impl Provider for Hosted {
             );
             last["content"] = Value::String(asked);
         }
+        // A plain answer's thought has no closing to be ended with, so
+        // it is asked to be brief, whatever the session reasons at, and
+        // not to take the answer's tokens.
         let outcome = self.complete(
             (messages, Vec::new()),
             limit + ANSWER_THOUGHT,
-            Some(ANSWER_THOUGHT),
+            Effort::Low,
             None,
             |chunk| match chunk {
                 Chunk::Text(text) => on_text(text),
@@ -667,11 +677,39 @@ mod tests {
             &openrouter::HOST,
             "key".to_string(),
             Model::QwenMax,
+            Effort::Xhigh,
             None,
             None,
         );
         provider.url = url;
         (provider, serving)
+    }
+
+    #[test]
+    fn a_reply_is_asked_at_the_effort_of_the_session_and_a_plain_answer_at_low() {
+        let (mut provider, serving) = provider(vec![
+            events(&[json!({ "content": "Done." })]),
+            events(&[json!({ "content": "A note." })]),
+        ]);
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        let generation = Generation {
+            reserve: 0,
+            thought_limit: Some(2048),
+            closing: Some("I will decide now.".to_string()),
+        };
+        provider
+            .reply(&chat, &generation, |_| ControlFlow::Continue(()))
+            .unwrap();
+        provider
+            .answer(&chat, &[], 100, &generation, |_| ControlFlow::Continue(()))
+            .unwrap();
+        let asked = serving.join().unwrap();
+
+        assert_eq!(asked[0]["reasoning"], json!({ "effort": "xhigh" }));
+        assert_eq!(asked[1]["reasoning"], json!({ "effort": "low" }));
     }
 
     #[test]

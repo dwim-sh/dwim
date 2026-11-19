@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Model, Result, Sampling},
+    model::{Effort, Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -31,17 +31,22 @@ pub const HOST: Host = Host {
 };
 
 /// The medium model at Cerebras, with the key in the environment or kept
-/// from signing in, with
-/// room for `context` tokens of conversation, or as many as a model at a
-/// host has unless told, sampled at `temperature`, or as the model's
-/// makers recommend. The large model does not run there.
-pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+/// from signing in, reasoning at `effort`, with room for `context` tokens
+/// of conversation, or as many as a model at a host has unless told,
+/// sampled at `temperature`, or as the model's makers recommend. The
+/// large model does not run there.
+pub fn open(
+    model: Model,
+    effort: Effort,
+    context: Option<usize>,
+    temperature: Option<f32>,
+) -> Result<Hosted> {
     if model == Model::QwenMax {
         return Err(format!("{model} does not run at Cerebras").into());
     }
     let key = key()
         .ok_or_else(|| format!("there is no key to Cerebras: /login takes one, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, model, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
 /// `model` as Cerebras names it. Only the medium model runs there; the
@@ -62,13 +67,10 @@ pub fn key() -> Option<String> {
 /// Adds to a request what Cerebras is asked in its own way. It says what
 /// the reply used without being asked, and lists no way to sample from
 /// the likeliest tokens only, so that is left to it.
-///
-/// Cerebras takes how much the model thinks as an effort, not as a
-/// number of tokens, and thinks at high effort unless told. A thought
-/// that is ended here at its limit is left to the model, and one that is
-/// not, which is a plain answer's, is asked to be brief.
-fn ask(body: &mut Value, _sampling: &Sampling, thought: Option<usize>, ended: bool) {
-    if thought.is_some() && !ended {
-        body["reasoning_effort"] = json!("low");
+/// The model is asked to reason at `effort`, except at `xhigh`: Cerebras
+/// refuses to be asked for it, and reasons at it unless asked otherwise.
+fn ask(body: &mut Value, _sampling: &Sampling, effort: Effort) {
+    if effort != Effort::Xhigh {
+        body["reasoning_effort"] = json!(effort.name());
     }
 }

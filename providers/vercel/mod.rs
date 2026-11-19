@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Model, Result, Sampling},
+    model::{Effort, Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -31,13 +31,19 @@ pub const HOST: Host = Host {
 };
 
 /// `model` at the gateway, with the key in the environment
-/// or kept from signing in, with room for `context` tokens of conversation, or as many as a model
-/// at a host has unless told, sampled at `temperature`, or as the model's
-/// makers recommend.
-pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+/// or kept from signing in, reasoning at `effort`, with room for
+/// `context` tokens of conversation, or as many as a model at a host has
+/// unless told, sampled at `temperature`, or as the model's makers
+/// recommend.
+pub fn open(
+    model: Model,
+    effort: Effort,
+    context: Option<usize>,
+    temperature: Option<f32>,
+) -> Result<Hosted> {
     let key = key()
         .ok_or_else(|| format!("there is no key to Vercel: /login takes one, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, model, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
 /// `model` as the gateway names it.
@@ -57,15 +63,8 @@ pub fn key() -> Option<String> {
 /// Adds to a request what the gateway is asked in its own way: to say
 /// what the reply used, as the last event of the stream. The gateway
 /// lists no way to sample from the likeliest tokens only, so that is left
-/// to the provider.
-///
-/// The gateway takes how much these models think as an effort, not as a
-/// number of tokens. A thought that is ended here at its limit is left to
-/// the model, and one that is not, which is a plain answer's, is asked to
-/// be brief.
-fn ask(body: &mut Value, _sampling: &Sampling, thought: Option<usize>, ended: bool) {
+/// to the provider. The model is asked to reason at `effort`.
+fn ask(body: &mut Value, _sampling: &Sampling, effort: Effort) {
     body["stream_options"] = json!({ "include_usage": true });
-    if thought.is_some() && !ended {
-        body["reasoning"] = json!({ "effort": "low" });
-    }
+    body["reasoning"] = json!({ "effort": effort.name() });
 }

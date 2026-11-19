@@ -20,6 +20,15 @@ pub enum Effort {
 }
 
 impl Effort {
+    /// The effort as the template, and a host, name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Effort::Xhigh => "xhigh",
+            Effort::Medium => "medium",
+            Effort::Low => "low",
+        }
+    }
+
     /// The line the template opens the system prompt with, if any.
     pub fn instruction(self) -> Option<&'static str> {
         match self {
