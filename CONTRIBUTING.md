@@ -118,6 +118,7 @@ evals/swebench/run.py --instance django__django-11790  # one instance
 evals/swebench/run.py --limit 10                       # the first ten
 evals/swebench/run.py                                  # all 50
 evals/swebench/run.py --dataset lite -- --temperature 0
+evals/swebench/run.py --agent opencode                 # another agent
 evals/swebench/run.py --pull                           # fetch the images
 evals/swebench/run.py --gold                           # check the scoring
 ```
@@ -133,14 +134,26 @@ follows `--` is given to `dwim`. It needs Docker and
 harness for it; on Apple Silicon it needs a Docker that runs x86_64 images,
 such as Colima started with `--vz-rosetta`. `--help` lists the rest.
 
-A run is a directory under `evals/runs/`, named for the dataset and the
-commit of `dwim`. Its `manifest.json` says what was run, and each instance
-has a directory with its `result.json`, its `patch.diff`, the transcript and
-the logs. The same command again takes the run up where it stopped: it
-leaves the instances that are done, tries again those that could not be run
-for a reason that was not the agent's, such as a pull that failed, and
-scores the patches that are not scored. A run is of one dataset by one
+A run is a directory under `evals/runs/`, named for the dataset, the agent,
+and the commit of `dwim`. Its `manifest.json` says what was run, its
+`report.md` what came of it, and each instance has a directory with its
+`result.json`, its `patch.diff`, the transcript and the logs. A run over a
+whole dataset also writes its report to `evals/results/`, which is kept in
+git: commit it with the change it measures. The commit a run is named for
+is the last to change anything but `evals/`, so that a change to the script
+is not taken for a change to `dwim`. The same command again takes the run
+up where it stopped: it leaves the instances that are done, tries again
+those that could not be run for a reason that was not the agent's, such as
+a pull that failed, and scores the patches that are not scored. A run is of one dataset by one
 `dwim` asked one way, so a change to any of them wants a run of its own.
+
+`--agent opencode` runs [opencode](https://opencode.ai) in place of `dwim`,
+on the same model through the Vercel AI Gateway unless `--model` names
+another, with its shell commands in the same container and its tools that
+reach the web turned off. It has to be installed and signed in (`opencode
+auth login`); its own configuration and instructions in your home are kept
+out of the run. `dwim` goes to whichever provider it would for you, which
+the report names: say `-- --provider vercel` to hold it to one.
 
 Before trusting the numbers on a machine, run `--gold` once: it scores the
 dataset's own fixes in place of the agent's, and they all resolve where the

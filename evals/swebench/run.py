@@ -18,18 +18,24 @@ agent works on this one, and the last one's patch is scored behind it.
     evals/swebench/run.py --limit 10
     evals/swebench/run.py
     evals/swebench/run.py --dataset lite -- --temperature 0
+    evals/swebench/run.py --agent opencode
     evals/swebench/run.py --gold
     evals/swebench/run.py --pull
 
-What follows `--` is given to `dwim`. `--gold` scores the dataset's own
+What follows `--` is given to the agent, which is `dwim` unless `--agent`
+names another: opencode is run the same way, on the same model, for its
+results to be held against `dwim`'s. `--gold` scores the dataset's own
 fixes instead of the agent's, which all resolve where the images and the
 harness work. `--pull` only pulls the instances' images, one each of a
 few gigabytes, which is where a first run's time goes; they are kept, so
 it is paid once.
 
-A run is a directory under evals/runs/, named for the dataset and the
-commit of `dwim`: manifest.json says what was run, and each instance has a
+A run is a directory under evals/runs/, named for the dataset, the agent,
+and the commit of `dwim` or the version of opencode: manifest.json says
+what was run, report.md what came of it, and each instance has a
 directory with its result.json, patch.diff, the transcript and the logs.
+The report of a run over a whole dataset is written to evals/results/ as
+well, to be kept in git.
 The same command again takes the run up where it stopped: it leaves the
 instances that are done, tries again those that failed for a reason that
 was not the agent's, and scores the patches that are not scored.
@@ -38,7 +44,7 @@ The agent's commands run in the container, but the model runs here, and
 its read and edit tools work on the checkout as you, on an untrusted issue.
 Run this in a virtual machine rather than on a machine you care about.
 """
-import argparse, datetime, glob, json, os, pathlib, platform, shutil, stat, subprocess, sys, time, urllib.parse, urllib.request
+import argparse, datetime, glob, json, os, pathlib, platform, shutil, stat, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -100,6 +106,21 @@ sys.argv[0] = "run_evaluation"
 runpy.run_module("swebench.harness.run_evaluation", run_name="__main__")
 """
 
+# The model each agent runs where none is asked for: the same one, so that
+# a run of one agent can be held against a run of the other.
+MODELS = {"dwim": "medium", "opencode": "vercel/alibaba/qwen3.8-27b"}
+
+# What opencode is configured with, in place of whatever configuration of
+# yours it would find: without its tools that reach the web, which run
+# here and not in the container that has no network, and without the
+# copies it keeps of the checkout as it goes.
+OPENCODE = {
+    "permission": {"webfetch": "deny", "websearch": "deny"},
+    "snapshot": False,
+    "share": "disabled",
+    "autoupdate": False,
+}
+
 # The name the harness files a run's logs and reports under. A run has a
 # directory of its own, so they all take the same.
 HARNESS_RUN = "score"
@@ -118,14 +139,14 @@ def main():
     if args.pull:
         pull_all(rows, args.workers)
         return
-    dwim = None if args.gold else binary(args.dwim)
-    run = directory(args, dwim)
+    agent = None if args.gold else program(args)
+    run = directory(args, agent)
     print(f"run in {run}", file=sys.stderr)
     scored = set()
     if args.gold:
         gold(run, rows)
     else:
-        scored = solve_all(args, run, dwim, rows)
+        scored = solve_all(args, run, agent, rows)
     if not args.no_score:
         unscored = [
             row["instance_id"] for row in rows
@@ -136,29 +157,32 @@ def main():
             print(f"scoring {len(unscored)} patches, {args.workers} at a time, which runs each project's tests in Docker", file=sys.stderr)
             score(args, run, unscored, args.workers)
     summary(run, rows)
+    report(run, rows, keep=not (args.gold or args.instance or args.limit is not None))
 
 
 def arguments():
-    """The command line, with what follows `--` set apart for `dwim`."""
-    argv, dwim_args = sys.argv[1:], []
+    """The command line, with what follows `--` set apart for the agent."""
+    argv, agent_args = sys.argv[1:], []
     if "--" in argv:
         at = argv.index("--")
-        argv, dwim_args = argv[:at], argv[at + 1:]
+        argv, agent_args = argv[:at], argv[at + 1:]
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", choices=[*SUBSETS, *DATASETS], default="verified-mini", help="dataset to run (default: %(default)s)")
     parser.add_argument("--instance", action="append", help="instance to run, repeatable (default: all of the dataset)")
     parser.add_argument("--limit", type=int, help="run only the first so many instances")
-    parser.add_argument("--model", default="medium", help="model for `dwim` to run (default: %(default)s)")
+    parser.add_argument("--agent", choices=MODELS, default="dwim", help="agent to run (default: %(default)s)")
+    parser.add_argument("--model", help=f"model for the agent to run, as it names them (default: {', '.join(f'{model} for {agent}' for agent, model in MODELS.items())})")
     parser.add_argument("--timeout", type=int, default=600, help="seconds the agent has per instance (default: %(default)s)")
-    parser.add_argument("--run-id", help="name of the run, to start or to take up (default: the dataset and dwim's commit)")
+    parser.add_argument("--run-id", help="name of the run, to start or to take up (default: the dataset, the agent, and dwim's commit or opencode's version)")
     parser.add_argument("--runs", default=str(ROOT / "evals" / "runs"), help="where runs are kept (default: %(default)s)")
-    parser.add_argument("--dwim", help="dwim binary to run (default: build target/release/dwim)")
+    parser.add_argument("--binary", help="the agent's program (default: target/release/dwim, built, or opencode as it is on the path)")
     parser.add_argument("--pull", action="store_true", help="pull the instances' images, which a first run spends most of its time on, and stop")
     parser.add_argument("--gold", action="store_true", help="score the dataset's own fixes, to check the images and the harness")
     parser.add_argument("--no-score", action="store_true", help="make the patches without scoring them")
     parser.add_argument("--workers", type=int, default=4, help="images pulled at once, and instances scored at once when none are being solved (default: %(default)s)")
     args = parser.parse_args(argv)
-    args.dwim_args = dwim_args
+    args.agent_args = agent_args
+    args.model = args.model or MODELS[args.agent]
     return args
 
 
@@ -176,8 +200,7 @@ def table(dataset):
     url = f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(dataset, safe='')}&config=default&split=test"
     rows, total = [], None
     while total is None or len(rows) < total:
-        with urllib.request.urlopen(f"{url}&offset={len(rows)}&length=100") as response:
-            page = json.load(response)
+        page = fetched(f"{url}&offset={len(rows)}&length=100")
         if not page["rows"]:
             break
         total = page["num_rows_total"]
@@ -205,24 +228,32 @@ def required():
         sys.exit("docker is needed to run the agent's commands and score its patches: install it")
 
 
-def binary(path):
-    """The `dwim` binary, built if it isn't already."""
-    if path:
-        return str(pathlib.Path(path).resolve())
+def program(args):
+    """The agent's program: the one named, or else `dwim` built from this
+    checkout, and `opencode` as it is on the path."""
+    if args.binary:
+        return str(pathlib.Path(args.binary).resolve())
+    if args.agent == "opencode":
+        found = shutil.which("opencode")
+        if not found:
+            sys.exit("opencode is not on the path: install it, or name it with --binary")
+        return found
     print("building dwim", file=sys.stderr)
     subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
     return str(ROOT / "target" / "release" / "dwim")
 
 
-def directory(args, dwim):
+def directory(args, agent):
     """The run's directory, with its manifest: made for a new run, and
     checked for one taken up, which has to be of the same dataset, by the
-    same `dwim`, asked the same way, for its results to be of one thing."""
-    now = manifest(args, dwim)
-    agent = "gold"
-    if dwim:
-        agent = now["agent"]["commit"][:12] + ("-dirty" if now["agent"]["dirty"] else "")
-    run = pathlib.Path(args.runs).resolve() / (args.run_id or f"{args.dataset}-{agent}")
+    same agent, asked the same way, for its results to be of one thing."""
+    now = manifest(args, agent)
+    name = "gold"
+    if agent and args.agent == "dwim":
+        name = f"dwim-{now['agent']['commit'][:12]}{'-dirty' if now['agent']['dirty'] else ''}"
+    elif agent:
+        name = f"{args.agent}-{now['agent']['version']}"
+    run = pathlib.Path(args.runs).resolve() / (args.run_id or f"{args.dataset}-{name}")
     run.mkdir(parents=True, exist_ok=True)
     path = run / "manifest.json"
     if path.exists():
@@ -235,29 +266,29 @@ def directory(args, dwim):
     return run
 
 
-def manifest(args, dwim):
-    """What is run: the dataset as it is now, and the agent, which is
-    `dwim` as built from this checkout and asked as the command line says,
-    or the dataset's own fixes."""
+def manifest(args, agent):
+    """What is run: the dataset as it is now, and the agent, which is the
+    program `agent` asked as the command line says, or the dataset's own
+    fixes. `dwim` is told by the commit it is built from, which is the
+    last to change anything but evals/, and by whether anything but
+    evals/ has changed since: a change to this script is not one to
+    `dwim`."""
     revision = {}
     for dataset in sources(args.dataset):
-        with urllib.request.urlopen(f"https://huggingface.co/api/datasets/{dataset}") as response:
-            revision[dataset] = json.load(response)["sha"]
-    agent = "gold"
-    if dwim:
-        agent = {
-            "version": subprocess.run([dwim, "--version"], capture_output=True, text=True).stdout.strip(),
-            "commit": git("rev-parse", "HEAD", cwd=ROOT).strip(),
-            "dirty": bool(git("status", "--porcelain", cwd=ROOT).strip()),
-            "model": args.model,
-            "arguments": args.dwim_args,
-            "timeout": args.timeout,
-            "task": TASK,
-        }
+        revision[dataset] = fetched(f"https://huggingface.co/api/datasets/{dataset}")["sha"]
+    described = "gold"
+    if agent:
+        version = subprocess.run([agent, "--version"], capture_output=True, text=True).stdout.strip()
+        described = {"name": args.agent, "version": version.removeprefix("dwim ")}
+        if args.agent == "dwim":
+            source = (".", ":(exclude)evals")
+            described["commit"] = git("log", "-1", "--format=%H", "--", *source, cwd=ROOT).strip()
+            described["dirty"] = bool(git("status", "--porcelain", "--", *source, cwd=ROOT).strip())
+        described |= {"model": args.model, "arguments": args.agent_args, "timeout": args.timeout, "task": TASK}
     return {
         "dataset": args.dataset,
         "revision": revision,
-        "agent": agent,
+        "agent": described,
         "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
     }
@@ -279,8 +310,8 @@ def gold(run, rows):
             record(run, row["instance_id"], {"agent": "gold"}, row["patch"])
 
 
-def solve_all(args, run, dwim, rows):
-    """Runs `dwim` over the instances of `rows` that are not done, recording
+def solve_all(args, run, agent, rows):
+    """Runs the agent over the instances of `rows` that are not done, recording
     a result for each, and scoring it unless told not to. The model is the
     bottleneck, so one thread prepares the next instance while the agent
     works on this one, and another scores the patches made, one at a time,
@@ -295,7 +326,7 @@ def solve_all(args, run, dwim, rows):
         print(f"[{i}/{len(rows)}] {instance_id}", file=sys.stderr)
         upcoming = preparer.submit(prepare, row=rows[i], run=run) if i < len(rows) else None
         try:
-            outcome, patch = solve(row, args, dwim, run, prepared.result())
+            outcome, patch = solve(row, args, agent, run, prepared.result())
         except (subprocess.CalledProcessError, OSError) as e:
             # Not the agent's doing: a pull that failed, a full disk, a
             # Docker that went away. Say so, and leave it for the next go.
@@ -381,9 +412,9 @@ def checkout(row, run):
     return clone
 
 
-def solve(row, args, dwim, run, clone):
-    """Runs `dwim` over one instance, in its prepared checkout `clone`, and
-    returns how that went and the patch it leaves behind. The patch is
+def solve(row, args, agent, run, clone):
+    """Runs the agent over one instance, in its prepared checkout `clone`,
+    and returns how that went and the patch it leaves behind. The patch is
     everything that differs from the checkout as the image had it: files
     added as well as changed, whether or not the agent committed them. An
     agent out of time is stopped, and what it had changed is its patch."""
@@ -393,18 +424,19 @@ def solve(row, args, dwim, run, clone):
     shell = out / "shell.sh"
     shell.write_text(SHELL.format(container=name))
     shell.chmod(shell.stat().st_mode | stat.S_IXUSR)
+    argv, environment, prints_transcript = command(args, agent, shell, out, TASK.format(issue=row["problem_statement"]))
     started = time.monotonic()
     outcome = {}
     try:
-        with open(out / "dwim.log", "w") as log:
+        with open(out / "agent.log", "w") as log, open(out / "transcript.jsonl", "a") as transcript:
             code = subprocess.run(
-                [
-                    dwim, "--model", args.model, "--shell", str(shell), "--transcript", str(out / "transcript.jsonl"),
-                    *args.dwim_args, TASK.format(issue=row["problem_statement"]),
-                ],
+                argv,
                 cwd=clone,
+                # PWD as well: opencode takes the directory to work in
+                # from it, and it is still where this script was run.
+                env={**os.environ, "PWD": str(clone), **environment},
                 stdin=subprocess.DEVNULL,
-                stdout=log,
+                stdout=transcript if prints_transcript else log,
                 stderr=log,
                 timeout=args.timeout,
             ).returncode
@@ -420,6 +452,26 @@ def solve(row, args, dwim, run, clone):
     )
     shutil.rmtree(clone, ignore_errors=True)
     return outcome, patch
+
+
+def command(args, agent, shell, out, task):
+    """How the agent is run on `task`: its command line, what is added to
+    its environment, and whether it prints its transcript, where `dwim`
+    writes its own to a file. Either way the agent's shell commands go
+    through `shell`, into the container. opencode is asked for it in SHELL,
+    and is kept from the configuration and the instructions in your home,
+    which are yours and not the run's; its sign-in stays where it is."""
+    if args.agent == "opencode":
+        (out / "config").mkdir(exist_ok=True)
+        environment = {
+            "SHELL": str(shell),
+            "XDG_CONFIG_HOME": str(out / "config"),
+            "OPENCODE_CONFIG_CONTENT": json.dumps(OPENCODE),
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+        }
+        return [agent, "run", "--pure", "--print-logs", "--format", "json", "--model", args.model, *args.agent_args, task], environment, True
+    transcript = str(out / "transcript.jsonl")
+    return [agent, "--model", args.model, "--shell", str(shell), "--transcript", transcript, *args.agent_args, task], {}, False
 
 
 def snapshot(clone, out):
@@ -469,7 +521,7 @@ def describe(outcome):
     if outcome["agent"] == "error":
         return f"could not run: {outcome['error']}"
     if outcome["agent"] == "failed":
-        return f"dwim exited with {outcome['exit_code']} after {outcome['seconds']}s"
+        return f"the agent exited with {outcome['exit_code']} after {outcome['seconds']}s"
     return f"{outcome['agent']} after {outcome['seconds']}s"
 
 
@@ -577,12 +629,83 @@ def summary(run, rows):
         ("harness error", count("verdict", "error")),
         ("could not run", len(results) - sum(1 for r in results if done(r))),
         ("timed out", count("agent", "timed out")),
-        ("dwim failed", count("agent", "failed")),
+        ("agent failed", count("agent", "failed")),
     ]
     for name, value in lines:
         if value or name == "resolved":
             print(f"{name:14} {value}")
     print(f"results in {run}")
+
+
+def report(run, rows, keep):
+    """Writes the run up as Markdown in its directory: what was run, what
+    came of it, and each instance. A run of a whole dataset is one to
+    `keep`, and its report goes to evals/results/ as well, which git has,
+    where the runs themselves are too large for it."""
+    said = json.loads((run / "manifest.json").read_text())
+    agent = said["agent"]
+    results = [result(run, row["instance_id"]) or {"agent": "error", "patch_bytes": 0} for row in rows]
+    known = [facts(agent, run / row["instance_id"] / "transcript.jsonl") for row in rows]
+    served = sorted({fact["served"] for fact in known if fact.get("served")})
+    resolved = sum(1 for r in results if r.get("verdict") == "resolved")
+    lines = [f"# {run.name}", "", "| | |", "|---|---|", f"| Dataset | {said['dataset']}, {len(rows)} instances |"]
+    if agent == "gold":
+        lines += ["| Agent | none: the dataset's own fixes |"]
+    else:
+        built = f", commit {agent['commit'][:12]}{', with changes not committed' if agent['dirty'] else ''}" if "commit" in agent else ""
+        lines += [
+            f"| Agent | {agent.get('name', 'dwim')} {agent['version'].removeprefix('dwim ')}{built} |",
+            f"| Model | {agent['model']}{', served as ' + '; '.join(served) if served else ''} |",
+            f"| Arguments | {' '.join(agent['arguments']) or 'none'} |",
+            f"| Time limit | {agent['timeout']} seconds an instance |",
+        ]
+    lines += [f"| Started | {said['started']} |", "", f"**{resolved} of {len(rows)} resolved.**", "", "| Outcome | Instances |", "|---|---|"]
+    tally = {}
+    for r in results:
+        tally[verdict_of(r)] = tally.get(verdict_of(r), 0) + 1
+    lines += [f"| {outcome} | {count} |" for outcome, count in sorted(tally.items(), key=lambda item: -item[1])]
+    for ended in ("timed out", "failed"):
+        count = sum(1 for r in results if r["agent"] == ended)
+        if count:
+            lines += ["", f"The agent {ended} on {count}, which are counted above by what it had changed by then."]
+    lines += ["", "| Instance | Agent | Seconds | Tool calls | Outcome |", "|---|---|---|---|---|"]
+    lines += [
+        f"| {row['instance_id']} | {r['agent']} | {r.get('seconds', '')} | {fact.get('calls', '')} | {verdict_of(r)} |"
+        for row, r, fact in zip(rows, results, known)
+    ]
+    text = "\n".join(lines) + "\n"
+    write(run / "report.md", text)
+    if keep:
+        kept = ROOT / "evals" / "results" / f"{run.name}.md"
+        kept.parent.mkdir(exist_ok=True)
+        write(kept, text)
+        print(f"report in {kept}")
+
+
+def facts(agent, transcript):
+    """What an instance's transcript tells that its result does not: how
+    many tool calls the agent made, and for `dwim`, where the model was
+    served and with how much context, which `dwim` chooses for itself
+    when it is not told."""
+    try:
+        rows = [json.loads(line) for line in transcript.read_text().splitlines() if line.startswith("{")]
+    except (FileNotFoundError, ValueError):
+        return {}
+    if isinstance(agent, dict) and agent.get("name") == "opencode":
+        return {"calls": sum(1 for row in rows if row.get("type") == "tool_use")}
+    known = {"calls": sum(1 for row in rows if row.get("type") == "call")}
+    if rows and rows[0].get("type") == "start":
+        known["served"] = f"{rows[0].get('device')} with a context of {rows[0].get('context')} tokens"
+    return known
+
+
+def verdict_of(result):
+    """What became of an instance, in a word or two."""
+    if not done(result):
+        return "could not run"
+    if not result["patch_bytes"]:
+        return "empty patch"
+    return {"error": "harness error"}.get(result.get("verdict"), result.get("verdict", "not scored"))
 
 
 def done(result):
@@ -624,6 +747,20 @@ def write(path, text):
     partial = path.with_name(path.name + ".partial")
     partial.write_text(text)
     partial.replace(path)
+
+
+def fetched(url):
+    """The JSON at `url`, asked for a few times over before giving up:
+    Hugging Face answers now and then with an error that is gone the next
+    moment."""
+    for pause in (1, 4, 16, None):
+        try:
+            with urllib.request.urlopen(url) as response:
+                return json.load(response)
+        except (urllib.error.URLError, TimeoutError):
+            if pause is None:
+                raise
+            time.sleep(pause)
 
 
 def git(*args, cwd, env=None):
