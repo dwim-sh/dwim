@@ -97,4 +97,21 @@ do not write it.
 - The body says why, and what was and was not verified.
 - A pull request's title is a subject too, written the same way.
 
+A pull request's description is mandatory and is written for a reader
+who has not seen the code or the commits. It stands on its own, in
+three parts:
+
+1. **Problem**: a paragraph on what is wrong or missing, and why it
+   matters.
+2. **Solution**: a paragraph or more on what the change does about it,
+   as a whole.
+3. **Results**: numbers for the claims, such as a benchmark, timings,
+   sizes, or tokens, measured before and after where there is a before.
+   Then what was verified and what was not. Say so when a claim cannot
+   be measured.
+
+Leave the details of each change to the commits. A description does not
+list the commits, retell their messages, or list every flag and fix. When
+a pull request changes, rewrite its description to match.
+
 `CONTRIBUTING.md` has the longer version, and how to run SWE-bench.
