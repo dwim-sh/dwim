@@ -38,8 +38,8 @@ program. One package: `lib.rs` is the library, `cli/` and
   reads only what it has not read of it
 - `inference/` - running the model on this machine: `gguf`, `quants`,
   `qwen35` (the transformer, documented there), `model` (loading and
-  sizing), `local`, `sampler`, `states` (saved system prompts), `fetch`
-  (downloads into the cache)
+  sizing), `local`, `copies` (drafts copied from the context), `sampler`,
+  `states` (saved system prompts), `fetch` (downloads into the cache)
 - `model/` - what is known of the model wherever it runs: `session` (the
   `Session` the harness holds), `chat` (a conversation as a request
   carries it), `format` (the chat format), `tokenizer`, `gguf` (a file's
