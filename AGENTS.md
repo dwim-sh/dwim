@@ -11,7 +11,10 @@ program. One package: `lib.rs` is the library, `cli/` and
 - **Format**: `cargo fmt --check`
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
-  `cargo run --bin difftest`
+  `cargo run --bin difftest model`
+- **Check**: `make check` checks the Lean specs in `specs/` and their
+  proofs, makes their pages, and checks the code against them with
+  `difftest`. It needs `lake` from a Lean toolchain.
 - **Fetch the weights** (16 GB, into the Hugging Face cache):
   `dwim --download`
 - Before calling a change done, run `./target/debug/dwim` in a terminal
@@ -56,6 +59,9 @@ program. One package: `lib.rs` is the library, `cli/` and
   `run.py`: `swebench` (Lite, Verified, Verified Mini); `results/` is
   the report of each run over a whole dataset, and `runs/` what the runs
   leave, which is not kept in git
+- `specs/` - Lean specs of the code, a file for each Rust one they
+  specify: what it must do, examples checked when built, and proofs.
+  Verso makes them pages, and `difftest` checks the code against each
 - `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built

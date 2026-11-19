@@ -64,8 +64,8 @@ pub fn reserve<S: Session>(session: &mut S) -> Result<usize, Box<dyn Error>> {
 /// Makes room for `input`, and for `more` tokens after it, compacting
 /// the conversation first if they would take the context past the
 /// high-water mark. Returns whether the input may go in: not if the
-/// compaction was interrupted, and an error if the input cannot fit
-/// even so.
+/// compaction was interrupted. Whether it fits even so is the caller's
+/// to see to.
 pub fn make_room<S: Session>(
     harness: &mut Harness<S>,
     input: &Turn,
@@ -74,18 +74,11 @@ pub fn make_room<S: Session>(
 ) -> Result<bool, Box<dyn Error>> {
     let needed = harness.session.measure(input)? + more;
     let capacity = harness.session.capacity();
-    if harness.session.tokens() + needed > capacity * HIGH_WATER.0 / HIGH_WATER.1
-        && !harness.transcript.is_empty()
-        && !compact(harness, on_event)?
-    {
-        return Ok(false);
-    }
-    if needed > harness.session.free() {
-        return Err(
-            format!("a message of {needed} tokens does not fit in the context window").into(),
-        );
-    }
-    Ok(true)
+    Ok(
+        harness.session.tokens() + needed <= capacity * HIGH_WATER.0 / HIGH_WATER.1
+            || harness.transcript.is_empty()
+            || compact(harness, on_event)?,
+    )
 }
 
 /// Compacts the conversation, as [`Harness::compact`] does.
@@ -116,8 +109,7 @@ pub fn compact<S: Session>(
     }
 
     let capacity = harness.session.capacity();
-    let start = tail(&harness.transcript, capacity / TAIL);
-    let messages = messages(&harness.transcript[..start], capacity / MESSAGES);
+    let (start, messages) = select(&harness.said, &harness.transcript, capacity);
     let head = note_turn(
         &environment(&harness.dir),
         &note,
@@ -141,7 +133,11 @@ pub fn start_over<S: Session>(
 ) -> Result<(), Box<dyn Error>> {
     let before = harness.session.tokens();
     let start = tail(&harness.transcript, 0);
-    let messages = messages(&harness.said, harness.session.capacity() / MESSAGES);
+    let messages = messages(
+        &harness.said,
+        &harness.transcript[start..],
+        harness.session.capacity() / MESSAGES,
+    );
     let head = step_turn(
         &environment(&harness.dir),
         &harness.tools.plan().brief(),
@@ -182,12 +178,27 @@ fn restart<S: Session>(
     Ok(())
 }
 
+/// What a compaction keeps of `transcript` in a context of `capacity`
+/// tokens, when the user has said `said`: where the exchanges read back
+/// start, and the user's messages the note turn carries.
+pub fn select<'a>(
+    said: &'a [Entry],
+    transcript: &[Entry],
+    capacity: usize,
+) -> (usize, Vec<&'a str>) {
+    let start = tail(transcript, capacity / TAIL);
+    (
+        start,
+        messages(said, &transcript[start..], capacity / MESSAGES),
+    )
+}
+
 /// Where the exchanges to read back after a compaction start in the
 /// transcript: the most recent whole exchanges that fit in `budget`
 /// tokens, each starting at a reply, and always the last reply, which any
 /// pending tool results answer. The whole transcript's length if there is
 /// no reply yet.
-fn tail(transcript: &[Entry], budget: usize) -> usize {
+pub fn tail(transcript: &[Entry], budget: usize) -> usize {
     let replies: Vec<usize> = (0..transcript.len())
         .filter(|&i| matches!(transcript[i].turn, Turn::Reply { .. }))
         .collect();
@@ -207,27 +218,38 @@ fn tail(transcript: &[Entry], budget: usize) -> usize {
     start
 }
 
-/// The user's own messages among `entries`, oldest first, as many of the
-/// most recent as fit in `budget` tokens: not the harness's prompts, such
-/// as the notes of earlier compactions.
-fn messages(entries: &[Entry], budget: usize) -> Vec<&str> {
+/// The user's messages the note turn carries, oldest first: of all the
+/// user has sent, `said`, but for the last ones, which are in `tail`, the
+/// most recent that fit in `budget` tokens, stopping at the first that
+/// does not; and, when `tail` holds none of the user's, at least the
+/// latest the user sent, whatever it takes. Never the harness's prompts,
+/// such as the notes of earlier compactions.
+pub fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
+    let in_tail = tail.iter().filter_map(own).count();
+    let mut candidates: Vec<(&str, usize)> = said.iter().filter_map(own).collect();
+    candidates.truncate(candidates.len().saturating_sub(in_tail));
     let mut kept = Vec::new();
     let mut total = 0;
-    for entry in entries.iter().rev() {
-        let Turn::User(message) = &entry.turn else {
-            continue;
-        };
-        if entry.prompt {
-            continue;
-        }
-        if total + entry.tokens > budget {
+    for &(message, tokens) in candidates.iter().rev() {
+        if total + tokens > budget {
             break;
         }
-        total += entry.tokens;
-        kept.push(message.as_str());
+        total += tokens;
+        kept.push(message);
+    }
+    if kept.is_empty() && in_tail == 0 {
+        kept.extend(candidates.last().map(|&(message, _)| message));
     }
     kept.reverse();
     kept
+}
+
+/// The message and the tokens of `entry`, if the user wrote it.
+fn own(entry: &Entry) -> Option<(&str, usize)> {
+    match &entry.turn {
+        Turn::User(message) if !entry.prompt => Some((message.as_str(), entry.tokens)),
+        _ => None,
+    }
 }
 
 /// The turn that opens a compacted conversation: where the agent is, the
@@ -582,14 +604,28 @@ mod tests {
             user(3),
         ];
         assert_eq!(
-            messages(&turns, 100),
+            messages(&turns, &[], 100),
             ["message 1", "message 2", "message 3"]
         );
         assert_eq!(
-            messages(&turns, 20),
+            messages(&turns, &[], 20),
             ["message 2", "message 3"],
             "the newest that fit"
         );
-        assert_eq!(messages(&turns, 5), Vec::<&str>::new());
+        assert_eq!(
+            messages(&turns, &[], 5),
+            ["message 3"],
+            "the latest, whatever it takes"
+        );
+        assert_eq!(
+            messages(&turns, &turns[8..], 5),
+            Vec::<&str>::new(),
+            "the latest is in the tail"
+        );
+        assert_eq!(
+            messages(&turns, &turns[8..], 20),
+            ["message 1", "message 2"],
+            "not those in the tail"
+        );
     }
 }

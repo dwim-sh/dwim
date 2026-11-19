@@ -40,7 +40,6 @@ pub const TOOL_RESPONSE_END: &str = "</tool_response>";
 
 /// The chat format's tags, as a vocabulary for it has them: the ones
 /// starting with `<|` are control tokens, the rest user-defined.
-#[cfg(test)]
 pub const SPECIAL_TOKENS: [&str; 9] = [
     END_OF_TEXT,
     IM_START,

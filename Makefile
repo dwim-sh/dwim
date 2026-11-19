@@ -6,6 +6,11 @@
 # `make` builds as you, so `make && sudo make install PREFIX=/usr/local`
 # builds nothing as root.
 #
+# `make check` checks the Lean specs in specs/, their definitions, their
+# examples and their proofs; makes the pages that show them, in
+# specs/.lake/build/literate-html/index.html; and checks that the code
+# does what the specs say, with difftest.
+#
 # Each step prints one line such as `  INSTALL ~/.local/bin/dwim`.
 # `make V=1` prints the commands instead.
 
@@ -24,8 +29,11 @@ ifeq ($(V),1)
   msg =
 else
   Q = @
-  msg = @printf '  %-7s %s\n' '$(1)' '$(2)'
+  msg = @printf '  %-8s %s\n' '$(1)' '$(2)'
 endif
+# $(call quiet,command) shows what the command printed only if it fails.
+quiet = out=$$($(1) 2>&1) || { printf '%s\n' "$$out"; exit 1; }
+
 ifneq ($(findstring s,$(firstword -$(MAKEFLAGS))),)
   msg =
 endif
@@ -55,8 +63,21 @@ test:
 	$(call msg,TEST,dwim)
 	$(Q)cargo test
 
+check: difftest-compaction difftest-harness
+	$(call msg,LAKE,specs/.lake/build/literate-html/index.html)
+	@# Verso does not notice changes to images and style.css: without its
+	@# trace, it makes the pages again, which takes a second.
+	$(Q)rm -f specs/.lake/build/literate-html.trace
+	$(Q)cd specs && lake --quiet query :literateHtml > /dev/null
+
+# `make difftest-SUBJECT` checks one subject against its reference, as
+# `difftest SUBJECT` does: `make difftest-compaction`, `make difftest-model`.
+difftest-%:
+	$(call msg,DIFFTEST,$*)
+	$(Q)$(call quiet,cargo run --quiet --bin difftest $*)
+
 clean:
 	$(call msg,CLEAN,target)
 	$(Q)cargo clean
 
-.PHONY: all install uninstall test clean
+.PHONY: all install uninstall test check clean
