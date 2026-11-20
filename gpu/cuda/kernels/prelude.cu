@@ -72,6 +72,18 @@ struct AttentionParams {
     u32 chunks;
 };
 
+// Attention over the caches in chunks of `chunk` positions, `chunks` of
+// them to a token, for the tokens from `first` on, `count` of them.
+struct AttentionTileParams {
+    u32 n_heads;
+    u32 n_kv_heads;
+    u32 pos;
+    u32 first;
+    u32 count;
+    u32 chunks;
+    u32 chunk;
+};
+
 struct StoreParams {
     u32 offset;
     u32 len;

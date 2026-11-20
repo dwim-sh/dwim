@@ -36,15 +36,27 @@ const ROWS_TOKENS: usize = 8;
 
 /// Tokens a block of the wide tile kernel takes, and of the narrow one,
 /// which takes what is left of a batch after the wide one's.
-const TILE_TOKENS: usize = 128;
+const TILE_TOKENS: usize = 64;
 const TILE_TOKENS_NARROW: usize = 16;
 
 /// Tokens to a batch on a GPU with tensor cores.
-const TILE_BATCH: usize = 512;
+const TILE_BATCH: usize = 256;
 
 /// Tiles a block of the tile kernels holds in shared memory at once: the
 /// one it is multiplying and the ones on their way.
 const TILE_STAGES: usize = 3;
+
+/// The head the attention tile kernels are written for, lines of query
+/// heads a block of the narrow and of the wide one takes, and the positions
+/// they take at a step.
+const ATTENTION_TILE_DIM: usize = 256;
+const ATTENTION_TILE_LINES: [usize; 2] = [16, 64];
+const ATTENTION_TILE_KEYS: usize = 32;
+
+/// Blocks an attention over the tiles is spread over, about, and the
+/// fewest positions worth a chunk of their own.
+const ATTENTION_TILE_BLOCKS: usize = 192;
+const ATTENTION_TILE_CHUNK: usize = 256;
 
 /// The compute capability the tile kernels need, for their tensor cores
 /// and the copies into shared memory that are not waited for.
@@ -65,7 +77,7 @@ const MAX_GRID_Y: usize = 65535;
 
 /// The kernels, compiled together in this order: a kernel may use what an
 /// earlier one defines.
-const KERNELS: [(&str, &str); 16] = [
+const KERNELS: [(&str, &str); 17] = [
     ("prelude", include_str!("kernels/prelude.cu")),
     ("add", include_str!("kernels/add.cu")),
     ("silu_mul", include_str!("kernels/silu_mul.cu")),
@@ -85,6 +97,7 @@ const KERNELS: [(&str, &str); 16] = [
     ("to_f16", include_str!("kernels/to_f16.cu")),
     ("matmul_rows", include_str!("kernels/matmul_rows.cu")),
     ("matmul_tile", include_str!("kernels/matmul_tile.cu")),
+    ("attention_tile", include_str!("kernels/attention_tile.cu")),
 ];
 
 /// A vector of f32 activations in device memory.
@@ -125,8 +138,8 @@ struct QuantKernels {
     /// A token in single precision, and a batch eight tokens at a time.
     row: CudaFunction,
     rows: CudaFunction,
-    /// A batch on the tensor cores, 16 and 128 tokens at a time, where the
-    /// GPU has them.
+    /// The tokens on the tensor cores, 16 and 64 at a time, where the GPU
+    /// has them.
     tiles: Option<(CudaFunction, CudaFunction)>,
 }
 
@@ -135,6 +148,9 @@ struct Kernels {
     q4_0: QuantKernels,
     q8_0: QuantKernels,
     to_f16: CudaFunction,
+    /// Attention on the tensor cores, narrow and wide, and the kernel that
+    /// merges their chunks, where the GPU has them.
+    attention_tiles: Option<([CudaFunction; 2], CudaFunction)>,
     add: CudaFunction,
     rmsnorm: CudaFunction,
     l2norm: CudaFunction,
@@ -211,7 +227,24 @@ impl Cuda {
                 tiles,
             })
         };
+        let attention_tiles = if tiles && arch >= TILE_CAPABILITY {
+            let tile = |lines: usize| -> Result<CudaFunction, Box<dyn Error>> {
+                let f = kernel(&format!("attention_tile{lines}"))?;
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    attention_tile_shared(lines) as i32,
+                )?;
+                Ok(f)
+            };
+            Some((
+                [tile(ATTENTION_TILE_LINES[0])?, tile(ATTENTION_TILE_LINES[1])?],
+                kernel("attention_tile_combine")?,
+            ))
+        } else {
+            None
+        };
         let kernels = Kernels {
+            attention_tiles,
             matmul_bf16: kernel("matmul_bf16")?,
             q4_0: quant("q4_0", 1)?,
             q8_0: quant("q8_0", 2)?,
@@ -313,6 +346,87 @@ impl Cuda {
         );
         (blocks as u32, 1)
     }
+    /// Attention on the tensor cores, for heads of [`ATTENTION_TILE_DIM`]:
+    /// the positions are cut into chunks so that there are blocks enough
+    /// to fill the GPU, each a chunk of a key/value head for as many
+    /// tokens as have a tile's lines of query heads between them, and the
+    /// chunks are merged after.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_tiles(
+        &self,
+        tiles: &[CudaFunction; 2],
+        combine: &CudaFunction,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+    ) {
+        let n = q.len / (n_heads * ATTENTION_TILE_DIM);
+        let group = n_heads / n_kv_heads;
+        // The narrow kernel for the tokens it takes in two blocks' worth,
+        // the wide one for more.
+        let narrow = ATTENTION_TILE_LINES[0] / group;
+        let (kernel, lines, threads) = if n <= 2 * narrow {
+            (&tiles[0], ATTENTION_TILE_LINES[0], 128)
+        } else {
+            (&tiles[1], ATTENTION_TILE_LINES[1], 256)
+        };
+        let tokens = lines / group;
+        let len = pos + n;
+        let chunks = ATTENTION_TILE_BLOCKS
+            .div_ceil(n.div_ceil(tokens) * n_kv_heads)
+            .min(len / ATTENTION_TILE_CHUNK)
+            .max(1);
+        let chunk = len.div_ceil(chunks).next_multiple_of(ATTENTION_TILE_KEYS);
+        let chunks = len.div_ceil(chunk);
+        let per_token = n_heads * chunks * (ATTENTION_TILE_DIM + 2);
+        let per_dispatch = PARTIALS / per_token / tokens * tokens;
+        assert!(
+            per_dispatch > 0,
+            "attention over {len} positions needs more partials than {PARTIALS}"
+        );
+        for first in (0..n).step_by(per_dispatch) {
+            let count = per_dispatch.min(n - first);
+            let params = AttentionTileParams {
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                pos: pos as u32,
+                first: first as u32,
+                count: count as u32,
+                chunks: chunks as u32,
+                chunk: chunk as u32,
+            };
+            self.launch_shared(
+                kernel,
+                &[
+                    self.ptr(&out.buf),
+                    self.ptr(&q.buf),
+                    self.ptr(&k_cache.quants),
+                    self.ptr(&k_cache.scales),
+                    self.ptr(&v_cache.quants),
+                    self.ptr(&v_cache.scales),
+                    self.ptr(&self.partials),
+                ],
+                &params,
+                self.grid(count.div_ceil(tokens) * n_kv_heads * chunks, 1),
+                threads,
+                attention_tile_shared(lines),
+            );
+            if chunks > 1 {
+                self.launch(
+                    combine,
+                    &[self.ptr(&out.buf), self.ptr(&self.partials)],
+                    &params,
+                    self.grid(count * n_heads, 1),
+                    ATTENTION_TILE_DIM as u32,
+                );
+            }
+        }
+    }
+
     /// A matmul through bf16 weights: one block of 64 threads per row and
     /// group of eight tokens, the rows across the grid and each group of
     /// tokens a row of it.
@@ -346,6 +460,16 @@ impl Cuda {
 fn tile_shared(tokens: usize, bytes: usize) -> usize {
     let stage = tokens * TILE_COLS * 2 + TILE_ROWS * TILE_COLS / 2 * bytes + 2 * TILE_ROWS * 2;
     TILE_STAGES * stage
+}
+
+/// Bytes of shared memory a block of an attention tile kernel of `lines`
+/// lines takes: each line's query and its scores and weights for a step,
+/// what it is scaled by, its maximum and its sum, and two stages of a
+/// step's keys and values and the scales of each.
+fn attention_tile_shared(lines: usize) -> usize {
+    let line = ATTENTION_TILE_DIM * 2 + ATTENTION_TILE_KEYS * (4 + 2) + 3 * 4;
+    let stage = 2 * ATTENTION_TILE_KEYS * (ATTENTION_TILE_DIM + 16);
+    lines * line + 2 * stage
 }
 
 /// Lays a block-quantized matrix out in tiles of [`TILE_ROWS`] rows by
@@ -551,6 +675,18 @@ struct AttentionParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct AttentionTileParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    pos: u32,
+    first: u32,
+    count: u32,
+    chunks: u32,
+    chunk: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct StoreParams {
     offset: u32,
     len: u32,
@@ -570,6 +706,7 @@ unsafe impl DeviceRepr for RopeParams {}
 unsafe impl DeviceRepr for ConvParams {}
 unsafe impl DeviceRepr for DeltaNetParams {}
 unsafe impl DeviceRepr for AttentionParams {}
+unsafe impl DeviceRepr for AttentionTileParams {}
 unsafe impl DeviceRepr for StoreParams {}
 unsafe impl DeviceRepr for LenParams {}
 
@@ -822,11 +959,9 @@ impl Device for Cuda {
         );
         let bytes = if w.format == Format::Q8_0 { 2 } else { 1 };
         let whole = n / TILE_TOKENS * TILE_TOKENS;
-        // Four warps take 32 rows each of the narrow tile, and eight
-        // share the wide one's tokens too.
-        for (kernel, tokens, threads, first, count) in [
-            (wide, TILE_TOKENS, 256, 0, whole),
-            (narrow, TILE_TOKENS_NARROW, 128, whole, n - whole),
+        for (kernel, tokens, first, count) in [
+            (wide, TILE_TOKENS, 0, whole),
+            (narrow, TILE_TOKENS_NARROW, whole, n - whole),
         ] {
             if count == 0 {
                 continue;
@@ -841,7 +976,7 @@ impl Device for Cuda {
                 ],
                 &batch(first, count),
                 (count.div_ceil(tokens) as u32, groups),
-                threads,
+                128,
                 tile_shared(tokens, bytes),
             );
         }
@@ -941,6 +1076,13 @@ impl Device for Cuda {
             n_heads / n_kv_heads <= 8,
             "the kernel holds up to eight query heads per key/value head"
         );
+        if let Some((tiles, combine)) = &self.kernels.attention_tiles
+            && head_dim == ATTENTION_TILE_DIM
+        {
+            return self.attention_tiles(
+                tiles, combine, out, q, k_cache, v_cache, pos, n_heads, n_kv_heads,
+            );
+        }
         // Every token's heads get as many chunks as the last token attends
         // over, as many tokens to a dispatch as the partials fit.
         let chunks = (pos + n).div_ceil(CHUNK);
@@ -1083,7 +1225,8 @@ impl Device for Cuda {
             n_v_heads: n_v_heads as u32,
             head_dim: head_dim as u32,
         };
-        let grid = self.grid(n_v_heads, 1);
+        // Two blocks to a head, 64 of its values each.
+        let grid = self.grid(2 * n_v_heads, 1);
         self.launch(
             &self.kernels.delta_net,
             &[
@@ -1097,7 +1240,7 @@ impl Device for Cuda {
             ],
             &params,
             grid,
-            256,
+            128,
         );
     }
 }

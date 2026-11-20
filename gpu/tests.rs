@@ -297,6 +297,9 @@ fn matmul_speed<D: Device>(
     let mut rng = Rng(21);
     let (rows, cols) = (17408, 5120);
     let weight = gpu.upload(quantized(&[rows, cols]));
+    // Reading a buffer back waits for the device: a small one, so that
+    // the copy is not what is timed.
+    let sync = gpu.alloc(1);
     for n in [1, 2, 4, 8, 12, 16, 32, 64, 96, 128, 256] {
         let x = buffer(gpu, &rng.floats(n * cols));
         let mut out = gpu.alloc(n * rows);
@@ -304,13 +307,13 @@ fn matmul_speed<D: Device>(
         for _ in 0..(1600 / n).max(40) {
             gpu.matmul(&mut out, &weight, &x);
         }
-        gpu.read(&out);
+        gpu.read(&sync);
         let runs = (800 / n).max(20);
         let start = std::time::Instant::now();
         for _ in 0..runs {
             gpu.matmul(&mut out, &weight, &x);
         }
-        gpu.read(&out);
+        gpu.read(&sync);
         let each = start.elapsed().as_secs_f64() / runs as f64;
         let flops = 2.0 * (rows * cols * n) as f64 / each;
         eprintln!(

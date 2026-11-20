@@ -5,12 +5,14 @@
 // weights are tiled as `mod.rs` lays them out, 128 rows by 64 columns to
 // a tile, each lane's words of a tile side by side.
 //
-// A block takes a group of 128 rows and `16 * MT * WM` tokens, and walks
-// the row's tiles: the threads copy a tile's weights and scales and the
-// tokens' activations for its columns into shared memory, a few tiles
-// ahead of the one being multiplied, without waiting for them; then each
-// of the `4 * WM` warps multiplies 32 rows by `16 * MT` tokens of it, 16
-// tokens by 8 rows by 16 columns at a time.
+// A block of four warps takes a group of 128 rows and `16 * MT` tokens,
+// and walks the row's tiles: the threads copy a tile's weights and scales
+// and the tokens' activations for its columns into shared memory, a few
+// tiles ahead of the one being multiplied, without waiting for them; then
+// each warp multiplies 32 rows by the tokens of it, 16 tokens by 8 rows
+// by 16 columns at a time. Four warps to a block rather than eight, and
+// stages small enough that several blocks share a multiprocessor, keep
+// the tensor cores busiest.
 // The blocks of a group of rows come one after another in the grid, so
 // that a group's weights are read from memory once for the whole batch.
 //
@@ -85,11 +87,11 @@ __device__ __forceinline__ u32 swizzle(u32 row, u32 chunk) {
     return row * TILE_X + ((chunk ^ (row & 7)) * 16);
 }
 
-template <int MT, int WM, bool Q8, int STAGES>
+template <int MT, bool Q8, int STAGES>
 __device__ __forceinline__ void tile_body(
     float* out, const unsigned char* w, const u16* scales, const u16* x, TileParams p, unsigned char* buf) {
-    const u32 THREADS = WM * 4 * 32;
-    const u32 BM = WM * MT * 16;
+    const u32 THREADS = 4 * 32;
+    const u32 BM = MT * 16;
     // A stage: the activations, the weights, the scales.
     const u32 X = BM * TILE_X;
     const u32 W = TILE_N * (Q8 ? 64 : 32);
@@ -97,9 +99,7 @@ __device__ __forceinline__ void tile_body(
     const u32 STAGE = X + W + S;
     const u32 tid = threadIdx.x;
     const u32 lane = tid & 31;
-    const u32 warp = tid >> 5;
-    const u32 wm = warp / 4;
-    const u32 wn = warp % 4;
+    const u32 wn = tid >> 5;
     const u32 group = blockIdx.y;
     const u32 m0 = blockIdx.x * BM;
     const size_t tiles = (size_t)group * p.tiles;
@@ -170,7 +170,7 @@ __device__ __forceinline__ void tile_body(
             u32 a[MT][4];
 #pragma unroll
             for (u32 i = 0; i < MT; i++) {
-                u32 r = (wm * MT + i) * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                u32 r = i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
                 load_matrix(a[i], stage + swizzle(r, k * 2 + (lane >> 4)));
             }
 #pragma unroll
@@ -197,7 +197,7 @@ __device__ __forceinline__ void tile_body(
             u32 row = group * TILE_N + wn * 32 + j * 8 + (lane & 3) * 2;
 #pragma unroll
             for (u32 h = 0; h < 2; h++) {
-                u32 t = m0 + (wm * MT + i) * 16 + (lane >> 2) + h * 8;
+                u32 t = m0 + i * 16 + (lane >> 2) + h * 8;
                 if (t < p.count) {
                     float* at = out + (size_t)(p.first + t) * p.rows + row;
                     if (row < p.rows) {
@@ -212,16 +212,16 @@ __device__ __forceinline__ void tile_body(
     }
 }
 
-#define TILE_KERNEL(name, MT, WM, Q8, STAGES) \
-    extern "C" __global__ void __launch_bounds__(WM * 4 * 32) name( \
+#define TILE_KERNEL(name, MT, Q8, STAGES) \
+    extern "C" __global__ void __launch_bounds__(4 * 32) name( \
         float* out, const unsigned char* w, const u16* scales, const u16* x, TileParams p) { \
         extern __shared__ __align__(16) unsigned char buf[]; \
-        tile_body<MT, WM, Q8, STAGES>(out, w, scales, x, p, buf); \
+        tile_body<MT, Q8, STAGES>(out, w, scales, x, p, buf); \
     }
 
-TILE_KERNEL(matmul_tile16_q4_0, 1, 1, false, TILE_STAGES)
-TILE_KERNEL(matmul_tile16_q8_0, 1, 1, true, TILE_STAGES)
-TILE_KERNEL(matmul_tile128_q4_0, 4, 2, false, TILE_STAGES)
-TILE_KERNEL(matmul_tile128_q8_0, 4, 2, true, TILE_STAGES)
+TILE_KERNEL(matmul_tile16_q4_0, 1, false, TILE_STAGES)
+TILE_KERNEL(matmul_tile16_q8_0, 1, true, TILE_STAGES)
+TILE_KERNEL(matmul_tile64_q4_0, 4, false, TILE_STAGES)
+TILE_KERNEL(matmul_tile64_q8_0, 4, true, TILE_STAGES)
 
 #endif

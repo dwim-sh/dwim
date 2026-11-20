@@ -2,10 +2,12 @@ TensorFold
 Copyright 2026 TensorFold contributors
 https://github.com/ashhart/TensorFold
 
-The CUDA matmul kernels on the tensor cores (`gpu/cuda/kernels/matmul_tile.cu`)
-follow TensorFold's: the staged copies into shared memory, the layout of
-the weights for a warp's lanes, and the decoding of 4-bit weights as pairs
-of half-precision floats.
+The CUDA kernels on the tensor cores (`gpu/cuda/kernels/matmul_tile.cu`,
+`attention_tile.cu`) and of the delta rule (`delta_net.cu`) follow
+TensorFold's: the staged copies into shared memory, the layout of the
+weights for a warp's lanes, the decoding of 4-bit and 8-bit integers as
+pairs of half-precision floats, the softmax a step of keys at a time, and
+the delta rule a value's column to a pair of threads.
 
 
                                  Apache License
