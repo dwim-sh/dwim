@@ -26,6 +26,26 @@ struct MatmulParams {
     u32 splits;
 };
 
+// What a tile matmul does with its products: writes them as they are, or
+// as halves, or adds them to what is there, or writes
+// `silu(product) * other` as halves.
+#define TILE_FLOATS 0
+#define TILE_HALVES 1
+#define TILE_ADD 2
+#define TILE_SWIGLU 3
+
+// A matmul over tiled weights: `tiles` steps of 64 columns to a row, and
+// the tokens from `first` on, `count` of them; `mode` is what becomes of
+// the products.
+struct TileParams {
+    u32 rows;
+    u32 cols;
+    u32 tiles;
+    u32 first;
+    u32 count;
+    u32 mode;
+};
+
 struct RmsnormParams {
     u32 dim;
     float eps;
@@ -62,6 +82,18 @@ struct AttentionParams {
     u32 chunks;
 };
 
+// Attention over the caches in chunks of `chunk` positions, `chunks` of
+// them to a token, for the tokens from `first` on, `count` of them.
+struct AttentionTileParams {
+    u32 n_heads;
+    u32 n_kv_heads;
+    u32 pos;
+    u32 first;
+    u32 count;
+    u32 chunks;
+    u32 chunk;
+};
+
 struct StoreParams {
     u32 offset;
     u32 len;
@@ -84,6 +116,24 @@ __device__ __forceinline__ u32 f32_to_f16(float f) {
     u16 h;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
     return h;
+}
+
+// The bits of the half nearest to `f`, or of the largest finite one for an
+// activation past it, rather than an infinity.
+__device__ __forceinline__ u32 f32_to_finite_f16(float f) {
+    return f32_to_f16(fminf(fmaxf(f, -65504.0f), 65504.0f));
+}
+
+// Four activations as halves, two to a word.
+__device__ __forceinline__ uint2 halves4(float4 v) {
+    return make_uint2(
+        f32_to_finite_f16(v.x) | f32_to_finite_f16(v.y) << 16,
+        f32_to_finite_f16(v.z) | f32_to_finite_f16(v.w) << 16);
+}
+
+// The four activations of two words of halves.
+__device__ __forceinline__ float4 floats4(uint2 h) {
+    return make_float4(f16_to_f32(h.x), f16_to_f32(h.x >> 16), f16_to_f32(h.y), f16_to_f32(h.y >> 16));
 }
 
 // The sum, and the largest, over the warp's lanes, which every lane gets.

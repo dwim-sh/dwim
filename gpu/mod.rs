@@ -193,6 +193,16 @@ pub trait Device {
     /// GPU that shares the host's memory, that is the host's memory free.
     fn memory(&self) -> Option<u64>;
 
+    /// Most tokens a forward pass should run through the device at once.
+    /// Running a batch of tokens together reads each weight once for the
+    /// whole batch, rather than once per token, and the activations are
+    /// allocated for this many. A batch is one submission to the device,
+    /// which a driver may abandon as hung if it runs for seconds, so
+    /// batches are kept short.
+    fn batch(&self) -> usize {
+        64
+    }
+
     /// Copies a weight matrix into device memory.
     fn upload(&self, tensor: Tensor) -> Self::Weight;
 
@@ -243,8 +253,56 @@ pub trait Device {
     /// and `out` `rows` per token.
     fn matmul(&self, out: &mut Self::Buffer, w: &Self::Weight, x: &Self::Buffer);
 
+    /// `x += w · input`, a row of `x` for each of `input`: a matrix
+    /// multiplication whose result goes to the residual stream. `scratch`
+    /// is as long as `x`, and is left undefined.
+    fn matmul_add(
+        &self,
+        x: &mut Self::Buffer,
+        w: &Self::Weight,
+        input: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+    ) {
+        self.matmul(scratch, w, input);
+        self.add(x, scratch);
+    }
+
+    /// `out = silu(gate · x) * (up · x)` for each row of `x`: the SwiGLU
+    /// feed-forward network up to its last matrix. `scratch` is as long as
+    /// `out`, and is left undefined. A device may keep the result in half
+    /// precision, for the matrix multiplication it is for.
+    fn swiglu(
+        &self,
+        out: &mut Self::Buffer,
+        gate: &Self::Weight,
+        up: &Self::Weight,
+        x: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+    ) {
+        self.matmul(out, gate, x);
+        self.matmul(scratch, up, x);
+        self.silu_mul(out, scratch);
+    }
+
     /// `x += y`
     fn add(&self, x: &mut Self::Buffer, y: &Self::Buffer);
+
+    /// `out = rmsnorm(x) * weight` for the first `len` activations of `x`,
+    /// which is how long `out` is: [`rmsnorm`](Self::rmsnorm) into another
+    /// buffer, which is what a matrix multiplication's input goes through.
+    /// A device may keep the result in half precision, for the matrix
+    /// multiplications it is for.
+    fn normalize(
+        &self,
+        out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        len: usize,
+        eps: f32,
+    ) {
+        self.copy(out, 0, x, 0, len);
+        self.rmsnorm(out, weight, eps);
+    }
 
     /// Normalizes each `weight.len()`-long row of `x` by its root mean square,
     /// then scales it by `weight`.

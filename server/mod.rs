@@ -749,6 +749,10 @@ impl LanguageModel for Shared {
         self.pool.borrow().model.max_len()
     }
 
+    fn batch(&self) -> usize {
+        self.pool.borrow().model.batch()
+    }
+
     /// A session runs the one sequence it took.
     fn add_sequence(&mut self) -> crate::inference::Result<usize> {
         Err("a session runs one sequence".into())

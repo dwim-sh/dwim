@@ -167,6 +167,10 @@ impl Device for Gpu {
         dispatch!(self, memory())
     }
 
+    fn batch(&self) -> usize {
+        dispatch!(self, batch())
+    }
+
     fn upload(&self, tensor: Tensor) -> Weight {
         dispatch!(self, upload(tensor) => Weight)
     }
@@ -266,6 +270,25 @@ impl Device for Gpu {
                 n_kv_heads
             )
         )
+    }
+
+    fn matmul_add(&self, x: &mut Buffer, w: &Weight, input: &Buffer, scratch: &mut Buffer) {
+        dispatch!(self, matmul_add([x], { w }, [input], [scratch]))
+    }
+
+    fn swiglu(
+        &self,
+        out: &mut Buffer,
+        gate: &Weight,
+        up: &Weight,
+        x: &Buffer,
+        scratch: &mut Buffer,
+    ) {
+        dispatch!(self, swiglu([out], { gate }, { up }, [x], [scratch]))
+    }
+
+    fn normalize(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, len: usize, eps: f32) {
+        dispatch!(self, normalize([out], [x], [weight], len, eps))
     }
 
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {

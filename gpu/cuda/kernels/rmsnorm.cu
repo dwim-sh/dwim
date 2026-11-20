@@ -1,5 +1,6 @@
 // Normalizes each row of x by its root mean square and scales it by the
-// weight: one block of 256 threads per row. The row is read as vectors of
+// weight, in place, or into `out` as halves: one block of 256 threads per
+// row. The row is read as vectors of
 // four, a fixed number per thread with the index clamped rather than the
 // load skipped, so that the loads go out together instead of one round
 // trip after another.
@@ -7,7 +8,8 @@
 // Vectors a thread reads: rows of up to 8192 elements.
 #define RMSNORM_PER_THREAD 8
 
-extern "C" __global__ void __launch_bounds__(256) rmsnorm(float4* x, const float4* weight, RmsnormParams p) {
+template <bool HALVES>
+__device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const float4* weight, RmsnormParams p) {
     __shared__ float partial[8];
     const u32 lid = threadIdx.x;
     const u32 lane = lid & 31;
@@ -36,7 +38,21 @@ extern "C" __global__ void __launch_bounds__(256) rmsnorm(float4* x, const float
     for (u32 k = 0; k < RMSNORM_PER_THREAD; k++) {
         u32 i = lid + k * 256;
         if (i < vectors) {
-            x[base + i] = mul4(scale4(vs[k], scale), weight[i]);
+            float4 v = mul4(scale4(vs[k], scale), weight[i]);
+            if (HALVES) {
+                ((uint2*)out)[base + i] = halves4(v);
+            } else {
+                ((float4*)out)[base + i] = v;
+            }
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) rmsnorm(float4* x, const float4* weight, RmsnormParams p) {
+    rmsnorm_body<false>(x, x, weight, p);
+}
+
+extern "C" __global__ void __launch_bounds__(256) normalize_f16(
+    uint2* out, const float4* x, const float4* weight, RmsnormParams p) {
+    rmsnorm_body<true>(out, x, weight, p);
 }

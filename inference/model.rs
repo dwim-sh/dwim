@@ -228,6 +228,10 @@ impl LanguageModel for Model {
         self.model.max_len()
     }
 
+    fn batch(&self) -> usize {
+        self.model.batch()
+    }
+
     fn add_sequence(&mut self) -> Result<usize> {
         self.model.add_sequence()
     }
@@ -257,6 +261,14 @@ impl Opened {
         match self {
             Opened::Cpu(device) => device.name(),
             Opened::Gpu(device) => format!("{} via {}", device.name(), device.api()),
+        }
+    }
+
+    /// Most tokens the device takes at once.
+    fn batch(&self) -> usize {
+        match self {
+            Opened::Cpu(device) => device.batch(),
+            Opened::Gpu(device) => device.batch(),
         }
     }
 
@@ -295,7 +307,7 @@ fn size(gguf: &Gguf, device: &Opened, context: Option<usize>, sessions: usize) -
     // Past the positions the model was trained on, its attention degrades.
     let config = qwen35::Config::load(gguf)?;
     let trained = config.context_length;
-    let memory = qwen35::Memory::of(&config, gguf)?;
+    let memory = qwen35::Memory::of(&config, gguf, device.batch())?;
     let context = match context {
         Some(context) => context,
         None => fit(&memory, device, trained, sessions),

@@ -8,10 +8,6 @@ use crate::{
     },
 };
 
-/// Most tokens fed to the model at once while it reads a prompt, between
-/// progress reports.
-const BATCH: usize = 64;
-
 /// A conversation with an instruction-tuned model, in the ChatML format that
 /// Qwen models are trained on:
 ///
@@ -120,9 +116,11 @@ impl<M: LanguageModel> Local<M> {
     /// how many, as it goes.
     fn read(&mut self, tokens: &[u32], mut on_progress: impl FnMut(usize, usize)) -> Result<()> {
         on_progress(0, tokens.len());
-        for (i, batch) in tokens.chunks(BATCH).enumerate() {
+        // A batch of the model's at a time, between progress reports.
+        let most = self.model.batch();
+        for (i, batch) in tokens.chunks(most).enumerate() {
             self.feed(batch, Kind::Prompt)?;
-            on_progress(i * BATCH + batch.len(), tokens.len());
+            on_progress(i * most + batch.len(), tokens.len());
         }
         Ok(())
     }
@@ -1041,7 +1039,7 @@ mod tests {
         // The replay is read in batches from its own first token.
         let mut message = String::new();
         while !(session.measure(&Turn::User(message.clone())).unwrap() + opening)
-            .is_multiple_of(BATCH)
+            .is_multiple_of(session.model.batch())
         {
             message.push('x');
         }

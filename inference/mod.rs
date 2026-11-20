@@ -72,6 +72,10 @@ pub trait LanguageModel {
     /// Longest sequence the state has room for.
     fn max_len(&self) -> usize;
 
+    /// Most tokens the model runs at once: a longer run goes through it
+    /// in batches of this many.
+    fn batch(&self) -> usize;
+
     /// Allocates another sequence, with state of its own and room for as
     /// many tokens as the first, beside the model's others, which share its
     /// weights, and returns its number. A model starts with one sequence,
@@ -122,6 +126,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for Box<M> {
 
     fn max_len(&self) -> usize {
         (**self).max_len()
+    }
+
+    fn batch(&self) -> usize {
+        (**self).batch()
     }
 
     fn add_sequence(&mut self) -> Result<usize> {
