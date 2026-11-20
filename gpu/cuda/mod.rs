@@ -464,12 +464,11 @@ fn tile_shared(tokens: usize, bytes: usize) -> usize {
 
 /// Bytes of shared memory a block of an attention tile kernel of `lines`
 /// lines takes: each line's query and its scores and weights for a step,
-/// what it is scaled by, its maximum and its sum, and two stages of a
-/// step's keys and values and the scales of each.
+/// what it is scaled by, its maximum and its sum, and a step's keys and
+/// values as halves.
 fn attention_tile_shared(lines: usize) -> usize {
     let line = ATTENTION_TILE_DIM * 2 + ATTENTION_TILE_KEYS * (4 + 2) + 3 * 4;
-    let stage = 2 * ATTENTION_TILE_KEYS * (ATTENTION_TILE_DIM + 16);
-    lines * line + 2 * stage
+    lines * line + 2 * ATTENTION_TILE_KEYS * ATTENTION_TILE_DIM * 2
 }
 
 /// Lays a block-quantized matrix out in tiles of [`TILE_ROWS`] rows by
@@ -1319,7 +1318,7 @@ mod tests {
     #[ignore]
     fn attention_speed() {
         match super::Cuda::new() {
-            Ok(gpu) => crate::gpu::tests::attention_speed(&gpu, 64),
+            Ok(gpu) => crate::gpu::tests::attention_speed(&gpu, 256),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
