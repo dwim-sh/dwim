@@ -462,11 +462,19 @@ impl<D: Device> Model<D> {
     }
 
     /// Runs a batch of tokens, the first at position `pos`, and returns the
-    /// logits after the last; or, verifying, the logits after each, a row
-    /// per token, with the tokens not committed: the linear layers' states
-    /// are run forward apart from the real ones, and the drafter waits for
-    /// `rewind` to say which tokens were kept.
-    fn forward_batch(&mut self, tokens: &[u32], pos: usize, verify: bool) -> Vec<f32> {
+    /// logits after the last, if they are `wanted`: a batch that another
+    /// follows has no use for them, and reading the head is a twentieth of
+    /// reading the model. Or, verifying, returns the logits after each
+    /// token, a row per token, with the tokens not committed: the linear
+    /// layers' states are run forward apart from the real ones, and the
+    /// drafter waits for `rewind` to say which tokens were kept.
+    fn forward_batch(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        verify: bool,
+        wanted: bool,
+    ) -> Vec<f32> {
         let p = Pass {
             c: &self.config,
             d: &self.device,
@@ -484,6 +492,9 @@ impl<D: Device> Model<D> {
             s.seq.parity = !s.seq.parity;
         }
         let Some(draft) = &self.draft else {
+            if !wanted {
+                return p.finish(&mut s.xb);
+            }
             // Only the last token's logits are wanted.
             d.resize(&mut s.xb, c.hidden);
             d.resize(&mut s.xh, c.hidden);
@@ -503,10 +514,12 @@ impl<D: Device> Model<D> {
             d.matmul(&mut s.logits, &self.lm_head, &s.xh);
             return d.read(&s.logits);
         }
-        d.resize(&mut s.xb, c.hidden);
-        d.copy(&mut s.xb, 0, &s.xh, (n - 1) * c.hidden, c.hidden);
-        d.resize(&mut s.logits, c.vocab);
-        d.matmul(&mut s.logits, &self.lm_head, &s.xb);
+        if wanted {
+            d.resize(&mut s.xb, c.hidden);
+            d.copy(&mut s.xb, 0, &s.xh, (n - 1) * c.hidden, c.hidden);
+            d.resize(&mut s.logits, c.vocab);
+            d.matmul(&mut s.logits, &self.lm_head, &s.xb);
+        }
         // The drafter catches up: it runs at every position whose next
         // token is known, from the one carried over if there is one, and
         // the hidden state after the batch is carried over for the next.
@@ -521,7 +534,11 @@ impl<D: Device> Model<D> {
             &tokens[first..],
         );
         s.carry_over(d, n);
-        d.read(&s.logits)
+        if wanted {
+            d.read(&s.logits)
+        } else {
+            p.finish(&mut s.xb)
+        }
     }
 }
 
@@ -534,6 +551,15 @@ struct Pass<'a, D: Device> {
 }
 
 impl<'a, D: Device> Pass<'a, D> {
+    /// Waits for a batch whose logits are not wanted, by reading an
+    /// activation of `scratch` back, and returns no logits: a batch is a
+    /// submission of its own to the device, not the start of the next's.
+    fn finish(&self, scratch: &mut D::Buffer) -> Vec<f32> {
+        self.d.resize(scratch, 1);
+        self.d.read(scratch);
+        Vec::new()
+    }
+
     /// `out = rmsnorm(x) * weight` for `rows` rows of `x`, as wide as
     /// `weight`: what a matrix multiplication's input goes through.
     fn normalize(&self, out: &mut D::Buffer, x: &D::Buffer, weight: &D::Buffer, rows: usize) {
@@ -1055,8 +1081,9 @@ impl<D: Device> LanguageModel for Model<D> {
         );
         let mut logits = Vec::new();
         let most = self.state.most;
+        let batches = tokens.len().div_ceil(most);
         for (i, batch) in tokens.chunks(most).enumerate() {
-            logits = self.forward_batch(batch, pos + i * most, false);
+            logits = self.forward_batch(batch, pos + i * most, false, i + 1 == batches);
         }
         logits
     }
@@ -1109,7 +1136,7 @@ impl<D: Device> LanguageModel for Model<D> {
             pos + tokens.len() <= self.state.seq.max_len,
             "tokens past the end of the cache"
         );
-        self.forward_batch(tokens, pos, true)
+        self.forward_batch(tokens, pos, true, true)
     }
 
     /// The linear layers' states run through the whole batch become the
