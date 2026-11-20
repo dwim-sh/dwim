@@ -58,13 +58,6 @@ pub fn dir() -> Option<PathBuf> {
     hub::snapshot_dir(REPO, REVISION)
 }
 
-/// Most tokens a forward pass runs through the model at once. Running a
-/// batch of tokens together reads each weight once for the whole batch,
-/// rather than once per token; the activations are allocated for this many.
-/// A batch is one submission to the device, which a driver may abandon as
-/// hung if it runs for seconds, so batches are kept short.
-pub const BATCH: usize = 64;
-
 /// Most tokens the model drafts at once: a batch to be verified holds them
 /// and the token before.
 pub const MAX_DRAFTS: usize = 8;
@@ -254,7 +247,7 @@ impl Memory {
     /// The memory the model in `gguf`, configured as `c`, takes on a
     /// device. Fails if the file does not say how big one of its tensors
     /// is.
-    pub fn of(c: &Config, gguf: &Gguf) -> Result<Self> {
+    pub fn of(c: &Config, gguf: &Gguf, batch: usize) -> Result<Self> {
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host, in the format the device holds it
         // in: a matrix of Q4_1 or Q6_K is quantized again as Q8_0 on
@@ -276,14 +269,14 @@ impl Memory {
         // The activations of a batch, and the copy a mark keeps of a
         // sequence's linear layers' states and of the row of hidden state
         // carried over for the drafter.
-        let mut activations = BATCH * (c.widths().iter().sum::<usize>() + 2 * c.intermediate)
+        let mut activations = batch * (c.widths().iter().sum::<usize>() + 2 * c.intermediate)
             + c.vocab
             + linear * (c.conv_width() + c.ssm_width())
             + c.hidden;
         // A sequence's two convolution states and one recurrent state per
         // linear layer, and the hidden state after each token of a batch,
         // for the drafter.
-        let sequence = linear * (2 * c.conv_width() + c.ssm_width()) + (BATCH + 1) * c.hidden;
+        let sequence = linear * (2 * c.conv_width() + c.ssm_width()) + (batch + 1) * c.hidden;
         // The drafter has a key/value cache of its own in each sequence,
         // and verifying a batch keeps the linear layers' states run through
         // it apart, their inputs for it, the drafter's output, and every
@@ -291,7 +284,7 @@ impl Memory {
         let caches = attention + c.drafter as usize;
         if c.drafter {
             activations += linear
-                * (c.ssm_width() + BATCH * (2 * c.k_dim() + c.v_dim() + 2 * c.v_heads))
+                * (c.ssm_width() + batch * (2 * c.k_dim() + c.v_dim() + 2 * c.v_heads))
                 + c.hidden
                 + MAX_DRAFTS * c.vocab;
         }
@@ -1049,7 +1042,7 @@ impl<D: Device> LanguageModel for Model<D> {
     }
 
     /// Adds the tokens to the model's state. Tokens run through the model
-    /// in batches of up to [`BATCH`].
+    /// in batches of as many as the device takes at once.
     fn forward(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
         assert!(!tokens.is_empty(), "no tokens to run");
         assert!(
@@ -1061,8 +1054,9 @@ impl<D: Device> LanguageModel for Model<D> {
             "a batch is being verified"
         );
         let mut logits = Vec::new();
-        for (i, batch) in tokens.chunks(BATCH).enumerate() {
-            logits = self.forward_batch(batch, pos + i * BATCH, false);
+        let most = self.state.most;
+        for (i, batch) in tokens.chunks(most).enumerate() {
+            logits = self.forward_batch(batch, pos + i * most, false);
         }
         logits
     }
@@ -1281,6 +1275,10 @@ impl<D: Device> LanguageModel for Model<D> {
         self.state.seq.max_len
     }
 
+    fn batch(&self) -> usize {
+        self.state.most
+    }
+
     /// Allocates another sequence of the length the first has, on the
     /// device, as before any token.
     fn add_sequence(&mut self) -> Result<usize> {
@@ -1292,6 +1290,7 @@ impl<D: Device> LanguageModel for Model<D> {
             self.state.seq.max_len,
             self.caches,
             self.slots,
+            self.state.most,
         );
         self.parked.insert(id, seq);
         Ok(id)
@@ -1321,6 +1320,8 @@ impl<D: Device> LanguageModel for Model<D> {
 /// recurrent states of the linear attention layers; and the rotary position
 /// embedding table for every position there is room for.
 struct State<D: Device> {
+    /// Most tokens to a batch, which the per-token buffers have room for.
+    most: usize,
     /// Activations per token of each per-token buffer, in field order.
     widths: [usize; 11],
     x: D::Buffer,
@@ -1395,7 +1396,15 @@ impl<D: Device> Sequence<D> {
     /// Allocates the state of sequence `id`, of up to `max_len` tokens,
     /// with `caches` key/value caches and `slots` linear layers' states,
     /// all as before any token.
-    fn new(c: &Config, d: &D, id: usize, max_len: usize, caches: usize, slots: usize) -> Self {
+    fn new(
+        c: &Config,
+        d: &D,
+        id: usize,
+        max_len: usize,
+        caches: usize,
+        slots: usize,
+        batch: usize,
+    ) -> Self {
         let kv_dim = c.kv_heads * c.head_dim;
         let conv_width = c.conv_width();
         let zeroed = |len: usize| {
@@ -1417,7 +1426,7 @@ impl<D: Device> Sequence<D> {
             parity: false,
             ssm_state: (0..slots).map(|_| zeroed(c.ssm_width())).collect(),
             max_len,
-            hidden: d.alloc((BATCH + 1) * c.hidden),
+            hidden: d.alloc((batch + 1) * c.hidden),
             carry: false,
             verified: Vec::new(),
             verified_at: 0,
@@ -1429,9 +1438,9 @@ impl<D: Device> State<D> {
     /// Allocates the buffers, and the first sequence, number 0, for
     /// sequences of up to `max_len` tokens.
     fn new(c: &Config, d: &D, max_len: usize, caches: usize, slots: usize) -> Self {
+        let most = d.batch();
         let widths = c.widths();
-        let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] =
-            widths.map(|width| d.alloc(BATCH * width));
+        let [x, xb, xh, q, gate, k, v, att, qkv, z, ab] = widths.map(|width| d.alloc(most * width));
         let table = rope_table(max_len, c.rot_dim, c.rope_theta);
         let mut rope = d.alloc(table.len());
         d.write(&mut rope, &table);
@@ -1449,8 +1458,8 @@ impl<D: Device> State<D> {
             qkv,
             z,
             ab,
-            up: d.alloc(BATCH * c.intermediate),
-            gate_ffn: d.alloc(BATCH * c.intermediate),
+            up: d.alloc(most * c.intermediate),
+            gate_ffn: d.alloc(most * c.intermediate),
             intermediate: c.intermediate,
             logits: d.alloc(if c.drafter { MAX_DRAFTS + 1 } else { 1 } * c.vocab),
             rope,
@@ -1459,17 +1468,18 @@ impl<D: Device> State<D> {
                 .map(|_| d.alloc(c.ssm_width()))
                 .collect(),
             qkv_saved: (0..if c.drafter { slots } else { 0 })
-                .map(|_| d.alloc(BATCH * (2 * c.k_dim() + c.v_dim())))
+                .map(|_| d.alloc(most * (2 * c.k_dim() + c.v_dim())))
                 .collect(),
             ab_saved: (0..if c.drafter { slots } else { 0 })
-                .map(|_| d.alloc(BATCH * 2 * c.v_heads))
+                .map(|_| d.alloc(most * 2 * c.v_heads))
                 .collect(),
             mark_conv: (0..slots).map(|_| d.alloc(conv_width)).collect(),
             mark_ssm: (0..slots).map(|_| d.alloc(c.ssm_width())).collect(),
             mark_hidden: d.alloc(c.hidden),
             mark_carry: false,
             marked: None,
-            seq: Sequence::new(c, d, 0, max_len, caches, slots),
+            seq: Sequence::new(c, d, 0, max_len, caches, slots, most),
+            most,
         }
     }
 
@@ -1485,7 +1495,11 @@ impl<D: Device> State<D> {
 
     /// Sizes the buffers for a batch of `n` tokens.
     fn batch(&mut self, device: &D, n: usize) {
-        assert!(n <= BATCH, "a batch of {n} tokens is more than {BATCH}");
+        assert!(
+            n <= self.most,
+            "a batch of {n} tokens is more than {}",
+            self.most
+        );
         let buffers = [
             &mut self.x,
             &mut self.xb,

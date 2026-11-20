@@ -212,8 +212,13 @@ fn close_batch(got: &[f32], want: &[f32], what: &str) {
 /// tiles of the tile kernels, which a batch of more than a few tokens goes
 /// through where the matrix is a whole number of their steps of 128
 /// columns, through `quantized` matrices: a single token is held to the
-/// usual error, a batch to a batch's.
-fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usize]) -> Tensor) {
+/// usual error, unless the device multiplies it `in_halves` too, and a
+/// batch to a batch's.
+fn block_matmul_matches_cpu<D: Device>(
+    gpu: &D,
+    quantized: &mut dyn FnMut(&[usize]) -> Tensor,
+    in_halves: bool,
+) {
     for (rows, cols, n) in [
         (1, 32, 1),
         (200, 5120, 1),
@@ -235,7 +240,7 @@ fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usiz
         let mut out = gpu.alloc(n * rows);
         gpu.matmul(&mut out, &weight, &buffer(gpu, &x));
         let got = gpu.read(&out);
-        if n > 1 {
+        if n > 1 || in_halves {
             close_batch(&got, &want, &format!("{rows}x{cols} n={n}"));
         } else {
             close(&got, &want, 1e-4);
@@ -245,12 +250,25 @@ fn block_matmul_matches_cpu<D: Device>(gpu: &D, quantized: &mut dyn FnMut(&[usiz
 
 pub fn q4_0_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(40);
-    block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape));
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape), false);
 }
 
 pub fn q8_0_matmul_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(80);
-    block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape));
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape), false);
+}
+
+/// The Q4_0 matmul of a device that multiplies single tokens in half
+/// precision as it does batches.
+pub fn q4_0_matmul_in_halves_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(40);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape), true);
+}
+
+/// The Q8_0 matmul likewise.
+pub fn q8_0_matmul_in_halves_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(80);
+    block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape), true);
 }
 
 /// Times the Q4_0 matmul likewise.

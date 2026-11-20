@@ -167,6 +167,10 @@ impl Device for Gpu {
         dispatch!(self, memory())
     }
 
+    fn batch(&self) -> usize {
+        dispatch!(self, batch())
+    }
+
     fn upload(&self, tensor: Tensor) -> Weight {
         dispatch!(self, upload(tensor) => Weight)
     }

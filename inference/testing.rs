@@ -229,6 +229,10 @@ impl LanguageModel for Scripted {
         self.max_len
     }
 
+    fn batch(&self) -> usize {
+        64
+    }
+
     fn add_sequence(&mut self) -> Result<usize> {
         let id = self.parked.len() + 1;
         self.parked.insert(id, Default::default());

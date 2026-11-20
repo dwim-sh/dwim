@@ -26,6 +26,16 @@ struct MatmulParams {
     u32 splits;
 };
 
+// A matmul over tiled weights: `tiles` steps of 64 columns to a row, and
+// the tokens from `first` on, `count` of them.
+struct TileParams {
+    u32 rows;
+    u32 cols;
+    u32 tiles;
+    u32 first;
+    u32 count;
+};
+
 struct RmsnormParams {
     u32 dim;
     float eps;

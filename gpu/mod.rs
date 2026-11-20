@@ -193,6 +193,16 @@ pub trait Device {
     /// GPU that shares the host's memory, that is the host's memory free.
     fn memory(&self) -> Option<u64>;
 
+    /// Most tokens a forward pass should run through the device at once.
+    /// Running a batch of tokens together reads each weight once for the
+    /// whole batch, rather than once per token, and the activations are
+    /// allocated for this many. A batch is one submission to the device,
+    /// which a driver may abandon as hung if it runs for seconds, so
+    /// batches are kept short.
+    fn batch(&self) -> usize {
+        64
+    }
+
     /// Copies a weight matrix into device memory.
     fn upload(&self, tensor: Tensor) -> Self::Weight;
 

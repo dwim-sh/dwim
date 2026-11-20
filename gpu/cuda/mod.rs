@@ -8,22 +8,47 @@
 //! opens, so a build needs no CUDA, and a machine without them gets an
 //! error from [`Cuda::new`] rather than a device.
 
-use std::{error::Error, slice, sync::Arc};
+use std::{cell::RefCell, error::Error, slice, sync::Arc};
 
 use cudarc::{
     driver::{
         CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
-        PushKernelArg, sys,
+        PushKernelArg,
+        sys::{self, CUfunction_attribute},
     },
     nvrtc::{self, CompileError, CompileOptions, Ptx},
 };
+use rayon::prelude::*;
 
 use crate::gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, quant};
 
-/// Tokens a block of the bf16 and block-quantized matmul kernels takes at
-/// once, and rows a block of the block-quantized ones does, a warp each.
+/// Tokens a block of the bf16 matmul kernel takes at once.
 const MATMUL_TOKENS: usize = 8;
-const QUANT_ROWS: usize = 8;
+
+/// Rows and columns of a tile of block-quantized weights: a group of rows
+/// a block of the quantized matmul kernels takes, and two of the format's
+/// blocks of columns.
+const TILE_ROWS: usize = 128;
+const TILE_COLS: usize = 2 * quant::BLOCK;
+
+/// Tokens a block of the row kernels takes at once, of a batch.
+const ROWS_TOKENS: usize = 8;
+
+/// Tokens a block of the wide tile kernel takes, and of the narrow one,
+/// which takes what is left of a batch after the wide one's.
+const TILE_TOKENS: usize = 128;
+const TILE_TOKENS_NARROW: usize = 16;
+
+/// Tokens to a batch on a GPU with tensor cores.
+const TILE_BATCH: usize = 512;
+
+/// Tiles a block of the tile kernels holds in shared memory at once: the
+/// one it is multiplying and the ones on their way.
+const TILE_STAGES: usize = 3;
+
+/// The compute capability the tile kernels need, for their tensor cores
+/// and the copies into shared memory that are not waited for.
+const TILE_CAPABILITY: i32 = 80;
 
 /// Positions one block of the attention kernel takes.
 const CHUNK: usize = 128;
@@ -40,7 +65,7 @@ const MAX_GRID_Y: usize = 65535;
 
 /// The kernels, compiled together in this order: a kernel may use what an
 /// earlier one defines.
-const KERNELS: [(&str, &str); 15] = [
+const KERNELS: [(&str, &str); 16] = [
     ("prelude", include_str!("kernels/prelude.cu")),
     ("add", include_str!("kernels/add.cu")),
     ("silu_mul", include_str!("kernels/silu_mul.cu")),
@@ -57,8 +82,9 @@ const KERNELS: [(&str, &str); 15] = [
     ("conv", include_str!("kernels/conv.cu")),
     ("delta_net", include_str!("kernels/delta_net.cu")),
     ("matmul_bf16", include_str!("kernels/matmul_bf16.cu")),
-    ("matmul_q8_0", include_str!("kernels/matmul_q8_0.cu")),
-    ("matmul_q4_0", include_str!("kernels/matmul_q4_0.cu")),
+    ("to_f16", include_str!("kernels/to_f16.cu")),
+    ("matmul_rows", include_str!("kernels/matmul_rows.cu")),
+    ("matmul_tile", include_str!("kernels/matmul_tile.cu")),
 ];
 
 /// A vector of f32 activations in device memory.
@@ -77,7 +103,8 @@ pub struct Cache {
 }
 
 /// A weight matrix in device memory: its weights, and for the
-/// block-quantized formats their scales in a buffer of their own.
+/// block-quantized formats their scales in a buffer of their own, both in
+/// tiles, as [`tile`] lays them out.
 pub struct Weight {
     buf: CudaSlice<u8>,
     scales: CudaSlice<u16>,
@@ -93,10 +120,21 @@ enum Format {
     Q8_0,
 }
 
+/// The matmul kernels of a block-quantized format.
+struct QuantKernels {
+    /// A token in single precision, and a batch eight tokens at a time.
+    row: CudaFunction,
+    rows: CudaFunction,
+    /// A batch on the tensor cores, 16 and 128 tokens at a time, where the
+    /// GPU has them.
+    tiles: Option<(CudaFunction, CudaFunction)>,
+}
+
 struct Kernels {
     matmul_bf16: CudaFunction,
-    matmul_q4_0: CudaFunction,
-    matmul_q8_0: CudaFunction,
+    q4_0: QuantKernels,
+    q8_0: QuantKernels,
+    to_f16: CudaFunction,
     add: CudaFunction,
     rmsnorm: CudaFunction,
     l2norm: CudaFunction,
@@ -115,12 +153,27 @@ pub struct Cuda {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     partials: CudaSlice<f32>,
+    /// A batch's activations as halves, for the tile kernels.
+    halves: RefCell<CudaSlice<u16>>,
     name: String,
 }
 
 impl Cuda {
     /// Opens the first NVIDIA GPU, compiling the kernels for it.
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        Self::open(true)
+    }
+
+    /// Opens the GPU as one without tensor cores is opened, whatever it
+    /// has, to check the kernels such a GPU runs.
+    #[cfg(test)]
+    fn without_tensor_cores() -> Result<Self, Box<dyn Error>> {
+        Self::open(false)
+    }
+
+    /// Opens the first NVIDIA GPU, with the tile kernels if `tiles` and
+    /// the GPU has the tensor cores for them.
+    fn open(tiles: bool) -> Result<Self, Box<dyn Error>> {
         if !unsafe { sys::is_culib_present() } {
             return Err("no CUDA driver".into());
         }
@@ -133,14 +186,36 @@ impl Cuda {
         unsafe { ctx.disable_event_tracking() };
         let name = ctx.name()?;
         let (major, minor) = ctx.compute_capability()?;
-        let ptx = compile(major * 10 + minor).map_err(|e| format!("{name}: {e}"))?;
+        let (ptx, arch) = compile(major * 10 + minor).map_err(|e| format!("{name}: {e}"))?;
         let module = ctx.load_module(ptx)?;
         let stream = ctx.default_stream();
         let kernel = |name: &str| module.load_function(name);
+        let quant = |format: &str, bytes: usize| -> Result<QuantKernels, Box<dyn Error>> {
+            let tiles = if tiles && arch >= TILE_CAPABILITY {
+                let tile = |tokens: usize| -> Result<CudaFunction, Box<dyn Error>> {
+                    let f = kernel(&format!("matmul_tile{tokens}_{format}"))?;
+                    // More shared memory than a kernel may have unasked.
+                    f.set_attribute(
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        tile_shared(tokens, bytes) as i32,
+                    )?;
+                    Ok(f)
+                };
+                Some((tile(TILE_TOKENS_NARROW)?, tile(TILE_TOKENS)?))
+            } else {
+                None
+            };
+            Ok(QuantKernels {
+                row: kernel(&format!("matmul_rows_{format}"))?,
+                rows: kernel(&format!("matmul_rows{ROWS_TOKENS}_{format}"))?,
+                tiles,
+            })
+        };
         let kernels = Kernels {
             matmul_bf16: kernel("matmul_bf16")?,
-            matmul_q4_0: kernel("matmul_q4_0")?,
-            matmul_q8_0: kernel("matmul_q8_0")?,
+            q4_0: quant("q4_0", 1)?,
+            q8_0: quant("q8_0", 2)?,
+            to_f16: kernel("to_f16")?,
             add: kernel("add")?,
             rmsnorm: kernel("rmsnorm")?,
             l2norm: kernel("l2norm")?,
@@ -154,11 +229,13 @@ impl Cuda {
             delta_net: kernel("delta_net")?,
         };
         let partials = stream.alloc_zeros::<f32>(PARTIALS)?;
+        let halves = RefCell::new(stream.alloc_zeros::<u16>(4)?);
         Ok(Self {
             ctx,
             stream,
             kernels,
             partials,
+            halves,
             name,
         })
     }
@@ -195,6 +272,20 @@ impl Cuda {
         grid: (u32, u32),
         threads: u32,
     ) {
+        self.launch_shared(kernel, buffers, params, grid, threads, 0);
+    }
+
+    /// As [`Self::launch`], with `shared` bytes of shared memory to a block
+    /// beside what the kernel declares.
+    fn launch_shared<P: DeviceRepr>(
+        &self,
+        kernel: &CudaFunction,
+        buffers: &[u64],
+        params: &P,
+        grid: (u32, u32),
+        threads: u32,
+        shared: usize,
+    ) {
         assert!(
             grid.1 as usize <= MAX_GRID_Y,
             "{} rows of blocks is more than the GPU allows",
@@ -203,7 +294,7 @@ impl Cuda {
         let config = LaunchConfig {
             grid_dim: (grid.0, grid.1, 1),
             block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: shared as u32,
         };
         let mut launch = self.stream.launch_builder(kernel);
         for buffer in buffers {
@@ -222,13 +313,126 @@ impl Cuda {
         );
         (blocks as u32, 1)
     }
+    /// A matmul through bf16 weights: one block of 64 threads per row and
+    /// group of eight tokens, the rows across the grid and each group of
+    /// tokens a row of it.
+    fn matmul_bf16(&self, out: &mut Buffer, w: &Weight, x: &Buffer, n: usize) {
+        let (rows, cols) = (w.shape[0], w.shape[1]);
+        let width = rows.min(MAX_GRID_X);
+        let grid = (
+            width as u32,
+            (rows.div_ceil(width) * n.div_ceil(MATMUL_TOKENS)) as u32,
+        );
+        let params = MatmulParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            n: n as u32,
+            stride: width as u32,
+            splits: 1,
+        };
+        self.launch(
+            &self.kernels.matmul_bf16,
+            &[self.ptr(&out.buf), self.ptr(&w.buf), self.ptr(&x.buf)],
+            &params,
+            grid,
+            64,
+        );
+    }
+}
+
+/// Bytes of shared memory a block of a tile kernel of `tokens` tokens
+/// takes, for weights of `bytes` bytes to a pair: a stage holds the
+/// tokens' halves for a tile's columns, the tile, and its scales.
+fn tile_shared(tokens: usize, bytes: usize) -> usize {
+    let stage = tokens * TILE_COLS * 2 + TILE_ROWS * TILE_COLS / 2 * bytes + 2 * TILE_ROWS * 2;
+    TILE_STAGES * stage
+}
+
+/// Lays a block-quantized matrix out in tiles of [`TILE_ROWS`] rows by
+/// [`TILE_COLS`] columns, the tiles of a group of rows one after another,
+/// for a kernel to read a tile as one run: each row of a tile as `words`
+/// packs its two blocks, and the tile's scales a block of columns at a
+/// time. Rows and blocks past the matrix's are zeros with a scale of zero.
+fn tile<const W: usize>(
+    quants: &[u8],
+    scales: &[u16],
+    rows: usize,
+    cols: usize,
+    words: fn(&[u8], &[u8]) -> [u32; W],
+) -> (Vec<u32>, Vec<u16>) {
+    let blocks = quant::blocks(cols);
+    let per_block = quants.len() / (rows * blocks);
+    let tiles = cols.div_ceil(TILE_COLS);
+    let groups = rows.div_ceil(TILE_ROWS);
+    let zeros = vec![0u8; per_block];
+    let mut tiled = vec![0u32; groups * tiles * TILE_ROWS * W];
+    let mut tiled_scales = vec![0u16; groups * tiles * 2 * TILE_ROWS];
+    tiled
+        .par_chunks_mut(tiles * TILE_ROWS * W)
+        .zip(tiled_scales.par_chunks_mut(tiles * 2 * TILE_ROWS))
+        .enumerate()
+        .for_each(|(group, (tiled, tiled_scales))| {
+            let first = group * TILE_ROWS;
+            for row in first..rows.min(first + TILE_ROWS) {
+                let block = |b: usize| {
+                    if b < blocks {
+                        &quants[(row * blocks + b) * per_block..][..per_block]
+                    } else {
+                        &zeros[..]
+                    }
+                };
+                for tile in 0..tiles {
+                    let at = tile * TILE_ROWS + row - first;
+                    tiled[at * W..][..W].copy_from_slice(&words(block(tile * 2), block(tile * 2 + 1)));
+                    for v in 0..2 {
+                        if tile * 2 + v < blocks {
+                            tiled_scales[(tile * 2 + v) * TILE_ROWS + row - first] =
+                                scales[row * blocks + tile * 2 + v];
+                        }
+                    }
+                }
+            }
+        });
+    (tiled, tiled_scales)
+}
+
+/// A row's two `Q4_0` blocks of a tile as the kernels take them: eight
+/// words, the lane's of each block side by side. Word `i` of a block has
+/// its bytes `2i`, `2i + 8`, `2i + 1` and `2i + 9`, whose low nibbles are
+/// the elements at those places and whose high nibbles the ones 16 after:
+/// the four of each 16 that a lane of the tensor cores' warp takes.
+fn q4_0_words(a: &[u8], b: &[u8]) -> [u32; 8] {
+    let mut words = [0; 8];
+    for (v, block) in [a, b].into_iter().enumerate() {
+        for i in 0..4 {
+            words[i * 2 + v] =
+                u32::from_le_bytes([block[2 * i], block[2 * i + 8], block[2 * i + 1], block[2 * i + 9]]);
+        }
+    }
+    words
+}
+
+/// A row's two `Q8_0` blocks of a tile likewise: sixteen words, word `i`
+/// of each of the tile's four runs of 16 columns side by side, with the
+/// run's elements `2i`, `2i + 1`, `2i + 8` and `2i + 9`.
+fn q8_0_words(a: &[u8], b: &[u8]) -> [u32; 16] {
+    let mut words = [0; 16];
+    for (v, block) in [a, b].into_iter().enumerate() {
+        for (half, run) in block.chunks_exact(16).enumerate() {
+            for i in 0..4 {
+                words[i * 4 + v * 2 + half] =
+                    u32::from_le_bytes([run[2 * i], run[2 * i + 1], run[2 * i + 8], run[2 * i + 9]]);
+            }
+        }
+    }
+    words
 }
 
 /// Compiles the kernels to PTX for a GPU of compute capability `cc`, as
 /// `major * 10 + minor`: for the newest architecture NVRTC knows that is
 /// no newer than the GPU's, since PTX runs on the architectures after its
 /// own.
-fn compile(cc: i32) -> Result<Ptx, Box<dyn Error>> {
+fn compile(cc: i32) -> Result<(Ptx, i32), Box<dyn Error>> {
     // What the kernels need: half-precision conversions came with 5.3.
     const ARCHS: [(i32, &str); 12] = [
         (120, "compute_120"),
@@ -244,16 +448,19 @@ fn compile(cc: i32) -> Result<Ptx, Box<dyn Error>> {
         (60, "compute_60"),
         (53, "compute_53"),
     ];
-    let source = KERNELS.map(|(_, source)| source).join("\n");
+    let source = format!(
+        "#define TILE_STAGES {TILE_STAGES}\n{}",
+        KERNELS.map(|(_, source)| source).join("\n")
+    );
     let mut log = String::new();
-    for &(_, arch) in ARCHS.iter().filter(|&&(known, _)| known <= cc) {
+    for &(known, arch) in ARCHS.iter().filter(|&&(known, _)| known <= cc) {
         let options = CompileOptions {
             arch: Some(arch),
             name: Some("dwim.cu".into()),
             ..Default::default()
         };
         match nvrtc::compile_ptx_with_opts(&source, options) {
-            Ok(ptx) => return Ok(ptx),
+            Ok(ptx) => return Ok((ptx, known)),
             Err(CompileError::CompileError { log: text, .. }) => {
                 log = text.to_string_lossy().into_owned();
                 // An NVRTC older than the GPU does not know its
@@ -284,6 +491,16 @@ struct MatmulParams {
     n: u32,
     stride: u32,
     splits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TileParams {
+    rows: u32,
+    cols: u32,
+    tiles: u32,
+    first: u32,
+    count: u32,
 }
 
 #[repr(C)]
@@ -347,6 +564,7 @@ struct LenParams {
 
 // Plain structs of 32-bit fields, passed to the kernels by value.
 unsafe impl DeviceRepr for MatmulParams {}
+unsafe impl DeviceRepr for TileParams {}
 unsafe impl DeviceRepr for RmsnormParams {}
 unsafe impl DeviceRepr for RopeParams {}
 unsafe impl DeviceRepr for ConvParams {}
@@ -367,6 +585,16 @@ impl Device for Cuda {
     fn memory(&self) -> Option<u64> {
         let (free, _total) = self.ctx.mem_get_info().ok()?;
         Some(free as u64)
+    }
+
+    fn batch(&self) -> usize {
+        // The tensor cores get through a longer batch in the time the
+        // row kernels take for a short one, and read the weights once
+        // for all of it.
+        match self.kernels.q4_0.tiles {
+            Some(_) => TILE_BATCH,
+            None => 64,
+        }
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
@@ -390,6 +618,7 @@ impl Device for Cuda {
             } => {
                 assert_eq!(quants.len(), shape[0] * shape[1] / 2);
                 assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                let (quants, scales) = tile(&quants, &scales, shape[0], shape[1], q4_0_words);
                 Weight {
                     buf: self.upload_bytes(&quants),
                     scales: self.stream.clone_htod(&scales).expect("out of GPU memory"),
@@ -404,6 +633,8 @@ impl Device for Cuda {
             } => {
                 assert_eq!(quants.len(), shape[0] * shape[1]);
                 assert_eq!(scales.len(), shape[0] * quant::blocks(shape[1]));
+                let bytes = unsafe { slice::from_raw_parts(quants.as_ptr().cast::<u8>(), quants.len()) };
+                let (quants, scales) = tile(bytes, &scales, shape[0], shape[1], q8_0_words);
                 Weight {
                     buf: self.upload_bytes(&quants),
                     scales: self.stream.clone_htod(&scales).expect("out of GPU memory"),
@@ -539,55 +770,81 @@ impl Device for Cuda {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
-        // One block of 64 threads per row of bf16 weights, or of a warp per
-        // row for eight rows of block-quantized weights, across the grid,
-        // and the tokens eight at a time, each group of them a row of the
-        // grid. The block-quantized kernels take the scales after the
-        // quants.
-        let (kernel, buffers, per_block, threads): (_, &[u64], _, _) = match w.format {
-            Format::Bf16 => (
-                &self.kernels.matmul_bf16,
-                &[self.ptr(&out.buf), self.ptr(&w.buf), self.ptr(&x.buf)],
-                1,
-                64,
-            ),
-            Format::Q4_0 => (
-                &self.kernels.matmul_q4_0,
-                &[
-                    self.ptr(&out.buf),
-                    self.ptr(&w.buf),
-                    self.ptr(&w.scales),
-                    self.ptr(&x.buf),
-                ],
-                QUANT_ROWS,
-                256,
-            ),
-            Format::Q8_0 => (
-                &self.kernels.matmul_q8_0,
-                &[
-                    self.ptr(&out.buf),
-                    self.ptr(&w.buf),
-                    self.ptr(&w.scales),
-                    self.ptr(&x.buf),
-                ],
-                QUANT_ROWS,
-                256,
-            ),
+        let kernels = match w.format {
+            Format::Bf16 => return self.matmul_bf16(out, w, x, n),
+            Format::Q4_0 => &self.kernels.q4_0,
+            Format::Q8_0 => &self.kernels.q8_0,
         };
-        let count = rows.div_ceil(per_block);
-        let width = count.min(MAX_GRID_X);
-        let grid = (
-            width as u32,
-            (count.div_ceil(width) * n.div_ceil(MATMUL_TOKENS)) as u32,
-        );
-        let params = MatmulParams {
+        let groups = rows.div_ceil(TILE_ROWS) as u32;
+        let batch = |first: usize, count: usize| TileParams {
             rows: rows as u32,
             cols: cols as u32,
-            n: n as u32,
-            stride: width as u32,
-            splits: 1,
+            tiles: cols.div_ceil(TILE_COLS) as u32,
+            first: first as u32,
+            count: count as u32,
         };
-        self.launch(kernel, buffers, &params, grid, threads);
+        // A GPU without tensor cores multiplies in single precision, a
+        // token to a block or eight of a batch.
+        let Some((narrow, wide)) = &kernels.tiles else {
+            let (kernel, per_block) = match n {
+                1 => (&kernels.row, 1),
+                _ => (&kernels.rows, ROWS_TOKENS),
+            };
+            self.launch(
+                kernel,
+                &[
+                    self.ptr(&out.buf),
+                    self.ptr(&w.buf),
+                    self.ptr(&w.scales),
+                    self.ptr(&x.buf),
+                ],
+                &batch(0, n),
+                (groups, n.div_ceil(per_block) as u32),
+                256,
+            );
+            return;
+        };
+        // The tokens go through the tensor cores as halves: as many whole
+        // wide tiles of them as there are, and the rest in narrow ones.
+        let mut halves = self.halves.borrow_mut();
+        if halves.len() < x.len {
+            *halves = self
+                .stream
+                .alloc_zeros::<u16>(x.len.next_multiple_of(4))
+                .expect("out of GPU memory");
+        }
+        self.launch(
+            &self.kernels.to_f16,
+            &[self.ptr(&halves), self.ptr(&x.buf)],
+            &LenParams { len: x.len as u32 },
+            self.grid(x.len / 4, 256),
+            256,
+        );
+        let bytes = if w.format == Format::Q8_0 { 2 } else { 1 };
+        let whole = n / TILE_TOKENS * TILE_TOKENS;
+        // Four warps take 32 rows each of the narrow tile, and eight
+        // share the wide one's tokens too.
+        for (kernel, tokens, threads, first, count) in [
+            (wide, TILE_TOKENS, 256, 0, whole),
+            (narrow, TILE_TOKENS_NARROW, 128, whole, n - whole),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            self.launch_shared(
+                kernel,
+                &[
+                    self.ptr(&out.buf),
+                    self.ptr(&w.buf),
+                    self.ptr(&w.scales),
+                    self.ptr(&halves),
+                ],
+                &batch(first, count),
+                (count.div_ceil(tokens) as u32, groups),
+                threads,
+                tile_shared(tokens, bytes),
+            );
+        }
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -847,7 +1104,34 @@ impl Device for Cuda {
 
 #[cfg(test)]
 mod tests {
-    check_against_cpu!(super::Cuda::new());
+    // With tensor cores, every matmul through block-quantized weights is
+    // in half precision; without them, none is.
+    check_against_cpu!(
+        super::Cuda::new();
+        write_and_read_round_trip,
+        alloc_is_zeroed_and_copy_moves_ranges,
+        matmul_matches_cpu,
+        q4_0_matmul_in_halves_matches_cpu,
+        q8_0_matmul_in_halves_matches_cpu,
+        rmsnorm_matches_cpu,
+        l2norm_matches_cpu,
+        rope_matches_cpu,
+        attention_matches_cpu,
+        store_quantizes_like_cpu,
+        cache_round_trips,
+        elementwise_match_cpu,
+        conv_matches_cpu,
+        delta_net_matches_cpu,
+        resize_keeps_capacity
+    );
+
+    mod without_tensor_cores {
+        check_against_cpu!(
+            super::super::Cuda::without_tensor_cores();
+            q4_0_matmul_matches_cpu,
+            q8_0_matmul_matches_cpu
+        );
+    }
 
     /// Times the Q4_0 matmul on the model's shapes; run with `--ignored
     /// --nocapture`.
