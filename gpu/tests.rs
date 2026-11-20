@@ -20,6 +20,9 @@ macro_rules! check_against_cpu {
             store_quantizes_like_cpu,
             cache_round_trips,
             elementwise_match_cpu,
+            normalize_matches_cpu,
+            swiglu_matches_cpu,
+            matmul_add_matches_cpu,
             conv_matches_cpu,
             delta_net_matches_cpu,
             resize_keeps_capacity
@@ -775,6 +778,93 @@ pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
     let mut x = buffer(gpu, &a);
     gpu.add(&mut x, &up);
     close(&gpu.read(&x), &want, 1e-6);
+}
+
+/// The result may be held in half precision, and is what the operations
+/// after it take, whichever way the device holds it.
+pub fn normalize_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(21);
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+        let w = rng.floats(dim);
+        let x = rng.floats(dim * (rows + 1));
+        let y = rng.floats(dim * rows);
+        let mut want = vec![0.0; dim * rows];
+        Cpu.normalize(&mut want, &x, &w, dim * rows, 1e-6);
+        let mut out = gpu.alloc(dim * rows);
+        gpu.normalize(
+            &mut out,
+            &buffer(gpu, &x),
+            &buffer(gpu, &w),
+            dim * rows,
+            1e-6,
+        );
+        close(&gpu.read(&out), &want, 1e-3);
+        Cpu.add(&mut want, &y);
+        gpu.add(&mut out, &buffer(gpu, &y));
+        close(&gpu.read(&out), &want, 1e-3);
+        let mut part = gpu.alloc(dim);
+        gpu.copy(&mut part, 0, &out, dim * (rows - 1), dim);
+        close(&gpu.read(&part), &want[dim * (rows - 1)..], 1e-3);
+    }
+}
+
+/// Shapes at the edges of the tile kernels' tiles and of their batches of
+/// tokens, with an odd number of rows among them.
+const FUSED_SHAPES: [(usize, usize, usize); 6] = [
+    (64, 128, 16),
+    (200, 5120, 1),
+    (77, 1056, 3),
+    (64, 160, 9),
+    (301, 1152, 130),
+    (2500, 512, 70),
+];
+
+pub fn swiglu_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(22);
+    for (rows, cols, n) in FUSED_SHAPES {
+        let (gate, up) = (rng.q4_0(&[rows, cols]), rng.q4_0(&[rows, cols]));
+        let x = rng.floats(n * cols);
+        let mut want = vec![0.0; n * rows];
+        Cpu.swiglu(
+            &mut want,
+            &clone(&gate),
+            &clone(&up),
+            &x,
+            &mut vec![0.0; n * rows],
+        );
+        let (gate, up) = (gpu.upload(gate), gpu.upload(up));
+        let mut out = gpu.alloc(n * rows);
+        let mut scratch = gpu.alloc(n * rows);
+        gpu.swiglu(&mut out, &gate, &up, &buffer(gpu, &x), &mut scratch);
+        close_batch(&gpu.read(&out), &want, &format!("{rows}x{cols} n={n}"));
+    }
+}
+
+pub fn matmul_add_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(23);
+    for (rows, cols, n) in FUSED_SHAPES {
+        for w in [
+            rng.q4_0(&[rows, cols]),
+            rng.q8_0(&[rows, cols]),
+            rng.bf16(&[rows, cols]),
+        ] {
+            let input = rng.floats(n * cols);
+            let x = rng.floats(n * rows);
+            let mut want = x.clone();
+            Cpu.matmul_add(&mut want, &clone(&w), &input, &mut vec![0.0; n * rows]);
+            let mut out = buffer(gpu, &x);
+            let mut scratch = gpu.alloc(n * rows);
+            gpu.matmul_add(&mut out, &gpu.upload(w), &buffer(gpu, &input), &mut scratch);
+            // What was added, which is what a batch's error is a part of.
+            let added =
+                |sum: &[f32]| -> Vec<f32> { sum.iter().zip(&x).map(|(s, x)| s - x).collect() };
+            close_batch(
+                &added(&gpu.read(&out)),
+                &added(&want),
+                &format!("{rows}x{cols} n={n}"),
+            );
+        }
+    }
 }
 
 pub fn conv_matches_cpu<D: Device>(gpu: &D) {

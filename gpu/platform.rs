@@ -272,6 +272,25 @@ impl Device for Gpu {
         )
     }
 
+    fn matmul_add(&self, x: &mut Buffer, w: &Weight, input: &Buffer, scratch: &mut Buffer) {
+        dispatch!(self, matmul_add([x], { w }, [input], [scratch]))
+    }
+
+    fn swiglu(
+        &self,
+        out: &mut Buffer,
+        gate: &Weight,
+        up: &Weight,
+        x: &Buffer,
+        scratch: &mut Buffer,
+    ) {
+        dispatch!(self, swiglu([out], { gate }, { up }, [x], [scratch]))
+    }
+
+    fn normalize(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, len: usize, eps: f32) {
+        dispatch!(self, normalize([out], [x], [weight], len, eps))
+    }
+
     fn silu_mul(&self, gate: &mut Buffer, up: &Buffer) {
         dispatch!(self, silu_mul([gate], [up]))
     }

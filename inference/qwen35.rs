@@ -564,8 +564,7 @@ impl<'a, D: Device> Pass<'a, D> {
     /// `weight`: what a matrix multiplication's input goes through.
     fn normalize(&self, out: &mut D::Buffer, x: &D::Buffer, weight: &D::Buffer, rows: usize) {
         let (c, d) = (self.c, self.d);
-        d.copy(out, 0, x, 0, rows * c.hidden);
-        d.rmsnorm(out, weight, c.eps);
+        d.normalize(out, x, weight, rows * c.hidden, c.eps);
     }
 
     /// Writes the embeddings of `tokens` into `out`, which is their size,
@@ -630,7 +629,7 @@ impl<'a, D: Device> Pass<'a, D> {
                     c.kv_heads,
                 );
                 d.sigmoid_mul(&mut s.att, &s.gate);
-                d.matmul(&mut s.xb, o, &s.att);
+                d.matmul_add(&mut s.x, o, &s.att, &mut s.xb);
             }
             Mixer::Linear {
                 qkv,
@@ -691,18 +690,14 @@ impl<'a, D: Device> Pass<'a, D> {
                 );
                 d.rmsnorm(&mut s.att, norm, eps);
                 d.silu_mul(&mut s.z, &s.att);
-                d.matmul(&mut s.xb, out, &s.z);
+                d.matmul_add(&mut s.x, out, &s.z, &mut s.xb);
             }
         }
-        d.add(&mut s.x, &s.xb);
 
         // Feed-forward network, likewise added back.
         self.normalize(&mut s.xh, &s.x, &layer.mlp_norm, n);
-        d.matmul(&mut s.up, &layer.gate, &s.xh);
-        d.matmul(&mut s.gate_ffn, &layer.up, &s.xh);
-        d.silu_mul(&mut s.up, &s.gate_ffn);
-        d.matmul(&mut s.xb, &layer.down, &s.up);
-        d.add(&mut s.x, &s.xb);
+        d.swiglu(&mut s.up, &layer.gate, &layer.up, &s.xh, &mut s.gate_ffn);
+        d.matmul_add(&mut s.x, &layer.down, &s.up, &mut s.xb);
     }
 
     /// Runs the drafter at `rows` positions from `pos`: each fed the

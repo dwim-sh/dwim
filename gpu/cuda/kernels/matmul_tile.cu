@@ -1,7 +1,11 @@
 // out[t][r] = w[r] · x[t] for a batch of tokens and block-quantized
 // weights, on the tensor cores: the activations as half-precision floats,
-// which `to_f16.cu` makes of them, the weights each times its block's
-// scale and rounded to a half, and the sums in single precision. The
+// the weights each times its block's scale and rounded to a half, and the
+// sums in single precision. What is written is the sums, as floats or as
+// halves, or the sums added to what `out` holds, or `silu(sum) * other`
+// as halves, by the parameters' mode: the feed-forward network's
+// activation and the residual stream's addition without a pass of their
+// own over the activations. The
 // weights are tiled as `mod.rs` lays them out, 128 rows by 64 columns to
 // a tile, each lane's words of a tile side by side.
 //
@@ -89,7 +93,8 @@ __device__ __forceinline__ u32 swizzle(u32 row, u32 chunk) {
 
 template <int MT, bool Q8, int STAGES>
 __device__ __forceinline__ void tile_body(
-    float* out, const unsigned char* w, const u16* scales, const u16* x, TileParams p, unsigned char* buf) {
+    void* out, const unsigned char* w, const u16* scales, const u16* x, const u16* other, TileParams p,
+    unsigned char* buf) {
     const u32 THREADS = 4 * 32;
     const u32 BM = MT * 16;
     // A stage: the activations, the weights, the scales.
@@ -198,13 +203,41 @@ __device__ __forceinline__ void tile_body(
 #pragma unroll
             for (u32 h = 0; h < 2; h++) {
                 u32 t = m0 + i * 16 + (lane >> 2) + h * 8;
-                if (t < p.count) {
-                    float* at = out + (size_t)(p.first + t) * p.rows + row;
-                    if (row < p.rows) {
-                        at[0] = acc[i][j][2 * h];
+                if (t >= p.count || row >= p.rows) {
+                    continue;
+                }
+                size_t at = (size_t)(p.first + t) * p.rows + row;
+                bool pair = row + 1 < p.rows;
+                float v0 = acc[i][j][2 * h];
+                float v1 = acc[i][j][2 * h + 1];
+                if (p.mode == TILE_FLOATS || p.mode == TILE_ADD) {
+                    float* o = (float*)out + at;
+                    if (p.mode == TILE_ADD) {
+                        v0 += o[0];
+                        v1 += pair ? o[1] : 0.0f;
                     }
-                    if (row + 1 < p.rows) {
-                        at[1] = acc[i][j][2 * h + 1];
+                    o[0] = v0;
+                    if (pair) {
+                        o[1] = v1;
+                    }
+                    continue;
+                }
+                // Two rows of a token side by side, which are a word of
+                // halves where a token's rows start on one.
+                bool word = pair && (p.rows & 1) == 0;
+                u16* o = (u16*)out + at;
+                if (p.mode == TILE_SWIGLU) {
+                    u32 u = word ? *(const u32*)(other + at) : other[at] | (pair ? other[at + 1] << 16 : 0);
+                    v0 = v0 * sigmoid(v0) * f16_to_f32(u);
+                    v1 = v1 * sigmoid(v1) * f16_to_f32(u >> 16);
+                }
+                u32 halves = f32_to_finite_f16(v0) | f32_to_finite_f16(v1) << 16;
+                if (word) {
+                    *(u32*)o = halves;
+                } else {
+                    o[0] = (u16)halves;
+                    if (pair) {
+                        o[1] = (u16)(halves >> 16);
                     }
                 }
             }
@@ -214,9 +247,9 @@ __device__ __forceinline__ void tile_body(
 
 #define TILE_KERNEL(name, MT, Q8, STAGES) \
     extern "C" __global__ void __launch_bounds__(4 * 32) name( \
-        float* out, const unsigned char* w, const u16* scales, const u16* x, TileParams p) { \
+        void* out, const unsigned char* w, const u16* scales, const u16* x, const u16* other, TileParams p) { \
         extern __shared__ __align__(16) unsigned char buf[]; \
-        tile_body<MT, Q8, STAGES>(out, w, scales, x, p, buf); \
+        tile_body<MT, Q8, STAGES>(out, w, scales, x, other, p, buf); \
     }
 
 TILE_KERNEL(matmul_tile16_q4_0, 1, false, TILE_STAGES)

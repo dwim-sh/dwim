@@ -8,7 +8,12 @@
 //! opens, so a build needs no CUDA, and a machine without them gets an
 //! error from [`Cuda::new`] rather than a device.
 
-use std::{cell::RefCell, error::Error, slice, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    error::Error,
+    slice,
+    sync::Arc,
+};
 
 use cudarc::{
     driver::{
@@ -100,11 +105,24 @@ const KERNELS: [(&str, &str); 17] = [
     ("attention_tile", include_str!("kernels/attention_tile.cu")),
 ];
 
-/// A vector of f32 activations in device memory.
+/// A vector of activations in device memory: as f32, and as halves too
+/// once something has them so, which the tile kernels read and write.
+/// Either may be behind the other, as `form` says, until an operation
+/// wants the one that is.
 pub struct Buffer {
     buf: CudaSlice<f32>,
+    halves: RefCell<Option<CudaSlice<u16>>>,
+    form: Cell<Form>,
     len: usize,
     cap: usize,
+}
+
+/// Which of a buffer's two forms hold its activations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Floats,
+    Halves,
+    Both,
 }
 
 /// A cache of activations in device memory, in blocks of 8-bit integers,
@@ -140,11 +158,26 @@ struct QuantKernels {
     rows: CudaFunction,
     /// The tokens on the tensor cores, 16 and 64 at a time, where the GPU
     /// has them.
-    tiles: Option<(CudaFunction, CudaFunction)>,
+    tiles: Option<Tiles>,
+}
+
+/// The narrow and the wide tile kernel of a format.
+type Tiles = (CudaFunction, CudaFunction);
+
+/// What a tile matmul does with its products, as the kernels number it.
+#[derive(Clone, Copy)]
+enum Products {
+    Floats = 0,
+    Halves = 1,
+    Add = 2,
+    Swiglu = 3,
 }
 
 struct Kernels {
     matmul_bf16: CudaFunction,
+    matmul_bf16_f16: CudaFunction,
+    from_f16: CudaFunction,
+    normalize_f16: CudaFunction,
     q4_0: QuantKernels,
     q8_0: QuantKernels,
     to_f16: CudaFunction,
@@ -169,8 +202,6 @@ pub struct Cuda {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     partials: CudaSlice<f32>,
-    /// A batch's activations as halves, for the tile kernels.
-    halves: RefCell<CudaSlice<u16>>,
     name: String,
 }
 
@@ -246,6 +277,9 @@ impl Cuda {
         let kernels = Kernels {
             attention_tiles,
             matmul_bf16: kernel("matmul_bf16")?,
+            matmul_bf16_f16: kernel("matmul_bf16_f16")?,
+            from_f16: kernel("from_f16")?,
+            normalize_f16: kernel("normalize_f16")?,
             q4_0: quant("q4_0", 1)?,
             q8_0: quant("q8_0", 2)?,
             to_f16: kernel("to_f16")?,
@@ -262,13 +296,11 @@ impl Cuda {
             delta_net: kernel("delta_net")?,
         };
         let partials = stream.alloc_zeros::<f32>(PARTIALS)?;
-        let halves = RefCell::new(stream.alloc_zeros::<u16>(4)?);
         Ok(Self {
             ctx,
             stream,
             kernels,
             partials,
-            halves,
             name,
         })
     }
@@ -276,6 +308,137 @@ impl Cuda {
     /// The address of a slice, for a kernel.
     fn ptr<T>(&self, slice: &CudaSlice<T>) -> u64 {
         slice.device_ptr(&self.stream).0
+    }
+
+    /// The address of a buffer's floats, made of its halves first if only
+    /// those hold its activations.
+    fn floats(&self, b: &Buffer) -> u64 {
+        if b.form.get() == Form::Halves {
+            let halves = b.halves.borrow();
+            let halves = halves.as_ref().expect("a buffer in halves has them");
+            self.launch(
+                &self.kernels.from_f16,
+                &[self.ptr(&b.buf), self.ptr(halves)],
+                &LenParams { len: b.len as u32 },
+                self.grid(b.len.div_ceil(4), 256),
+                256,
+            );
+            b.form.set(Form::Both);
+        }
+        self.ptr(&b.buf)
+    }
+
+    /// The address of a buffer's floats for an operation that changes
+    /// some of them, which leaves its halves behind.
+    fn floats_mut(&self, b: &mut Buffer) -> u64 {
+        let floats = self.floats(b);
+        b.form.set(Form::Floats);
+        floats
+    }
+
+    /// The address of a buffer's floats for an operation that writes them
+    /// all, whatever the buffer held.
+    fn floats_out(&self, b: &mut Buffer) -> u64 {
+        b.form.set(Form::Floats);
+        self.ptr(&b.buf)
+    }
+
+    /// The address of a buffer's halves, made of its floats first if only
+    /// those hold its activations.
+    fn halves(&self, b: &Buffer) -> u64 {
+        let halves = self.halves_of(b);
+        if b.form.get() == Form::Floats {
+            self.launch(
+                &self.kernels.to_f16,
+                &[halves, self.ptr(&b.buf)],
+                &LenParams { len: b.len as u32 },
+                self.grid(b.len.div_ceil(4), 256),
+                256,
+            );
+            b.form.set(Form::Both);
+        }
+        halves
+    }
+
+    /// The address of a buffer's halves as they are, allocated if it has
+    /// had none: for an operation that writes them all.
+    fn halves_of(&self, b: &Buffer) -> u64 {
+        let mut halves = b.halves.borrow_mut();
+        let halves = halves.get_or_insert_with(|| {
+            self.stream
+                .alloc_zeros::<u16>(b.cap.next_multiple_of(4).max(4))
+                .expect("out of GPU memory")
+        });
+        self.ptr(halves)
+    }
+
+    /// The address of a buffer's halves for an operation that writes them
+    /// as it writes the floats, where the GPU has the tensor cores that
+    /// read them, and none otherwise.
+    fn halves_too(&self, b: &Buffer) -> u64 {
+        if self.kernels.q4_0.tiles.is_none() {
+            return 0;
+        }
+        b.form.set(Form::Both);
+        self.halves_of(b)
+    }
+
+    /// The tile kernels for a weight, if it is block-quantized and the GPU
+    /// has the tensor cores.
+    fn tiles(&self, w: &Weight) -> Option<&Tiles> {
+        match w.format {
+            Format::Bf16 => None,
+            Format::Q4_0 => self.kernels.q4_0.tiles.as_ref(),
+            Format::Q8_0 => self.kernels.q8_0.tiles.as_ref(),
+        }
+    }
+
+    /// A matmul on the tensor cores of the `n` tokens whose halves are at
+    /// `x`, into `out` as `products` has it, with the halves at `other`
+    /// for the products to be multiplied by if that is what it has: as
+    /// many whole wide tiles of tokens as there are, and the rest in
+    /// narrow ones.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_tiles(
+        &self,
+        (narrow, wide): &Tiles,
+        out: u64,
+        w: &Weight,
+        x: u64,
+        other: u64,
+        n: usize,
+        products: Products,
+    ) {
+        let (rows, cols) = (w.shape[0], w.shape[1]);
+        let bytes = if w.format == Format::Q8_0 { 2 } else { 1 };
+        let whole = n / TILE_TOKENS * TILE_TOKENS;
+        for (kernel, tokens, first, count) in [
+            (wide, TILE_TOKENS, 0, whole),
+            (narrow, TILE_TOKENS_NARROW, whole, n - whole),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let params = TileParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                tiles: cols.div_ceil(TILE_COLS) as u32,
+                first: first as u32,
+                count: count as u32,
+                mode: products as u32,
+            };
+            self.launch_shared(
+                kernel,
+                &[out, self.ptr(&w.buf), self.ptr(&w.scales), x, other],
+                &params,
+                (
+                    count.div_ceil(tokens) as u32,
+                    rows.div_ceil(TILE_ROWS) as u32,
+                ),
+                128,
+                tile_shared(tokens, bytes),
+            );
+        }
     }
 
     /// Copies plain integers from the host into a new buffer of their
@@ -403,7 +566,7 @@ impl Cuda {
                 kernel,
                 &[
                     self.ptr(&out.buf),
-                    self.ptr(&q.buf),
+                    self.floats(q),
                     self.ptr(&k_cache.quants),
                     self.ptr(&k_cache.scales),
                     self.ptr(&v_cache.quants),
@@ -444,9 +607,14 @@ impl Cuda {
             stride: width as u32,
             splits: 1,
         };
+        // The activations as the buffer has them.
+        let (kernel, x) = match x.form.get() {
+            Form::Halves => (&self.kernels.matmul_bf16_f16, self.halves(x)),
+            _ => (&self.kernels.matmul_bf16, self.floats(x)),
+        };
         self.launch(
-            &self.kernels.matmul_bf16,
-            &[self.ptr(&out.buf), self.ptr(&w.buf), self.ptr(&x.buf)],
+            kernel,
+            &[self.floats_out(out), self.ptr(&w.buf), x],
             &params,
             grid,
             64,
@@ -624,6 +792,7 @@ struct TileParams {
     tiles: u32,
     first: u32,
     count: u32,
+    mode: u32,
 }
 
 #[repr(C)]
@@ -782,11 +951,19 @@ impl Device for Cuda {
     }
 
     fn alloc(&self, len: usize) -> Buffer {
+        // Whole fours, which the conversions between floats and halves
+        // take.
         let buf = self
             .stream
-            .alloc_zeros::<f32>(len.max(1))
+            .alloc_zeros::<f32>(len.next_multiple_of(4).max(4))
             .expect("out of GPU memory");
-        Buffer { buf, len, cap: len }
+        Buffer {
+            buf,
+            halves: RefCell::new(None),
+            form: Cell::new(Form::Floats),
+            len,
+            cap: len,
+        }
     }
 
     fn alloc_cache(&self, len: usize) -> Cache {
@@ -816,6 +993,7 @@ impl Device for Cuda {
     }
 
     fn read(&self, buf: &Buffer) -> Vec<f32> {
+        self.floats(buf);
         self.stream
             .clone_dtoh(&buf.buf.slice(..buf.len))
             .expect("reading a buffer")
@@ -823,6 +1001,7 @@ impl Device for Cuda {
 
     fn write(&self, buf: &mut Buffer, data: &[f32]) {
         assert_eq!(buf.len, data.len());
+        buf.form.set(Form::Floats);
         self.stream
             .memcpy_htod(data, &mut buf.buf.slice_mut(..buf.len))
             .expect("writing a buffer");
@@ -837,6 +1016,8 @@ impl Device for Cuda {
         len: usize,
     ) {
         assert!(dst_offset + len <= dst.len && src_offset + len <= src.len);
+        self.floats(src);
+        self.floats_mut(dst);
         self.stream
             .memcpy_dtod(
                 &src.buf.slice(src_offset..src_offset + len),
@@ -859,7 +1040,7 @@ impl Device for Cuda {
             &[
                 self.ptr(&cache.quants),
                 self.ptr(&cache.scales),
-                self.ptr(&src.buf),
+                self.floats(src),
             ],
             &params,
             grid,
@@ -906,79 +1087,114 @@ impl Device for Cuda {
         assert_eq!(x.len, n * cols);
         assert_eq!(out.len, n * rows);
         assert!(cols % 8 == 0);
+        if w.format == Format::Bf16 {
+            return self.matmul_bf16(out, w, x, n);
+        }
+        if let Some(tiles) = self.tiles(w) {
+            let x = self.halves(x);
+            let out = self.floats_out(out);
+            return self.matmul_tiles(tiles, out, w, x, 0, n, Products::Floats);
+        }
+        // A GPU without tensor cores multiplies in single precision, a
+        // token to a block or eight of a batch.
         let kernels = match w.format {
-            Format::Bf16 => return self.matmul_bf16(out, w, x, n),
-            Format::Q4_0 => &self.kernels.q4_0,
             Format::Q8_0 => &self.kernels.q8_0,
+            _ => &self.kernels.q4_0,
         };
-        let groups = rows.div_ceil(TILE_ROWS) as u32;
-        let batch = |first: usize, count: usize| TileParams {
+        let (kernel, per_block) = match n {
+            1 => (&kernels.row, 1),
+            _ => (&kernels.rows, ROWS_TOKENS),
+        };
+        let params = TileParams {
             rows: rows as u32,
             cols: cols as u32,
             tiles: cols.div_ceil(TILE_COLS) as u32,
-            first: first as u32,
-            count: count as u32,
+            first: 0,
+            count: n as u32,
+            mode: Products::Floats as u32,
         };
-        // A GPU without tensor cores multiplies in single precision, a
-        // token to a block or eight of a batch.
-        let Some((narrow, wide)) = &kernels.tiles else {
-            let (kernel, per_block) = match n {
-                1 => (&kernels.row, 1),
-                _ => (&kernels.rows, ROWS_TOKENS),
-            };
-            self.launch(
-                kernel,
-                &[
-                    self.ptr(&out.buf),
-                    self.ptr(&w.buf),
-                    self.ptr(&w.scales),
-                    self.ptr(&x.buf),
-                ],
-                &batch(0, n),
-                (groups, n.div_ceil(per_block) as u32),
-                256,
-            );
-            return;
-        };
-        // The tokens go through the tensor cores as halves: as many whole
-        // wide tiles of them as there are, and the rest in narrow ones.
-        let mut halves = self.halves.borrow_mut();
-        if halves.len() < x.len {
-            *halves = self
-                .stream
-                .alloc_zeros::<u16>(x.len.next_multiple_of(4))
-                .expect("out of GPU memory");
-        }
         self.launch(
-            &self.kernels.to_f16,
-            &[self.ptr(&halves), self.ptr(&x.buf)],
-            &LenParams { len: x.len as u32 },
-            self.grid(x.len / 4, 256),
+            kernel,
+            &[
+                self.floats_out(out),
+                self.ptr(&w.buf),
+                self.ptr(&w.scales),
+                self.floats(x),
+            ],
+            &params,
+            (
+                rows.div_ceil(TILE_ROWS) as u32,
+                n.div_ceil(per_block) as u32,
+            ),
             256,
         );
-        let bytes = if w.format == Format::Q8_0 { 2 } else { 1 };
-        let whole = n / TILE_TOKENS * TILE_TOKENS;
-        for (kernel, tokens, first, count) in [
-            (wide, TILE_TOKENS, 0, whole),
-            (narrow, TILE_TOKENS_NARROW, whole, n - whole),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            self.launch_shared(
-                kernel,
-                &[
-                    self.ptr(&out.buf),
-                    self.ptr(&w.buf),
-                    self.ptr(&w.scales),
-                    self.ptr(&halves),
-                ],
-                &batch(first, count),
-                (count.div_ceil(tokens) as u32, groups),
-                128,
-                tile_shared(tokens, bytes),
-            );
+    }
+
+    fn matmul_add(&self, x: &mut Buffer, w: &Weight, input: &Buffer, scratch: &mut Buffer) {
+        let Some(tiles) = self.tiles(w) else {
+            self.matmul(scratch, w, input);
+            return self.add(x, scratch);
+        };
+        let (rows, cols) = (w.shape[0], w.shape[1]);
+        let n = input.len / cols;
+        assert_eq!(input.len, n * cols);
+        assert_eq!(x.len, n * rows);
+        // The products are added to the floats where they are.
+        let input = self.halves(input);
+        let x = self.floats_mut(x);
+        self.matmul_tiles(tiles, x, w, input, 0, n, Products::Add);
+    }
+
+    fn swiglu(
+        &self,
+        out: &mut Buffer,
+        gate: &Weight,
+        up: &Weight,
+        x: &Buffer,
+        scratch: &mut Buffer,
+    ) {
+        let (Some(gate_tiles), Some(up_tiles)) = (self.tiles(gate), self.tiles(up)) else {
+            self.matmul(out, gate, x);
+            self.matmul(scratch, up, x);
+            return self.silu_mul(out, scratch);
+        };
+        let (rows, cols) = (gate.shape[0], gate.shape[1]);
+        let n = x.len / cols;
+        assert_eq!(x.len, n * cols);
+        assert_eq!(up.shape, gate.shape);
+        assert!(out.len == n * rows && scratch.len == out.len);
+        // Both in halves and nothing else: `up`'s products, and then
+        // `gate`'s through the activation times those as they come.
+        let x = self.halves(x);
+        let other = self.halves_of(scratch);
+        scratch.form.set(Form::Halves);
+        self.matmul_tiles(up_tiles, other, up, x, 0, n, Products::Halves);
+        let halves = self.halves_of(out);
+        out.form.set(Form::Halves);
+        self.matmul_tiles(gate_tiles, halves, gate, x, other, n, Products::Swiglu);
+    }
+
+    fn normalize(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, len: usize, eps: f32) {
+        // Without tensor cores nothing reads halves.
+        if self.kernels.q4_0.tiles.is_none() {
+            self.copy(out, 0, x, 0, len);
+            return self.rmsnorm(out, weight, eps);
         }
+        let dim = weight.len;
+        assert!(out.len == len && len <= x.len && len.is_multiple_of(dim));
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
+        let halves = self.halves_of(out);
+        out.form.set(Form::Halves);
+        self.launch(
+            &self.kernels.normalize_f16,
+            &[halves, self.floats(x), self.floats(weight)],
+            &params,
+            self.grid(len / dim, 1),
+            256,
+        );
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -987,7 +1203,7 @@ impl Device for Cuda {
         let grid = self.grid(x.len, 256);
         self.launch(
             &self.kernels.add,
-            &[self.ptr(&x.buf), self.ptr(&y.buf)],
+            &[self.floats_mut(x), self.floats(y)],
             &params,
             grid,
             256,
@@ -1004,7 +1220,7 @@ impl Device for Cuda {
         let grid = self.grid(x.len / dim, 1);
         self.launch(
             &self.kernels.rmsnorm,
-            &[self.ptr(&x.buf), self.ptr(&weight.buf)],
+            &[self.floats_mut(x), self.floats(weight)],
             &params,
             grid,
             256,
@@ -1020,7 +1236,7 @@ impl Device for Cuda {
         let grid = self.grid(x.len / dim, 1);
         self.launch(
             &self.kernels.l2norm,
-            &[self.ptr(&x.buf)],
+            &[self.floats_mut(x)],
             &params,
             grid,
             256,
@@ -1049,7 +1265,7 @@ impl Device for Cuda {
         let grid = self.grid(n * n_heads * rot_dim / 2, 256);
         self.launch(
             &self.kernels.rope,
-            &[self.ptr(&x.buf), self.ptr(&table.buf)],
+            &[self.floats_mut(x), self.floats(table)],
             &params,
             grid,
             256,
@@ -1071,6 +1287,7 @@ impl Device for Cuda {
         assert_eq!(q.len, n * n_heads * head_dim);
         assert_eq!(out.len, q.len);
         assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= 256);
+        out.form.set(Form::Floats);
         assert!(
             n_heads / n_kv_heads <= 8,
             "the kernel holds up to eight query heads per key/value head"
@@ -1107,7 +1324,7 @@ impl Device for Cuda {
                 &self.kernels.attention,
                 &[
                     self.ptr(&out.buf),
-                    self.ptr(&q.buf),
+                    self.floats(q),
                     self.ptr(&k_cache.quants),
                     self.ptr(&k_cache.scales),
                     self.ptr(&v_cache.quants),
@@ -1139,7 +1356,7 @@ impl Device for Cuda {
         let grid = self.grid(gate.len, 256);
         self.launch(
             &self.kernels.silu_mul,
-            &[self.ptr(&gate.buf), self.ptr(&up.buf)],
+            &[self.floats_mut(gate), self.halves_too(gate), self.floats(up)],
             &params,
             grid,
             256,
@@ -1152,7 +1369,7 @@ impl Device for Cuda {
         let grid = self.grid(x.len, 256);
         self.launch(
             &self.kernels.sigmoid_mul,
-            &[self.ptr(&x.buf), self.ptr(&gate.buf)],
+            &[self.floats_mut(x), self.halves_too(x), self.floats(gate)],
             &params,
             grid,
             256,
@@ -1185,13 +1402,13 @@ impl Device for Cuda {
         self.launch(
             &self.kernels.conv,
             &[
-                self.ptr(&q.buf),
-                self.ptr(&k.buf),
-                self.ptr(&v.buf),
-                self.ptr(&state_out.buf),
-                self.ptr(&x.buf),
-                self.ptr(&state.buf),
-                self.ptr(&weight.buf),
+                self.floats_out(q),
+                self.floats_out(k),
+                self.floats_out(v),
+                self.floats_out(state_out),
+                self.floats(x),
+                self.floats(state),
+                self.floats(weight),
             ],
             &params,
             grid,
@@ -1229,13 +1446,13 @@ impl Device for Cuda {
         self.launch(
             &self.kernels.delta_net,
             &[
-                self.ptr(&out.buf),
-                self.ptr(&q.buf),
-                self.ptr(&k.buf),
-                self.ptr(&v.buf),
-                self.ptr(&gates.buf),
-                self.ptr(&decay.buf),
-                self.ptr(&state.buf),
+                self.floats_out(out),
+                self.floats(q),
+                self.floats(k),
+                self.floats(v),
+                self.floats(gates),
+                self.floats(decay),
+                self.floats_mut(state),
             ],
             &params,
             grid,
@@ -1262,6 +1479,9 @@ mod tests {
         store_quantizes_like_cpu,
         cache_round_trips,
         elementwise_match_cpu,
+        normalize_matches_cpu,
+        swiglu_matches_cpu,
+        matmul_add_matches_cpu,
         conv_matches_cpu,
         delta_net_matches_cpu,
         resize_keeps_capacity
@@ -1271,7 +1491,10 @@ mod tests {
         check_against_cpu!(
             super::super::Cuda::without_tensor_cores();
             q4_0_matmul_matches_cpu,
-            q8_0_matmul_matches_cpu
+            q8_0_matmul_matches_cpu,
+            normalize_matches_cpu,
+            swiglu_matches_cpu,
+            matmul_add_matches_cpu
         );
     }
 
