@@ -45,7 +45,7 @@ const TILE_TOKENS: usize = 64;
 const TILE_TOKENS_NARROW: usize = 16;
 
 /// Tokens to a batch on a GPU with tensor cores.
-const TILE_BATCH: usize = 256;
+const TILE_BATCH: usize = 512;
 
 /// Tiles a block of the tile kernels holds in shared memory at once: the
 /// one it is multiplying and the ones on their way.
