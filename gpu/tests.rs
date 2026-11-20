@@ -262,13 +262,16 @@ pub fn q8_0_matmul_matches_cpu<D: Device>(gpu: &D) {
 }
 
 /// The Q4_0 matmul of a device that multiplies single tokens in half
-/// precision as it does batches.
+/// precision as it does batches. Only CUDA does, which is not built on
+/// Apple's platforms.
+#[cfg(not(target_vendor = "apple"))]
 pub fn q4_0_matmul_in_halves_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(40);
     block_matmul_matches_cpu(gpu, &mut |shape| rng.q4_0(shape), true);
 }
 
 /// The Q8_0 matmul likewise.
+#[cfg(not(target_vendor = "apple"))]
 pub fn q8_0_matmul_in_halves_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(80);
     block_matmul_matches_cpu(gpu, &mut |shape| rng.q8_0(shape), true);
