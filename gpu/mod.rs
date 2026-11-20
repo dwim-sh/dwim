@@ -1,7 +1,8 @@
 //! Devices a model runs on: the operations a transformer's forward pass is
 //! built from, and their implementations. [`Cpu`] is the reference; the
-//! `metal` and [`vulkan`] devices run the same operations on a GPU with
-//! hand-written compute kernels.
+//! `cuda`, `metal`, and [`vulkan`] devices run the same operations on a GPU
+//! with hand-written compute kernels, and [`Gpu`] is whichever of them
+//! opens.
 
 #[cfg(test)]
 #[macro_use]
@@ -9,32 +10,26 @@ mod tests;
 
 pub mod cpu;
 pub mod float;
+pub mod platform;
 pub mod quant;
 pub mod vulkan;
 
 pub use cpu::Cpu;
+pub use platform::Gpu;
 pub use vulkan::Vulkan;
 
-// The one place the platform decides anything here: Metal is built on
-// Apple's alone, where it is the GPU device, and Vulkan is elsewhere.
+// The one place the platform decides which devices are built: Metal on
+// Apple's alone, and CUDA elsewhere. [`Gpu`] is whichever of them opens.
 cfg_select! {
     target_vendor = "apple" => {
         pub mod metal;
 
         pub use metal::Metal;
-
-        /// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-        pub type Gpu = Metal;
-
-        /// The name of the API [`Gpu`] drives the GPU through.
-        pub const BACKEND: &str = "Metal";
     }
     _ => {
-        /// The GPU device of the platform: Metal on Apple's, Vulkan elsewhere.
-        pub type Gpu = Vulkan;
+        pub mod cuda;
 
-        /// The name of the API [`Gpu`] drives the GPU through.
-        pub const BACKEND: &str = "Vulkan";
+        pub use cuda::Cuda;
     }
 }
 

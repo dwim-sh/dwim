@@ -4,7 +4,6 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::gpu;
 use dwim::inference::{Model, OnDisk};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{Kind, hosted::Host};
@@ -61,8 +60,8 @@ pub fn model_listing(
     };
     let mut on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
-        (Device::Gpu, None) => "GPU".to_string(),
-        (Device::Gpu, Some(name)) => format!("GPU · {name} via {}", gpu::BACKEND),
+        (Device::Gpu(_), None) => "GPU".to_string(),
+        (Device::Gpu(_), Some(name)) => format!("GPU · {name}"),
     };
     if let Some(size) = size {
         on.push_str(&format!(" · {}", model::bytes(size.model)));

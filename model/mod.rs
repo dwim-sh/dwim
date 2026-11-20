@@ -15,7 +15,7 @@ pub use chat::{Chat, Generation, State};
 pub use format::{Format, Turn};
 pub use sampling::Sampling;
 pub use session::{Answer, Chunk, Reply, Session, Stats, Tally};
-pub use size::{Device, Size};
+pub use size::{Api, Device, Size};
 pub use tokenizer::Tokenizer;
 pub use variant::Variant;
 

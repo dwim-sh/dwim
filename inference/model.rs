@@ -247,15 +247,16 @@ impl Opened {
     fn open(device: Device) -> Result<Self> {
         Ok(match device {
             Device::Cpu => Opened::Cpu(Cpu),
-            Device::Gpu => Opened::Gpu(Box::new(Gpu::new()?)),
+            Device::Gpu(api) => Opened::Gpu(Box::new(Gpu::open(api)?)),
         })
     }
 
-    /// What the device is called.
+    /// What the device is called: a GPU's name, and the API it is driven
+    /// through.
     fn name(&self) -> String {
         match self {
             Opened::Cpu(device) => device.name(),
-            Opened::Gpu(device) => device.name(),
+            Opened::Gpu(device) => format!("{} via {}", device.name(), device.api()),
         }
     }
 

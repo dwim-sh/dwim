@@ -17,7 +17,8 @@ program. One package: `lib.rs` is the library, `cli/` and
 - Before calling a change done, run `./target/debug/dwim` in a terminal
   and ask the model something.
 - GPU tests skip a backend whose GPU is not there. The GPU is Metal on
-  macOS, Vulkan 1.1 with `VK_KHR_push_descriptor` elsewhere.
+  macOS, and elsewhere an NVIDIA driver with the CUDA toolkit's NVRTC, or
+  Vulkan 1.1 with `VK_KHR_push_descriptor`.
 
 ## Layout
 
@@ -47,8 +48,10 @@ program. One package: `lib.rs` is the library, `cli/` and
   nothing from the directories above, and `providers/` take nothing from
   `inference/`
 - `tools/` - the tools, one file each; `call` parses a call
-- `gpu/` - the `Device` trait; `cpu` is the reference, `vulkan` (WGSL
-  kernels, compiled by `build.rs`), `metal` (MSL kernels), `quant`, `float`
+- `gpu/` - the `Device` trait; `cpu` is the reference, `cuda` (CUDA C
+  kernels, compiled by NVRTC when the device opens), `vulkan` (WGSL
+  kernels, compiled by `build.rs`), `metal` (MSL kernels), `platform`
+  (`Gpu`, whichever of them opens: CUDA before Vulkan), `quant`, `float`
 - `sys/` - what is asked of the operating system: `darwin/` and `linux/`
   with the same modules, `unix/` for what both do the same way, all
   re-exported as `sys::memory` and so on
