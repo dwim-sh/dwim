@@ -25,10 +25,7 @@ use std::{
 };
 
 use dwim::gpu::{Cpu, Device, Gpu};
-use dwim::inference::{
-    Gguf, LanguageModel,
-    qwen35::{self, Model},
-};
+use dwim::inference::{Gguf, LanguageModel, qwen35::Model};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention
@@ -156,9 +153,10 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let model = qwen35::dir()
-        .ok_or("no home directory")?
-        .join(qwen35::WEIGHTS);
+    let weights = dwim::model::Model::default()
+        .weights()
+        .ok_or("the model does not run on this machine")?;
+    let model = weights.path(&weights.dir().ok_or("no home directory")?);
     if !model.exists() {
         return Err(format!(
             "no model at {}: run `dwim --download` to fetch it",

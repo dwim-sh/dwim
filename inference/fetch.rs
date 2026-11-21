@@ -10,11 +10,8 @@ use std::{
 };
 
 use crate::{
-    inference::{
-        Result,
-        qwen35::{self, File},
-    },
-    model::hub,
+    inference::Result,
+    model::{File, Weights, hub},
     sys,
 };
 
@@ -34,15 +31,15 @@ pub struct Download {
     pub total: Option<u64>,
 }
 
-/// Downloads the model's files into `dir`, its snapshot in the cache,
-/// skipping any that are already there, and reporting progress on each
-/// one as it comes in. A file's content goes in the repository's blobs,
+/// Downloads the files of `weights` into `dir`, their snapshot in the
+/// cache, skipping any that are already there, and reporting progress on
+/// each one as it comes in. A file's content goes in the repository's blobs,
 /// named by its digest, and the file in the snapshot is a link to it, as
 /// the cache's other users lay them out; a blob one of them downloaded is
 /// linked to without downloading it again.
-pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
-    let blobs = hub::blobs_dir(qwen35::REPO).ok_or("cannot determine the home directory")?;
-    for file in &qwen35::FILES {
+pub fn fetch(weights: &Weights, dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
+    let blobs = hub::blobs_dir(weights.repo).ok_or("cannot determine the home directory")?;
+    for file in weights.files {
         let path = dir.join(file.name);
         if path.exists() {
             continue;
@@ -55,7 +52,7 @@ pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
                     .into());
             }
             fs::create_dir_all(&blobs)?;
-            download(file, &blob, &mut progress)?;
+            download(weights, file, &blob, &mut progress)?;
         }
         fs::create_dir_all(dir)?;
         // A link left pointing at a blob that was removed is replaced.
@@ -67,7 +64,7 @@ pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
     Ok(())
 }
 
-/// Downloads one of the model's files to `blob`.
+/// Downloads `file`, one of the files of `weights`, to `blob`.
 ///
 /// The file is written under an `.incomplete` name, as the cache's other
 /// users write theirs, and renamed into place once complete, so an
@@ -75,7 +72,12 @@ pub fn fetch(dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
 /// another run is still writing is waited for; one nobody is writing is
 /// picked up where it left off, which matters for a model of several
 /// gigabytes on a slow link.
-fn download(file: &File, blob: &Path, progress: &mut impl FnMut(Download)) -> Result<()> {
+fn download(
+    weights: &Weights,
+    file: &File,
+    blob: &Path,
+    progress: &mut impl FnMut(Download),
+) -> Result<()> {
     let partial = blob.with_file_name(format!("{}.incomplete", file.digest));
     let mut done = loop {
         match fs::metadata(&partial) {
@@ -99,7 +101,7 @@ fn download(file: &File, blob: &Path, progress: &mut impl FnMut(Download)) -> Re
         done,
         total: None,
     });
-    let mut request = ureq::get(&hub::url(qwen35::REPO, qwen35::REVISION, file.name));
+    let mut request = ureq::get(&hub::url(weights.repo, weights.revision, file.name));
     if done > 0 {
         request = request.header("Range", &format!("bytes={done}-"));
     }

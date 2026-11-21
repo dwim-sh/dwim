@@ -5,10 +5,12 @@ mod chat;
 pub mod format;
 pub mod gguf;
 pub mod hub;
+pub mod qwen;
 mod sampling;
 mod session;
 mod size;
 mod tokenizer;
+mod weights;
 
 use std::{fmt, str::FromStr};
 
@@ -18,15 +20,18 @@ pub use sampling::Sampling;
 pub use session::{Answer, Chunk, Reply, Session, Stats, Tally};
 pub use size::{Api, Device, Size};
 pub use tokenizer::Tokenizer;
+pub use weights::{File, OnDisk, Weights};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// The models dwim runs: each a network its makers trained and named. They
 /// are of one family, with one chat format and one way of calling tools,
 /// so a conversation with one reads the same to another.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Model {
-    /// Qwen3.8-27B, which runs on this machine.
+    /// Qwen3.8-27B, which runs on this machine: the model dwim runs unless
+    /// told to run another.
+    #[default]
     Qwen27b,
     /// Qwen3.8-2.4T-A95B, the open weights of Qwen3.8 Max: 2.4 trillion
     /// parameters, of which 95 billion are active for a token. It takes
@@ -48,6 +53,14 @@ impl Model {
         match self {
             Model::Qwen27b => "medium",
             Model::QwenMax => "large",
+        }
+    }
+
+    /// The weights the model runs from on this machine, if it runs here.
+    pub fn weights(self) -> Option<&'static Weights> {
+        match self {
+            Model::Qwen27b => Some(&qwen::QWEN_27B),
+            Model::QwenMax => None,
         }
     }
 }

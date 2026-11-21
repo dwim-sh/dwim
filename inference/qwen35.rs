@@ -11,52 +11,12 @@
 //! file ends with a layer that predicts the token after the next, which the
 //! model drafts with.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
     inference::{Gguf, LanguageModel, Result, gguf, quants},
-    model::hub,
 };
-
-/// The model as `dwim` names it.
-pub const NAME: &str = crate::model::Model::Qwen27b.name();
-
-/// The file holding the model: a GGUF file, which carries the tokenizer
-/// and the sampling settings too.
-pub const WEIGHTS: &str = "Qwen3.8-27B-Q4_0.gguf";
-
-/// Where the model's files come from: Qwen ships no GGUF of its own, so
-/// bartowski's conversion of `Qwen/Qwen3.8-27B`, quantized with an
-/// importance matrix, at a pinned commit, so the weights can't change
-/// underneath us and outputs stay reproducible. Its Q4_0 file holds most
-/// matrices in 4-bit blocks of 32 with an f16 scale, the first layers' down
-/// projections as Q4_1, the linear attention's output projections as Q8_0,
-/// and the output and a few query projections as Q6_K; the norms and the
-/// small linear attention tensors are f32.
-pub const REPO: &str = "bartowski/Qwen3.8-27B-GGUF";
-pub const REVISION: &str = "87410e7b9a5c21e6ca70c0c9cc5237de909fe621";
-
-/// A file of the model in its repository.
-pub struct File {
-    pub name: &'static str,
-    /// What the Hugging Face cache names its content by: the SHA-256 of a
-    /// file in LFS storage, and the git blob SHA-1 of a small one.
-    pub digest: &'static str,
-}
-
-/// The files fetched: the weights.
-pub const FILES: [File; 1] = [File {
-    name: WEIGHTS,
-    digest: "5eb1de39e9b42aa7f99f1a4fe149d1952cc8103c698cf380b15a43d47e72b7c7",
-}];
-
-/// Where the model's files are kept: its repository's snapshot at the
-/// pinned revision in the Hugging Face cache, shared with every other
-/// tool that uses it. See [`hub`].
-pub fn dir() -> Option<PathBuf> {
-    hub::snapshot_dir(REPO, REVISION)
-}
 
 /// Most tokens the model drafts at once: a batch to be verified holds them
 /// and the token before.
@@ -2098,7 +2058,8 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dir().unwrap().join(WEIGHTS);
+        let weights = crate::model::Model::Qwen27b.weights().unwrap();
+        let path = weights.path(&weights.dir().unwrap());
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;

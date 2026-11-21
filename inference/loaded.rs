@@ -1,18 +1,12 @@
-//! The one model, Qwen3.8-27B, loaded: finding its files, opening the
-//! device it runs on, how much conversation it has room for there, and how
-//! it samples.
+//! A model loaded: the device it runs on, opened, how much conversation it
+//! has room for there, and how it samples.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{path::Path, sync::Arc, time::SystemTime};
 
 use crate::{
     gpu::{Cpu, Device as _, Gpu},
-    inference::{Download, Gguf, LanguageModel, Result, Sampler, fetch, qwen35},
-    model::{Device, Format, Size, Tokenizer},
+    inference::{Gguf, LanguageModel, Result, Sampler, qwen35},
+    model::{Device, Format, Model, Size, Tokenizer},
 };
 
 /// Tokens of conversation the model has room for when the device cannot
@@ -31,15 +25,6 @@ const MIN_CONTEXT: usize = 16384;
 /// fitted to the memory free: for the device's scratch buffers, the
 /// driver, and whatever else starts in the meantime.
 const HEADROOM: u64 = 256 << 20;
-
-/// How much of the model is in a directory: how many of its files, out
-/// of how many, and their size in bytes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OnDisk {
-    pub files: usize,
-    pub of: usize,
-    pub bytes: u64,
-}
 
 /// How far loading the model has got.
 pub enum Progress {
@@ -62,75 +47,40 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// The model's name.
-    pub const NAME: &str = qwen35::NAME;
-
     /// Sessions the model has room for at once, unless something else
     /// says: on a 32 GiB Mac, the memory beside the weights has room for
     /// two with a context of twenty-odd thousand tokens each, and three
     /// would each have less than the fewest a session is given.
     pub const SESSIONS: usize = 2;
 
-    /// The repository the model's files come from, and the commit of it
-    /// they are fetched at.
-    pub const REPO: &str = qwen35::REPO;
-    pub const REVISION: &str = qwen35::REVISION;
-
-    /// The directory the files of the model called `name` are kept in,
-    /// which is the one model's.
-    pub fn dir(name: &str) -> Result<PathBuf> {
-        if name != Self::NAME {
-            return Err(format!("unknown model '{name}' (known: {})", Self::NAME).into());
-        }
-        qwen35::dir().ok_or_else(|| "cannot determine the home directory".into())
-    }
-
-    /// The file in `dir` that holds the model's weights.
-    pub fn weights(dir: &Path) -> PathBuf {
-        dir.join(qwen35::WEIGHTS)
-    }
-
-    /// How much of the model is in `dir`.
-    pub fn on_disk(dir: &Path) -> OnDisk {
-        let found = qwen35::FILES
-            .iter()
-            .filter_map(|file| fs::metadata(dir.join(file.name)).ok());
-        OnDisk {
-            files: found.clone().count(),
-            of: qwen35::FILES.len(),
-            bytes: found.map(|metadata| metadata.len()).sum(),
-        }
-    }
-
-    /// Downloads the model's files into `dir` unless they are there,
-    /// telling `on_download` how each is coming in.
-    pub fn fetch(dir: &Path, on_download: impl FnMut(Download)) -> Result<()> {
-        fetch::fetch(dir, on_download)
-    }
-
-    /// The size of the model on `device` with the context it gets by
+    /// The size of `model` on `device` with the context it gets by
     /// default, if the model is downloaded and the device opens.
-    pub fn default_size(device: Device) -> Option<Size> {
-        let weights = Self::weights(&Self::dir(Self::NAME).ok()?);
-        if !weights.exists() {
+    pub fn default_size(model: Model, device: Device) -> Option<Size> {
+        let weights = model.weights()?;
+        let path = weights.path(&weights.dir()?);
+        if !path.exists() {
             return None;
         }
-        let gguf = Gguf::open(&weights).ok()?;
+        let gguf = Gguf::open(&path).ok()?;
         size(&gguf, &Opened::open(device).ok()?, None, Self::SESSIONS).ok()
     }
 
-    /// Opens `device` and loads the model in `dir` onto it, with room for
-    /// `sessions` sessions of `context` tokens of conversation each, or
-    /// as many tokens as fit in the memory the device has free, telling
-    /// `on_progress` of each stage.
+    /// Opens `device` and loads `model`, whose files are in `dir`, onto
+    /// it, with room for `sessions` sessions of `context` tokens of
+    /// conversation each, or as many tokens as fit in the memory the
+    /// device has free, telling `on_progress` of each stage.
     pub fn load(
+        model: Model,
         dir: &Path,
         device: Device,
         context: Option<usize>,
         sessions: usize,
         mut on_progress: impl FnMut(Progress),
     ) -> Result<Self> {
-        let gguf = Arc::new(Gguf::open(&Self::weights(dir))?);
+        let weights = model
+            .weights()
+            .ok_or_else(|| format!("{model} does not run on this machine"))?;
+        let gguf = Arc::new(Gguf::open(&weights.path(dir))?);
         let device = Opened::open(device)?;
         let name = device.name();
         on_progress(Progress::Device(name.clone()));

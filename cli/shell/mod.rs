@@ -1369,7 +1369,7 @@ impl App {
         match provider.host() {
             Some(host) => view::hosted_listing(host, self.model, self.context, columns),
             None => view::model_listing(
-                self.model.name(),
+                self.model,
                 self.device,
                 self.device_name.as_deref(),
                 self.size.as_ref(),

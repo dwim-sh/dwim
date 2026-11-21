@@ -11,7 +11,7 @@ use std::{
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::inference::{Loaded, Progress};
+use dwim::inference::{self, Loaded, Progress};
 use dwim::model::{Device, Model, Tally};
 use dwim::providers::{
     Any, Conversation, Kind, cerebras,
@@ -259,8 +259,12 @@ pub fn fetch_model(
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
     memory::check()?;
-    let dir = Loaded::dir(settings.model.name())?;
-    Loaded::fetch(&dir, |progress| {
+    let model = settings.model;
+    let weights = model
+        .weights()
+        .ok_or_else(|| format!("{model} does not run on this machine"))?;
+    let dir = weights.dir().ok_or("cannot determine the home directory")?;
+    inference::fetch(weights, &dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
             done: progress.done,
@@ -280,6 +284,7 @@ pub fn load_model(
 ) -> Result<Loaded, Box<dyn Error>> {
     let dir = fetch_model(settings, &mut on_status)?;
     Loaded::load(
+        settings.model,
         &dir,
         settings.device,
         settings.context,

@@ -323,7 +323,8 @@ impl Server {
                 },
                 request => match sessions.get_mut(&id) {
                     Some(served) => {
-                        let response = serve(served, request, &peer, self.states);
+                        let states = self.states.then_some(inner.hello.model.as_str());
+                        let response = serve(served, request, &peer, states);
                         // A reply that failed part way may leave a batch
                         // being verified: it is committed before another
                         // session has the model. What the model has read
@@ -490,12 +491,13 @@ fn state<M: LanguageModel>(session: &Local<M>) -> State {
 
 /// Serves a session's request on the model, streaming what there is to
 /// `peer` along the way. The state after a system prompt is saved and
-/// taken up from if `states` says so.
+/// taken up from under the model's name, which `states` is, if it is to
+/// be.
 fn serve(
     served: &mut Served,
     request: Request,
     peer: &Peer,
-    states: bool,
+    states: Option<&str>,
 ) -> Result<Response, Box<dyn Error>> {
     let progress = |read: usize, total: usize| {
         let _ = peer.write(&Response::Status(Status::Prompting { read, total }));
@@ -600,7 +602,7 @@ impl Served {
         &mut self,
         system: &str,
         turns: &[Turn],
-        states: bool,
+        states: Option<&str>,
         on_progress: impl FnMut(usize, usize),
     ) -> Result<(), Box<dyn Error>> {
         let goes_on = self
@@ -610,10 +612,11 @@ impl Served {
         if !goes_on {
             self.read = None;
             self.session.clear()?;
-            if states {
-                self.session.start(system, on_progress)?;
-            } else {
-                self.session.system(system, on_progress)?;
+            match states {
+                Some(model) => {
+                    self.session.start(model, system, on_progress)?;
+                }
+                None => self.session.system(system, on_progress)?,
             }
             self.read = Some(Chat {
                 system: system.to_string(),

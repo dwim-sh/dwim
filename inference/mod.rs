@@ -12,9 +12,9 @@ mod states;
 #[cfg(test)]
 pub mod testing;
 
-pub use fetch::Download;
+pub use fetch::{Download, fetch};
 pub use gguf::Gguf;
-pub use loaded::{Loaded, OnDisk, Progress};
+pub use loaded::{Loaded, Progress};
 pub use local::{DRAFTS, Local};
 pub use sampler::Sampler;
 

@@ -4,8 +4,7 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::inference::{Loaded, OnDisk};
-use dwim::model::{Device, Model, Size};
+use dwim::model::{Device, Model, OnDisk, Size};
 use dwim::providers::{Kind, hosted::Host};
 use dwim::sys;
 use dwim::tools::plan::{Plan, Step};
@@ -38,16 +37,17 @@ pub fn help(columns: usize) -> Vec<Line> {
 /// how much conversation it has room for and the memory that takes, as a
 /// table of labels and values.
 pub fn model_listing(
-    name: &str,
+    model: Model,
     device: Device,
     device_name: Option<&str>,
     size: Option<&Size>,
     columns: usize,
 ) -> Vec<Line> {
-    let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match Loaded::dir(name) {
-        Ok(dir) => {
-            let OnDisk { files, of, bytes } = Loaded::on_disk(&dir);
+    let header = vec![span("● "), span(model.name().to_string()).bold()];
+    let weights = model.weights();
+    let on_disk = match weights.map(|weights| (weights, weights.dir())) {
+        Some((weights, Some(dir))) => {
+            let OnDisk { files, of, bytes } = weights.on_disk(&dir);
             match files {
                 0 => "not fetched".to_string(),
                 n if n == of => {
@@ -56,7 +56,8 @@ pub fn model_listing(
                 n => format!("{n}/{of} files, {} in {}", model::bytes(bytes), tilde(&dir)),
             }
         }
-        Err(e) => e.to_string(),
+        Some((_, None)) => "cannot determine the home directory".to_string(),
+        None => "none for this machine".to_string(),
     };
     let mut on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
@@ -66,14 +67,15 @@ pub fn model_listing(
     if let Some(size) = size {
         on.push_str(&format!(" · {}", model::bytes(size.model)));
     }
-    let mut rows = vec![
-        (
+    let mut rows = Vec::new();
+    if let Some(weights) = weights {
+        rows.push((
             "source",
-            format!("{} at {}", Loaded::REPO, &Loaded::REVISION[..7]),
-        ),
-        ("weights", weights),
-        ("device", on),
-    ];
+            format!("{} at {}", weights.repo, &weights.revision[..7]),
+        ));
+    }
+    rows.push(("weights", on_disk));
+    rows.push(("device", on));
     if let Some(size) = size {
         rows.push((
             "context",
