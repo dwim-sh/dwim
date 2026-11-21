@@ -67,10 +67,11 @@ pub fn key() -> Option<String> {
 /// Adds to a request what Cerebras is asked in its own way. It says what
 /// the reply used without being asked, and lists no way to sample from
 /// the likeliest tokens only, so that is left to it.
-/// The model is asked to reason at `effort`, except at `xhigh`: Cerebras
-/// refuses to be asked for it, and reasons at it unless asked otherwise.
-fn ask(body: &mut Value, _sampling: &Sampling, effort: Effort) {
-    if effort != Effort::Xhigh {
-        body["reasoning_effort"] = json!(effort.name());
+/// The model is asked to reason at `effort`, or not to when there is
+/// none, except at `xhigh`: Cerebras refuses to be asked for it, and
+/// reasons at it unless asked otherwise.
+fn ask(body: &mut Value, _sampling: &Sampling, effort: Option<Effort>) {
+    if effort != Some(Effort::Xhigh) {
+        body["reasoning_effort"] = json!(effort.map_or("none", Effort::name));
     }
 }

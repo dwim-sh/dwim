@@ -63,8 +63,9 @@ pub fn key() -> Option<String> {
 /// Adds to a request what the gateway is asked in its own way: to say
 /// what the reply used, as the last event of the stream. The gateway
 /// lists no way to sample from the likeliest tokens only, so that is left
-/// to the provider. The model is asked to reason at `effort`.
-fn ask(body: &mut Value, _sampling: &Sampling, effort: Effort) {
+/// to the provider. The model is asked to reason at `effort`, or not to
+/// when there is none.
+fn ask(body: &mut Value, _sampling: &Sampling, effort: Option<Effort>) {
     body["stream_options"] = json!({ "include_usage": true });
-    body["reasoning"] = json!({ "effort": effort.name() });
+    body["reasoning"] = json!({ "effort": effort.map_or("none", Effort::name) });
 }
