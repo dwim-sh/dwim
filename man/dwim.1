@@ -125,18 +125,22 @@ until one ends.
 .BI \-\-reasoning\-effort " effort"
 How much the model reasons before it replies:
 .BR xhigh ,
-.B medium
-(default), or
-.BR low .
+.BR medium ,
+or
+.B low
+(default).
 The model's chat template asks for it with a line at the start of the
 system prompt, for
 .B xhigh
 and
 .B low
 only.
-The model's makers advise
+A host is asked for it with the request, and writes the line itself.
+.B low
+asks for the briefest thoughts, which the thinking budget cuts short
+the least; PrismML, for its ternary build of the model, advise
 .B medium
-for the model's long reasoning, and find that
+instead, and find that
 .B low
 thinks about as long as
 .BR xhigh .

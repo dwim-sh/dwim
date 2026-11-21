@@ -48,7 +48,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{Chunk, Session, Turn};
+use crate::model::{Chunk, Effort, Session, Turn};
 use crate::tools::{ToolCall, Tools, bash, plan::Plan, read};
 
 pub use crate::harness::log::Log;
@@ -224,61 +224,14 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// How much the model reasons before it replies, as its chat template
-/// asks for it: the template opens the system prompt with a line for an
-/// effort of `xhigh`, its default, or `low`, and with none for `medium`.
-/// Medium unless set: PrismML's known issues for Bonsai, its ternary
-/// build of the model, which these figures are from and are carried over
-/// unmeasured (huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf,
-/// KNOWN_ISSUES.md), advise it for the model's long reasoning, as "about as accurate" as
-/// `xhigh` when the output is limited and thinking "noticeably less", and
-/// find that `low` "used about as many tokens as the default `xhigh`".
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Effort {
-    Xhigh,
-    #[default]
-    Medium,
-    Low,
-}
-
-impl Effort {
-    /// The line the template opens the system prompt with, if any.
-    pub fn instruction(self) -> Option<&'static str> {
-        match self {
-            Effort::Xhigh => Some(
-                "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
-            ),
-            Effort::Medium => None,
-            Effort::Low => Some(
-                "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
-            ),
-        }
-    }
-}
-
-impl std::str::FromStr for Effort {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "xhigh" => Ok(Effort::Xhigh),
-            "medium" => Ok(Effort::Medium),
-            "low" => Ok(Effort::Low),
-            _ => Err(format!(
-                "unknown reasoning effort '{s}' (expected xhigh, medium or low)"
-            )),
-        }
-    }
-}
-
-/// The system prompt for an agent working in `dir`, reasoning at
-/// `effort`: the template's line for the effort, if it has one, the tools,
-/// then how to behave, and the project's own instructions from its
-/// `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
+/// The system prompt for an agent working in `dir`: the template's line
+/// for `effort`, if the prompt is to carry one and the effort has one,
+/// the tools, then how to behave, and the project's own instructions
+/// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
 /// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, effort: Effort) -> String {
+pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
     let mut prompt = String::new();
-    if let Some(line) = effort.instruction() {
+    if let Some(line) = effort.and_then(Effort::instruction) {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
@@ -2165,12 +2118,13 @@ mod tests {
     #[test]
     fn opens_the_prompt_with_the_line_for_the_effort() {
         // As the model's template does: a line for xhigh and for low, ahead of
-        // the tools, and none for medium, the default.
+        // the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert_eq!(Effort::default(), Effort::Medium);
-        assert!(system_prompt(dir, Effort::Medium).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Some(Effort::Medium)).starts_with("# Tools\n"));
+        // A host writes the line itself, so its prompt is given none.
+        assert!(system_prompt(dir, None).starts_with("# Tools\n"));
         for (effort, word) in [(Effort::Xhigh, "xhigh"), (Effort::Low, "low")] {
-            let prompt = system_prompt(dir, effort);
+            let prompt = system_prompt(dir, Some(effort));
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2183,7 +2137,7 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Effort::Medium);
+        let prompt = system_prompt(dir, Some(Effort::Medium));
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")

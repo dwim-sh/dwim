@@ -7,7 +7,7 @@ pub mod login;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Model, Result, Sampling},
+    model::{Effort, Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -29,14 +29,19 @@ pub const HOST: Host = Host {
     refused: "/login signs in again",
 };
 
-/// `model` at OpenRouter, with the key in the environment or
-/// kept from a sign-in, with room for `context` tokens of conversation,
-/// or as many as a model at a host has unless told, sampled at
-/// `temperature`, or as the model's makers recommend.
-pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+/// `model` at OpenRouter, with the key in the environment or kept from a
+/// sign-in, reasoning at `effort`, with room for `context` tokens of
+/// conversation, or as many as a model at a host has unless told, sampled
+/// at `temperature`, or as the model's makers recommend.
+pub fn open(
+    model: Model,
+    effort: Effort,
+    context: Option<usize>,
+    temperature: Option<f32>,
+) -> Result<Hosted> {
     let key = key()
         .ok_or_else(|| format!("there is no key to OpenRouter: /login signs in, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, model, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
 /// `model` as OpenRouter names it.
@@ -55,11 +60,9 @@ pub fn key() -> Option<String> {
 
 /// Adds to a request what OpenRouter is asked in its own way: to say what
 /// the reply used and cost, to sample from the likeliest tokens only, and
-/// to limit the thought to a number of tokens.
-fn ask(body: &mut Value, sampling: &Sampling, thought: Option<usize>, _ended: bool) {
+/// to reason at `effort`.
+fn ask(body: &mut Value, sampling: &Sampling, effort: Effort) {
     body["usage"] = json!({ "include": true });
     body["top_k"] = json!(sampling.top_k);
-    if let Some(thought) = thought {
-        body["reasoning"] = json!({ "max_tokens": thought });
-    }
+    body["reasoning"] = json!({ "effort": effort.name() });
 }

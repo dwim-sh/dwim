@@ -2,6 +2,7 @@
 //! it and by whatever reaches one that does.
 
 mod chat;
+mod effort;
 pub mod format;
 pub mod gguf;
 pub mod hub;
@@ -15,6 +16,7 @@ mod weights;
 use std::{fmt, str::FromStr, sync::Arc};
 
 pub use chat::{Chat, Generation, State};
+pub use effort::Effort;
 pub use format::{Format, Turn};
 pub use sampling::Sampling;
 pub use session::{Answer, Chunk, Reply, Session, Stats, Tally};
