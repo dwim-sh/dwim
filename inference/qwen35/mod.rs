@@ -1,5 +1,5 @@
-//! Qwen3.8-27B, the `qwen35` architecture of llama.cpp's files: a hybrid
-//! transformer in which every fourth layer is full attention and the rest
+//! The `qwen35` architecture of llama.cpp's files, which Qwen3.8-27B is
+//! of: a hybrid transformer in which every fourth layer is full attention and the rest
 //! are Gated DeltaNet linear attention, written as a sequence of operations
 //! on a [`Device`]. It runs the model from a file quantized as llama.cpp
 //! does, each matrix in whichever format the file has it.
@@ -15,8 +15,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
-    inference::{Gguf, LanguageModel, Result, gguf, quants},
+    inference::{Gguf, LanguageModel, Memory, Result, gguf, quants},
 };
+
+/// What a file of the architecture calls it.
+pub const ARCHITECTURE: &str = "qwen35";
 
 /// Most tokens the model drafts at once: a batch to be verified holds them
 /// and the token before.
@@ -53,7 +56,7 @@ pub struct Config {
 impl Config {
     pub fn load(gguf: &Gguf) -> Result<Self> {
         let arch = gguf.str("general.architecture")?;
-        if arch != "qwen35" {
+        if arch != ARCHITECTURE {
             return Err(format!("the '{arch}' architecture is not supported").into());
         }
         let key = |name: &str| gguf.u32(&format!("{arch}.{name}"));
@@ -190,24 +193,15 @@ impl Config {
     }
 }
 
-/// Device memory the model takes, in bytes: `fixed` for its weights and
-/// the activations, which the sequences share, and for each sequence,
-/// `per_sequence` for its recurrent states and `per_token` more for each
-/// token of its context, for the key/value caches. The rotary position
-/// embedding table, which the sequences share, is counted with each, at a
-/// few hundred bytes a token.
-#[derive(Clone, Copy, Debug)]
-pub struct Memory {
-    pub fixed: u64,
-    pub per_sequence: u64,
-    pub per_token: u64,
-}
-
-impl Memory {
-    /// The memory the model in `gguf`, configured as `c`, takes on a
-    /// device. Fails if the file does not say how big one of its tensors
-    /// is.
-    pub fn of(c: &Config, gguf: &Gguf, batch: usize) -> Result<Self> {
+impl Config {
+    /// The device memory the model in `gguf`, configured as this, takes:
+    /// `per_sequence` is for a sequence's recurrent states, and
+    /// `per_token` for the key/value caches. The rotary position embedding
+    /// table, which the sequences share, is counted with each, at a few
+    /// hundred bytes a token. Fails if the file does not say how big one
+    /// of its tensors is.
+    pub fn memory(&self, gguf: &Gguf, batch: usize) -> Result<Memory> {
+        let c = self;
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host, in the format the device holds it
         // in: a matrix of Q4_1 or Q6_K is quantized again as Q8_0 on
@@ -249,7 +243,7 @@ impl Memory {
                 + MAX_DRAFTS * c.vocab;
         }
         let kv_dim = c.kv_heads * c.head_dim;
-        Ok(Self {
+        Ok(Memory {
             fixed: (weights + 4 * activations) as u64,
             per_sequence: 4 * sequence as u64,
             per_token: (2 * caches * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
