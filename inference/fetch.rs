@@ -54,12 +54,12 @@ pub fn fetch(weights: &Weights, dir: &Path, mut progress: impl FnMut(Download)) 
             fs::create_dir_all(&blobs)?;
             download(weights, file, &blob, &mut progress)?;
         }
-        fs::create_dir_all(dir)?;
+        fs::create_dir_all(path.parent().unwrap_or(dir))?;
         // A link left pointing at a blob that was removed is replaced.
         if fs::symlink_metadata(&path).is_ok() {
             fs::remove_file(&path)?;
         }
-        sys::fs::symlink(&hub::blob_link(file.digest), &path)?;
+        sys::fs::symlink(&hub::blob_link(file.name, file.digest), &path)?;
     }
     Ok(())
 }

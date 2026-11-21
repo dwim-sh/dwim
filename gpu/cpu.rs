@@ -31,6 +31,10 @@ impl Device for Cpu {
         crate::sys::memory::available()
     }
 
+    fn takes_nvfp4(&self) -> bool {
+        true
+    }
+
     fn upload(&self, tensor: Tensor) -> Tensor {
         tensor
     }
@@ -139,6 +143,13 @@ impl Device for Cpu {
                 .zip(quants.par_chunks_exact(cols))
                 .for_each(|((results, scales), quants)| {
                     row_dot(results, &|x| quant::dot_q8_0(scales, quants, x))
+                }),
+            Tensor::Nvfp4 { scales, quants, .. } => by_row
+                .par_chunks_exact_mut(n)
+                .zip(scales.par_chunks_exact(cols / quant::NVFP4_BLOCK))
+                .zip(quants.par_chunks_exact(cols / 2))
+                .for_each(|((results, scales), quants)| {
+                    row_dot(results, &|x| quant::dot_nvfp4(scales, quants, x))
                 }),
         }
         for (r, results) in by_row.chunks_exact(n).enumerate() {
@@ -358,6 +369,305 @@ impl Device for Cpu {
             for t in 0..n {
                 out[(t * n_v_heads + h) * head_dim..][..head_dim]
                     .copy_from_slice(&o[t * head_dim..][..head_dim]);
+            }
+        }
+    }
+
+    fn mix(&self, out: &mut Vec<f32>, states: &[&Vec<f32>], query: &Vec<f32>, eps: f32) {
+        let dim = query.len();
+        let scale = 1.0 / (dim as f32).sqrt();
+        let mut normed = vec![0.0; states.len() * dim];
+        let mut scores = vec![0.0; states.len()];
+        for (t, out) in out.chunks_exact_mut(dim).enumerate() {
+            for ((state, normed), score) in states
+                .iter()
+                .zip(normed.chunks_exact_mut(dim))
+                .zip(&mut scores)
+            {
+                let row = &state[t * dim..][..dim];
+                let mean_square = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+                let norm = 1.0 / (mean_square + eps).sqrt();
+                let mut dot = 0.0;
+                for ((n, &v), &q) in normed.iter_mut().zip(row).zip(query) {
+                    *n = v * norm;
+                    dot += *n * q;
+                }
+                *score = dot * scale;
+            }
+            softmax(&mut scores);
+            out.fill(0.0);
+            for (normed, &score) in normed.chunks_exact(dim).zip(&scores) {
+                for (o, &n) in out.iter_mut().zip(normed) {
+                    *o += score * n;
+                }
+            }
+        }
+    }
+
+    fn gated_update(
+        &self,
+        x: &mut Vec<f32>,
+        forget: &Vec<f32>,
+        gain: &Vec<f32>,
+        message: &Vec<f32>,
+    ) {
+        for (((x, &f), &g), &m) in x.iter_mut().zip(forget).zip(gain).zip(message) {
+            *x = *x - f.tanh() * *x + g.tanh() * m;
+        }
+    }
+
+    fn short_conv(
+        &self,
+        out: &mut Vec<f32>,
+        x: &Vec<f32>,
+        state: &mut Vec<f32>,
+        weight: &Vec<f32>,
+        dynamic: Option<(&Vec<f32>, usize)>,
+    ) {
+        let channels = weight.len() - state.len();
+        let taps = weight.len() / channels;
+        let n = x.len() / channels;
+        assert!(x.len() == n * channels && out.len() == x.len());
+        assert_eq!(state.len(), (taps - 1) * channels);
+        // The channel's input `back` tokens before token `t`.
+        let input = |t: usize, back: usize, c: usize| {
+            if back > t {
+                state[(taps - 1 + t - back) * channels + c]
+            } else {
+                x[(t - back) * channels + c]
+            }
+        };
+        let scale = 1.0 / ((if dynamic.is_some() { 2 } else { 1 } * taps + 1) as f32).sqrt();
+        for t in 0..n {
+            for c in 0..channels {
+                let mut acc = x[t * channels + c];
+                for j in 0..taps {
+                    acc += weight[c * taps + j] * input(t, taps - 1 - j, c);
+                }
+                if let Some((dynamic, heads)) = dynamic {
+                    let head = c / (channels / heads);
+                    for lag in 0..taps {
+                        acc += dynamic[(t * heads + head) * taps + lag] * input(t, lag, c);
+                    }
+                }
+                out[t * channels + c] = acc * scale;
+            }
+        }
+        let mut next = vec![0.0; state.len()];
+        for s in 0..taps - 1 {
+            for c in 0..channels {
+                // The state's row `s` is the token `taps - 1 - s` back
+                // from the one after the batch.
+                next[s * channels + c] = if n + s >= taps - 1 {
+                    x[(n + s + 1 - taps) * channels + c]
+                } else {
+                    state[(n + s) * channels + c]
+                };
+            }
+        }
+        *state = next;
+    }
+
+    fn clip(&self, x: &mut Vec<f32>, scale: &Vec<f32>, dim: usize, threshold: f32) {
+        for row in x.chunks_exact_mut(scale.len()) {
+            for (head, scale) in row.chunks_exact_mut(dim).zip(scale.chunks_exact(dim)) {
+                let mut square = 0.0;
+                for (v, &s) in head.iter_mut().zip(scale) {
+                    *v *= s;
+                    square += *v * *v;
+                }
+                let factor = (threshold / (square.sqrt() + 1e-6)).min(1.0);
+                for v in head {
+                    *v *= factor;
+                }
+            }
+        }
+    }
+
+    fn scale_rows(&self, x: &mut Vec<f32>, factors: &Vec<f32>) {
+        let width = x.len() / factors.len();
+        for (row, &factor) in x.chunks_exact_mut(width).zip(factors) {
+            for v in row {
+                *v *= factor;
+            }
+        }
+    }
+
+    fn attention_rel(
+        &self,
+        out: &mut Vec<f32>,
+        q: &Vec<f32>,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        rel: &Vec<f32>,
+        bias: &Vec<f32>,
+        sinks: &Vec<f32>,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+    ) {
+        let group = n_heads / n_kv_heads;
+        let kv_dim = n_kv_heads * head_dim;
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK));
+        let n = q.len() / (n_heads * head_dim);
+        let n_rel = rel.len() / (n * n_heads);
+        let extent = bias.len() / n_rel;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        out.par_chunks_exact_mut(head_dim)
+            .zip(q.par_chunks_exact(head_dim))
+            .enumerate()
+            .for_each(|(i, (out, q))| {
+                let (token, head) = (i / n_heads, i % n_heads);
+                let rel = &rel[i * n_rel..][..n_rel];
+                // The token attends up to and including its own position,
+                // from as far back as the window reaches.
+                let at = pos + token;
+                let first = (at + 1).saturating_sub(window);
+                let kv = head / group * head_dim;
+                let mut scores: Vec<f32> = (first..=at)
+                    .map(|t| {
+                        let distance = at - t;
+                        let bias = if distance < extent {
+                            let row = &bias[distance * n_rel..][..n_rel];
+                            rel.iter().zip(row).map(|(r, b)| r * b).sum()
+                        } else {
+                            0.0
+                        };
+                        scale * dot_q8(q, k_cache, t % rows * kv_dim + kv) + bias
+                    })
+                    .collect();
+                // The sink is one more to the softmax, with no value.
+                scores.push(sinks[i]);
+                softmax(&mut scores);
+                out.fill(0.0);
+                for (t, &score) in (first..=at).zip(&scores) {
+                    add_scaled_q8(out, score, v_cache, t % rows * kv_dim + kv);
+                }
+            });
+    }
+
+    fn route(
+        &self,
+        ids: &mut Vec<f32>,
+        weights: &mut Vec<f32>,
+        logits: &Vec<f32>,
+        bias: &Vec<f32>,
+        k: usize,
+        scale: f32,
+    ) {
+        let experts = bias.len();
+        for ((logits, ids), weights) in logits
+            .chunks_exact(experts)
+            .zip(ids.chunks_exact_mut(k))
+            .zip(weights.chunks_exact_mut(k))
+        {
+            let probs: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
+            // The highest scores first, the lower number first of two the
+            // same.
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&a, &b| {
+                (probs[b] + bias[b])
+                    .total_cmp(&(probs[a] + bias[a]))
+                    .then(a.cmp(&b))
+            });
+            let sum: f32 = order[..k].iter().map(|&e| probs[e]).sum();
+            for ((id, weight), &e) in ids.iter_mut().zip(weights.iter_mut()).zip(&order) {
+                *id = e as f32;
+                *weight = probs[e] / (sum + 1e-20) * scale;
+            }
+        }
+    }
+
+    fn expert_matmul(
+        &self,
+        out: &mut Vec<f32>,
+        w: &Tensor,
+        scale: &Vec<f32>,
+        x: &Vec<f32>,
+        ids: &Vec<f32>,
+        k: usize,
+    ) {
+        let cols = w.shape()[1];
+        let rows = w.shape()[0] / scale.len();
+        let n = ids.len() / k;
+        assert_eq!(out.len(), ids.len() * rows);
+        // A row of the input per token, or one per expert of a token.
+        let shared = x.len() == n * cols;
+        assert!(shared || x.len() == ids.len() * cols);
+        out.par_chunks_exact_mut(rows)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let expert = ids[i] as usize;
+                let x = &x[if shared { i / k } else { i } * cols..][..cols];
+                for (r, out) in out.iter_mut().enumerate() {
+                    let row = expert * rows + r;
+                    *out = scale[expert]
+                        * match w {
+                            Tensor::Bf16 { data, .. } => dot(&data[row * cols..][..cols], x),
+                            Tensor::Q4_0 { scales, quants, .. } => {
+                                let blocks = quant::blocks(cols);
+                                quant::dot_q4_0(
+                                    &scales[row * blocks..][..blocks],
+                                    &quants[row * cols / 2..][..cols / 2],
+                                    x,
+                                )
+                            }
+                            Tensor::Q8_0 { scales, quants, .. } => {
+                                let blocks = quant::blocks(cols);
+                                quant::dot_q8_0(
+                                    &scales[row * blocks..][..blocks],
+                                    &quants[row * cols..][..cols],
+                                    x,
+                                )
+                            }
+                            Tensor::Nvfp4 { scales, quants, .. } => {
+                                let blocks = cols / quant::NVFP4_BLOCK;
+                                quant::dot_nvfp4(
+                                    &scales[row * blocks..][..blocks],
+                                    &quants[row * cols / 2..][..cols / 2],
+                                    x,
+                                )
+                            }
+                        };
+                }
+            });
+    }
+
+    fn situ(
+        &self,
+        out: &mut Vec<f32>,
+        gate_up: &Vec<f32>,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+    ) {
+        for (out, gate_up) in out
+            .chunks_exact_mut(width)
+            .zip(gate_up.chunks_exact(2 * width))
+        {
+            let (gate, up) = gate_up.split_at(width);
+            for ((o, &g), &u) in out.iter_mut().zip(gate).zip(up) {
+                *o = beta * (g / beta).tanh() * sigmoid(g) * linear_beta * (u / linear_beta).tanh();
+            }
+        }
+    }
+
+    fn weighted_sum(&self, out: &mut Vec<f32>, y: &Vec<f32>, weights: &Vec<f32>) {
+        let width = y.len() / weights.len();
+        let k = weights.len() / (out.len() / width);
+        for ((out, y), weights) in out
+            .chunks_exact_mut(width)
+            .zip(y.chunks_exact(k * width))
+            .zip(weights.chunks_exact(k))
+        {
+            out.fill(0.0);
+            for (y, &weight) in y.chunks_exact(width).zip(weights) {
+                for (o, &y) in out.iter_mut().zip(y) {
+                    *o += weight * y;
+                }
             }
         }
     }

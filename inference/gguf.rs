@@ -31,6 +31,7 @@ pub const Q4_1: u32 = 3;
 pub const Q8_0: u32 = 8;
 pub const Q6_K: u32 = 14;
 pub const BF16: u32 = 30;
+pub const NVFP4: u32 = 40;
 
 /// Bytes of a row of `cols` weights of a tensor type.
 pub fn row_bytes(dtype: u32, cols: usize) -> Result<usize> {
@@ -48,6 +49,7 @@ pub fn row_bytes(dtype: u32, cols: usize) -> Result<usize> {
         Q4_1 => blocks(quant::BLOCK, quants::Q4_1_BYTES),
         Q8_0 => blocks(quant::BLOCK, quants::Q8_0_BYTES),
         Q6_K => blocks(quants::Q6_K_BLOCK, quants::Q6_K_BYTES),
+        NVFP4 => blocks(quants::NVFP4_FILE_BLOCK, quants::NVFP4_BYTES),
         other => Err(format!("tensor type {other} is not supported").into()),
     }
 }
@@ -72,6 +74,7 @@ pub fn dequantize_row(dtype: u32, row: &[u8], out: &mut [f32]) -> Result<()> {
         Q4_1 => quants::dequantize_q4_1(row, out),
         Q8_0 => quants::dequantize_q8_0(row, out),
         Q6_K => quants::dequantize_q6_k(row, out),
+        NVFP4 => quants::dequantize_nvfp4(row, out),
         _ => unreachable!("sized above"),
     }
     Ok(())
@@ -233,6 +236,29 @@ impl Gguf {
                 );
             }
         })
+    }
+
+    /// Copies out the matrices of a layer's experts, which the file has
+    /// one after another in a tensor of three dimensions, as one matrix
+    /// of all their rows, the first expert's first: in NVFP4 or `Q8_0`,
+    /// as the file has them. Returns how many experts there are with it.
+    pub fn experts(&self, name: &str) -> Result<(Tensor, usize)> {
+        let info = self.info(name)?;
+        let &[cols, rows, experts] = info.dims.as_slice() else {
+            return Err(format!("tensor '{name}' is not a matrix per expert").into());
+        };
+        let bytes = self.bytes(name)?;
+        let tensor = match info.dtype {
+            NVFP4 => quants::nvfp4(bytes, experts * rows, cols),
+            Q8_0 => quants::q8_0(bytes, experts * rows, cols),
+            other => {
+                return Err(format!(
+                    "tensor '{name}' is of type {other}, which no device takes for experts"
+                )
+                .into());
+            }
+        };
+        Ok((tensor, experts))
     }
 
     /// Reconstructs row `index` of a matrix into `out`, as wide as a row.

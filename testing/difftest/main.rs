@@ -103,6 +103,14 @@ const CONTINUATION: usize = 32;
 /// CPU's. On an RX 5700 XT under RADV, the GPU is at most 1.1e-5 off.
 const MAX_KL: f64 = 1e-3;
 
+/// The same for Inkling, whose router picks each token's experts: a sum
+/// that comes out the other way in its last bit rounds a key in the
+/// caches differently, and enough of those tip which expert is the
+/// eighth, after which the two runs are of slightly different networks.
+/// On an M5, the GPU is at most 1.9e-2 off, with the same top token at
+/// 171 of 172 checks; a kernel that is wrong is off by far more.
+const MAX_KL_ROUTED: f64 = 5e-2;
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 fn main() -> ExitCode {
@@ -116,9 +124,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// What the command line asks for: the prompts named, or all, and how many
-/// times the GPU runs them.
+/// What the command line asks for: the model, the default unless one is
+/// named, the prompts named, or all, and how many times the GPU runs them.
 struct Args {
+    model: Model,
     prompts: Vec<(&'static str, &'static str)>,
     repeat: usize,
 }
@@ -127,9 +136,12 @@ impl Args {
     fn parse() -> Result<Self> {
         let mut prompts = Vec::new();
         let mut repeat = 1;
+        let mut model = Model::default();
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
-            if arg == "--repeat" {
+            if arg == "--model" {
+                model = args.next().ok_or("--model takes a model")?.parse()?;
+            } else if arg == "--repeat" {
                 repeat = args
                     .next()
                     .and_then(|n| n.parse().ok())
@@ -145,7 +157,11 @@ impl Args {
         if prompts.is_empty() {
             prompts = PROMPTS.to_vec();
         }
-        Ok(Self { prompts, repeat })
+        Ok(Self {
+            model,
+            prompts,
+            repeat,
+        })
     }
 }
 
@@ -154,7 +170,7 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let named = Model::default();
+    let named = args.model;
     let weights = named
         .weights()
         .ok_or("the model does not run on this machine")?;
@@ -200,6 +216,10 @@ fn run() -> Result<bool> {
     }
     drop(cpu);
 
+    let max_kl = match named {
+        Model::InklingMini => MAX_KL_ROUTED,
+        Model::Qwen27b | Model::QwenMax => MAX_KL,
+    };
     let mut gpu = arch::load(gguf, Gpu::new()?, 4096, |_, _| {})?;
     let mut agreed = true;
     for round in 0..args.repeat {
@@ -214,7 +234,7 @@ fn run() -> Result<bool> {
                     }
                     tops += usize::from(argmax(got) == argmax(want));
                 }
-                let ok = worst.0 < MAX_KL;
+                let ok = worst.0 < max_kl;
                 let (kl, end, piece) = worst;
                 println!(
                     "{} {name}{}{}: KL at most {kl:.2e} (after token {end}, run {}); the same \

@@ -69,6 +69,33 @@ pub fn signatures() -> String {
         .join("\n")
 }
 
+/// What opens and closes the harness's declaration of the tools in a
+/// system prompt, and the signatures in it, a line each.
+const DECLARATION: (&str, &str) = ("# Tools\n", "</IMPORTANT>");
+const SIGNATURES: (&str, &str) = ("<tools>\n", "\n</tools>");
+
+/// A system prompt without its declaration of the tools, and the tools it
+/// declared, as a request declares them. A prompt that declares none, or
+/// not as expected, is left as it is, and the model calls the tools as the
+/// prompt tells it to.
+pub fn declared(system: &str) -> (String, Vec<Value>) {
+    let parts = || {
+        let start = system.find(DECLARATION.0)?;
+        let end = start + system[start..].find(DECLARATION.1)? + DECLARATION.1.len();
+        let declaration = &system[start..end];
+        let from = declaration.find(SIGNATURES.0)? + SIGNATURES.0.len();
+        let to = from + declaration[from..].find(SIGNATURES.1)?;
+        let tools: Vec<Value> = declaration[from..to]
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        let rest = format!("{}{}", &system[..start], system[end..].trim_start());
+        Some((rest, tools))
+    };
+    parts().unwrap_or_else(|| (system.to_string(), Vec::new()))
+}
+
 /// A tool's signature: what it does, and its parameters.
 struct Signature {
     description: String,

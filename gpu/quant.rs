@@ -10,6 +10,14 @@
 //! and element `j + 16` in its high nibble, each as a value from 0 to 15
 //! that stands for 8 less; a `Q8_0` block's 32 bytes hold its elements in
 //! order as signed integers.
+//!
+//! Weights in NVFP4, the format some models are trained in, are 4-bit
+//! floats in blocks of 16 sharing an 8-bit scale: each weight a sign, two
+//! bits of exponent and one of mantissa, which come to 0, 0.5, 1, 1.5, 2,
+//! 3, 4 or 6 either way, and the scale an unsigned float of four bits of
+//! exponent and three of mantissa. A block's 8 bytes hold element `j` in
+//! the low nibble of byte `j` and element `j + 8` in its high nibble, and
+//! the devices keep the quants and the scales apart here too.
 
 use crate::gpu::{
     CACHE_BLOCK,
@@ -151,6 +159,68 @@ pub fn dot_q4_0(scales: &[u16], quants: &[u8], x: &[f32]) -> f32 {
     acc
 }
 
+/// Weights per NVFP4 block.
+pub const NVFP4_BLOCK: usize = 16;
+
+/// What the sixteen values of an NVFP4 weight stand for, doubled: the
+/// scale is halved to match, so that the values are whole numbers.
+pub const NVFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// The scale of an NVFP4 block from its bits, halved, as
+/// [`NVFP4_VALUES`] are doubled: an unsigned float of four bits of
+/// exponent, biased by 7, over three of mantissa. Zero and the bits of a
+/// NaN scale a block to nothing, as llama.cpp reads them.
+pub fn nvfp4_scale(bits: u8) -> f32 {
+    if bits == 0 || bits == 0x7f {
+        return 0.0;
+    }
+    let (exp, mantissa) = ((bits >> 3) & 0xf, (bits & 7) as f32);
+    let raw = if exp == 0 {
+        mantissa * 2.0f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2.0f32.powi(exp as i32 - 7)
+    };
+    raw * 0.5
+}
+
+/// Reconstructs a row of NVFP4 weights.
+pub fn dequantize_nvfp4_row(scales: &[u8], quants: &[u8], out: &mut [f32]) {
+    assert_eq!(scales.len() * NVFP4_BLOCK, out.len());
+    assert_eq!(quants.len(), out.len() / 2);
+    for ((&scale, quants), out) in scales
+        .iter()
+        .zip(quants.chunks_exact(NVFP4_BLOCK / 2))
+        .zip(out.chunks_exact_mut(NVFP4_BLOCK))
+    {
+        let d = nvfp4_scale(scale);
+        for (j, &q) in quants.iter().enumerate() {
+            out[j] = NVFP4_VALUES[(q & 0xf) as usize] as f32 * d;
+            out[j + NVFP4_BLOCK / 2] = NVFP4_VALUES[(q >> 4) as usize] as f32 * d;
+        }
+    }
+}
+
+/// Dot product of a row of NVFP4 weights with activations.
+pub fn dot_nvfp4(scales: &[u8], quants: &[u8], x: &[f32]) -> f32 {
+    assert_eq!(scales.len() * NVFP4_BLOCK, x.len());
+    assert_eq!(quants.len(), x.len() / 2);
+    let mut acc = 0.0;
+    for ((&scale, q), x) in scales
+        .iter()
+        .zip(quants.chunks_exact(NVFP4_BLOCK / 2))
+        .zip(x.chunks_exact(NVFP4_BLOCK))
+    {
+        let (lo, hi) = x.split_at(NVFP4_BLOCK / 2);
+        let mut sum = [0.0f32; 8];
+        for i in 0..8 {
+            sum[i] = NVFP4_VALUES[(q[i] & 0xf) as usize] as f32 * lo[i]
+                + NVFP4_VALUES[(q[i] >> 4) as usize] as f32 * hi[i];
+        }
+        acc += nvfp4_scale(scale) * sum.iter().sum::<f32>();
+    }
+    acc
+}
+
 /// Quantizes a block of [`CACHE_BLOCK`] activations as caches hold them: the
 /// scale is the largest magnitude over 127 rounded to f16, and each
 /// activation the nearest multiple of it, ties away from zero. Returns the
@@ -227,6 +297,26 @@ mod tests {
         let mut back = vec![0.0; BLOCK];
         dequantize_q4_0_row(&scales, &quants, &mut back);
         assert_eq!(back, x);
+    }
+
+    #[test]
+    fn nvfp4_reads_values_and_scales_as_llama_cpp_does() {
+        // A scale of exponent 8 and mantissa 0 is 2, halved; one of
+        // exponent 0 is a multiple of 2^-9; NaN bits scale to nothing.
+        assert_eq!(nvfp4_scale(8 << 3), 1.0);
+        assert_eq!(nvfp4_scale((7 << 3) | 4), 0.75);
+        assert_eq!(nvfp4_scale(3), 3.0 / 1024.0);
+        assert_eq!(nvfp4_scale(0x7f), 0.0);
+        // Byte j holds element j low and element j + 8 high: 0x1f is the
+        // value 15, which is -6, under the value 1, which is 0.5.
+        let mut quants = [0u8; 8];
+        quants[0] = 0x1f;
+        quants[7] = 0x70;
+        let mut out = [0.0; 16];
+        dequantize_nvfp4_row(&[8 << 3], &quants, &mut out);
+        assert_eq!((out[0], out[8], out[15]), (-12.0, 1.0, 12.0));
+        let x: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        assert_eq!(dot_nvfp4(&[8 << 3], &quants, &x), 8.0 + 15.0 * 12.0);
     }
 
     #[test]

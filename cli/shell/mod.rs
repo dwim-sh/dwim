@@ -627,13 +627,14 @@ impl App {
         }
     }
 
-    /// The model the session goes on with at `provider`: the one it is on,
-    /// but for the large one, which does not run on this machine or at
-    /// Cerebras.
+    /// The model the session goes on with at `provider`: the one it is on
+    /// if it runs there, as the large one does not on this machine or at
+    /// Cerebras, nor Inkling at a host, and the medium one otherwise.
     fn model_at(&self, provider: Kind) -> Model {
-        match provider {
-            Kind::Local | Kind::Cerebras => Model::Qwen27b,
-            Kind::OpenRouter | Kind::Vercel => self.model,
+        if session::runs(provider, self.model) {
+            self.model
+        } else {
+            Model::Qwen27b
         }
     }
 

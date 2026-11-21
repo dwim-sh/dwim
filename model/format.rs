@@ -73,8 +73,15 @@ pub trait Format: Send + Sync {
     fn opening(&self, thinking: bool) -> Result<Vec<u32>>;
 
     /// What ends a reply the way the format expects, ready for the next
-    /// message: the thought closed first if it is still open.
-    fn end_of_reply(&self, thinking: bool) -> Result<Vec<u32>>;
+    /// message: what the reply was in the middle of closed first, if it
+    /// is still `open`, as [`Reader::open`] says.
+    fn end_of_reply(&self, open: bool) -> Result<Vec<u32>>;
+
+    /// What ends a plain answer, made from the opening of a reply without
+    /// thinking.
+    fn end_of_answer(&self) -> Result<Vec<u32>> {
+        self.end_of_reply(false)
+    }
 
     /// What writes `closing` into a thought as the model's own and ends
     /// the thought there, for the reply to go on from.
@@ -116,7 +123,7 @@ pub trait Format: Send + Sync {
         Ok(self.user(message)?.len()
             + self.opening(false)?.len()
             + limit
-            + self.end_of_reply(false)?.len())
+            + self.end_of_answer()?.len())
     }
 }
 
@@ -125,6 +132,13 @@ pub trait Format: Send + Sync {
 pub trait Reader {
     /// Whether the reply is in its thought.
     fn thinking(&self) -> bool;
+
+    /// Whether the reply is in the middle of something its end must close
+    /// first: its thought, or in a format of messages, the one being
+    /// written.
+    fn open(&self) -> bool {
+        self.thinking()
+    }
 
     /// Tokens of the thought since it opened.
     fn thought(&self) -> usize;

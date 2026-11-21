@@ -965,6 +965,7 @@ impl Device for Vulkan {
                     format: Format::Q8_0,
                 }
             }
+            Tensor::Nvfp4 { .. } => panic!("{} does not take NVFP4 weights", self.name()),
         }
     }
 

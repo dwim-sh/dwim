@@ -73,16 +73,22 @@ or
 .BR metal .
 .TP
 .BI \-\-model " model"
-Model to run, by size:
+Model to run, by name:
+.B qwen3.8\-27b
+(default), which
 .B medium
-(default), which is
-.BR qwen3.8\-27b ,
-or
-.BR large ,
-which is
+also names;
 .BR qwen3.8\-2.4t\-a95b ,
-of the same family. The large model takes more memory than a machine
+of the same family, which
+.B large
+also names; or
+.BR inkling2\-mini .
+The large model takes more memory than a machine
 has, and runs only at a provider.
+.B inkling2\-mini
+is run only on this
+machine, and only on Metal: its experts' weights are in NVFP4, the format
+they were trained in, which the other GPUs do not take.
 .TP
 .BI \-\-provider " provider"
 Where the model runs:
@@ -255,10 +261,7 @@ doing. The line under the box names the directory the agent works in.
 Lines starting with a slash are commands:
 .TP
 .B /model
-Open a picker of the models,
-.B medium
-and
-.BR large ,
+Open a picker of the models
 and under them the provider that runs them:
 up and down move over the models, left and right change the provider,
 enter picks, esc cancels.

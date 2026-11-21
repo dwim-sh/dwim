@@ -25,6 +25,14 @@ macro_rules! check_against_cpu {
             matmul_add_matches_cpu,
             conv_matches_cpu,
             delta_net_matches_cpu,
+            expert_matmul_matches_cpu,
+            mix_matches_cpu,
+            short_conv_matches_cpu,
+            attention_rel_matches_cpu,
+            route_matches_cpu,
+            rows_and_gates_match_cpu,
+            gate_matches_cpu,
+            copy_cache_copies_a_prefix,
             resize_keeps_capacity
         );
     };
@@ -102,6 +110,22 @@ impl Rng {
     }
 }
 
+impl Rng {
+    /// A matrix of NVFP4: every value there is, under scales from an
+    /// eighth to eight.
+    fn nvfp4(&mut self, shape: &[usize]) -> Tensor {
+        let n = shape[0] * shape[1];
+        let mut byte = |below: f32| ((self.next() + 1.0) * 0.5 * below) as u8;
+        Tensor::Nvfp4 {
+            shape: shape.to_vec(),
+            scales: (0..n / quant::NVFP4_BLOCK)
+                .map(|_| (4 << 3) + byte(48.0))
+                .collect(),
+            quants: (0..n / 2).map(|_| byte(256.0)).collect(),
+        }
+    }
+}
+
 fn clone(t: &Tensor) -> Tensor {
     match t {
         Tensor::Bf16 { shape, data } => Tensor::Bf16 {
@@ -122,6 +146,15 @@ fn clone(t: &Tensor) -> Tensor {
             scales,
             quants,
         } => Tensor::Q8_0 {
+            shape: shape.clone(),
+            scales: scales.clone(),
+            quants: quants.clone(),
+        },
+        Tensor::Nvfp4 {
+            shape,
+            scales,
+            quants,
+        } => Tensor::Nvfp4 {
             shape: shape.clone(),
             scales: scales.clone(),
             quants: quants.clone(),
@@ -972,4 +1005,358 @@ pub fn resize_keeps_capacity<D: Device>(gpu: &D) {
     assert_eq!(gpu.read(&buf).len(), 16);
     gpu.resize(&mut buf, 64);
     assert_eq!(gpu.read(&buf).len(), 64);
+}
+
+/// The experts' matrix multiplication, where the device runs it: over
+/// NVFP4 and Q8_0 weights, with an input row per token and one per expert
+/// of a token; for a few tokens, with an expert picked twice and one never
+/// picked, and for a batch, which a device may take an expert at a time,
+/// with one expert picked by more tokens than a tile of them holds.
+pub fn expert_matmul_matches_cpu<D: Device>(gpu: &D) {
+    if !gpu.takes_nvfp4() {
+        return;
+    }
+    let mut rng = Rng(2304);
+    let (experts, k) = (5, 3);
+    let few: Vec<f32> = [0, 4, 2, 2, 0, 1, 4, 4, 1, 1, 2, 0]
+        .iter()
+        .map(|&e| e as f32)
+        .collect();
+    // Every token of the batch picks expert 2, most pick 0, and none 3.
+    let batch: Vec<f32> = (0..70)
+        .flat_map(|t| [2, if t % 4 == 0 { 4 } else { 0 }, 1 + 3 * (t % 2)])
+        .map(|e| e as f32)
+        .collect();
+    let scale = rng.floats(experts);
+    for ids in [few, batch] {
+        let n = ids.len() / k;
+        for (rows, cols) in [(40, 64), (192, 2304), (2304, 1152)] {
+            for nvfp4 in [true, false] {
+                for shared in [true, false] {
+                    let w = if nvfp4 {
+                        rng.nvfp4(&[experts * rows, cols])
+                    } else {
+                        rng.q8_0(&[experts * rows, cols])
+                    };
+                    let x = rng.floats(if shared { n } else { n * k } * cols);
+                    let mut want = vec![0.0; n * k * rows];
+                    let host = clone(&w);
+                    Cpu.expert_matmul(&mut want, &host, &scale, &x, &ids, k);
+                    let mut out = gpu.alloc(n * k * rows);
+                    let on_gpu = buffer(gpu, &ids);
+                    let (w, scales) = (gpu.upload(w), buffer(gpu, &scale));
+                    gpu.expert_matmul(&mut out, &w, &scales, &buffer(gpu, &x), &on_gpu, k);
+                    let what = format!("{rows}x{cols} n={n} nvfp4={nvfp4} shared={shared}");
+                    close_batch(&gpu.read(&out), &want, &what);
+                    // And again with the same picks, as a layer's second
+                    // multiplication is.
+                    let x = rng.floats(if shared { n } else { n * k } * cols);
+                    Cpu.expert_matmul(&mut want, &host, &scale, &x, &ids, k);
+                    gpu.expert_matmul(&mut out, &w, &scales, &buffer(gpu, &x), &on_gpu, k);
+                    close_batch(&gpu.read(&out), &want, &format!("{what} again"));
+                }
+            }
+        }
+    }
+}
+
+/// The mix over the depth, of one state and of as many as a model keeps,
+/// of the model's width and of a narrow one.
+pub fn mix_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(60);
+    for (dim, count, n) in [(2304, 5, 3), (64, 1, 2), (2304, 2, 64), (128, 6, 1)] {
+        // States of different sizes, so that normalizing them matters.
+        let states: Vec<Vec<f32>> = (0..count)
+            .map(|s| {
+                let size = 0.1 + 3.0 * s as f32;
+                rng.floats(n * dim).iter().map(|x| x * size).collect()
+            })
+            .collect();
+        let query: Vec<f32> = rng.floats(dim).iter().map(|x| x * 4.0).collect();
+        let mut want = vec![0.0; n * dim];
+        Cpu.mix(&mut want, &states.iter().collect::<Vec<_>>(), &query, 1e-6);
+        let on_gpu: Vec<D::Buffer> = states.iter().map(|state| buffer(gpu, state)).collect();
+        let mut out = gpu.alloc(n * dim);
+        gpu.mix(
+            &mut out,
+            &on_gpu.iter().collect::<Vec<_>>(),
+            &buffer(gpu, &query),
+            1e-6,
+        );
+        close(&gpu.read(&out), &want, 1e-4);
+    }
+}
+
+/// The short convolution, over batches of every size against its taps,
+/// with and without taps of the heads' own, its state carried from a batch
+/// to the next.
+pub fn short_conv_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(61);
+    for (channels, taps, heads) in [(1024, 4, 0), (1024, 4, 8), (2304, 4, 0), (48, 3, 4)] {
+        let weight = rng.floats(taps * channels);
+        let mut cpu_state = rng.floats((taps - 1) * channels);
+        let mut state = buffer(gpu, &cpu_state);
+        let on_gpu = buffer(gpu, &weight);
+        for n in [1, 1, 2, 3, 5, 64, 1] {
+            let x = rng.floats(n * channels);
+            let dynamic = rng.floats(n * heads.max(1) * taps);
+            let mut want = vec![0.0; n * channels];
+            Cpu.short_conv(
+                &mut want,
+                &x,
+                &mut cpu_state,
+                &weight,
+                (heads > 0).then_some((&dynamic, heads)),
+            );
+            let mut out = gpu.alloc(n * channels);
+            let dynamic = buffer(gpu, &dynamic);
+            gpu.short_conv(
+                &mut out,
+                &buffer(gpu, &x),
+                &mut state,
+                &on_gpu,
+                (heads > 0).then_some((&dynamic, heads)),
+            );
+            close(&gpu.read(&out), &want, 1e-5);
+            close(&gpu.read(&state), &cpu_state, 0.0);
+        }
+    }
+}
+
+/// Attention with a bias by distance and a sink: over everything and over
+/// a window, in caches as long as the sequence and in rings the positions
+/// have gone round, of one chunk of positions and of several, a batch and
+/// a token at a time.
+pub fn attention_rel_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(62);
+    // Heads, their width, key/value heads, tokens, the position of the
+    // first, the window, the rows of the caches, and the distances the
+    // bias has rows for.
+    let cases = [
+        (4, 32, 2, 3, 5, usize::MAX, 8, 4),
+        (24, 128, 8, 2, 300, usize::MAX, 302, 1024),
+        (24, 128, 8, 1, 0, usize::MAX, 16, 1024),
+        (24, 128, 8, 64, 2000, 1024, 1088, 1024),
+        (24, 128, 8, 1, 5000, 1024, 1088, 1024),
+        (24, 128, 8, 5, 40, 16, 24, 16),
+        (24, 128, 8, 3, 1500, usize::MAX, 1503, 100),
+        // A token deep into a context, which a device may take on other
+        // kernels than a token near the start.
+        (24, 128, 8, 1, 3000, usize::MAX, 3001, 1024),
+        (24, 128, 8, 1, 40000, usize::MAX, 40001, 1024),
+        (6, 64, 2, 64, 100, 7, 71, 7),
+    ];
+    let n_rel = 16;
+    for (n_heads, head_dim, n_kv_heads, n, pos, window, rows, extent) in cases {
+        let kv_dim = n_kv_heads * head_dim;
+        let q: Vec<f32> = rng.floats(n * n_heads * head_dim);
+        let rel = rng.floats(n * n_heads * n_rel);
+        let bias = rng.floats(extent * n_rel);
+        // Sinks from far below the keys' scores to above them.
+        let sinks: Vec<f32> = rng.floats(n * n_heads).iter().map(|x| x * 6.0).collect();
+        // What the caches hold once the batch's keys are stored: the
+        // latest positions, each in its row.
+        let held = (pos + n).min(rows);
+        let (k_cache, v_cache) = (rng.floats(held * kv_dim), rng.floats(held * kv_dim));
+        let mut want = vec![0.0; q.len()];
+        Cpu.attention_rel(
+            &mut want,
+            &q,
+            &cache(&Cpu, &k_cache, 0),
+            &cache(&Cpu, &v_cache, 0),
+            &rel,
+            &bias,
+            &sinks,
+            pos,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+        );
+        let mut out = gpu.alloc(want.len());
+        gpu.attention_rel(
+            &mut out,
+            &buffer(gpu, &q),
+            &cache(gpu, &k_cache, 0),
+            &cache(gpu, &v_cache, 0),
+            &buffer(gpu, &rel),
+            &buffer(gpu, &bias),
+            &buffer(gpu, &sinks),
+            pos,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+        );
+        // A batch of heads of 128 may go through kernels that hold the
+        // queries, the keys and the softmax's weights as half floats, and
+        // is held to a batch's error.
+        if (n > 1 || pos >= 2048) && head_dim == 128 {
+            close_batch(&gpu.read(&out), &want, &format!("{n} tokens at {pos}"));
+        } else {
+            close(&gpu.read(&out), &want, 1e-4);
+        }
+    }
+}
+
+/// The router: the experts picked are the same, and what each counts for.
+pub fn route_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(63);
+    for (experts, k, n) in [(128, 8, 5), (4, 2, 1), (256, 32, 3), (16, 16, 2)] {
+        let logits: Vec<f32> = rng.floats(n * experts).iter().map(|x| x * 4.0).collect();
+        let bias: Vec<f32> = rng.floats(experts).iter().map(|x| x * 0.2).collect();
+        let (mut want_ids, mut want_weights) = (vec![0.0; n * k], vec![0.0; n * k]);
+        Cpu.route(&mut want_ids, &mut want_weights, &logits, &bias, k, 8.0);
+        let (mut ids, mut weights) = (gpu.alloc(n * k), gpu.alloc(n * k));
+        gpu.route(
+            &mut ids,
+            &mut weights,
+            &buffer(gpu, &logits),
+            &buffer(gpu, &bias),
+            k,
+            8.0,
+        );
+        assert_eq!(gpu.read(&ids), want_ids);
+        close(&gpu.read(&weights), &want_weights, 1e-5);
+    }
+}
+
+/// The operations a thread an element takes: the gate on a message, the
+/// clip, the scaling of rows, the SiTU activation, and the experts' sum.
+pub fn rows_and_gates_match_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(64);
+    let mut wide =
+        |n: usize, size: f32| -> Vec<f32> { rng.floats(n).iter().map(|x| x * size).collect() };
+
+    let len = 3 * 2304;
+    let (x, forget, gain, message) = (
+        wide(len, 2.0),
+        wide(len, 3.0),
+        wide(len, 3.0),
+        wide(len, 2.0),
+    );
+    let mut want = x.clone();
+    Cpu.gated_update(&mut want, &forget, &gain, &message);
+    let mut got = buffer(gpu, &x);
+    gpu.gated_update(
+        &mut got,
+        &buffer(gpu, &forget),
+        &buffer(gpu, &gain),
+        &buffer(gpu, &message),
+    );
+    close(&gpu.read(&got), &want, 1e-5);
+
+    // Heads longer than the threshold and shorter, of the queries' width
+    // and of the bias's.
+    for (heads, dim, n, threshold) in [(24, 128, 3, 22.6), (24, 16, 5, 8.0), (8, 128, 2, 0.5)] {
+        let x = wide(n * heads * dim, 6.0);
+        let scale = wide(heads * dim, 1.5);
+        let mut want = x.clone();
+        Cpu.clip(&mut want, &scale, dim, threshold);
+        let mut got = buffer(gpu, &x);
+        gpu.clip(&mut got, &buffer(gpu, &scale), dim, threshold);
+        close(&gpu.read(&got), &want, 1e-5);
+    }
+
+    let (x, factors) = (wide(5 * 3072, 1.0), wide(5, 2.0));
+    let mut want = x.clone();
+    Cpu.scale_rows(&mut want, &factors);
+    let mut got = buffer(gpu, &x);
+    gpu.scale_rows(&mut got, &buffer(gpu, &factors));
+    close(&gpu.read(&got), &want, 0.0);
+
+    // Gates and up projections past where the activation's tanh bends.
+    let (width, rows) = (1152, 16);
+    let gate_up = wide(rows * 2 * width, 40.0);
+    let mut want = vec![0.0; rows * width];
+    Cpu.situ(&mut want, &gate_up, width, 4.0, 25.0);
+    let mut got = gpu.alloc(rows * width);
+    gpu.situ(&mut got, &buffer(gpu, &gate_up), width, 4.0, 25.0);
+    close(&gpu.read(&got), &want, 1e-4);
+
+    let (width, k, n) = (2304, 8, 3);
+    let (y, weights) = (wide(n * k * width, 1.0), wide(n * k, 2.0));
+    let mut want = vec![0.0; n * width];
+    Cpu.weighted_sum(&mut want, &y, &weights);
+    let mut got = gpu.alloc(n * width);
+    gpu.weighted_sum(&mut got, &buffer(gpu, &y), &buffer(gpu, &weights));
+    close(&gpu.read(&got), &want, 1e-5);
+}
+
+/// A copy of the first of a cache's activations takes those, and leaves
+/// the rest of the other as it was.
+pub fn copy_cache_copies_a_prefix<D: Device>(gpu: &D) {
+    let len = 34 * CACHE_BLOCK;
+    let (from, to) = (Rng(65).floats(len), Rng(66).floats(len));
+    let src = cache(gpu, &from, 0);
+    let mut dst = cache(gpu, &to, 0);
+    let part = 21 * CACHE_BLOCK;
+    gpu.copy_cache(&mut dst, &src, part);
+    let (copied, kept) = (
+        gpu.read_cache(&src, len),
+        gpu.read_cache(&cache(gpu, &to, 0), len),
+    );
+    let got = gpu.read_cache(&dst, len);
+    // The quants, then the scales, two bytes a block.
+    assert_eq!(got[..part], copied[..part]);
+    assert_eq!(got[part..len], kept[part..len]);
+    let (blocks, scales) = (part / CACHE_BLOCK * 2, len);
+    assert_eq!(got[scales..][..blocks], copied[scales..][..blocks]);
+    assert_eq!(got[scales + blocks..], kept[scales + blocks..]);
+}
+
+/// The gate on a message, of the model's width and rank and of narrow
+/// ones, a token and a batch.
+pub fn gate_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(67);
+    for (dim, rank, n) in [(2304, 64, 3), (64, 8, 1), (2304, 64, 64), (128, 16, 5)] {
+        let x: Vec<f32> = rng.floats(n * dim).iter().map(|x| x * 3.0).collect();
+        let message = rng.floats(n * dim);
+        // Weights small enough that the gate is not shut or open all the
+        // way, where what is left of `x` is the difference of two numbers
+        // almost the same.
+        let mut small = |rows: usize, cols: usize| Tensor::Bf16 {
+            shape: vec![rows, cols],
+            data: rng
+                .floats(rows * cols)
+                .iter()
+                .map(|w| crate::gpu::float::to_bf16(w / (cols as f32).sqrt()))
+                .collect(),
+        };
+        let weights = [
+            small(rank, dim),
+            small(rank, dim),
+            small(dim, rank),
+            small(dim, rank),
+        ];
+        let mut want = x.clone();
+        let [a, b, c, d] = &weights;
+        Cpu.gate(
+            &mut want,
+            &message,
+            &clone(a),
+            &clone(b),
+            &clone(c),
+            &clone(d),
+            dim,
+            rank,
+            1e-6,
+        );
+        let [a, b, c, d] = weights.map(|w| gpu.upload(w));
+        let mut got = buffer(gpu, &x);
+        gpu.gate(
+            &mut got,
+            &buffer(gpu, &message),
+            &a,
+            &b,
+            &c,
+            &d,
+            dim,
+            rank,
+            1e-6,
+        );
+        close(&gpu.read(&got), &want, 1e-4);
+    }
 }

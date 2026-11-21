@@ -252,7 +252,7 @@ impl<M: LanguageModel> Local<M> {
             }
         }
 
-        let end = self.format.end_of_reply(reader.thinking())?;
+        let end = self.format.end_of_reply(reader.open())?;
         self.feed(&end, Kind::Prompt)?;
         // The reply's text as shown, to feed back without the thought.
         let (shown, calls) = reader.finish();
@@ -466,7 +466,7 @@ impl<M: LanguageModel> Session for Local<M> {
 
         let mut text = Utf8Stream::default();
         let mut answer = String::new();
-        let end = self.format.end_of_reply(false)?;
+        let end = self.format.end_of_answer()?;
         let heads: Vec<(&str, Vec<u32>)> = heads
             .iter()
             .map(|head| Ok((*head, self.format.tokenizer().encode(head)?)))

@@ -99,6 +99,13 @@ const BF16_TOKENS: usize = 8;
 const QUANT_TOKENS: usize = 4;
 const QUANT_COLS: usize = 128;
 
+/// Fewest tokens of a batch whose experts are multiplied in tiles on the
+/// matrix accelerators, an expert at a time, and the pairs of a token and
+/// an expert a tile takes: below it, a pair at a time reads fewer of the
+/// experts' weights than unpacking each expert's matrix for a tile.
+const EXPERT_TOKENS: usize = 4;
+const EXPERT_TILE: usize = 16;
+
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
 const ATTENTION_THREADS: usize = 256;
@@ -157,6 +164,7 @@ enum Format {
     Bf16,
     Q4_0,
     Q8_0,
+    Nvfp4,
 }
 
 /// The index of a block-quantized format's kernels in their arrays.
@@ -165,6 +173,7 @@ fn quant_index(format: Format) -> usize {
         Format::Q4_0 => 0,
         Format::Q8_0 => 1,
         Format::Bf16 => unreachable!("not block-quantized"),
+        Format::Nvfp4 => unreachable!("only the experts' matrices are NVFP4"),
     }
 }
 
@@ -199,6 +208,35 @@ struct Kernels {
     store_q8: Object<dyn MTLComputePipelineState>,
     conv: Object<dyn MTLComputePipelineState>,
     delta_net: Object<dyn MTLComputePipelineState>,
+    /// The experts' matrix multiplication over NVFP4 and over Q8_0 weights,
+    /// a pair of a token and an expert at a time; and for a batch, in
+    /// tiles on the matrix accelerators, where the GPU has them, with the
+    /// packing of the tiles' inputs and the putting back of their results.
+    expert_matmul: [Object<dyn MTLComputePipelineState>; 2],
+    expert_matmul_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    expert_pack: Object<dyn MTLComputePipelineState>,
+    expert_scatter: Object<dyn MTLComputePipelineState>,
+    mix: Object<dyn MTLComputePipelineState>,
+    gated_update: Object<dyn MTLComputePipelineState>,
+    gate: Object<dyn MTLComputePipelineState>,
+    short_conv: Object<dyn MTLComputePipelineState>,
+    short_conv_state: Object<dyn MTLComputePipelineState>,
+    clip: Object<dyn MTLComputePipelineState>,
+    scale_rows: Object<dyn MTLComputePipelineState>,
+    /// Attention with a bias by distance and a sink: a token at a time,
+    /// the merging of its chunks, and for heads of 128 the kernel on the
+    /// matrix accelerators, where the GPU has them, in tiles of
+    /// [`MMA_ROWS`] rows for a batch and of [`DECODE_ROWS`] for a token
+    /// deep into a context.
+    attention_rel: Object<dyn MTLComputePipelineState>,
+    attention_rel_combine: Object<dyn MTLComputePipelineState>,
+    attention_rel_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    route: Object<dyn MTLComputePipelineState>,
+    situ: Object<dyn MTLComputePipelineState>,
+    weighted_sum: Object<dyn MTLComputePipelineState>,
+    /// The copy of a cache's quants, four bytes at a time, and of its
+    /// scales.
+    copy_words: [Object<dyn MTLComputePipelineState>; 2],
 }
 
 /// A command buffer with commands encoded but not yet committed.
@@ -224,10 +262,34 @@ pub struct Metal {
     /// per SIMD group.
     matmul_rows: usize,
     name: String,
+    /// What a batch's experts are multiplied in tiles with.
+    experts: RefCell<Experts>,
     pending: RefCell<Option<Pending>>,
     /// Command buffers committed and not yet waited for, in order.
     committed: RefCell<Vec<Object<dyn MTLCommandBuffer>>>,
 }
+
+/// What a batch's experts are multiplied in tiles with: the pairs of a
+/// token and an expert in the order of the tiles, an expert's together;
+/// the tiles, each its expert, its first pair in that order and how many
+/// it has; the inputs packed in that order; and the results in it. The
+/// order and the tiles are laid out on the host from the experts the
+/// router picked, once for both of a layer's multiplications.
+#[derive(Default)]
+struct Experts {
+    order: Scratch,
+    tiles: Scratch,
+    packed: Scratch,
+    sorted: Scratch,
+    /// The buffer of picks the order and the tiles are of, as it was, and
+    /// how many tiles there are.
+    planned: Option<(u64, u64)>,
+    count: usize,
+}
+
+/// A buffer that is made, and made again longer, as it is needed.
+#[derive(Default)]
+struct Scratch(Option<(Object<dyn MTLBuffer>, usize)>);
 
 // Commands are only encoded from whichever thread owns the device.
 unsafe impl Send for Metal {}
@@ -320,6 +382,23 @@ impl Metal {
         } else {
             None
         };
+        let expert_matmul_mma = if matmul_quant_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let tiled = |bits| {
+                compile(
+                    &device,
+                    "expert_matmul_mma",
+                    MATRIX_THREADS,
+                    &[("BITS", bits), ("TOKENS", EXPERT_TILE)],
+                    &[source!("expert_matmul_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([tiled(4)?, tiled(8)?])
+        } else {
+            None
+        };
         let attention_mma = if matmul_quant_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
@@ -338,6 +417,26 @@ impl Metal {
                 mma(256, MMA_ROWS, MMA_THREADS)?,
                 mma(128, DECODE_ROWS, DECODE_THREADS)?,
                 mma(256, DECODE_ROWS, DECODE_THREADS)?,
+            ])
+        } else {
+            None
+        };
+        let attention_rel_mma = if matmul_quant_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let mma = |rows, threads| {
+                compile(
+                    &device,
+                    "attention_rel_mma",
+                    threads,
+                    &[("DIM", 128), ("ROWS", rows), ("THREADS", threads)],
+                    &[source!("attention_rel_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([
+                mma(MMA_ROWS, MMA_THREADS)?,
+                mma(DECODE_ROWS, DECODE_THREADS)?,
             ])
         } else {
             None
@@ -417,6 +516,30 @@ impl Metal {
             store_q8: msl!("store_q8", THREADS),
             conv: msl!("conv", THREADS),
             delta_net: msl!("delta_net", THREADS),
+            expert_matmul: [
+                msl!("expert_matmul", THREADS, "BITS" = 4),
+                msl!("expert_matmul", THREADS, "BITS" = 8),
+            ],
+            expert_matmul_mma,
+            expert_pack: msl!("expert_pack", THREADS),
+            expert_scatter: msl!("expert_scatter", THREADS),
+            mix: msl!("mix", THREADS),
+            gated_update: msl!("gated_update", THREADS),
+            gate: msl!("gate", THREADS),
+            short_conv: msl!("short_conv", THREADS),
+            short_conv_state: msl!("short_conv_state", THREADS),
+            clip: msl!("clip", THREADS),
+            scale_rows: msl!("scale_rows", THREADS),
+            attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
+            attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
+            attention_rel_mma,
+            route: msl!("route", THREADS),
+            situ: msl!("situ", THREADS),
+            weighted_sum: msl!("weighted_sum", THREADS),
+            copy_words: [
+                msl!("copy_words", THREADS, "BYTES" = 4),
+                msl!("copy_words", THREADS, "BYTES" = 2),
+            ],
         };
         let matmul_rows = THREADS / kernels.matmul_bf16.threadExecutionWidth();
         let partials = device
@@ -435,6 +558,7 @@ impl Metal {
             allocated: Cell::new(0),
             matmul_rows,
             name,
+            experts: RefCell::new(Experts::default()),
             pending: RefCell::new(None),
             committed: RefCell::new(Vec::new()),
         })
@@ -530,6 +654,126 @@ impl Metal {
             &[&self.packed, &x.buf],
             &pack,
             (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    /// The scratch buffer, with room for `bytes`.
+    fn scratch<'a>(&self, scratch: &'a mut Scratch, bytes: usize) -> &'a Object<dyn MTLBuffer> {
+        if scratch.0.as_ref().is_none_or(|(_, len)| *len < bytes) {
+            scratch.0 = Some((self.buffer(bytes), bytes));
+        }
+        &scratch.0.as_ref().expect("made above").0
+    }
+
+    /// Multiplies a batch's pairs of a token and an expert in tiles of one
+    /// expert's pairs, with `kernel` on the matrix accelerators: what
+    /// [`Device::expert_matmul`] does, reading each expert's matrix once
+    /// for a tile rather than once for each token that goes through it.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_tiles(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        out: &mut Buffer,
+        w: &Weight,
+        scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+        shared: bool,
+    ) {
+        let (pairs, experts) = (ids.len, scale.len);
+        let (rows, cols) = (w.shape[0] / experts, w.shape[1]);
+        let mut scratch = self.experts.borrow_mut();
+        let Experts {
+            order,
+            tiles,
+            packed,
+            sorted,
+            planned,
+            count,
+        } = &mut *scratch;
+        // The pairs in the order of their experts, and each expert's in
+        // tiles: laid out once for the picks, which both of a layer's
+        // multiplications are of. Reading the picks waits for the router.
+        if *planned != Some((ids.id, ids.version)) {
+            let picks: Vec<usize> = self.read(ids).iter().map(|&e| e as usize).collect();
+            let mut counts = vec![0u32; experts];
+            for &expert in &picks {
+                counts[expert] += 1;
+            }
+            let mut first = vec![0u32; experts];
+            for expert in 1..experts {
+                first[expert] = first[expert - 1] + counts[expert - 1];
+            }
+            let mut sorted_pairs = vec![0u32; pairs];
+            let mut next = first.clone();
+            for (pair, &expert) in picks.iter().enumerate() {
+                sorted_pairs[next[expert] as usize] = pair as u32;
+                next[expert] += 1;
+            }
+            let mut laid = Vec::new();
+            for expert in 0..experts {
+                for at in (0..counts[expert]).step_by(EXPERT_TILE) {
+                    let of = (counts[expert] - at).min(EXPERT_TILE as u32);
+                    laid.extend([expert as u32, first[expert] + at, of]);
+                }
+            }
+            for (scratch, words) in [(&mut *order, &sorted_pairs), (&mut *tiles, &laid)] {
+                let buf = self.scratch(scratch, words.len() * 4);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        words.as_ptr(),
+                        buf.contents().as_ptr().cast(),
+                        words.len(),
+                    )
+                };
+            }
+            *planned = Some((ids.id, ids.version));
+            *count = laid.len() / 3;
+        }
+        // The last tile reaches a whole tile past its first pair.
+        let padded = pairs + EXPERT_TILE;
+        let order = &order.0.as_ref().expect("laid out above").0;
+        let tiles = &tiles.0.as_ref().expect("laid out above").0;
+        let packed = self.scratch(packed, padded * cols * 2);
+        let sorted = self.scratch(sorted, pairs * rows * 4);
+        out.touch();
+        let pack = ExpertPackParams {
+            pairs: pairs as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+            share: if shared { k as u32 } else { 1 },
+        };
+        self.dispatch(
+            &self.kernels.expert_pack,
+            &[packed, &x.buf, order],
+            &pack,
+            (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
+        let params = ExpertTileParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+        };
+        let scales = w.scales.as_ref().expect("quantized weights have scales");
+        self.dispatch_grid(
+            kernel,
+            &[sorted, &w.buf, scales, packed, tiles, &scale.buf],
+            &params,
+            (rows.div_ceil(TILE_ROWS), *count),
+            MATRIX_THREADS,
+        );
+        let scatter = ExpertScatterParams {
+            pairs: pairs as u32,
+            rows: rows as u32,
+        };
+        self.dispatch(
+            &self.kernels.expert_scatter,
+            &[&out.buf, sorted, order],
+            &scatter,
+            (pairs * rows / 4).div_ceil(THREADS),
             THREADS,
         );
     }
@@ -692,6 +936,128 @@ struct LenParams {
     len: u32,
 }
 
+/// What `attention_rel.metal` and the kernel that merges its chunks are
+/// told.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttentionRelParams {
+    n_heads: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
+    pos: u32,
+    first: u32,
+    chunks: u32,
+    /// Positions to a chunk.
+    chunk: u32,
+    /// Tokens the dispatch covers, and the rows of a key/value head's
+    /// packed queries of it, for the kernel on the matrix accelerators.
+    tokens: u32,
+    padded: u32,
+    window: u32,
+    ring: u32,
+    n_rel: u32,
+    extent: u32,
+    /// For that kernel, whose chunks are the dispatch's rather than each
+    /// token's: the first position the dispatch attends over.
+    base: u32,
+    batched: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MixParams {
+    dim: u32,
+    count: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GateParams {
+    dim: u32,
+    rank: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShortConvParams {
+    n: u32,
+    channels: u32,
+    taps: u32,
+    heads: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ClipParams {
+    heads: u32,
+    width: u32,
+    dim: u32,
+    threshold: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteParams {
+    n: u32,
+    experts: u32,
+    k: u32,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SituParams {
+    len: u32,
+    width: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+/// What the kernels over rows of a width are told: `scale_rows.metal`,
+/// and `weighted_sum.metal`, with how many experts a token has.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RowsParams {
+    len: u32,
+    width: u32,
+    k: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertPackParams {
+    pairs: u32,
+    cols: u32,
+    padded: u32,
+    share: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertTileParams {
+    rows: u32,
+    cols: u32,
+    padded: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertScatterParams {
+    pairs: u32,
+    rows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertParams {
+    rows: u32,
+    cols: u32,
+    k: u32,
+    shared: u32,
+}
+
 /// The most of the machine's memory a model may take, as a fraction: the
 /// weights and caches are wired while the model runs, and the system and
 /// the applications beside it need the rest. Nine sixteenths is 18 GiB
@@ -732,6 +1098,10 @@ impl Device for Metal {
             free = free.min((total / SHARE.1 * SHARE.0).saturating_sub(allocated));
         }
         Some(free)
+    }
+
+    fn takes_nvfp4(&self) -> bool {
+        true
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
@@ -782,6 +1152,20 @@ impl Device for Metal {
                     with_bytes(bytes(quants)),
                     Some(with_bytes(bytes(scales))),
                     Format::Q8_0,
+                )
+            }
+            Tensor::Nvfp4 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * shape[1] / quant::NVFP4_BLOCK);
+                (
+                    shape,
+                    with_bytes(quants),
+                    Some(with_bytes(scales)),
+                    Format::Nvfp4,
                 )
             }
         };
@@ -1331,6 +1715,491 @@ impl Device for Metal {
             &buffers,
             &params,
             n_v_heads,
+            THREADS,
+        );
+    }
+
+    fn expert_matmul(
+        &self,
+        out: &mut Buffer,
+        w: &Weight,
+        scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+    ) {
+        let cols = w.shape[1];
+        let rows = w.shape[0] / scale.len;
+        let pairs = ids.len;
+        assert_eq!(out.len, pairs * rows);
+        let shared = x.len == pairs / k * cols;
+        assert!(shared || x.len == pairs * cols);
+        let which = match w.format {
+            Format::Nvfp4 => 0,
+            Format::Q8_0 => 1,
+            Format::Bf16 | Format::Q4_0 => {
+                panic!("the experts' matrices are NVFP4 or Q8_0")
+            }
+        };
+        // A batch goes expert by expert in tiles on the matrix
+        // accelerators, where the matrices are whole steps of the tiles.
+        if let Some(tiled) = &self.kernels.expert_matmul_mma
+            && pairs >= EXPERT_TOKENS * k
+            && cols.is_multiple_of(128)
+            && rows.is_multiple_of(4)
+        {
+            self.expert_tiles(&tiled[which], out, w, scale, x, ids, k, shared);
+            return;
+        }
+        let kernel = &self.kernels.expert_matmul[which];
+        let scales = w.scales.as_ref().expect("quantized weights have scales");
+        out.touch();
+        let params = ExpertParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            k: k as u32,
+            shared: shared as u32,
+        };
+        self.dispatch_grid(
+            kernel,
+            &[&out.buf, &w.buf, scales, &x.buf, &ids.buf, &scale.buf],
+            &params,
+            (rows.div_ceil(self.matmul_rows), pairs),
+            THREADS,
+        );
+    }
+
+    fn copy_cache(&self, dst: &mut Cache, src: &Cache, len: usize) {
+        assert!(len <= dst.len && len <= src.len && len.is_multiple_of(CACHE_BLOCK));
+        for (kernel, dst, src, words) in [
+            (&self.kernels.copy_words[0], &dst.quants, &src.quants, len / 4),
+            (
+                &self.kernels.copy_words[1],
+                &dst.scales,
+                &src.scales,
+                len / CACHE_BLOCK,
+            ),
+        ] {
+            let params = LenParams { len: words as u32 };
+            self.dispatch(
+                kernel,
+                &[dst, src],
+                &params,
+                words.div_ceil(THREADS),
+                THREADS,
+            );
+        }
+    }
+
+    fn mix(&self, out: &mut Buffer, states: &[&Buffer], query: &Buffer, eps: f32) {
+        let dim = query.len;
+        assert!(
+            !states.is_empty() && states.len() <= 6,
+            "the kernel mixes up to six states"
+        );
+        assert!(
+            dim.is_multiple_of(4) && dim <= 4096,
+            "the kernel takes rows of up to 4096 in fours"
+        );
+        assert!(states.iter().all(|state| state.len == out.len) && out.len.is_multiple_of(dim));
+        out.touch();
+        let params = MixParams {
+            dim: dim as u32,
+            count: states.len() as u32,
+            eps,
+        };
+        // The kernel binds six states: the ones there are not are the
+        // first again, which it does not read.
+        let state = |i: usize| &*states[i.min(states.len() - 1)].buf;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 8] = [
+            &out.buf,
+            &query.buf,
+            state(0),
+            state(1),
+            state(2),
+            state(3),
+            state(4),
+            state(5),
+        ];
+        self.dispatch(&self.kernels.mix, &buffers, &params, out.len / dim, THREADS);
+    }
+
+    fn gated_update(&self, x: &mut Buffer, forget: &Buffer, gain: &Buffer, message: &Buffer) {
+        assert!(forget.len == x.len && gain.len == x.len && message.len == x.len);
+        x.touch();
+        let params = LenParams { len: x.len as u32 };
+        self.dispatch(
+            &self.kernels.gated_update,
+            &[&x.buf, &forget.buf, &gain.buf, &message.buf],
+            &params,
+            x.len.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn gate(
+        &self,
+        x: &mut Buffer,
+        message: &Buffer,
+        down_input: &Weight,
+        down_message: &Weight,
+        gain: &Weight,
+        forget: &Weight,
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        assert!(x.len.is_multiple_of(dim) && message.len == x.len);
+        assert!(
+            dim.is_multiple_of(8) && rank.is_multiple_of(8) && rank <= 64,
+            "the kernel takes a gate of up to 64 dimensions, in eights"
+        );
+        for (w, shape) in [
+            (down_input, [rank, dim]),
+            (down_message, [rank, dim]),
+            (gain, [dim, rank]),
+            (forget, [dim, rank]),
+        ] {
+            assert!(
+                w.format == Format::Bf16 && w.shape == shape,
+                "a gate's weights are bf16"
+            );
+        }
+        x.touch();
+        let params = GateParams {
+            dim: dim as u32,
+            rank: rank as u32,
+            eps,
+        };
+        self.dispatch(
+            &self.kernels.gate,
+            &[
+                &x.buf,
+                &message.buf,
+                &down_input.buf,
+                &down_message.buf,
+                &gain.buf,
+                &forget.buf,
+            ],
+            &params,
+            x.len / dim,
+            THREADS,
+        );
+    }
+
+    fn short_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+    ) {
+        let channels = weight.len - state.len;
+        let taps = weight.len / channels;
+        let n = x.len / channels;
+        assert!(x.len == n * channels && out.len == x.len);
+        assert_eq!(state.len, (taps - 1) * channels);
+        assert!(taps <= 9, "the kernel keeps up to eight tokens of state");
+        if let Some((dynamic, heads)) = dynamic {
+            assert!(dynamic.len == n * heads * taps && channels.is_multiple_of(heads));
+        }
+        out.touch();
+        state.touch();
+        let params = ShortConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            taps: taps as u32,
+            heads: dynamic.map_or(0, |(_, heads)| heads) as u32,
+        };
+        // Without taps of the heads' own, the kernel is bound the weight
+        // in their place, which it does not read.
+        let taps = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
+        self.dispatch(
+            &self.kernels.short_conv,
+            &[&out.buf, &x.buf, &state.buf, &weight.buf, taps],
+            &params,
+            (n * channels).div_ceil(THREADS),
+            THREADS,
+        );
+        // A token alone has its state moved on by the threads that
+        // convolve it, a thread a channel.
+        if n > 1 {
+            self.dispatch(
+                &self.kernels.short_conv_state,
+                &[&state.buf, &x.buf],
+                &params,
+                channels.div_ceil(THREADS),
+                THREADS,
+            );
+        }
+    }
+
+    fn clip(&self, x: &mut Buffer, scale: &Buffer, dim: usize, threshold: f32) {
+        assert!(x.len.is_multiple_of(scale.len) && scale.len.is_multiple_of(dim));
+        x.touch();
+        let heads = x.len / dim;
+        let params = ClipParams {
+            heads: heads as u32,
+            width: scale.len as u32,
+            dim: dim as u32,
+            threshold,
+        };
+        self.dispatch(
+            &self.kernels.clip,
+            &[&x.buf, &scale.buf],
+            &params,
+            heads.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
+        assert!(x.len.is_multiple_of(factors.len));
+        x.touch();
+        let params = RowsParams {
+            len: x.len as u32,
+            width: (x.len / factors.len) as u32,
+            k: 0,
+        };
+        self.dispatch(
+            &self.kernels.scale_rows,
+            &[&x.buf, &factors.buf],
+            &params,
+            x.len.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn attention_rel(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+    ) {
+        let n = q.len / (n_heads * head_dim);
+        assert_eq!(q.len, n * n_heads * head_dim);
+        assert_eq!(out.len, q.len);
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= ATTENTION_THREADS);
+        assert!(
+            n_heads / n_kv_heads <= 8,
+            "the kernel holds up to eight query heads per key/value head"
+        );
+        assert!(sinks.len == n * n_heads && rel.len.is_multiple_of(n * n_heads));
+        let n_rel = rel.len / (n * n_heads);
+        assert!(bias.len.is_multiple_of(n_rel));
+        out.touch();
+        let group = n_heads / n_kv_heads;
+        let extent = bias.len / n_rel;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 10] = [
+            &out.buf,
+            &q.buf,
+            &k_cache.quants,
+            &k_cache.scales,
+            &v_cache.quants,
+            &v_cache.scales,
+            &self.partials,
+            &rel.buf,
+            &bias.buf,
+            &sinks.buf,
+        ];
+        let params = |first: usize, tokens: usize, chunks: usize, chunk: usize| AttentionRelParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            n_kv_heads: n_kv_heads as u32,
+            pos: pos as u32,
+            first: first as u32,
+            chunks: chunks as u32,
+            chunk: chunk as u32,
+            tokens: tokens as u32,
+            padded: 0,
+            window: window.min(u32::MAX as usize) as u32,
+            ring: rows as u32,
+            n_rel: n_rel as u32,
+            extent: extent as u32,
+            base: 0,
+            batched: 0,
+        };
+        // A batch of tokens of heads of 128 goes through the kernel on the
+        // matrix accelerators, where the GPU has them, and so does a token
+        // that attends over enough positions that reading the caches is
+        // the work, in tiles of its own size. The queries are packed for
+        // it: as many tokens to a dispatch as the partials and the packed
+        // queries fit at the most chunks a dispatch has, over chunks that
+        // start where the dispatch's first token attends from.
+        let decode = n == 1 && (pos + 1).min(window) >= DECODE_DEPTH;
+        if let Some(kernels) = &self.kernels.attention_rel_mma
+            && (n >= FLASH_TOKENS || decode)
+            && head_dim == 128
+            && n_rel.is_multiple_of(4)
+            && n_rel <= 16
+        {
+            let (kernel, tile_rows, threads) = match decode {
+                false => (&kernels[0], MMA_ROWS, MMA_THREADS),
+                true => (&kernels[1], DECODE_ROWS, DECODE_THREADS),
+            };
+            let packed_rows = PACKED / (n_kv_heads * head_dim) / tile_rows * tile_rows;
+            let per_dispatch = (PARTIALS / (n_heads * MMA_CHUNKS * (head_dim + 2)))
+                .min(packed_rows / group)
+                .max(1);
+            for first in (0..n).step_by(per_dispatch) {
+                let tokens = per_dispatch.min(n - first);
+                let base = (pos + first + 1).saturating_sub(window);
+                let span = pos + first + tokens - base;
+                let chunk = span.div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK);
+                let chunks = span.div_ceil(chunk);
+                let padded = (tokens * group).next_multiple_of(tile_rows);
+                self.packed_for.set(None);
+                let pack = PackQueriesParams {
+                    n_heads: n_heads as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    dim: head_dim as u32,
+                    first: first as u32,
+                    n: tokens as u32,
+                    padded: padded as u32,
+                };
+                self.dispatch(
+                    &self.kernels.pack_queries,
+                    &[&self.packed, &q.buf],
+                    &pack,
+                    (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
+                    THREADS,
+                );
+                let params = AttentionRelParams {
+                    padded: padded as u32,
+                    base: base as u32,
+                    batched: 1,
+                    ..params(first, tokens, chunks, chunk)
+                };
+                let mut packed = buffers;
+                packed[1] = &self.packed;
+                self.dispatch_grid(
+                    kernel,
+                    &packed,
+                    &params,
+                    ((tokens * group).div_ceil(tile_rows), n_kv_heads * chunks),
+                    threads,
+                );
+                if chunks > 1 {
+                    self.dispatch(
+                        &self.kernels.attention_rel_combine,
+                        &[&out.buf, &self.partials, &sinks.buf],
+                        &params,
+                        tokens * n_heads,
+                        ATTENTION_THREADS,
+                    );
+                }
+            }
+            return;
+        }
+        // Every token's heads get as many chunks as the last token attends
+        // over, as many tokens to a dispatch as the partials fit.
+        let chunks = (pos + n).min(window).div_ceil(CHUNK);
+        let per_token = n_heads * chunks * (head_dim + 2);
+        assert!(
+            per_token <= PARTIALS,
+            "attention over {} positions needs more partials than {PARTIALS}",
+            pos + n
+        );
+        let per_dispatch = PARTIALS / per_token;
+        for first in (0..n).step_by(per_dispatch) {
+            let tokens = per_dispatch.min(n - first);
+            let params = params(first, tokens, chunks, CHUNK);
+            self.dispatch(
+                &self.kernels.attention_rel,
+                &buffers,
+                &params,
+                tokens * n_kv_heads * chunks,
+                ATTENTION_THREADS,
+            );
+            if chunks > 1 {
+                self.dispatch(
+                    &self.kernels.attention_rel_combine,
+                    &[&out.buf, &self.partials, &sinks.buf],
+                    &params,
+                    tokens * n_heads,
+                    ATTENTION_THREADS,
+                );
+            }
+        }
+    }
+
+    fn route(
+        &self,
+        ids: &mut Buffer,
+        weights: &mut Buffer,
+        logits: &Buffer,
+        bias: &Buffer,
+        k: usize,
+        scale: f32,
+    ) {
+        let experts = bias.len;
+        let n = logits.len / experts;
+        assert!(logits.len == n * experts && ids.len == n * k && weights.len == n * k);
+        assert!(
+            experts <= 256 && k <= 32 && k <= experts,
+            "the kernel picks up to 32 of up to 256 experts"
+        );
+        ids.touch();
+        weights.touch();
+        let params = RouteParams {
+            n: n as u32,
+            experts: experts as u32,
+            k: k as u32,
+            scale,
+        };
+        self.dispatch(
+            &self.kernels.route,
+            &[&ids.buf, &weights.buf, &logits.buf, &bias.buf],
+            &params,
+            n.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn situ(&self, out: &mut Buffer, gate_up: &Buffer, width: usize, beta: f32, linear_beta: f32) {
+        assert!(gate_up.len == 2 * out.len && out.len.is_multiple_of(width));
+        out.touch();
+        let params = SituParams {
+            len: out.len as u32,
+            width: width as u32,
+            beta,
+            linear_beta,
+        };
+        self.dispatch(
+            &self.kernels.situ,
+            &[&out.buf, &gate_up.buf],
+            &params,
+            out.len.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn weighted_sum(&self, out: &mut Buffer, y: &Buffer, weights: &Buffer) {
+        let width = y.len / weights.len;
+        assert!(y.len == weights.len * width && out.len.is_multiple_of(width));
+        let k = weights.len / (out.len / width);
+        out.touch();
+        let params = RowsParams {
+            len: out.len as u32,
+            width: width as u32,
+            k: k as u32,
+        };
+        self.dispatch(
+            &self.kernels.weighted_sum,
+            &[&out.buf, &y.buf, &weights.buf],
+            &params,
+            out.len.div_ceil(THREADS),
             THREADS,
         );
     }
