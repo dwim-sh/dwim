@@ -42,7 +42,8 @@ pub const CACHE_BLOCK: usize = 32;
 
 /// A weight matrix on the host, of shape `[rows, cols]`: raw bf16 bits, or
 /// rows of 4-bit or 8-bit blocks with their scales apart, as [`quant`] lays
-/// them out.
+/// them out. A matrix of NVFP4 is one a device may not take: see
+/// [`Device::takes`].
 pub enum Tensor {
     Bf16 {
         shape: Vec<usize>,
@@ -58,6 +59,11 @@ pub enum Tensor {
         scales: Vec<u16>,
         quants: Vec<i8>,
     },
+    Nvfp4 {
+        shape: Vec<usize>,
+        scales: Vec<u8>,
+        quants: Vec<u8>,
+    },
 }
 
 impl Tensor {
@@ -65,7 +71,8 @@ impl Tensor {
         match self {
             Tensor::Bf16 { shape, .. }
             | Tensor::Q4_0 { shape, .. }
-            | Tensor::Q8_0 { shape, .. } => shape,
+            | Tensor::Q8_0 { shape, .. }
+            | Tensor::Nvfp4 { shape, .. } => shape,
         }
     }
 
@@ -95,6 +102,11 @@ impl Tensor {
                 shape,
                 scales: take(scales, quant::blocks(cols), rows),
                 quants: take(quants, cols, rows),
+            },
+            Tensor::Nvfp4 { scales, quants, .. } => Tensor::Nvfp4 {
+                shape,
+                scales: take(scales, cols / quant::NVFP4_BLOCK, rows),
+                quants: take(quants, cols / 2, rows),
             },
         }
     }
@@ -132,6 +144,16 @@ impl Tensor {
                 scales: take(scales, quant::blocks(cols), quant::blocks(width), groups),
                 quants: take(quants, cols, width, groups),
             },
+            Tensor::Nvfp4 { scales, quants, .. } => Tensor::Nvfp4 {
+                shape,
+                scales: take(
+                    scales,
+                    cols / quant::NVFP4_BLOCK,
+                    width / quant::NVFP4_BLOCK,
+                    groups,
+                ),
+                quants: take(quants, cols / 2, width / 2, groups),
+            },
         }
     }
 
@@ -159,6 +181,14 @@ impl Tensor {
                     quant::dequantize_q8_0_row(
                         &scales[r * blocks..][..blocks],
                         &quants[r * cols..][..cols],
+                        out,
+                    );
+                }
+                Tensor::Nvfp4 { scales, quants, .. } => {
+                    let blocks = cols / quant::NVFP4_BLOCK;
+                    quant::dequantize_nvfp4_row(
+                        &scales[r * blocks..][..blocks],
+                        &quants[r * cols / 2..][..cols / 2],
                         out,
                     );
                 }
@@ -201,6 +231,13 @@ pub trait Device {
     /// batches are kept short.
     fn batch(&self) -> usize {
         64
+    }
+
+    /// Whether the device takes weights in NVFP4, and runs
+    /// [`expert_matmul`](Self::expert_matmul) over them. The other
+    /// formats every device takes.
+    fn takes_nvfp4(&self) -> bool {
+        false
     }
 
     /// Copies a weight matrix into device memory.
@@ -247,6 +284,11 @@ pub trait Device {
     /// Sets the first activations of a cache to `data`, bytes as
     /// [`read_cache`](Self::read_cache) gives them.
     fn write_cache(&self, cache: &mut Self::Cache, data: &[u8]);
+
+    /// `dst[..len] = src[..len]`, of two caches, a whole number of blocks.
+    fn copy_cache(&self, dst: &mut Self::Cache, src: &Self::Cache, len: usize) {
+        self.write_cache(dst, &self.read_cache(src, len));
+    }
 
     /// `out[t] = w · x[t]` for each row `x[t]` of `x`, for a weight matrix
     /// `w` of shape `[rows, cols]`: `x` holds `cols` activations per token,
@@ -398,6 +440,267 @@ pub trait Device {
         n_v_heads: usize,
         head_dim: usize,
     );
+
+    /// Attention over the depth of the model: for each token, `out` is a
+    /// mix of the token's rows of `states`, the residual stream as it was
+    /// at several depths, each normalized by its root mean square. A
+    /// state's share is the softmax, over the states, of its normalized
+    /// row's dot product with `query`, which is as wide as a row, over the
+    /// square root of the width.
+    ///
+    /// The operations from here on are a model's own, and a device that
+    /// has no kernel for one runs it on the host, with the CPU's.
+    fn mix(
+        &self,
+        out: &mut Self::Buffer,
+        states: &[&Self::Buffer],
+        query: &Self::Buffer,
+        eps: f32,
+    ) {
+        let states: Vec<Vec<f32>> = states.iter().map(|s| self.read(s)).collect();
+        let mut host = self.read(out);
+        Cpu.mix(
+            &mut host,
+            &states.iter().collect::<Vec<_>>(),
+            &self.read(query),
+            eps,
+        );
+        self.write(out, &host);
+    }
+
+    /// `x = x - tanh(forget) * x + tanh(gain) * message`: what a gate
+    /// lets into the residual stream of a message, and what it has the
+    /// stream forget.
+    fn gated_update(
+        &self,
+        x: &mut Self::Buffer,
+        forget: &Self::Buffer,
+        gain: &Self::Buffer,
+        message: &Self::Buffer,
+    ) {
+        let mut host = self.read(x);
+        Cpu.gated_update(
+            &mut host,
+            &self.read(forget),
+            &self.read(gain),
+            &self.read(message),
+        );
+        self.write(x, &host);
+    }
+
+    /// A gate on a message, for each row of `x` and of `message`: both
+    /// rows, each normalized by its root mean square, go through
+    /// `down_input` and `down_message` to a few dimensions, the two
+    /// results are added, and from the sum `gain` and `forget` give what
+    /// [`gated_update`](Self::gated_update) takes, which changes `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn gate(
+        &self,
+        x: &mut Self::Buffer,
+        message: &Self::Buffer,
+        down_input: &Self::Weight,
+        down_message: &Self::Weight,
+        gain: &Self::Weight,
+        forget: &Self::Weight,
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        let rows = self.read(x).len() / dim;
+        let ones = {
+            let mut ones = self.alloc(dim);
+            self.write(&mut ones, &vec![1.0; dim]);
+            ones
+        };
+        let (mut input, mut normed) = (self.alloc(rows * dim), self.alloc(rows * dim));
+        self.normalize(&mut input, x, &ones, rows * dim, eps);
+        self.normalize(&mut normed, message, &ones, rows * dim, eps);
+        let (mut down, mut from_message) = (self.alloc(rows * rank), self.alloc(rows * rank));
+        self.matmul(&mut down, down_input, &input);
+        self.matmul(&mut from_message, down_message, &normed);
+        self.add(&mut down, &from_message);
+        self.matmul(&mut input, gain, &down);
+        self.matmul(&mut normed, forget, &down);
+        self.gated_update(x, &normed, &input, message);
+    }
+
+    /// A short causal convolution with a residual: each channel of `x`,
+    /// which holds a row of channels per token, is convolved over the
+    /// token and the `taps - 1` before it with its taps from `weight`,
+    /// which holds `taps` per channel, the last for the token itself. With
+    /// `dynamic`, a row per token of `taps` more for each of its heads,
+    /// which the channels are split evenly between, the token `lag` back
+    /// is also taken times the head's tap `lag`. The sum is added to the
+    /// channel, and the whole divided by the square root of the taps and
+    /// one. `state` holds the rows of the `taps - 1` tokens before the
+    /// batch, and is left holding the last `taps - 1` of it.
+    fn short_conv(
+        &self,
+        out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        state: &mut Self::Buffer,
+        weight: &Self::Buffer,
+        dynamic: Option<(&Self::Buffer, usize)>,
+    ) {
+        let mut host = self.read(out);
+        let mut host_state = self.read(state);
+        let taps = dynamic.map(|(taps, heads)| (self.read(taps), heads));
+        Cpu.short_conv(
+            &mut host,
+            &self.read(x),
+            &mut host_state,
+            &self.read(weight),
+            taps.as_ref().map(|(taps, heads)| (taps, *heads)),
+        );
+        self.write(out, &host);
+        self.write(state, &host_state);
+    }
+
+    /// Scales each `scale.len()`-long row of `x` by `scale`, then each
+    /// `dim`-long head of it down to a length of `threshold`, if it is
+    /// longer.
+    fn clip(&self, x: &mut Self::Buffer, scale: &Self::Buffer, dim: usize, threshold: f32) {
+        let mut host = self.read(x);
+        Cpu.clip(&mut host, &self.read(scale), dim, threshold);
+        self.write(x, &host);
+    }
+
+    /// Scales each of the `factors.len()` rows of `x` by its factor.
+    fn scale_rows(&self, x: &mut Self::Buffer, factors: &Self::Buffer) {
+        let mut host = self.read(x);
+        Cpu.scale_rows(&mut host, &self.read(factors));
+        self.write(x, &host);
+    }
+
+    /// Causal self-attention as [`attention`](Self::attention) is, over
+    /// the keys no more than `window - 1` positions back, with a bias by
+    /// distance and a sink. The caches hold `rows` positions, position `p`
+    /// in row `p % rows`: as many as a sequence is long, or a ring of the
+    /// latest, no fewer than the window and the batch reach back. A key `d` positions back has added to its
+    /// score the dot product of the head's row of `rel`, which holds a row
+    /// per head per token, with row `d` of `bias`, a row as wide per
+    /// distance; a key further back than `bias` has rows gets none. The
+    /// softmax is taken over the keys and a sink that has no value, whose
+    /// score is the head's of `sinks`, which holds one per head per token:
+    /// what the sink takes, no key gets.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rel(
+        &self,
+        out: &mut Self::Buffer,
+        q: &Self::Buffer,
+        k_cache: &Self::Cache,
+        v_cache: &Self::Cache,
+        rel: &Self::Buffer,
+        bias: &Self::Buffer,
+        sinks: &Self::Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+    ) {
+        let q = self.read(q);
+        let n = q.len() / (n_heads * head_dim);
+        let kv_dim = n_kv_heads * head_dim;
+        let len = (pos + n).min(rows) * kv_dim;
+        let cache = |device: &Self::Cache| {
+            let mut host = Cpu.alloc_cache(len);
+            Cpu.write_cache(&mut host, &self.read_cache(device, len));
+            host
+        };
+        let mut host = self.read(out);
+        Cpu.attention_rel(
+            &mut host,
+            &q,
+            &cache(k_cache),
+            &cache(v_cache),
+            &self.read(rel),
+            &self.read(bias),
+            &self.read(sinks),
+            pos,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+        );
+        self.write(out, &host);
+    }
+
+    /// Picks each token's experts: the `k` of them whose score is highest,
+    /// the score of each being the sigmoid of its logit, of which `logits`
+    /// holds a row per token, plus its `bias`. `ids` gets the experts'
+    /// numbers, a row of `k` per token, the highest score first, and
+    /// `weights` what each one's output counts for: its sigmoid over the
+    /// sum of the `k`, times `scale`.
+    fn route(
+        &self,
+        ids: &mut Self::Buffer,
+        weights: &mut Self::Buffer,
+        logits: &Self::Buffer,
+        bias: &Self::Buffer,
+        k: usize,
+        scale: f32,
+    ) {
+        let (mut host_ids, mut host_weights) = (self.read(ids), self.read(weights));
+        Cpu.route(
+            &mut host_ids,
+            &mut host_weights,
+            &self.read(logits),
+            &self.read(bias),
+            k,
+            scale,
+        );
+        self.write(ids, &host_ids);
+        self.write(weights, &host_weights);
+    }
+
+    /// A matrix multiplication by each token's experts: `w` holds the
+    /// matrices of all the experts, one after another, as many as `scale`
+    /// has scales, and `ids` a row of `k` experts per token, as
+    /// [`route`](Self::route) picks them. `out` gets a row per expert of a
+    /// token: the expert's matrix times the token's row of `x`, or times
+    /// the expert's own row of it where `x` holds one per expert, scaled
+    /// by the expert's scale.
+    fn expert_matmul(
+        &self,
+        out: &mut Self::Buffer,
+        w: &Self::Weight,
+        scale: &Self::Buffer,
+        x: &Self::Buffer,
+        ids: &Self::Buffer,
+        k: usize,
+    ) {
+        let _ = (out, w, scale, x, ids, k);
+        unimplemented!("{} does not run mixtures of experts", self.name());
+    }
+
+    /// The SiTU activation of a feed-forward network: each row of
+    /// `gate_up` is a gate then an up projection, each `width` wide, as a
+    /// row of `out` is, which gets
+    /// `beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta)`.
+    fn situ(
+        &self,
+        out: &mut Self::Buffer,
+        gate_up: &Self::Buffer,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+    ) {
+        let mut host = self.read(out);
+        Cpu.situ(&mut host, &self.read(gate_up), width, beta, linear_beta);
+        self.write(out, &host);
+    }
+
+    /// `out[t] = sum over e of weights[t][e] * y[t][e]`: the outputs of a
+    /// token's experts, of which `y` holds a row each, summed by what each
+    /// counts for.
+    fn weighted_sum(&self, out: &mut Self::Buffer, y: &Self::Buffer, weights: &Self::Buffer) {
+        let mut host = self.read(out);
+        Cpu.weighted_sum(&mut host, &self.read(y), &self.read(weights));
+        self.write(out, &host);
+    }
 }
 
 /// The bytes a cache holds for `len` activations, a whole number of blocks.
