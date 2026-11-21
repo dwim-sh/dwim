@@ -99,6 +99,13 @@ const BF16_TOKENS: usize = 8;
 const QUANT_TOKENS: usize = 4;
 const QUANT_COLS: usize = 128;
 
+/// Fewest tokens of a batch whose experts are multiplied in tiles on the
+/// matrix accelerators, an expert at a time, and the pairs of a token and
+/// an expert a tile takes: below it, a pair at a time reads fewer of the
+/// experts' weights than unpacking each expert's matrix for a tile.
+const EXPERT_TOKENS: usize = 4;
+const EXPERT_TILE: usize = 16;
+
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
 const ATTENTION_THREADS: usize = 256;
@@ -201,8 +208,14 @@ struct Kernels {
     store_q8: Object<dyn MTLComputePipelineState>,
     conv: Object<dyn MTLComputePipelineState>,
     delta_net: Object<dyn MTLComputePipelineState>,
-    /// The experts' matrix multiplication over NVFP4 and over Q8_0 weights.
+    /// The experts' matrix multiplication over NVFP4 and over Q8_0 weights,
+    /// a pair of a token and an expert at a time; and for a batch, in
+    /// tiles on the matrix accelerators, where the GPU has them, with the
+    /// packing of the tiles' inputs and the putting back of their results.
     expert_matmul: [Object<dyn MTLComputePipelineState>; 2],
+    expert_matmul_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    expert_pack: Object<dyn MTLComputePipelineState>,
+    expert_scatter: Object<dyn MTLComputePipelineState>,
     mix: Object<dyn MTLComputePipelineState>,
     gated_update: Object<dyn MTLComputePipelineState>,
     gate: Object<dyn MTLComputePipelineState>,
@@ -210,8 +223,14 @@ struct Kernels {
     short_conv_state: Object<dyn MTLComputePipelineState>,
     clip: Object<dyn MTLComputePipelineState>,
     scale_rows: Object<dyn MTLComputePipelineState>,
+    /// Attention with a bias by distance and a sink: a token at a time,
+    /// the merging of its chunks, and for heads of 128 the kernel on the
+    /// matrix accelerators, where the GPU has them, in tiles of
+    /// [`MMA_ROWS`] rows for a batch and of [`DECODE_ROWS`] for a token
+    /// deep into a context.
     attention_rel: Object<dyn MTLComputePipelineState>,
     attention_rel_combine: Object<dyn MTLComputePipelineState>,
+    attention_rel_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
     route: Object<dyn MTLComputePipelineState>,
     situ: Object<dyn MTLComputePipelineState>,
     weighted_sum: Object<dyn MTLComputePipelineState>,
@@ -243,10 +262,34 @@ pub struct Metal {
     /// per SIMD group.
     matmul_rows: usize,
     name: String,
+    /// What a batch's experts are multiplied in tiles with.
+    experts: RefCell<Experts>,
     pending: RefCell<Option<Pending>>,
     /// Command buffers committed and not yet waited for, in order.
     committed: RefCell<Vec<Object<dyn MTLCommandBuffer>>>,
 }
+
+/// What a batch's experts are multiplied in tiles with: the pairs of a
+/// token and an expert in the order of the tiles, an expert's together;
+/// the tiles, each its expert, its first pair in that order and how many
+/// it has; the inputs packed in that order; and the results in it. The
+/// order and the tiles are laid out on the host from the experts the
+/// router picked, once for both of a layer's multiplications.
+#[derive(Default)]
+struct Experts {
+    order: Scratch,
+    tiles: Scratch,
+    packed: Scratch,
+    sorted: Scratch,
+    /// The buffer of picks the order and the tiles are of, as it was, and
+    /// how many tiles there are.
+    planned: Option<(u64, u64)>,
+    count: usize,
+}
+
+/// A buffer that is made, and made again longer, as it is needed.
+#[derive(Default)]
+struct Scratch(Option<(Object<dyn MTLBuffer>, usize)>);
 
 // Commands are only encoded from whichever thread owns the device.
 unsafe impl Send for Metal {}
@@ -339,6 +382,23 @@ impl Metal {
         } else {
             None
         };
+        let expert_matmul_mma = if matmul_quant_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let tiled = |bits| {
+                compile(
+                    &device,
+                    "expert_matmul_mma",
+                    MATRIX_THREADS,
+                    &[("BITS", bits), ("TOKENS", EXPERT_TILE)],
+                    &[source!("expert_matmul_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([tiled(4)?, tiled(8)?])
+        } else {
+            None
+        };
         let attention_mma = if matmul_quant_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
@@ -357,6 +417,26 @@ impl Metal {
                 mma(256, MMA_ROWS, MMA_THREADS)?,
                 mma(128, DECODE_ROWS, DECODE_THREADS)?,
                 mma(256, DECODE_ROWS, DECODE_THREADS)?,
+            ])
+        } else {
+            None
+        };
+        let attention_rel_mma = if matmul_quant_mma.is_some() {
+            let metal4 = MTLCompileOptions::new();
+            metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            let mma = |rows, threads| {
+                compile(
+                    &device,
+                    "attention_rel_mma",
+                    threads,
+                    &[("DIM", 128), ("ROWS", rows), ("THREADS", threads)],
+                    &[source!("attention_rel_mma")],
+                    Some(&metal4),
+                )
+            };
+            Some([
+                mma(MMA_ROWS, MMA_THREADS)?,
+                mma(DECODE_ROWS, DECODE_THREADS)?,
             ])
         } else {
             None
@@ -440,6 +520,9 @@ impl Metal {
                 msl!("expert_matmul", THREADS, "BITS" = 4),
                 msl!("expert_matmul", THREADS, "BITS" = 8),
             ],
+            expert_matmul_mma,
+            expert_pack: msl!("expert_pack", THREADS),
+            expert_scatter: msl!("expert_scatter", THREADS),
             mix: msl!("mix", THREADS),
             gated_update: msl!("gated_update", THREADS),
             gate: msl!("gate", THREADS),
@@ -449,6 +532,7 @@ impl Metal {
             scale_rows: msl!("scale_rows", THREADS),
             attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
             attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
+            attention_rel_mma,
             route: msl!("route", THREADS),
             situ: msl!("situ", THREADS),
             weighted_sum: msl!("weighted_sum", THREADS),
@@ -474,6 +558,7 @@ impl Metal {
             allocated: Cell::new(0),
             matmul_rows,
             name,
+            experts: RefCell::new(Experts::default()),
             pending: RefCell::new(None),
             committed: RefCell::new(Vec::new()),
         })
@@ -569,6 +654,126 @@ impl Metal {
             &[&self.packed, &x.buf],
             &pack,
             (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    /// The scratch buffer, with room for `bytes`.
+    fn scratch<'a>(&self, scratch: &'a mut Scratch, bytes: usize) -> &'a Object<dyn MTLBuffer> {
+        if scratch.0.as_ref().is_none_or(|(_, len)| *len < bytes) {
+            scratch.0 = Some((self.buffer(bytes), bytes));
+        }
+        &scratch.0.as_ref().expect("made above").0
+    }
+
+    /// Multiplies a batch's pairs of a token and an expert in tiles of one
+    /// expert's pairs, with `kernel` on the matrix accelerators: what
+    /// [`Device::expert_matmul`] does, reading each expert's matrix once
+    /// for a tile rather than once for each token that goes through it.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_tiles(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        out: &mut Buffer,
+        w: &Weight,
+        scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+        shared: bool,
+    ) {
+        let (pairs, experts) = (ids.len, scale.len);
+        let (rows, cols) = (w.shape[0] / experts, w.shape[1]);
+        let mut scratch = self.experts.borrow_mut();
+        let Experts {
+            order,
+            tiles,
+            packed,
+            sorted,
+            planned,
+            count,
+        } = &mut *scratch;
+        // The pairs in the order of their experts, and each expert's in
+        // tiles: laid out once for the picks, which both of a layer's
+        // multiplications are of. Reading the picks waits for the router.
+        if *planned != Some((ids.id, ids.version)) {
+            let picks: Vec<usize> = self.read(ids).iter().map(|&e| e as usize).collect();
+            let mut counts = vec![0u32; experts];
+            for &expert in &picks {
+                counts[expert] += 1;
+            }
+            let mut first = vec![0u32; experts];
+            for expert in 1..experts {
+                first[expert] = first[expert - 1] + counts[expert - 1];
+            }
+            let mut sorted_pairs = vec![0u32; pairs];
+            let mut next = first.clone();
+            for (pair, &expert) in picks.iter().enumerate() {
+                sorted_pairs[next[expert] as usize] = pair as u32;
+                next[expert] += 1;
+            }
+            let mut laid = Vec::new();
+            for expert in 0..experts {
+                for at in (0..counts[expert]).step_by(EXPERT_TILE) {
+                    let of = (counts[expert] - at).min(EXPERT_TILE as u32);
+                    laid.extend([expert as u32, first[expert] + at, of]);
+                }
+            }
+            for (scratch, words) in [(&mut *order, &sorted_pairs), (&mut *tiles, &laid)] {
+                let buf = self.scratch(scratch, words.len() * 4);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        words.as_ptr(),
+                        buf.contents().as_ptr().cast(),
+                        words.len(),
+                    )
+                };
+            }
+            *planned = Some((ids.id, ids.version));
+            *count = laid.len() / 3;
+        }
+        // The last tile reaches a whole tile past its first pair.
+        let padded = pairs + EXPERT_TILE;
+        let order = &order.0.as_ref().expect("laid out above").0;
+        let tiles = &tiles.0.as_ref().expect("laid out above").0;
+        let packed = self.scratch(packed, padded * cols * 2);
+        let sorted = self.scratch(sorted, pairs * rows * 4);
+        out.touch();
+        let pack = ExpertPackParams {
+            pairs: pairs as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+            share: if shared { k as u32 } else { 1 },
+        };
+        self.dispatch(
+            &self.kernels.expert_pack,
+            &[packed, &x.buf, order],
+            &pack,
+            (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
+        let params = ExpertTileParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+        };
+        let scales = w.scales.as_ref().expect("quantized weights have scales");
+        self.dispatch_grid(
+            kernel,
+            &[sorted, &w.buf, scales, packed, tiles, &scale.buf],
+            &params,
+            (rows.div_ceil(TILE_ROWS), *count),
+            MATRIX_THREADS,
+        );
+        let scatter = ExpertScatterParams {
+            pairs: pairs as u32,
+            rows: rows as u32,
+        };
+        self.dispatch(
+            &self.kernels.expert_scatter,
+            &[&out.buf, sorted, order],
+            &scatter,
+            (pairs * rows / 4).div_ceil(THREADS),
             THREADS,
         );
     }
@@ -744,10 +949,18 @@ struct AttentionRelParams {
     chunks: u32,
     /// Positions to a chunk.
     chunk: u32,
+    /// Tokens the dispatch covers, and the rows of a key/value head's
+    /// packed queries of it, for the kernel on the matrix accelerators.
+    tokens: u32,
+    padded: u32,
     window: u32,
-    rows: u32,
+    ring: u32,
     n_rel: u32,
     extent: u32,
+    /// For that kernel, whose chunks are the dispatch's rather than each
+    /// token's: the first position the dispatch attends over.
+    base: u32,
+    batched: u32,
 }
 
 #[repr(C)]
@@ -810,6 +1023,30 @@ struct RowsParams {
     len: u32,
     width: u32,
     k: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertPackParams {
+    pairs: u32,
+    cols: u32,
+    padded: u32,
+    share: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertTileParams {
+    rows: u32,
+    cols: u32,
+    padded: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertScatterParams {
+    pairs: u32,
+    rows: u32,
 }
 
 #[repr(C)]
@@ -1497,13 +1734,24 @@ impl Device for Metal {
         assert_eq!(out.len, pairs * rows);
         let shared = x.len == pairs / k * cols;
         assert!(shared || x.len == pairs * cols);
-        let kernel = match w.format {
-            Format::Nvfp4 => &self.kernels.expert_matmul[0],
-            Format::Q8_0 => &self.kernels.expert_matmul[1],
+        let which = match w.format {
+            Format::Nvfp4 => 0,
+            Format::Q8_0 => 1,
             Format::Bf16 | Format::Q4_0 => {
                 panic!("the experts' matrices are NVFP4 or Q8_0")
             }
         };
+        // A batch goes expert by expert in tiles on the matrix
+        // accelerators, where the matrices are whole steps of the tiles.
+        if let Some(tiled) = &self.kernels.expert_matmul_mma
+            && pairs >= EXPERT_TOKENS * k
+            && cols.is_multiple_of(128)
+            && rows.is_multiple_of(4)
+        {
+            self.expert_tiles(&tiled[which], out, w, scale, x, ids, k, shared);
+            return;
+        }
+        let kernel = &self.kernels.expert_matmul[which];
         let scales = w.scales.as_ref().expect("quantized weights have scales");
         out.touch();
         let params = ExpertParams {
@@ -1751,6 +1999,109 @@ impl Device for Metal {
         let n_rel = rel.len / (n * n_heads);
         assert!(bias.len.is_multiple_of(n_rel));
         out.touch();
+        let group = n_heads / n_kv_heads;
+        let extent = bias.len / n_rel;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 10] = [
+            &out.buf,
+            &q.buf,
+            &k_cache.quants,
+            &k_cache.scales,
+            &v_cache.quants,
+            &v_cache.scales,
+            &self.partials,
+            &rel.buf,
+            &bias.buf,
+            &sinks.buf,
+        ];
+        let params = |first: usize, tokens: usize, chunks: usize, chunk: usize| AttentionRelParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            n_kv_heads: n_kv_heads as u32,
+            pos: pos as u32,
+            first: first as u32,
+            chunks: chunks as u32,
+            chunk: chunk as u32,
+            tokens: tokens as u32,
+            padded: 0,
+            window: window.min(u32::MAX as usize) as u32,
+            ring: rows as u32,
+            n_rel: n_rel as u32,
+            extent: extent as u32,
+            base: 0,
+            batched: 0,
+        };
+        // A batch of tokens of heads of 128 goes through the kernel on the
+        // matrix accelerators, where the GPU has them, and so does a token
+        // that attends over enough positions that reading the caches is
+        // the work, in tiles of its own size. The queries are packed for
+        // it: as many tokens to a dispatch as the partials and the packed
+        // queries fit at the most chunks a dispatch has, over chunks that
+        // start where the dispatch's first token attends from.
+        let decode = n == 1 && (pos + 1).min(window) >= DECODE_DEPTH;
+        if let Some(kernels) = &self.kernels.attention_rel_mma
+            && (n >= FLASH_TOKENS || decode)
+            && head_dim == 128
+            && n_rel.is_multiple_of(4)
+            && n_rel <= 16
+        {
+            let (kernel, tile_rows, threads) = match decode {
+                false => (&kernels[0], MMA_ROWS, MMA_THREADS),
+                true => (&kernels[1], DECODE_ROWS, DECODE_THREADS),
+            };
+            let packed_rows = PACKED / (n_kv_heads * head_dim) / tile_rows * tile_rows;
+            let per_dispatch = (PARTIALS / (n_heads * MMA_CHUNKS * (head_dim + 2)))
+                .min(packed_rows / group)
+                .max(1);
+            for first in (0..n).step_by(per_dispatch) {
+                let tokens = per_dispatch.min(n - first);
+                let base = (pos + first + 1).saturating_sub(window);
+                let span = pos + first + tokens - base;
+                let chunk = span.div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK);
+                let chunks = span.div_ceil(chunk);
+                let padded = (tokens * group).next_multiple_of(tile_rows);
+                self.packed_for.set(None);
+                let pack = PackQueriesParams {
+                    n_heads: n_heads as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    dim: head_dim as u32,
+                    first: first as u32,
+                    n: tokens as u32,
+                    padded: padded as u32,
+                };
+                self.dispatch(
+                    &self.kernels.pack_queries,
+                    &[&self.packed, &q.buf],
+                    &pack,
+                    (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
+                    THREADS,
+                );
+                let params = AttentionRelParams {
+                    padded: padded as u32,
+                    base: base as u32,
+                    batched: 1,
+                    ..params(first, tokens, chunks, chunk)
+                };
+                let mut packed = buffers;
+                packed[1] = &self.packed;
+                self.dispatch_grid(
+                    kernel,
+                    &packed,
+                    &params,
+                    ((tokens * group).div_ceil(tile_rows), n_kv_heads * chunks),
+                    threads,
+                );
+                if chunks > 1 {
+                    self.dispatch(
+                        &self.kernels.attention_rel_combine,
+                        &[&out.buf, &self.partials, &sinks.buf],
+                        &params,
+                        tokens * n_heads,
+                        ATTENTION_THREADS,
+                    );
+                }
+            }
+            return;
+        }
         // Every token's heads get as many chunks as the last token attends
         // over, as many tokens to a dispatch as the partials fit.
         let chunks = (pos + n).min(window).div_ceil(CHUNK);
@@ -1763,31 +2114,7 @@ impl Device for Metal {
         let per_dispatch = PARTIALS / per_token;
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
-            let params = AttentionRelParams {
-                n_heads: n_heads as u32,
-                head_dim: head_dim as u32,
-                n_kv_heads: n_kv_heads as u32,
-                pos: pos as u32,
-                first: first as u32,
-                chunks: chunks as u32,
-                chunk: CHUNK as u32,
-                window: window.min(u32::MAX as usize) as u32,
-                rows: rows as u32,
-                n_rel: n_rel as u32,
-                extent: (bias.len / n_rel) as u32,
-            };
-            let buffers: [&ProtocolObject<dyn MTLBuffer>; 10] = [
-                &out.buf,
-                &q.buf,
-                &k_cache.quants,
-                &k_cache.scales,
-                &v_cache.quants,
-                &v_cache.scales,
-                &self.partials,
-                &rel.buf,
-                &bias.buf,
-                &sinks.buf,
-            ];
+            let params = params(first, tokens, chunks, CHUNK);
             self.dispatch(
                 &self.kernels.attention_rel,
                 &buffers,

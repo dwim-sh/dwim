@@ -3,7 +3,7 @@
 // Inkling's attention adds to it. One threadgroup per (token, key/value
 // head, chunk of CHUNK positions), for every query head that shares the
 // key/value head. A token attends over the positions no more than
-// `window - 1` back, and the caches hold position `p` in row `p % rows`.
+// `window - 1` back, and the caches hold position `p` in row `p % ring`.
 // A key `d` positions back has added to its score the dot product of the
 // head's row of `rel` with row `d` of `bias`, if `bias` has one. The
 // softmax is taken over the keys and a sink that has no value, whose score
@@ -22,10 +22,14 @@ struct Params {
     uint first;
     uint chunks;
     uint chunk;
+    uint tokens;
+    uint padded;
     uint window;
-    uint rows;
+    uint ring;
     uint n_rel;
     uint extent;
+    uint base;
+    uint batched;
 };
 
 #ifndef CHUNK
@@ -100,7 +104,7 @@ kernel void attention_rel(
         for (uint r = 0; r < ROUNDS; r++) {
             uint d = r * 32 + lane;
             if (d < quads) {
-                uint e = ((start + i) % p.rows) * kv_dim + kv + 4 * d;
+                uint e = ((start + i) % p.ring) * kv_dim + kv + 4 * d;
                 float4 key = float4(k_quants[e / 4]) * float(k_scales[e / 32]);
                 for (uint g = 0; g < GROUP; g++) {
                     v[g] += dot(query[g][r], key);
@@ -194,7 +198,7 @@ kernel void attention_rel(
     }
     if (d < quads) {
         for (uint i = vlane; i < count; i += lanes) {
-            uint e = ((start + i) % p.rows) * kv_dim + kv + 4 * d;
+            uint e = ((start + i) % p.ring) * kv_dim + kv + 4 * d;
             float4 v = float4(v_quants[e / 4]) * float(v_scales[e / 32]);
             for (uint g = 0; g < GROUP; g++) {
                 acc[g] += scores[g][i] * v;

@@ -1009,39 +1009,52 @@ pub fn resize_keeps_capacity<D: Device>(gpu: &D) {
 
 /// The experts' matrix multiplication, where the device runs it: over
 /// NVFP4 and Q8_0 weights, with an input row per token and one per expert
-/// of a token, an expert picked twice and one never picked.
+/// of a token; for a few tokens, with an expert picked twice and one never
+/// picked, and for a batch, which a device may take an expert at a time,
+/// with one expert picked by more tokens than a tile of them holds.
 pub fn expert_matmul_matches_cpu<D: Device>(gpu: &D) {
     if !gpu.takes_nvfp4() {
         return;
     }
     let mut rng = Rng(2304);
-    let (experts, k, n) = (5, 3, 4);
-    let ids: Vec<f32> = [0, 4, 2, 2, 0, 1, 4, 4, 1, 1, 2, 0]
+    let (experts, k) = (5, 3);
+    let few: Vec<f32> = [0, 4, 2, 2, 0, 1, 4, 4, 1, 1, 2, 0]
         .iter()
         .map(|&e| e as f32)
         .collect();
+    // Every token of the batch picks expert 2, most pick 0, and none 3.
+    let batch: Vec<f32> = (0..70)
+        .flat_map(|t| [2, if t % 4 == 0 { 4 } else { 0 }, 1 + 3 * (t % 2)])
+        .map(|e| e as f32)
+        .collect();
     let scale = rng.floats(experts);
-    for (rows, cols) in [(40, 64), (192, 2304), (2304, 1152)] {
-        for nvfp4 in [true, false] {
-            for shared in [true, false] {
-                let w = if nvfp4 {
-                    rng.nvfp4(&[experts * rows, cols])
-                } else {
-                    rng.q8_0(&[experts * rows, cols])
-                };
-                let x = rng.floats(if shared { n } else { n * k } * cols);
-                let mut want = vec![0.0; n * k * rows];
-                Cpu.expert_matmul(&mut want, &clone(&w), &scale, &x, &ids, k);
-                let mut out = gpu.alloc(n * k * rows);
-                gpu.expert_matmul(
-                    &mut out,
-                    &gpu.upload(w),
-                    &buffer(gpu, &scale),
-                    &buffer(gpu, &x),
-                    &buffer(gpu, &ids),
-                    k,
-                );
-                close(&gpu.read(&out), &want, 2e-3);
+    for ids in [few, batch] {
+        let n = ids.len() / k;
+        for (rows, cols) in [(40, 64), (192, 2304), (2304, 1152)] {
+            for nvfp4 in [true, false] {
+                for shared in [true, false] {
+                    let w = if nvfp4 {
+                        rng.nvfp4(&[experts * rows, cols])
+                    } else {
+                        rng.q8_0(&[experts * rows, cols])
+                    };
+                    let x = rng.floats(if shared { n } else { n * k } * cols);
+                    let mut want = vec![0.0; n * k * rows];
+                    let host = clone(&w);
+                    Cpu.expert_matmul(&mut want, &host, &scale, &x, &ids, k);
+                    let mut out = gpu.alloc(n * k * rows);
+                    let on_gpu = buffer(gpu, &ids);
+                    let (w, scales) = (gpu.upload(w), buffer(gpu, &scale));
+                    gpu.expert_matmul(&mut out, &w, &scales, &buffer(gpu, &x), &on_gpu, k);
+                    let what = format!("{rows}x{cols} n={n} nvfp4={nvfp4} shared={shared}");
+                    close_batch(&gpu.read(&out), &want, &what);
+                    // And again with the same picks, as a layer's second
+                    // multiplication is.
+                    let x = rng.floats(if shared { n } else { n * k } * cols);
+                    Cpu.expert_matmul(&mut want, &host, &scale, &x, &ids, k);
+                    gpu.expert_matmul(&mut out, &w, &scales, &buffer(gpu, &x), &on_gpu, k);
+                    close_batch(&gpu.read(&out), &want, &format!("{what} again"));
+                }
             }
         }
     }
@@ -1127,6 +1140,10 @@ pub fn attention_rel_matches_cpu<D: Device>(gpu: &D) {
         (24, 128, 8, 1, 5000, 1024, 1088, 1024),
         (24, 128, 8, 5, 40, 16, 24, 16),
         (24, 128, 8, 3, 1500, usize::MAX, 1503, 100),
+        // A token deep into a context, which a device may take on other
+        // kernels than a token near the start.
+        (24, 128, 8, 1, 3000, usize::MAX, 3001, 1024),
+        (24, 128, 8, 1, 40000, usize::MAX, 40001, 1024),
         (6, 64, 2, 64, 100, 7, 71, 7),
     ];
     let n_rel = 16;
@@ -1173,7 +1190,14 @@ pub fn attention_rel_matches_cpu<D: Device>(gpu: &D) {
             window,
             rows,
         );
-        close(&gpu.read(&out), &want, 1e-4);
+        // A batch of heads of 128 may go through kernels that hold the
+        // queries, the keys and the softmax's weights as half floats, and
+        // is held to a batch's error.
+        if (n > 1 || pos >= 2048) && head_dim == 128 {
+            close_batch(&gpu.read(&out), &want, &format!("{n} tokens at {pos}"));
+        } else {
+            close(&gpu.read(&out), &want, 1e-4);
+        }
     }
 }
 
