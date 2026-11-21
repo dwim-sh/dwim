@@ -102,11 +102,12 @@ impl Picker {
     pub fn rows(&self) -> (Vec<Line>, usize) {
         let group = &self.groups[self.provider];
         let models = self.models();
-        let sizes = models.iter().map(|m| m.size().len()).max().unwrap_or(0);
+        let alias = |model: Model| model.alias().unwrap_or("");
+        let sizes = models.iter().map(|&m| alias(m).len()).max().unwrap_or(0);
         let mut rows = vec![vec![span("  Select model").bold()], Line::new()];
         let mut cursor = 0;
         for &model in &models {
-            let size = format!("{:<sizes$}  ", model.size());
+            let size = format!("{:<sizes$}  ", alias(model));
             let tick = if Some((group.provider, model)) == self.current {
                 "  ✓"
             } else {

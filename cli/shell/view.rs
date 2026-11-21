@@ -111,11 +111,11 @@ pub fn provider_notice(provider: Kind, model: Model) -> String {
     match provider.host() {
         None => format!(
             "{} runs on this machine, in the dwim server · /server shows it",
-            model.size()
+            model.alias().unwrap_or(model.name())
         ),
         Some(host) => format!(
             "{} runs at {}, as {}",
-            model.size(),
+            model.alias().unwrap_or(model.name()),
             host.name,
             (host.model)(model)
         ),
