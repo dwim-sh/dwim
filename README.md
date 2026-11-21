@@ -100,6 +100,20 @@ it reads:
 man dwim
 ```
 
+## Performance
+
+How fast the local model, Qwen3.8-27B at four bits, reads a prompt
+(prefill) and writes its reply (decode), measured on the prompt "Summarize
+this repository in one paragraph":
+
+| Machine               |   Prefill |   Decode |
+|-----------------------|----------:|---------:|
+| NVIDIA DGX Spark      | 882 tok/s | 33 tok/s |
+| MacBook Pro, Apple M5 |  88 tok/s | 10 tok/s |
+
+`dwim --bench` measures both on your machine, at several depths of
+context.
+
 ## Using dwim as a sub-agent
 
 dwim also makes a good sub-agent: your main agent plans the change, and
