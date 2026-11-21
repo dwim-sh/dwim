@@ -35,7 +35,7 @@ and the commit of `dwim` or the version of opencode: manifest.json says
 what was run, report.md what came of it, and each instance has a
 directory with its result.json, patch.diff, the transcript and the logs.
 The report of a run over a whole dataset is written to evals/results/ as
-well, to be kept in git.
+well, named for the agent and the dataset, to be kept in git.
 The same command again takes the run up where it stopped: it leaves the
 instances that are done, tries again those that failed for a reason that
 was not the agent's, and scores the patches that are not scored.
@@ -63,6 +63,9 @@ DATASETS = {
 SUBSETS = {
     "verified-mini": ("verified", "MariusHobbhahn/swe-bench-verified-mini"),
 }
+
+# What a dataset goes by in the name of the report kept of a run over it.
+KEPT = {"verified-mini": "swebench-mini", "verified": "swebench-verified", "lite": "swebench-lite"}
 
 # The evaluation images only exist for x86_64; an arm64 Docker runs them
 # under Rosetta or QEMU, if asked for that platform.
@@ -120,6 +123,50 @@ OPENCODE = {
     "share": "disabled",
     "autoupdate": False,
 }
+
+# How a run is made, as its report says it, for a reader who has only the
+# report. What differs from one run to another is in the report's table.
+METHOD = """Each instance is one go of the agent at one issue, and the run is one go at
+each instance: the model's sampling is not seeded, so the count moves by a
+few from one run to the next.
+
+- **The task.** The agent is given the issue's text, asked to make the
+  smallest change that fixes it in the checkout, to update the tests the
+  change breaks, and to run them. It is not given the tests the fix is
+  scored by.
+- **The checkout.** The repository is copied out of the instance's
+  SWE-bench evaluation image, at the commit before the fix, with the
+  project installed. The agent's shell commands run in a container of that
+  image that has no network; the model is asked from this machine, and the
+  agent's tools that read and edit files work on the checkout here.
+- **The time.** The agent has the time limit above for an instance. One
+  that runs out of it is stopped, and what it had changed by then is its
+  patch.
+- **The patch.** Whatever differs from the checkout as the image had it,
+  files added as well as changed, committed or not.
+- **The score.** The official SWE-bench harness (swebench 5.0.2) applies
+  the patch in a fresh container of the same image and runs the tests of
+  the instance: resolved is every test the fix was to make pass passing,
+  and none that passed before failing. An instance with no patch is not
+  resolved.
+- **The settings.** The agent runs with its defaults and the arguments
+  above. For `dwim`, the table has what each session's transcript says it
+  was started with: where the model was served, the reasoning effort it
+  was asked for, the thinking budget, and the sampling.
+"""
+
+# What the report says of the thinking, under its figures.
+THINKING = """A thought's tokens are estimated from its text at four characters a token,
+which is how `dwim` counts a thought against the budget as it streams from
+a host: the host does not say what a reply that was ended early took. A
+thought that runs to the budget is ended, and the reply asked for again
+with no thought, up to three times in a reply. The host's own count is of the
+replies that ran to their end only, so it leaves out the thoughts that
+were ended.
+"""
+
+# Characters of a thought to a token, about: as `dwim` counts them.
+THOUGHT_CHARACTERS = 4
 
 # The name the harness files a run's logs and reports under. A run has a
 # directory of its own, so they all take the same.
@@ -641,14 +688,18 @@ def report(run, rows, keep):
     """Writes the run up as Markdown in its directory: what was run, what
     came of it, and each instance. A run of a whole dataset is one to
     `keep`, and its report goes to evals/results/ as well, which git has,
-    where the runs themselves are too large for it."""
+    where the runs themselves are too large for it. The report kept is
+    named for the agent and the dataset, as dwim-swebench-mini.md is, so
+    that a later run's takes the place of an earlier one's: which `dwim`
+    it was is the commit the report names."""
     said = json.loads((run / "manifest.json").read_text())
     agent = said["agent"]
     results = [result(run, row["instance_id"]) or {"agent": "error", "patch_bytes": 0} for row in rows]
     known = [facts(agent, run / row["instance_id"] / "transcript.jsonl") for row in rows]
     served = sorted({fact["served"] for fact in known if fact.get("served")})
     resolved = sum(1 for r in results if r.get("verdict") == "resolved")
-    lines = [f"# {run.name}", "", "| | |", "|---|---|", f"| Dataset | {said['dataset']}, {len(rows)} instances |"]
+    name = f"{'gold' if agent == 'gold' else agent.get('name', 'dwim')}-{KEPT[said['dataset']]}"
+    lines = [f"# {name}", "", "| | |", "|---|---|", f"| Dataset | {said['dataset']}, {len(rows)} instances |"]
     if agent == "gold":
         lines += ["| Agent | none: the dataset's own fixes |"]
     else:
@@ -656,6 +707,7 @@ def report(run, rows, keep):
         lines += [
             f"| Agent | {agent.get('name', 'dwim')} {agent['version'].removeprefix('dwim ')}{built} |",
             f"| Model | {agent['model']}{', served as ' + '; '.join(served) if served else ''} |",
+            *settings(known),
             f"| Arguments | {' '.join(agent['arguments']) or 'none'} |",
             f"| Time limit | {agent['timeout']} seconds an instance |",
         ]
@@ -668,25 +720,75 @@ def report(run, rows, keep):
         count = sum(1 for r in results if r["agent"] == ended)
         if count:
             lines += ["", f"The agent {ended} on {count}, which are counted above by what it had changed by then."]
-    lines += ["", "| Instance | Agent | Seconds | Tool calls | Outcome |", "|---|---|---|---|---|"]
+    lines += thinking(known)
+    if agent != "gold":
+        lines += ["", "## Method", "", METHOD.rstrip()]
+    lines += ["", "## Instances", "", "| Instance | Agent | Seconds | Tool calls | Thinking tokens | Thoughts ended | Outcome |", "|---|---|---|---|---|---|---|"]
     lines += [
-        f"| {row['instance_id']} | {r['agent']} | {r.get('seconds', '')} | {fact.get('calls', '')} | {verdict_of(r)} |"
+        f"| {row['instance_id']} | {r['agent']} | {r.get('seconds', '')} | {fact.get('calls', '')} | {fact.get('thinking', '')} | {fact.get('ended', '')} | {verdict_of(r)} |"
         for row, r, fact in zip(rows, results, known)
     ]
     text = "\n".join(lines) + "\n"
     write(run / "report.md", text)
     if keep:
-        kept = ROOT / "evals" / "results" / f"{run.name}.md"
+        kept = ROOT / "evals" / "results" / f"{name}.md"
         kept.parent.mkdir(exist_ok=True)
         write(kept, text)
         print(f"report in {kept}")
+
+
+def settings(known):
+    """The rows of the report's table for what `dwim` was started with, as
+    the instances' transcripts have it: every value that any of them had,
+    so that a run whose instances were not all asked the same way shows
+    it."""
+    def values(key, say=str):
+        return ", ".join(say(value) for value in sorted({fact[key] for fact in known if fact.get(key) is not None}, key=str))
+    rows = [
+        ("Reasoning effort", values("effort")),
+        ("Thinking budget", values("budget", lambda tokens: f"{tokens} tokens a thought" if tokens else "none")),
+        ("Sampling", values("sampling")),
+    ]
+    return [f"| {name} | {value} |" for name, value in rows if value]
+
+
+def thinking(known):
+    """The report's section on how much the model thought, and how often
+    the thinking budget ended a thought, where the transcripts say."""
+    known = [fact for fact in known if "thinking" in fact]
+    if not known:
+        return []
+    per_instance = sorted(fact["thinking"] for fact in known)
+    median = middle_of(per_instance)
+    thoughts = sum(fact["thoughts"] for fact in known)
+    ended = sum(fact["ended"] for fact in known)
+    return [
+        "", "## Thinking", "", "| | |", "|---|---|",
+        f"| Thinking tokens an instance, median | {median} |",
+        f"| Thinking tokens an instance, most | {per_instance[-1]} |",
+        f"| Thinking tokens an instance as the host counted them, median | {middle_of(sorted(fact['counted'] for fact in known))} |",
+        f"| Thinking tokens, all instances | {sum(per_instance)} |",
+        f"| Replies with a thought | {thoughts} |",
+        f"| Thoughts ended at the budget | {ended}, in {sum(1 for fact in known if fact['ended'])} instances |",
+        f"| Longest thought | {max(fact['longest'] for fact in known)} tokens |",
+        "", THINKING.rstrip(),
+    ]
+
+
+def middle_of(ordered):
+    """The median of numbers in order."""
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) // 2
 
 
 def facts(agent, transcript):
     """What an instance's transcript tells that its result does not: how
     many tool calls the agent made, and for `dwim`, where the model was
     served and with how much context, which `dwim` chooses for itself
-    when it is not told."""
+    when it is not told, the reasoning effort, the thinking budget and the
+    sampling it was started with, and how much it thought: the tokens of
+    its thoughts, about, how many replies had one, the longest, and how
+    many the budget ended."""
     try:
         rows = [json.loads(line) for line in transcript.read_text().splitlines() if line.startswith("{")]
     except (FileNotFoundError, ValueError):
@@ -695,7 +797,21 @@ def facts(agent, transcript):
         return {"calls": sum(1 for row in rows if row.get("type") == "tool_use")}
     known = {"calls": sum(1 for row in rows if row.get("type") == "call")}
     if rows and rows[0].get("type") == "start":
-        known["served"] = f"{rows[0].get('device')} with a context of {rows[0].get('context')} tokens"
+        start = rows[0]
+        known["served"] = f"{start.get('device')} with a context of {start.get('context')} tokens"
+        known["effort"] = start.get("reasoning_effort")
+        if "thinking_budget" in start:
+            known["budget"] = start["thinking_budget"] or 0
+        if "temperature" in start:
+            known["sampling"] = f"temperature {start['temperature']}, top-p {start.get('top_p')}"
+    # A reply's thought is the record of it before the reply's own, whole,
+    # with the closings that ended it.
+    thoughts = [len(row.get("text", "")) // THOUGHT_CHARACTERS for row in rows if row.get("type") == "thought"]
+    known["thinking"] = sum(thoughts)
+    known["thoughts"] = sum(1 for tokens in thoughts if tokens)
+    known["longest"] = max(thoughts, default=0)
+    known["ended"] = sum(1 for row in rows if row.get("type") == "reply" and row.get("thought_ended"))
+    known["counted"] = sum(row.get("thought_tokens", 0) for row in rows if row.get("type") == "reply")
     return known
 
 

@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::model::Sampling;
+use crate::model::{Effort, Sampling};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -138,7 +138,8 @@ impl Log {
     /// Records what the model is given before the first message: which
     /// model, on which device, where, how many tokens of context it has,
     /// how its tokens are sampled, the most tokens of a thought, if they
-    /// are limited, and the system prompt.
+    /// are limited, the effort it is asked to reason at, and the system
+    /// prompt.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
@@ -148,6 +149,7 @@ impl Log {
         context: usize,
         sampling: Sampling,
         thinking_budget: Option<usize>,
+        effort: Effort,
         system: &str,
     ) {
         let (date, time) = now();
@@ -166,6 +168,7 @@ impl Log {
                 "min_p": decimal(sampling.min_p),
                 "seed": sampling.seed,
                 "thinking_budget": thinking_budget,
+                "reasoning_effort": effort.name(),
                 "system": system,
             }),
         );
