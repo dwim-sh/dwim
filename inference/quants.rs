@@ -8,7 +8,9 @@
 //! each, and an f16 scale for the block. The last two are not given to a
 //! device: their weights are reconstructed and quantized again as `Q8_0`,
 //! which keeps them to within a 254th of each block's largest magnitude,
-//! finer than either format's own steps.
+//! finer than either format's own steps. NVFP4 blocks hold 64 weights in
+//! 36 bytes: four 8-bit scales, one for sixteen weights each, then each
+//! sixteen's 4-bit floats in eight bytes; they go to a device as they are.
 
 use crate::gpu::{Tensor, float::from_f16, quant};
 
@@ -20,6 +22,12 @@ pub const Q6_K_BYTES: usize = 210;
 
 /// Weights in a `Q6_K` block.
 pub const Q6_K_BLOCK: usize = 256;
+
+/// Bytes of a file block of NVFP4, the weights in it, and the scales
+/// ahead of them, one for each [`quant::NVFP4_BLOCK`].
+pub const NVFP4_BYTES: usize = 36;
+pub const NVFP4_FILE_BLOCK: usize = 64;
+const NVFP4_SCALES: usize = NVFP4_FILE_BLOCK / quant::NVFP4_BLOCK;
 
 fn f16(bytes: &[u8]) -> f32 {
     from_f16(u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -100,6 +108,34 @@ pub fn dequantize_q6_k(row: &[u8], out: &mut [f32]) {
                 }
             }
         }
+    }
+}
+
+/// Reconstructs a row of NVFP4 weights from the file.
+pub fn dequantize_nvfp4(row: &[u8], out: &mut [f32]) {
+    assert_eq!(row.len(), out.len() / NVFP4_FILE_BLOCK * NVFP4_BYTES);
+    for (block, out) in row
+        .chunks_exact(NVFP4_BYTES)
+        .zip(out.chunks_exact_mut(NVFP4_FILE_BLOCK))
+    {
+        let (scales, quants) = block.split_at(NVFP4_SCALES);
+        quant::dequantize_nvfp4_row(scales, quants, out);
+    }
+}
+
+/// An NVFP4 matrix from the file, its quants and scales parted.
+pub fn nvfp4(data: &[u8], rows: usize, cols: usize) -> Tensor {
+    assert_eq!(data.len(), rows * cols / NVFP4_FILE_BLOCK * NVFP4_BYTES);
+    let mut scales = Vec::with_capacity(rows * cols / quant::NVFP4_BLOCK);
+    let mut quants = Vec::with_capacity(rows * cols / 2);
+    for block in data.chunks_exact(NVFP4_BYTES) {
+        scales.extend_from_slice(&block[..NVFP4_SCALES]);
+        quants.extend_from_slice(&block[NVFP4_SCALES..]);
+    }
+    Tensor::Nvfp4 {
+        shape: vec![rows, cols],
+        scales,
+        quants,
     }
 }
 
@@ -215,6 +251,27 @@ mod tests {
         dequantize_q8_0(&packed, &mut from_file);
         assert_eq!(q8_0(&packed, 2, 128).dequantize(), from_file);
         assert!(x.iter().zip(&from_file).all(|(a, b)| (a - b).abs() < 0.005));
+    }
+
+    #[test]
+    fn nvfp4_blocks_read_back_the_same_in_either_layout() {
+        // Two rows of a block each: the scales of the second differ from
+        // the first's, and every byte of quants is different.
+        let mut data = Vec::new();
+        for r in 0..2u8 {
+            data.extend((0..4).map(|s| ((6 + r + s) << 3) | s));
+            data.extend((0..32u8).map(|j| j * 7 + r * 30));
+        }
+        let mut from_file = vec![0.0; 128];
+        dequantize_nvfp4(&data, &mut from_file);
+        assert_eq!(nvfp4(&data, 2, 64).dequantize(), from_file);
+        // Weight 16 + 8 + 3 of the first row is the high nibble of byte
+        // 8 + 3 of the quants, under the second scale: 1.125 halved.
+        let nibble = ((8 + 3) * 7u8) >> 4;
+        assert_eq!(
+            from_file[16 + 8 + 3],
+            quant::NVFP4_VALUES[nibble as usize] as f32 * 0.5625
+        );
     }
 
     #[test]

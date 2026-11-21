@@ -10,8 +10,9 @@ use crate::{model, session::Settings, tui};
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
-    /// model to run, by size: medium (default), which is qwen3.8-27b, or
-    /// large, qwen3.8-2.4t-a95b
+    /// model to run: qwen3.8-27b (default), which medium also names,
+    /// qwen3.8-2.4t-a95b, which large also names, or inkling2-mini, on
+    /// this machine only
     #[argh(option, default = "Model::default()")]
     pub model: Model,
 

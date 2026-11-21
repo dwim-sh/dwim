@@ -34,14 +34,14 @@ pub const HOST: Host = Host {
 /// from signing in, reasoning at `effort`, with room for `context` tokens
 /// of conversation, or as many as a model at a host has unless told,
 /// sampled at `temperature`, or as the model's makers recommend. The
-/// large model does not run there.
+/// large model does not run there, nor Inkling.
 pub fn open(
     model: Model,
     effort: Effort,
     context: Option<usize>,
     temperature: Option<f32>,
 ) -> Result<Hosted> {
-    if model == Model::QwenMax {
+    if model != Model::Qwen27b {
         return Err(format!("{model} does not run at Cerebras").into());
     }
     let key = key()
@@ -50,11 +50,12 @@ pub fn open(
 }
 
 /// `model` as Cerebras names it. Only the medium model runs there; the
-/// large one is named as it would be, for [`open`] to refuse.
+/// others are named as they would be, for [`open`] to refuse.
 pub fn model(model: Model) -> &'static str {
     match model {
         Model::Qwen27b => "qwen-3.8-27b",
         Model::QwenMax => "qwen-3.8-2.4t-a95b",
+        Model::InklingMini => "inkling-2-mini",
     }
 }
 

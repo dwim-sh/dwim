@@ -344,4 +344,170 @@ impl Device for Gpu {
             )
         )
     }
+
+    fn takes_nvfp4(&self) -> bool {
+        dispatch!(self, takes_nvfp4())
+    }
+
+    fn copy_cache(&self, dst: &mut Cache, src: &Cache, len: usize) {
+        dispatch!(self, copy_cache((dst), (src), len))
+    }
+
+    fn mix(&self, out: &mut Buffer, states: &[&Buffer], query: &Buffer, eps: f32) {
+        // The states are unwrapped one by one, which `dispatch!` cannot.
+        macro_rules! mix {
+            ($api:ident, $gpu:expr) => {{
+                let states: Vec<_> = states.iter().map(|state| unwrap!($api, [state])).collect();
+                $gpu.mix(unwrap!($api, [out]), &states, unwrap!($api, [query]), eps)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => mix!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => mix!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => mix!(Metal, gpu),
+        }
+    }
+
+    fn gated_update(&self, x: &mut Buffer, forget: &Buffer, gain: &Buffer, message: &Buffer) {
+        dispatch!(self, gated_update([x], [forget], [gain], [message]))
+    }
+
+    fn gate(
+        &self,
+        x: &mut Buffer,
+        message: &Buffer,
+        down_input: &Weight,
+        down_message: &Weight,
+        gain: &Weight,
+        forget: &Weight,
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        dispatch!(
+            self,
+            gate(
+                [x],
+                [message],
+                { down_input },
+                { down_message },
+                { gain },
+                { forget },
+                dim,
+                rank,
+                eps
+            )
+        )
+    }
+
+    fn short_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+    ) {
+        // The heads' taps are unwrapped where there are any, which
+        // `dispatch!` cannot.
+        macro_rules! short_conv {
+            ($api:ident, $gpu:expr) => {{
+                let dynamic = dynamic.map(|(taps, heads)| (unwrap!($api, [taps]), heads));
+                $gpu.short_conv(
+                    unwrap!($api, [out]),
+                    unwrap!($api, [x]),
+                    unwrap!($api, [state]),
+                    unwrap!($api, [weight]),
+                    dynamic,
+                )
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => short_conv!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => short_conv!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => short_conv!(Metal, gpu),
+        }
+    }
+
+    fn clip(&self, x: &mut Buffer, scale: &Buffer, dim: usize, threshold: f32) {
+        dispatch!(self, clip([x], [scale], dim, threshold))
+    }
+
+    fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
+        dispatch!(self, scale_rows([x], [factors]))
+    }
+
+    fn attention_rel(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+    ) {
+        dispatch!(
+            self,
+            attention_rel(
+                [out],
+                [q],
+                (k_cache),
+                (v_cache),
+                [rel],
+                [bias],
+                [sinks],
+                pos,
+                n_heads,
+                head_dim,
+                n_kv_heads,
+                window,
+                rows
+            )
+        )
+    }
+
+    fn route(
+        &self,
+        ids: &mut Buffer,
+        weights: &mut Buffer,
+        logits: &Buffer,
+        bias: &Buffer,
+        k: usize,
+        scale: f32,
+    ) {
+        dispatch!(self, route([ids], [weights], [logits], [bias], k, scale))
+    }
+
+    fn expert_matmul(
+        &self,
+        out: &mut Buffer,
+        w: &Weight,
+        scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+    ) {
+        dispatch!(self, expert_matmul([out], { w }, [scale], [x], [ids], k))
+    }
+
+    fn situ(&self, out: &mut Buffer, gate_up: &Buffer, width: usize, beta: f32, linear_beta: f32) {
+        dispatch!(self, situ([out], [gate_up], width, beta, linear_beta))
+    }
+
+    fn weighted_sum(&self, out: &mut Buffer, y: &Buffer, weights: &Buffer) {
+        dispatch!(self, weighted_sum([out], [y], [weights]))
+    }
 }

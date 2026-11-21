@@ -32,23 +32,29 @@ pub const HOST: Host = Host {
 /// `model` at OpenRouter, with the key in the environment or kept from a
 /// sign-in, reasoning at `effort`, with room for `context` tokens of
 /// conversation, or as many as a model at a host has unless told, sampled
-/// at `temperature`, or as the model's makers recommend.
+/// at `temperature`, or as the model's makers recommend. Inkling is run
+/// on this machine only.
 pub fn open(
     model: Model,
     effort: Effort,
     context: Option<usize>,
     temperature: Option<f32>,
 ) -> Result<Hosted> {
+    if model == Model::InklingMini {
+        return Err(format!("{model} is not run at OpenRouter").into());
+    }
     let key = key()
         .ok_or_else(|| format!("there is no key to OpenRouter: /login signs in, or set {KEY}"))?;
     Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
-/// `model` as OpenRouter names it.
+/// `model` as OpenRouter names it. Inkling is named as it is there, for
+/// [`open`] to refuse.
 pub fn model(model: Model) -> &'static str {
     match model {
         Model::Qwen27b => "qwen/qwen3.8-27b",
         Model::QwenMax => "qwen/qwen3.8-2.4t-a95b",
+        Model::InklingMini => "thinkingmachines/inkling-2-mini",
     }
 }
 

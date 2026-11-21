@@ -4,6 +4,7 @@
 pub mod arch;
 mod fetch;
 pub mod gguf;
+pub mod inkling2;
 mod loaded;
 mod local;
 mod memory;

@@ -99,15 +99,16 @@ impl Loaded {
 
     /// What makes a sampler for the model, seeded anew each time: with
     /// the settings its file recommends where it has them, at the
-    /// temperature given instead of the file's if one is. The file does
-    /// not carry `min_p`; 0.05 follows instructions more reliably than
-    /// none.
+    /// temperature given instead of the file's if one is. A file that
+    /// does not carry `min_p` gets 0.05, which follows instructions more
+    /// reliably than none.
     pub fn sampler(&self) -> impl Fn(Option<f32>) -> Sampler + use<> {
         let gguf = self.gguf.clone();
         move |temperature| {
             let number = |key: &str, default: f32| {
-                gguf.f32(&format!("general.sampling.{key}"))
-                    .unwrap_or(default)
+                gguf.get(&format!("general.sampling.{key}"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                    .map_or(default, |v| v as f32)
             };
             Sampler::new(
                 temperature.unwrap_or_else(|| number("temp", 1.0)),

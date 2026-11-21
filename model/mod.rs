@@ -6,6 +6,7 @@ mod effort;
 pub mod format;
 pub mod gguf;
 pub mod hub;
+pub mod inkling;
 pub mod qwen;
 mod sampling;
 mod session;
@@ -39,22 +40,32 @@ pub enum Model {
     /// parameters, of which 95 billion are active for a token. It takes
     /// more memory than a machine has, and runs where a provider has it.
     QwenMax,
+    /// Inkling 2 Mini, Thinking Machines' looped model of 26 billion
+    /// parameters, of which 3.4 billion are active for a token: it runs on
+    /// this machine, where the GPU takes its weights.
+    InklingMini,
 }
 
 impl Model {
+    /// Every model there is.
+    pub const ALL: [Model; 3] = [Model::Qwen27b, Model::QwenMax, Model::InklingMini];
+
     /// The model's name.
     pub const fn name(self) -> &'static str {
         match self {
             Model::Qwen27b => "qwen3.8-27b",
             Model::QwenMax => "qwen3.8-2.4t-a95b",
+            Model::InklingMini => "inkling2-mini",
         }
     }
 
-    /// The size the model is called by.
-    pub const fn size(self) -> &'static str {
+    /// Another word the model goes by, if it has one: the Qwen models go
+    /// by their sizes too.
+    pub const fn alias(self) -> Option<&'static str> {
         match self {
-            Model::Qwen27b => "medium",
-            Model::QwenMax => "large",
+            Model::Qwen27b => Some("medium"),
+            Model::QwenMax => Some("large"),
+            Model::InklingMini => None,
         }
     }
 
@@ -63,6 +74,7 @@ impl Model {
         match self {
             Model::Qwen27b => Some(&qwen::QWEN_27B),
             Model::QwenMax => None,
+            Model::InklingMini => Some(&inkling::INKLING_MINI),
         }
     }
 
@@ -71,6 +83,7 @@ impl Model {
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {
         match self {
             Model::Qwen27b | Model::QwenMax => qwen::format(gguf),
+            Model::InklingMini => inkling::format(gguf),
         }
     }
 }
@@ -84,11 +97,20 @@ impl fmt::Display for Model {
 impl FromStr for Model {
     type Err = String;
 
-    /// A model by its size, or by its name.
+    /// A model by its name, or by the other word it goes by.
     fn from_str(value: &str) -> std::result::Result<Self, String> {
-        [Model::Qwen27b, Model::QwenMax]
+        Model::ALL
             .into_iter()
-            .find(|model| value == model.size() || value == model.name())
-            .ok_or_else(|| format!("unknown model '{value}' (expected medium or large)"))
+            .find(|model| value == model.name() || Some(value) == model.alias())
+            .ok_or_else(|| {
+                let models: Vec<String> = Model::ALL
+                    .iter()
+                    .map(|model| match model.alias() {
+                        Some(alias) => format!("{model} or {alias}"),
+                        None => model.to_string(),
+                    })
+                    .collect();
+                format!("unknown model '{value}' (expected {})", models.join(", "))
+            })
     }
 }

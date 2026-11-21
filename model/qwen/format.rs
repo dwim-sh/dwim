@@ -178,9 +178,9 @@ impl Format for ChatMl {
         Ok(tokens)
     }
 
-    fn end_of_reply(&self, thinking: bool) -> Result<Vec<u32>> {
+    fn end_of_reply(&self, open: bool) -> Result<Vec<u32>> {
         let mut end = Vec::new();
-        if thinking {
+        if open {
             end.extend(self.tokenizer.encode("\n")?);
             end.push(self.think_end);
             end.extend(self.tokenizer.encode("\n\n")?);
