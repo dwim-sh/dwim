@@ -38,13 +38,16 @@ program. One package: `lib.rs` is the library, `cli/` and
   asked in: a request carries the whole conversation, and the server
   reads only what it has not read of it
 - `inference/` - running the model on this machine: `gguf`, `quants`,
-  `qwen35` (the transformer, documented there), `model` (loading and
-  sizing), `local`, `sampler`, `states` (saved system prompts), `fetch`
-  (downloads into the cache)
+  `arch` (which architecture a file is of), `qwen35` (the transformer,
+  documented there) and `inkling2` (Inkling 2 Mini's, likewise), `loaded`
+  (loading and sizing), `local`, `sampler`, `states` (saved system
+  prompts), `fetch` (downloads into the cache)
 - `model/` - what is known of the model wherever it runs: `session` (the
   `Session` the harness holds), `chat` (a conversation as a request
   carries it), `format` (the chat format), `tokenizer`, `gguf` (a file's
-  header), `hub` (the Hugging Face cache). It takes
+  header), `hub` (the Hugging Face cache), and a directory for each
+  family of models with what is its own: `qwen`, and `inkling` (Inkling
+  2 Mini, which `--model inkling2-mini` runs, on Metal). It takes
   nothing from the directories above, and `providers/` take nothing from
   `inference/`
 - `tools/` - the tools, one file each; `call` parses a call
