@@ -4,7 +4,7 @@ use crate::{
     inference::{LanguageModel, Result, Sampler},
     model::{
         Answer, Chunk, Format, Reply, Sampling, Session, Stats, Tally, Turn,
-        format::{CALL_OPENING, Repeats, Utf8Stream, opening},
+        format::{Read, Utf8Stream, opening},
     },
 };
 
@@ -42,14 +42,6 @@ use crate::{
 /// thought, for the note that compacts the conversation to be written
 /// from it. Everything else stays, and each turn runs the model over only
 /// its new tokens.
-///
-/// Qwen models call tools from inside the thought as well as after it: a
-/// `<tool_call>` tag followed by a `<function=…>` block ends the thought
-/// and opens the call, wherever it comes, as the model's makers read a
-/// reply. A `<tool_call>` tag followed by anything else, as one the model
-/// only mentions, is part of the thought. Left in the thought, a call the
-/// model meant gets no result, and the model goes on thinking about what
-/// it has asked for: a thought that never ends.
 pub struct Local<M: LanguageModel> {
     model: M,
     format: Format,
@@ -190,20 +182,11 @@ impl<M: LanguageModel> Local<M> {
         let prompt = opening(&self.format.tokenizer, true)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
-        let mut text = Utf8Stream::default();
+        let mut reader = self.format.reader();
         let mut reply = Reply::default();
-        // The reply's text as shown, to feed back without the thought.
-        let mut shown = String::new();
-        let mut thinking = true;
-        let mut thought = 0;
-        let mut call: Option<String> = None;
-        // What has followed a <tool_call> tag written in the thought, while
-        // it is not yet known whether the tag opens a call.
-        let mut held: Option<String> = None;
-        let mut repeats = Repeats::default();
-        let mut replied = false;
-        // Whether the model tried to end the reply without doing either, and
-        // must write out its answer before it may end.
+        // Whether the model tried to end the reply without saying or
+        // calling anything, and must write out its answer before it may
+        // end.
         let mut answering = false;
         let mut interrupted = false;
         loop {
@@ -216,27 +199,26 @@ impl<M: LanguageModel> Local<M> {
                 break;
             }
             if let Some(closing) = &self.closing
-                && thinking
-                && (self.thought_limit.is_some_and(|limit| thought >= limit) || repeats.repeating)
+                && reader.thinking()
+                && (self
+                    .thought_limit
+                    .is_some_and(|limit| reader.thought() >= limit)
+                    || reader.repeating())
             {
                 let closing = format!("\n\n{closing}\n");
-                let mut tokens = self.format.tokenizer.encode(&closing)?;
-                tokens.push(self.format.think_end);
-                tokens.extend(self.format.tokenizer.encode("\n\n")?);
+                let tokens = self.format.close_thought(&closing)?;
                 if !self.room(self.ending + tokens.len(), self.reserve) {
                     reply.cut = true;
                     interrupted = true;
                     break;
                 }
-                if let Some(pending) = held.take()
-                    && on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))).is_break()
-                {
+                if reader.flush(&mut on_chunk).is_break() {
                     interrupted = true;
                     break;
                 }
                 let flow = on_chunk(Chunk::Thought(&closing));
                 logits = self.feed(&tokens, Kind::Thought)?;
-                thinking = false;
+                reader.close_thought();
                 reply.thought_ended = true;
                 if flow.is_break() {
                     interrupted = true;
@@ -244,119 +226,30 @@ impl<M: LanguageModel> Local<M> {
                 }
                 continue;
             }
-            if answering && !replied {
-                for token in [
-                    self.format.im_end,
-                    self.format.end_of_text,
-                    self.format.tool_call,
-                ] {
+            if answering && !reader.replied() {
+                for token in self.format.unanswering() {
                     logits[token as usize] = f32::NEG_INFINITY;
                 }
             }
-            let mut token = self.pick(&logits);
-            let kind = if thinking {
+            let token = self.pick(&logits);
+            let kind = if reader.thinking() {
                 Kind::Thought
             } else {
                 Kind::Answer
             };
-            let special = [
-                self.format.im_end,
-                self.format.end_of_text,
-                self.format.think,
-                self.format.think_end,
-                self.format.tool_call,
-                self.format.tool_call_end,
-            ]
-            .contains(&token);
-            // A <tool_call> written in the thought is held until what
-            // follows it says what it is. The opening of a <function=…>
-            // block makes it a call, and the thought ends there, as the
-            // model's makers read it: the model calls tools from inside
-            // the thought, without closing it first. Anything else, as a
-            // tag the model only mentions, is part of the thought, shown
-            // as written.
-            let mut consumed = false;
-            if let Some(pending) = &mut held {
-                let settled = if special {
-                    Some(held.take().unwrap())
-                } else {
-                    consumed = true;
-                    pending.push_str(&text.push(self.format.tokenizer.decode(token)));
-                    if pending.starts_with(CALL_OPENING) {
-                        thinking = false;
-                        replied = true;
-                        call = held.take();
-                        None
-                    } else if CALL_OPENING.starts_with(pending.as_str()) {
-                        None
-                    } else {
-                        held.take()
-                    }
-                };
-                if let Some(pending) = settled
-                    && on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))).is_break()
-                {
+            let (token, flow) = match reader.read(token, &mut on_chunk) {
+                Read::Token(token, flow) => (token, flow),
+                Read::Interrupted => {
                     interrupted = true;
                     break;
                 }
-            }
-            if !consumed && (token == self.format.im_end || token == self.format.end_of_text) {
-                if thinking {
-                    // The model sometimes ends its reply while still
-                    // thinking, which leaves nothing to show for it: close
-                    // the thought instead, so that it goes on to reply.
-                    token = self.format.think_end;
-                } else if replied {
-                    break;
-                } else {
-                    // The model sometimes ends its reply having answered only
-                    // in its thought: make it write the answer out, as text
-                    // rather than another tool call.
+                Read::End => break,
+                Read::Unanswered => {
+                    // The model sometimes ends its reply having answered
+                    // only in its thought: make it write the answer out,
+                    // as text rather than another tool call.
                     answering = true;
                     continue;
-                }
-            }
-            if thinking {
-                thought += 1;
-                repeats.push(token);
-            }
-            let flow = if consumed {
-                ControlFlow::Continue(())
-            } else if token == self.format.think {
-                thinking = true;
-                thought = 0;
-                repeats = Repeats::default();
-                ControlFlow::Continue(())
-            } else if token == self.format.think_end {
-                thinking = false;
-                ControlFlow::Continue(())
-            } else if token == self.format.tool_call && thinking {
-                held = Some(String::new());
-                ControlFlow::Continue(())
-            } else if token == self.format.tool_call_end && thinking {
-                let chunk = text.push(self.format.tokenizer.decode(token));
-                on_chunk(Chunk::Thought(&chunk))
-            } else if token == self.format.tool_call {
-                replied = true;
-                call = Some(String::new());
-                ControlFlow::Continue(())
-            } else if token == self.format.tool_call_end {
-                reply.calls.extend(call.take());
-                ControlFlow::Continue(())
-            } else {
-                let chunk = text.push(self.format.tokenizer.decode(token));
-                match &mut call {
-                    Some(call) => {
-                        call.push_str(&chunk);
-                        ControlFlow::Continue(())
-                    }
-                    None if chunk.is_empty() => ControlFlow::Continue(()),
-                    None if thinking => on_chunk(Chunk::Thought(&chunk)),
-                    None => {
-                        replied |= !chunk.trim().is_empty();
-                        shown.push_str(&chunk);
-                        on_chunk(Chunk::Text(&chunk))
-                    }
                 }
             };
             // Feed the token even if the reply ends here, so that the model
@@ -373,10 +266,12 @@ impl<M: LanguageModel> Local<M> {
             }
         }
 
-        let end = self.format.end_of_reply(thinking)?;
+        let end = self.format.end_of_reply(reader.thinking())?;
         self.feed(&end, Kind::Prompt)?;
-        if interrupted {
-            reply.calls.clear();
+        // The reply's text as shown, to feed back without the thought.
+        let (shown, calls) = reader.finish();
+        if !interrupted {
+            reply.calls = calls;
         }
 
         // A reply made with a thought is fed back without it, as `replay`
