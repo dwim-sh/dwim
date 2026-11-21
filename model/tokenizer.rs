@@ -28,6 +28,9 @@ pub struct Tokenizer {
     merges: HashMap<(u32, u32), (usize, u32)>,
     /// Ids of special tokens such as `<|im_start|>`, by content.
     special: HashMap<String, u32>,
+    /// Ids of the other tokens by their bytes, where a word that is a
+    /// token is taken whole.
+    words: Option<HashMap<Vec<u8>, u32>>,
 }
 
 impl Tokenizer {
@@ -96,7 +99,25 @@ impl Tokenizer {
             bytes,
             merges,
             special,
+            words: None,
         })
+    }
+
+    /// The tokenizer with a word that is a token of the vocabulary taken
+    /// as that token, whatever the merges would make of it: how a
+    /// vocabulary whose merges were worked out from its tokens, rather
+    /// than the tokens from the merges, is meant to be read.
+    pub fn with_whole_words(mut self) -> Self {
+        let special: std::collections::HashSet<u32> = self.special.values().copied().collect();
+        self.words = Some(
+            self.tokens
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !special.contains(&(*id as u32)))
+                .map(|(id, bytes)| (bytes.clone(), id as u32))
+                .collect(),
+        );
+        self
     }
 
     /// Encodes text into tokens. Special tokens in the text are treated as
@@ -198,6 +219,10 @@ impl Tokenizer {
     }
 
     fn merge(&self, word: &[u8], out: &mut Vec<u32>) {
+        if let Some(&id) = self.words.as_ref().and_then(|words| words.get(word)) {
+            out.push(id);
+            return;
+        }
         let mut parts: Vec<u32> = word.iter().map(|&b| self.bytes[b as usize]).collect();
         while let Some((_, i, merged)) = parts
             .windows(2)
