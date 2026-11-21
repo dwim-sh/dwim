@@ -336,7 +336,13 @@ pub fn harness(
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);
     }
-    harness.keep_log(log, settings.model.name(), &device, &system);
+    harness.keep_log(
+        log,
+        settings.model.name(),
+        &device,
+        settings.effort,
+        &system,
+    );
     Ok(harness)
 }
 
