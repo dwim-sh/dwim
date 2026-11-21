@@ -21,12 +21,13 @@
 //! What only a server of dwim's own can do is done without. A closing
 //! cannot be written into a thought, and a host is asked how much the
 //! model reasons as an effort, not as a number of tokens, so a thought
-//! that runs to its limit is ended here: the reply
-//! is dropped where it is, and asked for again, with the thought so far
-//! and the closing put to the model as a reminder to act on. A plain
-//! answer is asked to write its headings itself, and tokens are counted by
-//! what the provider said the last request took, with an estimate of what
-//! was added since.
+//! that runs to its limit is ended here: the reply is dropped where it
+//! is, and asked for again without a thought, with the thought so far
+//! and the closing put to the model as a reminder to act on. A thought
+//! it has all the same is held to the limit as the first was, a few
+//! times over. A plain answer is asked to write its headings itself, and
+//! tokens are counted by what the provider said the last request took,
+//! with an estimate of what was added since.
 
 pub mod key;
 mod stream;
@@ -64,11 +65,11 @@ pub struct Host {
     pub model: fn(Model) -> &'static str,
     /// Adds to a request for a reply what the host is asked in its own
     /// way: to say what the reply used, how the tokens are sampled beyond
-    /// what every host takes, and the `effort` the model reasons at. The
-    /// host writes the effort's line into the system prompt as the
-    /// model's chat template does, and the line for `xhigh` when it is
-    /// asked for none, so it is always asked.
-    pub ask: fn(body: &mut Value, sampling: &Sampling, effort: Effort),
+    /// what every host takes, and the `effort` the model reasons at, or
+    /// not to reason when there is none. The host writes the effort's
+    /// line into the system prompt as the model's chat template does, and
+    /// the line for `xhigh` when it is not asked, so it is always asked.
+    pub ask: fn(body: &mut Value, sampling: &Sampling, effort: Option<Effort>),
     /// The environment variable the key to the host is read from, ahead
     /// of the key kept from signing in.
     pub key: &'static str,
@@ -89,6 +90,12 @@ const MAX_REPLY: usize = 32_768;
 /// Tokens a plain answer may think for, beside the tokens of the answer:
 /// the provider counts both against the most a reply may run to.
 const ANSWER_THOUGHT: usize = 2048;
+
+/// Most times the thought of a reply is ended at its limit, which is
+/// more than once only where a provider has the model think when it is
+/// asked not to. The thought after the last is let run, for the reply
+/// that has to come of it.
+const ENDINGS: usize = 3;
 
 /// Bytes of a thought to a token, about, as prose runs: a thought is
 /// counted against its limit as it streams, in text.
@@ -184,8 +191,10 @@ impl Hosted {
     /// most `limit` tokens, reasoned at `effort`, streaming it to
     /// `on_chunk`, and counts what it took. A thought that runs to the
     /// tokens of `ending`, if it has an ending, is ended with the closing
-    /// there, as the model's own: the reply is asked for again, to go on
-    /// from the thought so far and the closing.
+    /// there, as the model's own: the reply is asked for again, without
+    /// a thought, to go on from the thought so far and the closing. A
+    /// thought of that reply, if it has one all the same, is ended the
+    /// same way, [`ENDINGS`] times in all.
     fn complete(
         &mut self,
         messages: (Vec<Value>, Vec<Value>),
@@ -194,7 +203,7 @@ impl Hosted {
         ending: Option<(usize, &str)>,
         mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<Outcome> {
-        let (mut messages, tools) = messages;
+        let (messages, tools) = messages;
         let mut body = json!({
             "model": self.model(),
             "messages": messages,
@@ -206,11 +215,68 @@ impl Hosted {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        (self.host.ask)(&mut body, &self.sampling, effort);
+        (self.host.ask)(&mut body, &self.sampling, Some(effort));
         let most = ending.map(|(tokens, _)| tokens * THOUGHT_BYTES);
+        let asked = messages
+            .last()
+            .and_then(|last| last["content"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut thought = String::new();
+        let mut endings = 0;
+        loop {
+            // A reply has to come of the thought, so the one after the
+            // last ending is let run.
+            let most = most.filter(|_| endings < ENDINGS);
+            let (outcome, over) = self.ask_within(&body, most, &mut on_chunk)?;
+            if endings > 0 && !outcome.thought.trim().is_empty() {
+                thought.push_str("\n\n");
+            }
+            let Some((_, closing)) = ending.filter(|_| over) else {
+                if endings == 0 {
+                    return Ok(outcome);
+                }
+                thought.push_str(outcome.thought.trim());
+                return Ok(Outcome {
+                    thought,
+                    thought_ended: true,
+                    ..outcome
+                });
+            };
+            endings += 1;
+            thought = format!("{thought}{}\n\n{closing}", outcome.thought.trim());
+            if on_chunk(Chunk::Thought(&format!("\n\n{closing}\n"))).is_break() {
+                return Ok(Outcome {
+                    thought,
+                    thought_ended: true,
+                    ..outcome
+                });
+            }
+            // The model is asked not to think again. A provider that
+            // has it think all the same has that thought held to the
+            // limit as the last was.
+            if let Some(last) = body["messages"]
+                .as_array_mut()
+                .and_then(|messages| messages.last_mut())
+            {
+                last["content"] = Value::String(format!("{asked}\n\n{}", ended(&thought)));
+            }
+            (self.host.ask)(&mut body, &self.sampling, None);
+        }
+    }
+
+    /// Asks for a reply as [`Hosted::ask`] does, and drops it where its
+    /// thought runs to `most` bytes, if they are limited: what there was
+    /// of the reply, and whether it was dropped there.
+    fn ask_within(
+        &mut self,
+        body: &Value,
+        most: Option<usize>,
+        on_chunk: &mut impl FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Result<(Outcome, bool)> {
         let mut bytes = 0;
         let mut over = false;
-        let mut outcome = self.ask(&body, |chunk| {
+        let outcome = self.ask(body, |chunk| {
             let thinking = matches!(chunk, Chunk::Thought(_));
             if let Chunk::Thought(piece) = &chunk {
                 bytes += piece.len();
@@ -222,36 +288,7 @@ impl Hosted {
             }
             ControlFlow::Continue(())
         })?;
-        let Some((_, closing)) = ending.filter(|_| over) else {
-            return Ok(outcome);
-        };
-        outcome.thought = format!("{}\n\n{closing}", outcome.thought.trim_end());
-        outcome.thought_ended = true;
-        if on_chunk(Chunk::Thought(&format!("\n\n{closing}\n"))).is_break() {
-            return Ok(outcome);
-        }
-        if let Some(last) = messages.last_mut() {
-            let asked = format!(
-                "{}\n\n{}",
-                last["content"].as_str().unwrap_or(""),
-                ended(&outcome.thought)
-            );
-            last["content"] = Value::String(asked);
-        }
-        // The model may think again, since a provider can refuse a
-        // request that asks for none: it thinks on from where the thought
-        // was ended, and that thought is let run.
-        body["messages"] = Value::Array(messages);
-        let again = self.ask(&body, on_chunk)?;
-        if !again.thought.trim().is_empty() {
-            outcome.thought.push_str("\n\n");
-            outcome.thought.push_str(again.thought.trim());
-        }
-        Ok(Outcome {
-            thought: outcome.thought,
-            thought_ended: true,
-            ..again
-        })
+        Ok((outcome, over))
     }
 
     /// Posts a request for a reply, reads the reply as it streams to
@@ -763,6 +800,54 @@ mod tests {
             content.contains("Let me reconsider.\n\nI will decide now."),
             "{content}"
         );
+    }
+
+    #[test]
+    fn a_thought_of_the_reply_asked_again_is_held_to_the_limit_too() {
+        // The provider has the model think past the limit however it
+        // is asked: its thought is ended each time, and the last reply
+        // is let run.
+        let thinking: Vec<Value> = (0..50)
+            .map(|_| json!({ "reasoning": "Once more. " }))
+            .chain([json!({ "content": "Done." })])
+            .collect();
+        let (mut provider, serving) = provider(vec![events(&thinking); 4]);
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        let generation = Generation {
+            reserve: 0,
+            thought_limit: Some(2),
+            closing: Some("I will decide now.".to_string()),
+        };
+        let completion = provider
+            .reply(&chat, &generation, |_| ControlFlow::Continue(()))
+            .unwrap();
+        let asked = serving.join().unwrap();
+
+        assert_eq!(completion.text, "Done.");
+        assert!(completion.reply.thought_ended);
+        // Three thoughts were ended, and none of them ran on.
+        assert_eq!(asked.len(), 4);
+        assert_eq!(completion.thought.matches("I will decide now.").count(), 3);
+        assert!(
+            completion
+                .thought
+                .starts_with("Once more.\n\nI will decide now.\n\nOnce more.\n\nI will"),
+            "{}",
+            completion.thought
+        );
+        // Each reply asked again is asked not to think, and told all
+        // that was thought, after the one message it is to.
+        assert_eq!(asked[0]["reasoning"], json!({ "effort": "xhigh" }));
+        for request in &asked[1..] {
+            assert_eq!(request["reasoning"], json!({ "effort": "none" }));
+        }
+        let last = asked[3]["messages"].as_array().unwrap().last().unwrap();
+        let content = last["content"].as_str().unwrap();
+        assert_eq!(content.matches("Fix it.").count(), 1, "{content}");
+        assert_eq!(content.matches("I will decide now.").count(), 3);
     }
 
     #[test]

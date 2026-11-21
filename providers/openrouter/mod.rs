@@ -60,9 +60,9 @@ pub fn key() -> Option<String> {
 
 /// Adds to a request what OpenRouter is asked in its own way: to say what
 /// the reply used and cost, to sample from the likeliest tokens only, and
-/// to reason at `effort`.
-fn ask(body: &mut Value, sampling: &Sampling, effort: Effort) {
+/// to reason at `effort`, or not to when there is none.
+fn ask(body: &mut Value, sampling: &Sampling, effort: Option<Effort>) {
     body["usage"] = json!({ "include": true });
     body["top_k"] = json!(sampling.top_k);
-    body["reasoning"] = json!({ "effort": effort.name() });
+    body["reasoning"] = json!({ "effort": effort.map_or("none", Effort::name) });
 }
