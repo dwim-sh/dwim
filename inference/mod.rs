@@ -1,10 +1,12 @@
-//! Inference: Qwen3.8-27B run on this machine, from its weights, and a
-//! session with it.
+//! Inference: a model run on this machine, from its weights, and a session
+//! with it.
 
+pub mod arch;
 mod fetch;
 pub mod gguf;
 mod loaded;
 mod local;
+mod memory;
 pub mod quants;
 pub mod qwen35;
 mod sampler;
@@ -16,6 +18,7 @@ pub use fetch::{Download, fetch};
 pub use gguf::Gguf;
 pub use loaded::{Loaded, Progress};
 pub use local::{DRAFTS, Local};
+pub use memory::Memory;
 pub use sampler::Sampler;
 
 pub use crate::model::Result;

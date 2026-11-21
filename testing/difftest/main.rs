@@ -24,8 +24,8 @@ use std::{
     time::Instant,
 };
 
-use dwim::gpu::{Cpu, Device, Gpu};
-use dwim::inference::{Gguf, LanguageModel, qwen35::Model};
+use dwim::gpu::{Cpu, Gpu};
+use dwim::inference::{Gguf, LanguageModel, arch};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention
@@ -179,7 +179,7 @@ fn run() -> Result<bool> {
             None => {
                 let cpu = match &mut cpu {
                     Some(cpu) => cpu,
-                    None => cpu.insert(Model::load(gguf.clone(), Cpu, 4096, |_, _| {})?),
+                    None => cpu.insert(arch::load(gguf.clone(), Cpu, 4096, |_, _| {})?),
                 };
                 let start = Instant::now();
                 let run = Run::record(cpu, &gguf, prompt)?;
@@ -197,7 +197,7 @@ fn run() -> Result<bool> {
     }
     drop(cpu);
 
-    let mut gpu = Model::load(gguf, Gpu::new()?, 4096, |_, _| {})?;
+    let mut gpu = arch::load(gguf, Gpu::new()?, 4096, |_, _| {})?;
     let mut agreed = true;
     for round in 0..args.repeat {
         for (name, want) in &expected {
@@ -251,7 +251,7 @@ struct Run {
 impl Run {
     /// Has the CPU run `prompt` in the pieces the GPU will, and then write
     /// the continuation a token at a time.
-    fn record(cpu: &mut Model<Cpu>, gguf: &Gguf, prompt: &str) -> Result<Self> {
+    fn record(cpu: &mut dyn LanguageModel, gguf: &Gguf, prompt: &str) -> Result<Self> {
         let tokenizer = dwim::model::Tokenizer::from_gguf(gguf)?;
         let mut run = Self {
             tokens: tokenizer.encode(prompt)?,
@@ -270,7 +270,7 @@ impl Run {
     /// and returns the logits after each piece. With `detour`, the model
     /// is marked halfway through the prompt, runs the continuation's
     /// tokens there, and is rewound to the mark before the prompt goes on.
-    fn replay<D: Device>(&self, model: &mut Model<D>, detour: bool) -> Vec<Vec<f32>> {
+    fn replay(&self, model: &mut dyn LanguageModel, detour: bool) -> Vec<Vec<f32>> {
         let mut run = Self {
             tokens: self.tokens.clone(),
             prompt: self.prompt,
@@ -284,9 +284,9 @@ impl Run {
     /// asked, then each token after it alone, adding `write` more chosen
     /// from the logits, and returns where each piece ended, with its size,
     /// and the logits after it.
-    fn run<D: Device>(
+    fn run(
         &mut self,
-        model: &mut Model<D>,
+        model: &mut dyn LanguageModel,
         write: usize,
         detour: bool,
     ) -> (Vec<(usize, usize)>, Vec<Vec<f32>>) {
@@ -379,17 +379,13 @@ fn key(root: &Path, model: &Path) -> Result<u64> {
         .iter()
         .map(|f| root.join("gpu").join(f))
         .collect();
-    for entry in std::fs::read_dir(root.join("inference"))? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            files.push(path);
-        }
-    }
+    sources(&root.join("inference"), &mut files)?;
     files.sort();
     let mut hash = Fnv(0xcbf29ce484222325);
     for file in files {
-        hash.write(file.file_name().unwrap().as_encoded_bytes());
-        hash.write(&std::fs::read(file)?);
+        let name = file.strip_prefix(root).unwrap_or(&file);
+        hash.write(name.as_os_str().as_encoded_bytes());
+        hash.write(&std::fs::read(&file)?);
     }
     hash.write(format!("{PROMPTS:?} {PIECES:?} {CONTINUATION}").as_bytes());
     let meta = std::fs::metadata(model)?;
@@ -400,6 +396,20 @@ fn key(root: &Path, model: &Path) -> Result<u64> {
             .as_secs(),
     );
     Ok(hash.finish())
+}
+
+/// Adds the Rust sources in `dir` to `files`, and those in the directories
+/// under it.
+fn sources(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            sources(&path, files)?;
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// The FNV-1a hash, which unlike the standard library's is the same from

@@ -5,26 +5,9 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 
 use crate::{
     gpu::{Cpu, Device as _, Gpu},
-    inference::{Gguf, LanguageModel, Result, Sampler, qwen35},
+    inference::{Gguf, LanguageModel, Result, Sampler, arch},
     model::{Device, Format, Model, Size, Tokenizer},
 };
-
-/// Tokens of conversation the model has room for when the device cannot
-/// tell how much memory it has free, and nothing else says.
-const DEFAULT_CONTEXT: usize = 16384;
-
-/// Fewest tokens of conversation the model is given room for when it
-/// fits it to the memory free: room for the system prompt, which runs to
-/// a few thousand tokens with the project's `AGENTS.md`, the note a
-/// compaction writes, and a few turns. At 4096, the system prompt alone
-/// took four fifths of the window, and the conversation was compacted at
-/// its second message, to no avail.
-const MIN_CONTEXT: usize = 16384;
-
-/// Memory left free besides what the model takes, when its context is
-/// fitted to the memory free: for the device's scratch buffers, the
-/// driver, and whatever else starts in the meantime.
-const HEADROOM: u64 = 256 << 20;
 
 /// How far loading the model has got.
 pub enum Progress {
@@ -239,14 +222,10 @@ impl Opened {
         context: usize,
         on_progress: impl FnMut(usize, usize),
     ) -> Result<Box<dyn LanguageModel>> {
-        Ok(match self {
-            Opened::Cpu(device) => {
-                Box::new(qwen35::Model::load(gguf, device, context, on_progress)?)
-            }
-            Opened::Gpu(device) => {
-                Box::new(qwen35::Model::load(gguf, *device, context, on_progress)?)
-            }
-        })
+        match self {
+            Opened::Cpu(device) => arch::load(gguf, device, context, on_progress),
+            Opened::Gpu(device) => arch::load(gguf, *device, context, on_progress),
+        }
     }
 }
 
@@ -254,13 +233,10 @@ impl Opened {
 /// of `context` tokens of conversation each, or as many as fit in the
 /// memory it has free.
 fn size(gguf: &Gguf, device: &Opened, context: Option<usize>, sessions: usize) -> Result<Size> {
-    // Past the positions the model was trained on, its attention degrades.
-    let config = qwen35::Config::load(gguf)?;
-    let trained = config.context_length;
-    let memory = qwen35::Memory::of(&config, gguf, device.batch())?;
+    let arch::Plan { memory, trained } = arch::plan(gguf, device.batch())?;
     let context = match context {
         Some(context) => context,
-        None => fit(&memory, device, trained, sessions),
+        None => memory.fit(device.memory(), trained, sessions),
     };
     if context == 0 || context > trained {
         return Err(format!(
@@ -274,19 +250,6 @@ fn size(gguf: &Gguf, device: &Opened, context: Option<usize>, sessions: usize) -
         model: memory.fixed,
         conversation: memory.per_sequence + memory.per_token * context as u64,
     })
-}
-
-/// Tokens of conversation each of `sessions` sessions has room for in the
-/// memory the device has free beside the model, in whole thousands, at
-/// least [`MIN_CONTEXT`], and no more than the model was trained for.
-fn fit(memory: &qwen35::Memory, device: &Opened, trained: usize, sessions: usize) -> usize {
-    let Some(free) = device.memory() else {
-        return DEFAULT_CONTEXT.min(trained);
-    };
-    let each = free.saturating_sub(memory.fixed + HEADROOM) / sessions.max(1) as u64;
-    let room = each.saturating_sub(memory.per_sequence) / memory.per_token;
-    let tokens = (room as usize).min(trained) / 1024 * 1024;
-    tokens.max(MIN_CONTEXT).min(trained)
 }
 
 /// Seed for sampling, different on every run.
