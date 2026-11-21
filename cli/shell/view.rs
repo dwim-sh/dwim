@@ -4,8 +4,7 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::inference::{Model, OnDisk};
-use dwim::model::{Device, Size, Variant};
+use dwim::model::{Device, Model, OnDisk, Size};
 use dwim::providers::{Kind, hosted::Host};
 use dwim::sys;
 use dwim::tools::plan::{Plan, Step};
@@ -38,16 +37,17 @@ pub fn help(columns: usize) -> Vec<Line> {
 /// how much conversation it has room for and the memory that takes, as a
 /// table of labels and values.
 pub fn model_listing(
-    name: &str,
+    model: Model,
     device: Device,
     device_name: Option<&str>,
     size: Option<&Size>,
     columns: usize,
 ) -> Vec<Line> {
-    let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match Model::dir(name) {
-        Ok(dir) => {
-            let OnDisk { files, of, bytes } = Model::on_disk(&dir);
+    let header = vec![span("● "), span(model.name().to_string()).bold()];
+    let weights = model.weights();
+    let on_disk = match weights.map(|weights| (weights, weights.dir())) {
+        Some((weights, Some(dir))) => {
+            let OnDisk { files, of, bytes } = weights.on_disk(&dir);
             match files {
                 0 => "not fetched".to_string(),
                 n if n == of => {
@@ -56,7 +56,8 @@ pub fn model_listing(
                 n => format!("{n}/{of} files, {} in {}", model::bytes(bytes), tilde(&dir)),
             }
         }
-        Err(e) => e.to_string(),
+        Some((_, None)) => "cannot determine the home directory".to_string(),
+        None => "none for this machine".to_string(),
     };
     let mut on = match (device, device_name) {
         (Device::Cpu, _) => "CPU".to_string(),
@@ -66,14 +67,15 @@ pub fn model_listing(
     if let Some(size) = size {
         on.push_str(&format!(" · {}", model::bytes(size.model)));
     }
-    let mut rows = vec![
-        (
+    let mut rows = Vec::new();
+    if let Some(weights) = weights {
+        rows.push((
             "source",
-            format!("{} at {}", Model::REPO, &Model::REVISION[..7]),
-        ),
-        ("weights", weights),
-        ("device", on),
-    ];
+            format!("{} at {}", weights.repo, &weights.revision[..7]),
+        ));
+    }
+    rows.push(("weights", on_disk));
+    rows.push(("device", on));
     if let Some(size) = size {
         rows.push((
             "context",
@@ -94,28 +96,28 @@ pub fn model_listing(
 /// The model at `host`, for the `/model` command: what the host calls
 /// it, and how much conversation the session has room for, as a table of
 /// labels and values.
-pub fn hosted_listing(host: &Host, variant: Variant, context: usize, columns: usize) -> Vec<Line> {
-    let header = vec![span("● "), span(variant.name().to_string()).bold()];
+pub fn hosted_listing(host: &Host, model: Model, context: usize, columns: usize) -> Vec<Line> {
+    let header = vec![span("● "), span(model.name().to_string()).bold()];
     let rows = vec![
         ("provider", host.name.to_string()),
-        ("model", (host.model)(variant).to_string()),
+        ("model", (host.model)(model).to_string()),
         ("context", format!("{context} tokens")),
     ];
     report(header, table(rows), columns)
 }
 
 /// Where the model runs, for the provider picked that the session is on.
-pub fn provider_notice(provider: Kind, variant: Variant) -> String {
+pub fn provider_notice(provider: Kind, model: Model) -> String {
     match provider.host() {
         None => format!(
             "{} runs on this machine, in the dwim server · /server shows it",
-            variant.size()
+            model.size()
         ),
         Some(host) => format!(
             "{} runs at {}, as {}",
-            variant.size(),
+            model.size(),
             host.name,
-            (host.model)(variant)
+            (host.model)(model)
         ),
     }
 }
@@ -152,10 +154,10 @@ pub fn no_provider(key: bool) -> String {
 }
 
 /// How moving the conversation to another model is acknowledged.
-pub fn switched(variant: Variant, provider: Kind) -> String {
+pub fn switched(model: Model, provider: Kind) -> String {
     match provider.host() {
-        None => format!("Switched to {variant}, on this machine"),
-        Some(host) => format!("Switched to {variant}, at {}", host.name),
+        None => format!("Switched to {model}, on this machine"),
+        Some(host) => format!("Switched to {model}, at {}", host.name),
     }
 }
 

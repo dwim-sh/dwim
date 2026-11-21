@@ -9,7 +9,7 @@
 
 use std::error::Error;
 
-use dwim::inference::Model;
+use dwim::inference::Loaded;
 use dwim::server::{self, Hello, Server};
 
 use crate::session::{self, Settings, Stderr};
@@ -17,7 +17,7 @@ use crate::session::{self, Settings, Stderr};
 /// Runs the server with the model as `settings` have it, until it exits.
 pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let path = server::socket_path();
-    let sessions = settings.sessions.unwrap_or(Model::SESSIONS);
+    let sessions = settings.sessions.unwrap_or(Loaded::SESSIONS);
     if sessions == 0 {
         return Err("a server needs room for one session at least".into());
     }

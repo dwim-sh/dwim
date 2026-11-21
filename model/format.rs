@@ -1,21 +1,18 @@
-//! The chat format Qwen models are trained on, ChatML, as every session
-//! with one speaks it, wherever the model runs: its tags, the turns of a
-//! conversation as the chat template writes them, and what reading a reply
-//! as it comes takes.
+//! A chat format: a conversation as the tokens a family of models is
+//! trained to read it in, as every session with one speaks it, wherever
+//! the model runs. A family's format writes the turns as its chat template
+//! does, and reads a reply as it comes; the families' own are in their
+//! directories, and what holds one holds a [`Format`], whichever it is.
 
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::Arc,
+    ops::ControlFlow,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Result, Tokenizer};
-
-/// What follows a `<tool_call>` tag that opens a call, as the chat template
-/// writes one: a tag followed by anything else is text.
-pub const CALL_OPENING: &str = "\n<function=";
+use crate::model::{Chunk, Result, Tokenizer};
 
 /// A thought that writes the same [`REPEAT_WINDOW`] tokens for the
 /// [`REPEATS`]th time is going round in circles, and is ended as one that
@@ -25,33 +22,6 @@ pub const CALL_OPENING: &str = "\n<function=";
 /// times by a thought that is getting anywhere.
 pub const REPEAT_WINDOW: usize = 32;
 pub const REPEATS: u32 = 3;
-
-/// The tags of the chat format, which are special tokens of the model's
-/// vocabulary.
-pub const IM_START: &str = "<|im_start|>";
-pub const IM_END: &str = "<|im_end|>";
-pub const END_OF_TEXT: &str = "<|endoftext|>";
-pub const THINK: &str = "<think>";
-pub const THINK_END: &str = "</think>";
-pub const TOOL_CALL: &str = "<tool_call>";
-pub const TOOL_CALL_END: &str = "</tool_call>";
-pub const TOOL_RESPONSE: &str = "<tool_response>";
-pub const TOOL_RESPONSE_END: &str = "</tool_response>";
-
-/// The chat format's tags, as a vocabulary for it has them: the ones
-/// starting with `<|` are control tokens, the rest user-defined.
-#[cfg(test)]
-pub const SPECIAL_TOKENS: [&str; 9] = [
-    END_OF_TEXT,
-    IM_START,
-    IM_END,
-    TOOL_CALL,
-    TOOL_CALL_END,
-    TOOL_RESPONSE,
-    TOOL_RESPONSE_END,
-    THINK,
-    THINK_END,
-];
 
 /// A turn of a conversation, as a transcript of it keeps them: what the
 /// user said; what the model replied, as the text it showed and the tool
@@ -75,83 +45,58 @@ pub enum Turn {
     Results(Vec<String>),
 }
 
-/// The template's opening of a reply, for the model to go on from: with
-/// the thought open, for it to think, or with an empty thought closed at
-/// once, as the template opens a reply made without thinking.
-pub fn opening(tokenizer: &Tokenizer, thinking: bool) -> Result<Vec<u32>> {
-    let mut tokens = vec![tokenizer.special(IM_START)?];
-    tokens.extend(tokenizer.encode("assistant\n")?);
-    if thinking {
-        tokens.push(tokenizer.special(THINK)?);
-        tokens.extend(tokenizer.encode("\n")?);
-    } else {
-        tokens.extend(closed_thought(tokenizer)?);
-        tokens.extend(tokenizer.encode("\n\n")?);
-    }
-    Ok(tokens)
-}
+/// The chat format of a family of models, over the vocabulary of one of
+/// them. The format's tags are special tokens, which it puts in by id;
+/// what the user and the tools say is encoded as text, so that a message
+/// which spells out a tag stays text.
+pub trait Format: Send + Sync {
+    /// The tokenizer of the vocabulary.
+    fn tokenizer(&self) -> &Tokenizer;
 
-/// An empty thought, opened and closed, as the template writes one before
-/// a reply made without thinking, and before a reply written over.
-pub fn closed_thought(tokenizer: &Tokenizer) -> Result<Vec<u32>> {
-    let mut tokens = vec![tokenizer.special(THINK)?];
-    tokens.extend(tokenizer.encode("\n\n")?);
-    tokens.push(tokenizer.special(THINK_END)?);
-    Ok(tokens)
-}
+    /// The system prompt as the turn that opens a conversation. It is the
+    /// harness's to write, and may have the format's tags in it.
+    fn system(&self, text: &str) -> Result<Vec<u32>>;
 
-/// The chat format as the model's vocabulary has it: the tokenizer, and
-/// the ids of the format's tags, which are special tokens of it. It
-/// encodes the turns of a conversation as the chat template writes them.
-/// Cloning one shares the tokenizer.
-#[derive(Clone)]
-pub struct Format {
-    pub tokenizer: Arc<Tokenizer>,
-    pub im_start: u32,
-    pub im_end: u32,
-    pub end_of_text: u32,
-    pub think: u32,
-    pub think_end: u32,
-    pub tool_call: u32,
-    pub tool_call_end: u32,
-    pub tool_response: u32,
-    pub tool_response_end: u32,
-}
+    /// A message from the user as a turn.
+    fn user(&self, message: &str) -> Result<Vec<u32>>;
 
-impl Format {
-    /// The format over `tokenizer`'s vocabulary, which must have the tags.
-    pub fn new(tokenizer: Tokenizer) -> Result<Self> {
-        Ok(Self {
-            im_start: tokenizer.special(IM_START)?,
-            im_end: tokenizer.special(IM_END)?,
-            end_of_text: tokenizer.special(END_OF_TEXT)?,
-            think: tokenizer.special(THINK)?,
-            think_end: tokenizer.special(THINK_END)?,
-            tool_call: tokenizer.special(TOOL_CALL)?,
-            tool_call_end: tokenizer.special(TOOL_CALL_END)?,
-            tool_response: tokenizer.special(TOOL_RESPONSE)?,
-            tool_response_end: tokenizer.special(TOOL_RESPONSE_END)?,
-            tokenizer: Arc::new(tokenizer),
-        })
-    }
+    /// The results of tool calls as a turn.
+    fn results(&self, outputs: &[String]) -> Result<Vec<u32>>;
 
-    /// Number of tokens `turn` takes when fed, as `replay` writes it.
-    pub fn measure(&self, turn: &Turn) -> Result<usize> {
-        Ok(self.encode(turn)?.len())
-    }
+    /// A reply already made as a turn: its text, and its tool calls as
+    /// written, without the thought behind it.
+    fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>>;
 
-    /// Most tokens a plain answer to `message` takes with its framing, if
-    /// it is limited to `limit` tokens: what a plain answer needs room
-    /// for. Fails only if the message cannot be encoded.
-    pub fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
-        Ok(self.user(message)?.len()
-            + opening(&self.tokenizer, false)?.len()
-            + limit
-            + self.end_of_reply(false)?.len())
-    }
+    /// The opening of a reply, for the model to go on from: with the
+    /// thought open, for it to think, or as the format opens a reply made
+    /// without thinking.
+    fn opening(&self, thinking: bool) -> Result<Vec<u32>>;
 
-    /// `turn` as tokens, as `replay` writes it.
-    pub fn encode(&self, turn: &Turn) -> Result<Vec<u32>> {
+    /// What ends a reply the way the format expects, ready for the next
+    /// message: the thought closed first if it is still open.
+    fn end_of_reply(&self, thinking: bool) -> Result<Vec<u32>>;
+
+    /// What writes `closing` into a thought as the model's own and ends
+    /// the thought there, for the reply to go on from.
+    fn close_thought(&self, closing: &str) -> Result<Vec<u32>>;
+
+    /// The tokens a reply that must write its answer out may not pick:
+    /// the ones that end it, and what opens a call.
+    fn unanswering(&self) -> Vec<u32>;
+
+    /// The tokens a plain answer may not pick: what opens and closes a
+    /// thought, and what opens a call.
+    fn unplain(&self) -> Vec<u32>;
+
+    /// Whether `token` ends a reply.
+    fn ends(&self, token: u32) -> bool;
+
+    /// Reads a reply from the opening the format gives it, with the
+    /// thought open.
+    fn reader(&self) -> Box<dyn Reader>;
+
+    /// `turn` as tokens, as a conversation read over again has it.
+    fn encode(&self, turn: &Turn) -> Result<Vec<u32>> {
         match turn {
             Turn::User(message) => self.user(message),
             Turn::Reply { text, calls, .. } => self.reply(text, calls),
@@ -159,71 +104,68 @@ impl Format {
         }
     }
 
-    /// A message from the user as a turn.
-    pub fn user(&self, message: &str) -> Result<Vec<u32>> {
-        let content = self.tokenizer.encode(message)?;
-        self.turn("user", content)
+    /// Number of tokens `turn` takes when fed.
+    fn measure(&self, turn: &Turn) -> Result<usize> {
+        Ok(self.encode(turn)?.len())
     }
 
-    /// The results of tool calls as a turn: a `<tool_response>` block each.
-    pub fn results(&self, outputs: &[String]) -> Result<Vec<u32>> {
-        let mut content = Vec::new();
-        for (i, output) in outputs.iter().enumerate() {
-            if i > 0 {
-                content.extend(self.tokenizer.encode("\n")?);
-            }
-            content.push(self.tool_response);
-            content.extend(self.tokenizer.encode(&format!("\n{output}\n"))?);
-            content.push(self.tool_response_end);
-        }
-        self.turn("user", content)
+    /// Most tokens a plain answer to `message` takes with its framing, if
+    /// it is limited to `limit` tokens: what a plain answer needs room
+    /// for. Fails only if the message cannot be encoded.
+    fn answer_tokens(&self, message: &str, limit: usize) -> Result<usize> {
+        Ok(self.user(message)?.len()
+            + self.opening(false)?.len()
+            + limit
+            + self.end_of_reply(false)?.len())
     }
+}
 
-    /// A reply already made as a turn: an empty thought, its text, and its
-    /// tool calls as written, each in a `<tool_call>` block. A reply is
-    /// written without its thought wherever it comes: the model on this
-    /// machine reads a turn once, and to leave a thought out after the
-    /// user's next message would have it read the turn over. The newlines
-    /// the model puts between the thought and the text are the template's
-    /// to write, so the text's leading newlines are left out.
-    pub fn reply(&self, text: &str, calls: &[String]) -> Result<Vec<u32>> {
-        let mut content = closed_thought(&self.tokenizer)?;
-        let text = text.trim_start_matches('\n');
-        content.extend(self.tokenizer.encode(&format!("\n\n{text}"))?);
-        for (i, call) in calls.iter().enumerate() {
-            if i > 0 {
-                content.extend(self.tokenizer.encode("\n")?);
-            }
-            content.push(self.tool_call);
-            content.extend(self.tokenizer.encode(call)?);
-            content.push(self.tool_call_end);
-        }
-        self.turn("assistant", content)
-    }
+/// A reply as it is read, a token at a time: whether it is in its thought,
+/// and what it has said and called so far.
+pub trait Reader {
+    /// Whether the reply is in its thought.
+    fn thinking(&self) -> bool;
 
-    /// Encodes a turn of the conversation around its content's tokens.
-    pub fn turn(&self, role: &str, content: Vec<u32>) -> Result<Vec<u32>> {
-        let mut turn = vec![self.im_start];
-        turn.extend(self.tokenizer.encode(&format!("{role}\n"))?);
-        turn.extend(content);
-        turn.push(self.im_end);
-        turn.extend(self.tokenizer.encode("\n")?);
-        Ok(turn)
-    }
+    /// Tokens of the thought since it opened.
+    fn thought(&self) -> usize;
 
-    /// What ends a reply the way the chat format expects, ready for the
-    /// next message: the thought closed first if it is still open.
-    pub fn end_of_reply(&self, thinking: bool) -> Result<Vec<u32>> {
-        let mut end = Vec::new();
-        if thinking {
-            end.extend(self.tokenizer.encode("\n")?);
-            end.push(self.think_end);
-            end.extend(self.tokenizer.encode("\n\n")?);
-        }
-        end.push(self.im_end);
-        end.extend(self.tokenizer.encode("\n")?);
-        Ok(end)
-    }
+    /// Whether the thought is going round in circles.
+    fn repeating(&self) -> bool;
+
+    /// Whether the reply has said anything, or called a tool.
+    fn replied(&self) -> bool;
+
+    /// Takes the token picked as the reply's next, showing `on_chunk`
+    /// what it adds to the thought or to the text, and says what the
+    /// token comes to.
+    fn read(&mut self, token: u32, on_chunk: &mut dyn FnMut(Chunk) -> ControlFlow<()>) -> Read;
+
+    /// Shows `on_chunk` what of the thought was held back, if anything
+    /// was, as a thought that is about to be closed is no longer waiting
+    /// to find out what it is.
+    fn flush(&mut self, on_chunk: &mut dyn FnMut(Chunk) -> ControlFlow<()>) -> ControlFlow<()>;
+
+    /// Takes the thought as closed, by what [`Format::close_thought`]
+    /// wrote into it.
+    fn close_thought(&mut self);
+
+    /// The reply as it was read: its text as shown, and its calls as
+    /// written.
+    fn finish(self: Box<Self>) -> (String, Vec<String>);
+}
+
+/// What a token picked for a reply comes to.
+pub enum Read {
+    /// The reply goes on with the token, or with the one that takes its
+    /// place, and whether whoever is shown the reply ended it there.
+    Token(u32, ControlFlow<()>),
+    /// Whoever is shown the reply ended it before the token.
+    Interrupted,
+    /// The token ends the reply.
+    End,
+    /// The token would end a reply that has said nothing and called
+    /// nothing: the model answered only in its thought.
+    Unanswered,
 }
 
 /// Whether a thought is going round in circles: its tokens so far, how

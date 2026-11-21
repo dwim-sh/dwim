@@ -1,5 +1,5 @@
-//! Qwen3.8-27B, the `qwen35` architecture of llama.cpp's files: a hybrid
-//! transformer in which every fourth layer is full attention and the rest
+//! The `qwen35` architecture of llama.cpp's files, which Qwen3.8-27B is
+//! of: a hybrid transformer in which every fourth layer is full attention and the rest
 //! are Gated DeltaNet linear attention, written as a sequence of operations
 //! on a [`Device`]. It runs the model from a file quantized as llama.cpp
 //! does, each matrix in whichever format the file has it.
@@ -11,52 +11,15 @@
 //! file ends with a layer that predicts the token after the next, which the
 //! model drafts with.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
-    inference::{Gguf, LanguageModel, Result, gguf, quants},
-    model::{Variant, hub},
+    inference::{Gguf, LanguageModel, Memory, Result, gguf, quants},
 };
 
-/// The model as `dwim` names it.
-pub const NAME: &str = Variant::Medium.name();
-
-/// The file holding the model: a GGUF file, which carries the tokenizer
-/// and the sampling settings too.
-pub const WEIGHTS: &str = "Qwen3.8-27B-Q4_0.gguf";
-
-/// Where the model's files come from: Qwen ships no GGUF of its own, so
-/// bartowski's conversion of `Qwen/Qwen3.8-27B`, quantized with an
-/// importance matrix, at a pinned commit, so the weights can't change
-/// underneath us and outputs stay reproducible. Its Q4_0 file holds most
-/// matrices in 4-bit blocks of 32 with an f16 scale, the first layers' down
-/// projections as Q4_1, the linear attention's output projections as Q8_0,
-/// and the output and a few query projections as Q6_K; the norms and the
-/// small linear attention tensors are f32.
-pub const REPO: &str = "bartowski/Qwen3.8-27B-GGUF";
-pub const REVISION: &str = "87410e7b9a5c21e6ca70c0c9cc5237de909fe621";
-
-/// A file of the model in its repository.
-pub struct File {
-    pub name: &'static str,
-    /// What the Hugging Face cache names its content by: the SHA-256 of a
-    /// file in LFS storage, and the git blob SHA-1 of a small one.
-    pub digest: &'static str,
-}
-
-/// The files fetched: the weights.
-pub const FILES: [File; 1] = [File {
-    name: WEIGHTS,
-    digest: "5eb1de39e9b42aa7f99f1a4fe149d1952cc8103c698cf380b15a43d47e72b7c7",
-}];
-
-/// Where the model's files are kept: its repository's snapshot at the
-/// pinned revision in the Hugging Face cache, shared with every other
-/// tool that uses it. See [`hub`].
-pub fn dir() -> Option<PathBuf> {
-    hub::snapshot_dir(REPO, REVISION)
-}
+/// What a file of the architecture calls it.
+pub const ARCHITECTURE: &str = "qwen35";
 
 /// Most tokens the model drafts at once: a batch to be verified holds them
 /// and the token before.
@@ -93,7 +56,7 @@ pub struct Config {
 impl Config {
     pub fn load(gguf: &Gguf) -> Result<Self> {
         let arch = gguf.str("general.architecture")?;
-        if arch != "qwen35" {
+        if arch != ARCHITECTURE {
             return Err(format!("the '{arch}' architecture is not supported").into());
         }
         let key = |name: &str| gguf.u32(&format!("{arch}.{name}"));
@@ -230,24 +193,15 @@ impl Config {
     }
 }
 
-/// Device memory the model takes, in bytes: `fixed` for its weights and
-/// the activations, which the sequences share, and for each sequence,
-/// `per_sequence` for its recurrent states and `per_token` more for each
-/// token of its context, for the key/value caches. The rotary position
-/// embedding table, which the sequences share, is counted with each, at a
-/// few hundred bytes a token.
-#[derive(Clone, Copy, Debug)]
-pub struct Memory {
-    pub fixed: u64,
-    pub per_sequence: u64,
-    pub per_token: u64,
-}
-
-impl Memory {
-    /// The memory the model in `gguf`, configured as `c`, takes on a
-    /// device. Fails if the file does not say how big one of its tensors
-    /// is.
-    pub fn of(c: &Config, gguf: &Gguf, batch: usize) -> Result<Self> {
+impl Config {
+    /// The device memory the model in `gguf`, configured as this, takes:
+    /// `per_sequence` is for a sequence's recurrent states, and
+    /// `per_token` for the key/value caches. The rotary position embedding
+    /// table, which the sequences share, is counted with each, at a few
+    /// hundred bytes a token. Fails if the file does not say how big one
+    /// of its tensors is.
+    pub fn memory(&self, gguf: &Gguf, batch: usize) -> Result<Memory> {
+        let c = self;
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host, in the format the device holds it
         // in: a matrix of Q4_1 or Q6_K is quantized again as Q8_0 on
@@ -289,7 +243,7 @@ impl Memory {
                 + MAX_DRAFTS * c.vocab;
         }
         let kv_dim = c.kv_heads * c.head_dim;
-        Ok(Self {
+        Ok(Memory {
             fixed: (weights + 4 * activations) as u64,
             per_sequence: 4 * sequence as u64,
             per_token: (2 * caches * cache_bytes(kv_dim) + 4 * c.rot_dim) as u64,
@@ -2098,7 +2052,8 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
-        let path = dir().unwrap().join(WEIGHTS);
+        let weights = crate::model::Model::Qwen27b.weights().unwrap();
+        let path = weights.path(&weights.dir().unwrap());
         if !path.exists() {
             eprintln!("skipping: no model at {}", path.display());
             return;
@@ -2108,7 +2063,8 @@ mod tests {
 
     fn real_model(path: &Path) {
         let gguf = Arc::new(Gguf::open(path).unwrap());
-        let tokenizer = crate::model::Tokenizer::from_gguf(&gguf).unwrap();
+        let format = crate::model::Model::Qwen27b.format(&gguf).unwrap();
+        let tokenizer = format.tokenizer();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();
         let mut model = Model::load(gguf, device, 256, |_, _| {}).unwrap();

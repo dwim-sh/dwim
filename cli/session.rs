@@ -11,8 +11,8 @@ use std::{
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::inference::{Model, Progress};
-use dwim::model::{Device, Tally, Variant};
+use dwim::inference::{self, Loaded, Progress};
+use dwim::model::{Device, Model, Tally};
 use dwim::providers::{
     Any, Conversation, Kind, cerebras,
     dwim::{self as server},
@@ -33,7 +33,7 @@ pub use dwim::server::protocol::Status;
 #[derive(Clone)]
 pub struct Settings {
     /// The model to run.
-    pub model: Variant,
+    pub model: Model,
     /// Where it runs, if the command line says.
     pub provider: Option<Kind>,
     pub device: Device,
@@ -70,7 +70,7 @@ impl Settings {
 pub type Session = Conversation<Any>;
 
 /// The harness around the model, ready for a message.
-pub struct Loaded {
+pub struct Ready {
     pub harness: Harness<Session>,
     /// How long getting the model ready took: reaching the server, the
     /// loading if it was loading, and the system prompt.
@@ -87,16 +87,16 @@ pub struct Loaded {
 /// without a model then, for `/login` to sign in. A provider the command
 /// line names is only returned if the model can run there: a local one
 /// needs this machine to have the memory for it.
-pub fn provider(provider: Option<Kind>, model: Variant) -> Result<Option<Kind>, Box<dyn Error>> {
+pub fn provider(provider: Option<Kind>, model: Model) -> Result<Option<Kind>, Box<dyn Error>> {
     match (provider, model) {
-        (Some(Kind::Local), Variant::Large) => Err(format!(
+        (Some(Kind::Local), Model::QwenMax) => Err(format!(
             "{} does not run on this machine: it runs with --provider openrouter, or vercel",
-            Variant::Large
+            Model::QwenMax
         )
         .into()),
-        (Some(Kind::Cerebras), Variant::Large) => Err(format!(
+        (Some(Kind::Cerebras), Model::QwenMax) => Err(format!(
             "{} does not run at Cerebras: it runs with --provider openrouter, or vercel",
-            Variant::Large
+            Model::QwenMax
         )
         .into()),
         (Some(Kind::Local), _) => {
@@ -119,7 +119,7 @@ const KINDS: [Kind; 4] = [Kind::Local, Kind::OpenRouter, Kind::Vercel, Kind::Cer
 
 /// Whether `model` can run at `kind` as things are: on this machine with
 /// the memory for it, at a host that runs it with a key to the host.
-fn ready(kind: Kind, model: Variant) -> bool {
+fn ready(kind: Kind, model: Model) -> bool {
     runs(kind, model)
         && match kind {
             Kind::Local => memory::check().is_ok(),
@@ -131,9 +131,9 @@ fn ready(kind: Kind, model: Variant) -> bool {
 
 /// Whether `kind` is a provider of `model`: all are of the medium model,
 /// OpenRouter and Vercel's AI Gateway of the large one.
-fn runs(kind: Kind, model: Variant) -> bool {
+fn runs(kind: Kind, model: Model) -> bool {
     match kind {
-        Kind::Local | Kind::Cerebras => model == Variant::Medium,
+        Kind::Local | Kind::Cerebras => model == Model::Qwen27b,
         Kind::OpenRouter | Kind::Vercel => true,
     }
 }
@@ -141,7 +141,7 @@ fn runs(kind: Kind, model: Variant) -> bool {
 /// Why `model` has nowhere to run, when [`provider`] finds none: providers
 /// of it are disabled in `config`, or else it does not run on this
 /// machine, which leaves the hosts, without a key.
-pub fn nowhere(model: Variant, config: &Config) -> String {
+pub fn nowhere(model: Model, config: &Config) -> String {
     let disabled: Vec<&str> = KINDS
         .into_iter()
         .filter(|&kind| runs(kind, model) && config.disabled(kind))
@@ -154,8 +154,8 @@ pub fn nowhere(model: Variant, config: &Config) -> String {
         );
     }
     match (model, memory::check()) {
-        (Variant::Medium, Err(e)) => e.to_string(),
-        (Variant::Medium, Ok(())) => {
+        (Model::Qwen27b, Err(e)) => e.to_string(),
+        (Model::Qwen27b, Ok(())) => {
             format!("{model} runs only at OpenRouter, Vercel or Cerebras")
         }
         _ => format!("{model} runs only at OpenRouter or Vercel"),
@@ -175,7 +175,7 @@ fn name(kind: Kind) -> &'static str {
 /// them whatever is said of it, since the model does run there.
 pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
     let usable = |&kind: &Kind| {
-        Some(kind) == current || (!config.disabled(kind) && ready(kind, Variant::Medium))
+        Some(kind) == current || (!config.disabled(kind) && ready(kind, Model::Qwen27b))
     };
     let groups: Vec<Group> = SHOWN
         .into_iter()
@@ -183,7 +183,7 @@ pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
         .map(|kind| Group {
             provider: kind,
             name: label(kind),
-            models: [Variant::Medium, Variant::Large]
+            models: [Model::Qwen27b, Model::QwenMax]
                 .into_iter()
                 .filter(|&model| runs(kind, model))
                 .collect(),
@@ -259,8 +259,12 @@ pub fn fetch_model(
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
     memory::check()?;
-    let dir = Model::dir(settings.model.name())?;
-    Model::fetch(&dir, |progress| {
+    let model = settings.model;
+    let weights = model
+        .weights()
+        .ok_or_else(|| format!("{model} does not run on this machine"))?;
+    let dir = weights.dir().ok_or("cannot determine the home directory")?;
+    inference::fetch(weights, &dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
             done: progress.done,
@@ -277,9 +281,10 @@ pub fn load_model(
     settings: &Settings,
     sessions: usize,
     mut on_status: impl FnMut(Status),
-) -> Result<Model, Box<dyn Error>> {
+) -> Result<Loaded, Box<dyn Error>> {
     let dir = fetch_model(settings, &mut on_status)?;
-    Model::load(
+    Loaded::load(
+        settings.model,
         &dir,
         settings.device,
         settings.context,
@@ -303,11 +308,11 @@ pub fn load(
     settings: &Settings,
     log: Log,
     on_status: impl FnMut(Status) + Send + 'static,
-) -> Result<Loaded, Box<dyn Error>> {
+) -> Result<Ready, Box<dyn Error>> {
     let loading = Instant::now();
     let (session, system) = open(settings, on_status)?;
     let harness = harness(settings, session, system, log)?;
-    Ok(Loaded {
+    Ok(Ready {
         harness,
         loading: loading.elapsed(),
     })
@@ -389,8 +394,8 @@ pub fn open(
             openrouter::KEY,
             vercel::KEY,
             match settings.model {
-                Variant::Medium => format!(", or at Cerebras by setting {}", cerebras::KEY),
-                Variant::Large => String::new(),
+                Model::Qwen27b => format!(", or at Cerebras by setting {}", cerebras::KEY),
+                Model::QwenMax => String::new(),
             }
         )
         .into());

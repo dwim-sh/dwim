@@ -11,7 +11,7 @@
 //! whether there is a key to it.
 
 use crossterm::style::Stylize;
-use dwim::model::Variant;
+use dwim::model::Model;
 use dwim::providers::{Kind, hosted::Host};
 use unicode_width::UnicodeWidthStr;
 
@@ -25,25 +25,25 @@ pub struct Picker {
     /// things are.
     more: bool,
     /// The model the session is on, and where it runs, if anywhere.
-    current: Option<(Kind, Variant)>,
+    current: Option<(Kind, Model)>,
     /// Which of the providers is picked, and the model the cursor is on.
     provider: usize,
-    model: Variant,
+    model: Model,
 }
 
 /// A provider and the models it runs.
 pub struct Group {
     pub provider: Kind,
     pub name: &'static str,
-    pub models: Vec<Variant>,
+    pub models: Vec<Model>,
 }
 
 impl Picker {
     /// A picker of the models `groups` run, on the provider the session's
-    /// model runs at, if it runs anywhere, and the model, `variant`.
+    /// model runs at, if it runs anywhere, and the model, `model`.
     /// `more` says there are providers besides, to point at `/provider`
     /// for.
-    pub fn new(groups: Vec<Group>, more: bool, provider: Option<Kind>, variant: Variant) -> Self {
+    pub fn new(groups: Vec<Group>, more: bool, provider: Option<Kind>, model: Model) -> Self {
         let at = groups
             .iter()
             .position(|group| Some(group.provider) == provider)
@@ -51,9 +51,9 @@ impl Picker {
         let mut picker = Self {
             groups,
             more,
-            current: provider.map(|provider| (provider, variant)),
+            current: provider.map(|provider| (provider, model)),
             provider: at,
-            model: variant,
+            model,
         };
         picker.settle();
         picker
@@ -75,7 +75,7 @@ impl Picker {
     /// if there is one that way.
     pub fn step(&mut self, down: bool) {
         let models = self.models();
-        let runs = |&&model: &&Variant| self.groups[self.provider].models.contains(&model);
+        let runs = |&&model: &&Model| self.groups[self.provider].models.contains(&model);
         let at = models.iter().position(|&model| model == self.model);
         let next = match (at, down) {
             (Some(at), true) => models[at + 1..].iter().find(runs),
@@ -87,7 +87,7 @@ impl Picker {
 
     /// The model the cursor is on and the provider picked for it, if the
     /// provider runs it.
-    pub fn picked(&self) -> Option<(Kind, Variant)> {
+    pub fn picked(&self) -> Option<(Kind, Model)> {
         let group = &self.groups[self.provider];
         group
             .models
@@ -157,7 +157,7 @@ impl Picker {
     }
 
     /// The models, in the order they are shown.
-    fn models(&self) -> Vec<Variant> {
+    fn models(&self) -> Vec<Model> {
         let mut models = Vec::new();
         for &model in self.groups.iter().flat_map(|group| &group.models) {
             if !models.contains(&model) {
@@ -323,38 +323,38 @@ mod tests {
                 Group {
                     provider: Kind::Local,
                     name: "Local",
-                    models: vec![Variant::Medium],
+                    models: vec![Model::Qwen27b],
                 },
                 Group {
                     provider: Kind::OpenRouter,
                     name: "OpenRouter",
-                    models: vec![Variant::Medium, Variant::Large],
+                    models: vec![Model::Qwen27b, Model::QwenMax],
                 },
             ],
             false,
             Some(Kind::Local),
-            Variant::Medium,
+            Model::Qwen27b,
         )
     }
 
     #[test]
     fn picks_a_model_at_the_provider_turned_to() {
         let mut picker = picker();
-        assert_eq!(picker.picked(), Some((Kind::Local, Variant::Medium)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
         picker.turn(true);
-        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Variant::Medium)));
+        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Model::Qwen27b)));
         picker.step(true);
-        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Variant::Large)));
+        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Model::QwenMax)));
     }
 
     #[test]
     fn does_not_pick_a_model_the_provider_does_not_run() {
         let mut picker = picker();
         picker.step(true);
-        assert_eq!(picker.picked(), Some((Kind::Local, Variant::Medium)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
         picker.turn(true);
         picker.step(true);
         picker.turn(false);
-        assert_eq!(picker.picked(), Some((Kind::Local, Variant::Medium)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
     }
 }

@@ -1167,11 +1167,11 @@ fn event(chunk: Chunk) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use std::iter;
+    use std::{iter, sync::Arc};
 
     use crate::{
         inference::{Local, Sampler, testing::Scripted},
-        model::{Format, Tokenizer},
+        model::{Tokenizer, qwen::ChatMl},
     };
 
     use super::*;
@@ -1226,7 +1226,7 @@ mod tests {
         let model = Scripted::new(&tokenizer, &scripts, max_len).answers(&tokenizer, note);
         let mut session = Local::new(
             model,
-            Format::new(tokenizer).unwrap(),
+            Arc::new(ChatMl::new(tokenizer).unwrap()),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
         let model = Scripted::new(&tokenizer, &scripts, max_len);
         let mut session = Local::new(
             model,
-            Format::new(tokenizer).unwrap(),
+            Arc::new(ChatMl::new(tokenizer).unwrap()),
             Sampler::new(1.0, 1, 0.95, 0.0, 1),
         )
         .unwrap();

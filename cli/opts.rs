@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, env, path::PathBuf};
 
 use argh::{EarlyExit, FromArgs};
-use dwim::inference::Model;
-use dwim::model::{Device, Size, Variant};
+use dwim::inference::Loaded;
+use dwim::model::{Device, Model, Size};
 use dwim::providers::Kind;
 
 use crate::{model, session::Settings, tui};
@@ -12,8 +12,8 @@ use crate::{model, session::Settings, tui};
 pub struct Opts {
     /// model to run, by size: medium (default), which is qwen3.8-27b, or
     /// large, qwen3.8-2.4t-a95b
-    #[argh(option, default = "Variant::Medium")]
-    pub model: Variant,
+    #[argh(option, default = "Model::default()")]
+    pub model: Model,
 
     /// where the model runs: local, on this machine, openrouter, with the
     /// key in OPENROUTER_API_KEY, vercel, Vercel's AI Gateway, with the
@@ -231,16 +231,22 @@ const WIDTH: usize = 80;
 const ARGH_COLUMN: usize = 20;
 
 /// The help text: the options argh describes in `output`, sorted under
-/// headings, with the default context worked out for the device the
-/// arguments name, if the model is downloaded and the device opens.
+/// headings, with the default context worked out for the model and the
+/// device the arguments name, if the model is downloaded and the device
+/// opens.
 pub fn help(output: &str, args: &[&str]) -> String {
-    let device = args
-        .iter()
-        .position(|&arg| arg == "--device")
-        .and_then(|i| args.get(i + 1))
+    let value = |option: &str| {
+        args.iter()
+            .position(|&arg| arg == option)
+            .and_then(|i| args.get(i + 1))
+    };
+    let model = value("--model")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
+    let device = value("--device")
         .and_then(|value| device(value).ok())
         .unwrap_or(Device::Gpu(None));
-    layout(output, Model::default_size(device))
+    layout(output, Loaded::default_size(model, device))
 }
 
 /// The help text laid out from argh's `output`, saying the default context

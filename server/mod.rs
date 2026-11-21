@@ -134,7 +134,7 @@ struct Inner {
     build: String,
     peers: Mutex<HashMap<usize, Peer>>,
     /// The chat format, once the model is loaded, for measuring turns.
-    format: OnceLock<Format>,
+    format: OnceLock<Arc<dyn Format>>,
     /// How many sessions are open.
     sessions: AtomicUsize,
     /// Whose request the model is on, if any.
@@ -246,7 +246,7 @@ impl Server {
     pub fn run(
         self,
         mut model: Box<dyn LanguageModel>,
-        format: Format,
+        format: Arc<dyn Format>,
         device: String,
         size: Size,
         sampler: impl Fn(Option<f32>) -> Sampler,
@@ -323,7 +323,8 @@ impl Server {
                 },
                 request => match sessions.get_mut(&id) {
                     Some(served) => {
-                        let response = serve(served, request, &peer, self.states);
+                        let states = self.states.then_some(inner.hello.model.as_str());
+                        let response = serve(served, request, &peer, states);
                         // A reply that failed part way may leave a batch
                         // being verified: it is committed before another
                         // session has the model. What the model has read
@@ -490,12 +491,13 @@ fn state<M: LanguageModel>(session: &Local<M>) -> State {
 
 /// Serves a session's request on the model, streaming what there is to
 /// `peer` along the way. The state after a system prompt is saved and
-/// taken up from if `states` says so.
+/// taken up from under the model's name, which `states` is, if it is to
+/// be.
 fn serve(
     served: &mut Served,
     request: Request,
     peer: &Peer,
-    states: bool,
+    states: Option<&str>,
 ) -> Result<Response, Box<dyn Error>> {
     let progress = |read: usize, total: usize| {
         let _ = peer.write(&Response::Status(Status::Prompting { read, total }));
@@ -600,7 +602,7 @@ impl Served {
         &mut self,
         system: &str,
         turns: &[Turn],
-        states: bool,
+        states: Option<&str>,
         on_progress: impl FnMut(usize, usize),
     ) -> Result<(), Box<dyn Error>> {
         let goes_on = self
@@ -610,10 +612,11 @@ impl Served {
         if !goes_on {
             self.read = None;
             self.session.clear()?;
-            if states {
-                self.session.start(system, on_progress)?;
-            } else {
-                self.session.system(system, on_progress)?;
+            match states {
+                Some(model) => {
+                    self.session.start(model, system, on_progress)?;
+                }
+                None => self.session.system(system, on_progress)?,
             }
             self.read = Some(Chat {
                 system: system.to_string(),
@@ -773,7 +776,7 @@ mod tests {
 
     use crate::{
         inference::testing::Scripted,
-        model::{Session, Tokenizer, Turn},
+        model::{Session, Tokenizer, Turn, qwen::ChatMl},
         providers::{
             Conversation, Provider,
             dwim::{Connection, Remote},
@@ -821,7 +824,7 @@ mod tests {
                     }
                 });
             }
-            let format = Format::new(tokenizer).unwrap();
+            let format = Arc::new(ChatMl::new(tokenizer).unwrap());
             let size = Size {
                 sessions: 2,
                 context: 1 << 12,
@@ -904,7 +907,7 @@ mod tests {
             calls: vec!["<function=bash>\n</function>".to_string()],
             thought: String::new(),
         };
-        let format = Format::new(Tokenizer::tiny()).unwrap();
+        let format = Arc::new(ChatMl::new(Tokenizer::tiny()).unwrap());
         assert_eq!(a.measure(&turn).unwrap(), format.measure(&turn).unwrap());
         assert_eq!(
             a.answer_tokens("note", 100).unwrap(),
@@ -1064,7 +1067,7 @@ mod tests {
             server
                 .run(
                     Box::new(model),
-                    Format::new(tokenizer).unwrap(),
+                    Arc::new(ChatMl::new(tokenizer).unwrap()),
                     "cpu".to_string(),
                     Size {
                         sessions: 1,

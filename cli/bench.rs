@@ -46,7 +46,7 @@ pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let filler = model.format().tokenizer.encode(FILLER)?;
+    let filler = model.format().tokenizer().encode(FILLER)?;
     let token = |i: usize| filler[i % filler.len()];
     println!("{:>8}  {:>12}  {:>12}", "context", "read", "generate");
     let mut pos = 0;
