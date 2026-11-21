@@ -49,9 +49,14 @@ pub fn blobs_dir(repo: &str) -> Option<PathBuf> {
     Some(repo_dir(repo)?.join("blobs"))
 }
 
-/// The link a file in a snapshot is, to the blob called `digest`.
-pub fn blob_link(digest: &str) -> PathBuf {
-    Path::new("..").join("..").join("blobs").join(digest)
+/// The link `file` in a snapshot is, to the blob called `digest`: a file
+/// in a directory of its repository is that much further from the blobs.
+pub fn blob_link(file: &str, digest: &str) -> PathBuf {
+    let mut link = PathBuf::new();
+    for _ in 0..Path::new(file).components().count() + 1 {
+        link.push("..");
+    }
+    link.join("blobs").join(digest)
 }
 
 /// URL to download `file` of `repo` at `revision` from.
