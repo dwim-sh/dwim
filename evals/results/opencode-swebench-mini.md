@@ -1,4 +1,4 @@
-# verified-mini-opencode-1.19.6
+# opencode-swebench-mini
 
 | | |
 |---|---|
