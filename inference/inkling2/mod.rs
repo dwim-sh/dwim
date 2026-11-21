@@ -42,6 +42,13 @@ pub const ARCHITECTURE: &str = "inkling2_loop";
 /// mixed and where a message is gated.
 const MIX_EPS: f32 = 1e-6;
 
+/// Batches of the device's that the model runs as one. A device reads an
+/// expert's weights once for a batch, however many of its tokens go
+/// through the expert, and a short batch leaves most experts a token or
+/// two: a longer one costs little more, and reads a prompt that much
+/// faster.
+const BATCHES: usize = 4;
+
 /// The inputs a pass's messages go into: a layer's queries, keys and
 /// values, and its feed-forward network.
 const CONTROLS: usize = 4;
@@ -300,6 +307,7 @@ impl Config {
     /// say how big one of its tensors is.
     pub fn memory(&self, gguf: &Gguf, batch: usize) -> Result<Memory> {
         let c = self;
+        let batch = batch * BATCHES;
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host, in the format the file has it
         // in, but for a matrix of f32, which is rounded to bf16.
@@ -323,7 +331,9 @@ impl Config {
             // keeps of a sequence's rings and convolution states.
             fixed: (weights + 4 * (batch * c.activations() + c.vocab_padded + conv) + rings) as u64,
             per_sequence: (rings + 4 * conv) as u64,
-            per_token: (global * kv) as u64,
+            // And what the queries at the position grow by, which the
+            // sequences share, counted with each.
+            per_token: (global * kv + 4) as u64,
         })
     }
 }
@@ -679,13 +689,7 @@ impl<D: Device> Pass<'_, D> {
         // over everything grow with the logarithm of the position, and
         // the bias with them.
         if !layer.local && pos + n > c.log_floor {
-            let growth: Vec<f32> = (pos..pos + n)
-                .map(|at| {
-                    let past = ((at + 1) as f32 / c.log_floor as f32).max(1.0);
-                    1.0 + c.log_alpha * past.ln()
-                })
-                .collect();
-            d.write(&mut s.growth, &growth);
+            d.copy(&mut s.growth, 0, &s.grown, pos, n);
             d.scale_rows(&mut s.q, &s.growth);
             d.scale_rows(&mut s.rel, &s.growth);
         }
@@ -1275,8 +1279,11 @@ struct State<D: Device> {
     v_taps: D::Buffer,
     rel: D::Buffer,
     sinks: D::Buffer,
-    /// What each token's queries grow by, far into a sequence.
+    /// What each token's queries grow by, far into a sequence, and what
+    /// the queries at every position there is room for do: one, up to
+    /// where they start to grow.
     growth: D::Buffer,
+    grown: D::Buffer,
     att: D::Buffer,
     /// The output of attention or of the experts, and the same convolved.
     out: D::Buffer,
@@ -1351,7 +1358,7 @@ impl<D: Device> Sequence<D> {
 
 impl<D: Device> State<D> {
     fn new(c: &Config, device: &D, max_len: usize) -> Self {
-        let most = device.batch();
+        let most = device.batch() * BATCHES;
         let k = c.experts_used;
         let buf = |width: usize| device.alloc(most * width);
         let hidden = || buf(c.hidden);
@@ -1383,6 +1390,17 @@ impl<D: Device> State<D> {
             rel: buf(c.heads * c.rel),
             sinks: buf(c.heads),
             growth: buf(1),
+            grown: {
+                let growth: Vec<f32> = (0..max_len)
+                    .map(|at| {
+                        let past = ((at + 1) as f32 / c.log_floor as f32).max(1.0);
+                        1.0 + c.log_alpha * past.ln()
+                    })
+                    .collect();
+                let mut grown = device.alloc(max_len);
+                device.write(&mut grown, &growth);
+                grown
+            },
             att: buf(c.q_dim()),
             out: hidden(),
             out_conv: hidden(),
@@ -1516,10 +1534,10 @@ mod tests {
     /// over a window of four; four experts of which a token goes through
     /// two, in NVFP4 with scales in the first four layers and Q8_0 in the
     /// last two.
-    fn synthetic(path: &Path) {
+    fn synthetic(path: &Path, used: usize) {
         let (hidden, layers, heads, kv_heads, head_dim) = (64, 6, 4, 2, 32);
         let (window, rel, extent, taps, rank) = (4, 4, 8, 4, 8);
-        let (experts, used, inner) = (4, 2, 64);
+        let (experts, inner) = (4, 64);
         let (vocab, padded) = (40, 48);
         let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
         let mut rng = Rng(2);
@@ -1673,7 +1691,7 @@ mod tests {
         let meta = vec![
             ("general.architecture", Value::Str(a.into())),
             (key("block_count"), n(layers)),
-            (key("context_length"), n(256)),
+            (key("context_length"), n(1024)),
             (key("embedding_length"), n(hidden)),
             (key("attention.head_count"), each(heads)),
             (key("attention.head_count_kv"), each(kv_heads)),
@@ -1717,10 +1735,16 @@ mod tests {
 
     impl File {
         fn new(name: &str) -> Self {
+            Self::routing(name, 2)
+        }
+
+        /// The file of a model whose tokens go through `used` of its four
+        /// experts each.
+        fn routing(name: &str, used: usize) -> Self {
             let dir =
                 std::env::temp_dir().join(format!("dwim-inkling2-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            synthetic(&dir.join("model.gguf"));
+            synthetic(&dir.join("model.gguf"), used);
             Self(dir)
         }
 
@@ -1736,8 +1760,8 @@ mod tests {
         }
     }
 
-    /// A sequence longer than a windowed layer's ring, which is the window
-    /// and a batch.
+    /// A sequence of tokens: the tests' are longer than a windowed layer's
+    /// ring, which is the window and a batch.
     fn sequence(len: usize) -> Vec<u32> {
         (0..len)
             .map(|i| (i * 7 % 37 + i / 11) as u32 % 40)
@@ -1754,10 +1778,10 @@ mod tests {
     #[test]
     fn logits_do_not_depend_on_how_tokens_are_batched() {
         let file = File::new("batches");
-        let tokens = sequence(150);
+        let tokens = sequence(600);
         // Whole batches, which wrap the rings mid-batch; a token at a
         // time; and uneven pieces.
-        let mut model = file.load(Cpu, 200);
+        let mut model = file.load(Cpu, 700);
         let whole = model.forward(&tokens, 0);
         assert_eq!(whole.len(), 40);
         assert!(whole.iter().all(|logit| logit.is_finite()));
@@ -1770,7 +1794,7 @@ mod tests {
         model.reset();
         let mut pieces = Vec::new();
         let mut at = 0;
-        for size in [3, 64, 1, 30, 52] {
+        for size in [3, 256, 1, 130, 210] {
             pieces = model.forward(&tokens[at..at + size], at);
             at += size;
         }
@@ -1791,23 +1815,23 @@ mod tests {
     #[test]
     fn restores_a_saved_state() {
         let file = File::new("state");
-        let tokens = sequence(120);
+        let tokens = sequence(420);
         // A conversation of two parts, and one that takes up from the
         // first's saved state, past where the rings wrap: the same logits.
-        let mut whole = file.load(Cpu, 200);
-        whole.forward(&tokens[..100], 0);
-        let state = whole.save(100).unwrap();
-        let want = whole.forward(&tokens[100..], 100);
-        let mut resumed = file.load(Cpu, 200);
-        assert_eq!(resumed.restore(&state).unwrap(), 100);
-        assert_eq!(resumed.forward(&tokens[100..], 100), want);
+        let mut whole = file.load(Cpu, 500);
+        whole.forward(&tokens[..400], 0);
+        let state = whole.save(400).unwrap();
+        let want = whole.forward(&tokens[400..], 400);
+        let mut resumed = file.load(Cpu, 500);
+        assert_eq!(resumed.restore(&state).unwrap(), 400);
+        assert_eq!(resumed.forward(&tokens[400..], 400), want);
         assert!(resumed.restore(&state[..100]).is_err());
         // A model with room for less has shorter caches: not its state.
         assert!(file.load(Cpu, 50).restore(&state).is_err());
 
         // Reset, the model is as it was when loaded.
-        let fresh = file.load(Cpu, 200).forward(&tokens[..5], 0);
-        assert_ne!(whole.forward(&tokens[..5], 120), fresh);
+        let fresh = file.load(Cpu, 500).forward(&tokens[..5], 0);
+        assert_ne!(whole.forward(&tokens[..5], 420), fresh);
         whole.reset();
         assert_eq!(whole.forward(&tokens[..5], 0), fresh);
     }
@@ -1815,23 +1839,23 @@ mod tests {
     #[test]
     fn rewinds_to_a_mark() {
         let file = File::new("mark");
-        let tokens = sequence(160);
-        let mut model = file.load(Cpu, 200);
-        model.forward(&tokens[..90], 0);
-        let straight = model.forward(&tokens[90..], 90);
+        let tokens = sequence(400);
+        let mut model = file.load(Cpu, 700);
+        model.forward(&tokens[..300], 0);
+        let straight = model.forward(&tokens[300..], 300);
         // A detour from a mark, long enough to write over what the rings
         // held before it, then back: the same logits as without it.
         model.reset();
-        model.forward(&tokens[..90], 0);
+        model.forward(&tokens[..300], 0);
         assert!(model.mark());
-        model.forward(&sequence(80), 90);
+        model.forward(&sequence(280), 300);
         model.rewind_to_mark().unwrap();
-        assert_eq!(model.forward(&tokens[90..], 90), straight);
+        assert_eq!(model.forward(&tokens[300..], 300), straight);
         // Without the rewind, the detour stays.
         model.reset();
-        model.forward(&tokens[..90], 0);
-        model.forward(&sequence(30), 90);
-        assert_ne!(model.forward(&tokens[90..], 120), straight);
+        model.forward(&tokens[..300], 0);
+        model.forward(&sequence(30), 300);
+        assert_ne!(model.forward(&tokens[300..], 330), straight);
     }
 
     #[test]
@@ -1868,21 +1892,25 @@ mod tests {
             eprintln!("skipping: {} does not run NVFP4", gpu.name());
             return;
         }
-        let file = File::new("gpu");
-        let tokens = sequence(150);
+        // Every token goes through every expert: where the router picks,
+        // a sum that comes out the other way in its last bit can tip
+        // which expert is picked, and the two devices then run slightly
+        // different networks, which is not what is checked here.
+        let file = File::routing("gpu", 4);
+        let tokens = sequence(450);
         let run = |mut model: Box<dyn LanguageModel>| {
-            let prompt = model.forward(&tokens[..100], 0);
+            let prompt = model.forward(&tokens[..400], 0);
             assert!(model.mark());
-            model.forward(&sequence(40), 100);
+            model.forward(&sequence(40), 400);
             model.rewind_to_mark().unwrap();
             let mut last = Vec::new();
-            for (i, token) in tokens[100..].iter().enumerate() {
-                last = model.forward(&[*token], 100 + i);
+            for (i, token) in tokens[400..].iter().enumerate() {
+                last = model.forward(&[*token], 400 + i);
             }
             (prompt, last)
         };
-        let (want_prompt, want_last) = run(Box::new(file.load(Cpu, 200)));
-        let (prompt, last) = run(Box::new(file.load(gpu, 200)));
+        let (want_prompt, want_last) = run(Box::new(file.load(Cpu, 500)));
+        let (prompt, last) = run(Box::new(file.load(gpu, 500)));
         close(&prompt, &want_prompt, 2e-2);
         close(&last, &want_last, 2e-2);
     }
