@@ -1,7 +1,8 @@
 use crate::model::Sampling;
 
 /// Picks the next token from a model's logits: from the `top_k` most likely
-/// tokens, then the smallest set of those whose probability reaches `top_p`,
+/// tokens, or from all of them if `top_k` is zero, then the smallest set of
+/// those whose probability reaches `top_p`,
 /// leaving out any less than `min_p` times as likely as the most likely, at
 /// `temperature`. A temperature of zero always picks the most likely token.
 pub struct Sampler {
@@ -83,18 +84,24 @@ impl Sampler {
     /// temperature, cut to top_p and min_p. At a temperature of zero, the
     /// most likely alone, certain.
     fn candidates(&self, logits: &[f32]) -> (Vec<(u32, f32)>, f32) {
-        // The top k in one pass over the logits, kept in order: a vocabulary
-        // is a quarter of a million entries, and k is twenty.
-        let k = self.top_k.clamp(1, logits.len());
-        let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (token, &logit) in logits.iter().enumerate() {
-            if candidates.len() == k && logit <= candidates[k - 1].1 {
-                continue;
+        let candidates = if self.top_k == 0 {
+            self.within_reach(logits)
+        } else {
+            // The top k in one pass over the logits, kept in order: a
+            // vocabulary is a quarter of a million entries, and k is
+            // twenty.
+            let k = self.top_k.min(logits.len());
+            let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+            for (token, &logit) in logits.iter().enumerate() {
+                if candidates.len() == k && logit <= candidates[k - 1].1 {
+                    continue;
+                }
+                let at = candidates.partition_point(|&(_, l)| l >= logit);
+                candidates.insert(at, (token as u32, logit));
+                candidates.truncate(k);
             }
-            let at = candidates.partition_point(|&(_, l)| l >= logit);
-            candidates.insert(at, (token as u32, logit));
-            candidates.truncate(k);
-        }
+            candidates
+        };
         if self.temperature == 0.0 {
             return (vec![(candidates[0].0, 1.0)], 1.0);
         }
@@ -129,6 +136,30 @@ impl Sampler {
                 .collect(),
             kept,
         )
+    }
+}
+
+/// How far below the most likely token's logit, at a temperature of one,
+/// a token is still a candidate when none is cut by rank: one further
+/// down is less than two billionths as likely, and a vocabulary of them
+/// together less than a thousandth.
+const REACH: f32 = 20.0;
+
+impl Sampler {
+    /// Every token that could be picked with none cut by rank, most
+    /// likely first, each with its logit: the ones within [`REACH`] of the
+    /// most likely at the temperature.
+    fn within_reach(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let floor = max - REACH * self.temperature;
+        let mut candidates: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .filter(|&(_, &logit)| logit >= floor)
+            .map(|(token, &logit)| (token as u32, logit))
+            .collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        candidates
     }
 }
 
