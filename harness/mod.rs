@@ -581,8 +581,16 @@ impl<S: Session> Harness<S> {
     /// Keeps a transcript of the session in `log`, starting with what the
     /// model was given before the first message: `model`, the `device` it
     /// runs on, where it is, the room it has, how it samples, its thinking
-    /// budget, and the `system` prompt.
-    pub fn keep_log(&mut self, mut log: Log, model: &str, device: &str, system: &str) {
+    /// budget, the `effort` it is asked to reason at, and the `system`
+    /// prompt.
+    pub fn keep_log(
+        &mut self,
+        mut log: Log,
+        model: &str,
+        device: &str,
+        effort: Effort,
+        system: &str,
+    ) {
         log.start(
             model,
             device,
@@ -590,6 +598,7 @@ impl<S: Session> Harness<S> {
             self.session.capacity(),
             self.session.sampling(),
             self.thinking_budget,
+            effort,
             system,
         );
         self.log = log;
@@ -1277,7 +1286,13 @@ mod tests {
         assert_eq!(limited.thinking_budget, THINKING_BUDGET);
         assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
-        limited.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
+        limited.keep_log(
+            Log::create(&path).unwrap(),
+            "tiny",
+            "cpu",
+            Effort::Low,
+            "Be brief.",
+        );
         limited.set_thinking_budget(Some(100));
         let mut thought = String::new();
         let mut events = Vec::new();
@@ -1320,6 +1335,7 @@ mod tests {
         // The log has the budget, its change, and the thought it ended.
         let records = records(&path);
         assert_eq!(records[0]["thinking_budget"], 2048);
+        assert_eq!(records[0]["reasoning_effort"], "low");
         assert_eq!(records[1]["type"], "thinking_budget");
         assert_eq!(records[1]["tokens"], 100);
         let replies: Vec<&serde_json::Value> = records
@@ -1404,7 +1420,13 @@ mod tests {
         })
         .unwrap();
         harness.set_thinking_budget(Some(100));
-        harness.keep_log(Log::create(path).unwrap(), "tiny", "cpu", "Be brief.");
+        harness.keep_log(
+            Log::create(path).unwrap(),
+            "tiny",
+            "cpu",
+            Effort::Low,
+            "Be brief.",
+        );
         harness
     }
 
@@ -2024,7 +2046,13 @@ mod tests {
         // at the budget.
         harness.set_thinking_budget(None);
         let path = std::env::temp_dir().join(format!("dwim-log-{}.jsonl", std::process::id()));
-        harness.keep_log(Log::create(&path).unwrap(), "tiny", "cpu", "Be brief.");
+        harness.keep_log(
+            Log::create(&path).unwrap(),
+            "tiny",
+            "cpu",
+            Effort::Low,
+            "Be brief.",
+        );
         for i in 0..5 {
             send(&mut harness, &format!("message {i}"));
         }
