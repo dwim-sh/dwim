@@ -143,13 +143,24 @@ and the commit of `dwim`. Its `manifest.json` says what was run, its
 `report.md` what came of it, and each instance has a directory with its
 `result.json`, its `patch.diff`, the transcript and the logs. A run over a
 whole dataset also writes its report to `evals/results/`, which is kept in
-git: commit it with the change it measures. The commit a run is named for
+git: commit it with the change it measures. The report kept is named for
+the agent and the dataset, as `dwim-swebench-mini.md` is, and names the
+commit of `dwim` it is of, so a later run's takes the place of an earlier
+one's. The commit a run is named for
 is the last to change anything but `evals/`, so that a change to the script
 is not taken for a change to `dwim`. The same command again takes the run
 up where it stopped: it leaves the instances that are done, tries again
 those that could not be run for a reason that was not the agent's, such as
 a pull that failed, and scores the patches that are not scored. A run is of one dataset by one
 `dwim` asked one way, so a change to any of them wants a run of its own.
+
+The report says how the run was made as well as what came of it: where
+the model was served, the reasoning effort, the thinking budget and the
+sampling each session was started with, read from the transcripts and not
+from the defaults, and how much the model thought and how often the
+budget ended a thought. To run the `dwim` you have installed in place of
+one built for the run, install it from the commit the run is to be named
+for (`make install`) and name it: `--binary ~/.local/bin/dwim`.
 
 `--agent opencode` runs [opencode](https://opencode.ai) in place of `dwim`,
 on the same model through the Vercel AI Gateway unless `--model` names
