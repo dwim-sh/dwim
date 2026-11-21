@@ -6,12 +6,13 @@
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    ops::ControlFlow,
     sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Result, Tokenizer};
+use crate::model::{Chunk, Result, Tokenizer};
 
 /// What follows a `<tool_call>` tag that opens a call, as the chat template
 /// writes one: a tag followed by anything else is text.
@@ -223,6 +224,232 @@ impl Format {
         end.push(self.im_end);
         end.extend(self.tokenizer.encode("\n")?);
         Ok(end)
+    }
+
+    /// What writes `closing` into a thought as the model's own and ends
+    /// the thought there, for the reply to go on from.
+    pub fn close_thought(&self, closing: &str) -> Result<Vec<u32>> {
+        let mut tokens = self.tokenizer.encode(closing)?;
+        tokens.push(self.think_end);
+        tokens.extend(self.tokenizer.encode("\n\n")?);
+        Ok(tokens)
+    }
+
+    /// The tokens a reply that must write its answer out may not pick:
+    /// the ones that end it, and the one that opens a call.
+    pub fn unanswering(&self) -> [u32; 3] {
+        [self.im_end, self.end_of_text, self.tool_call]
+    }
+
+    /// Reads a reply from the opening the format gives it, with the
+    /// thought open.
+    pub fn reader(&self) -> Reader {
+        Reader {
+            format: self.clone(),
+            text: Utf8Stream::default(),
+            thinking: true,
+            thought: 0,
+            repeats: Repeats::default(),
+            held: None,
+            call: None,
+            replied: false,
+            shown: String::new(),
+            calls: Vec::new(),
+        }
+    }
+}
+
+/// A reply as it is read, a token at a time: whether it is in its thought,
+/// and what it has said and called so far.
+///
+/// Qwen models call tools from inside the thought as well as after it: a
+/// `<tool_call>` tag followed by a `<function=…>` block ends the thought
+/// and opens the call, wherever it comes, as the model's makers read a
+/// reply. A `<tool_call>` tag followed by anything else, as one the model
+/// only mentions, is part of the thought. Left in the thought, a call the
+/// model meant gets no result, and the model goes on thinking about what
+/// it has asked for: a thought that never ends.
+pub struct Reader {
+    format: Format,
+    text: Utf8Stream,
+    thinking: bool,
+    /// Tokens of the thought since it opened, and whether it is going
+    /// round in circles.
+    thought: usize,
+    repeats: Repeats,
+    /// What has followed a `<tool_call>` tag written in the thought, while
+    /// it is not yet known whether the tag opens a call.
+    held: Option<String>,
+    /// The call being written, as far as it has got.
+    call: Option<String>,
+    replied: bool,
+    /// The reply's text as shown, and the calls it has made, as written.
+    shown: String,
+    calls: Vec<String>,
+}
+
+/// What a token picked for a reply comes to.
+pub enum Read {
+    /// The reply goes on with the token, or with the one that takes its
+    /// place, and whether whoever is shown the reply ended it there.
+    Token(u32, ControlFlow<()>),
+    /// Whoever is shown the reply ended it before the token.
+    Interrupted,
+    /// The token ends the reply.
+    End,
+    /// The token would end a reply that has said nothing and called
+    /// nothing: the model answered only in its thought.
+    Unanswered,
+}
+
+impl Reader {
+    /// Whether the reply is in its thought.
+    pub fn thinking(&self) -> bool {
+        self.thinking
+    }
+
+    /// Tokens of the thought since it opened.
+    pub fn thought(&self) -> usize {
+        self.thought
+    }
+
+    /// Whether the thought is going round in circles.
+    pub fn repeating(&self) -> bool {
+        self.repeats.repeating
+    }
+
+    /// Whether the reply has said anything, or called a tool.
+    pub fn replied(&self) -> bool {
+        self.replied
+    }
+
+    /// Takes the token picked as the reply's next, showing `on_chunk`
+    /// what it adds to the thought or to the text, and says what the
+    /// token comes to.
+    pub fn read(
+        &mut self,
+        mut token: u32,
+        on_chunk: &mut dyn FnMut(Chunk) -> ControlFlow<()>,
+    ) -> Read {
+        let format = &self.format;
+        let special = [
+            format.im_end,
+            format.end_of_text,
+            format.think,
+            format.think_end,
+            format.tool_call,
+            format.tool_call_end,
+        ]
+        .contains(&token);
+        // A <tool_call> written in the thought is held until what
+        // follows it says what it is. The opening of a <function=…>
+        // block makes it a call, and the thought ends there, as the
+        // model's makers read it: the model calls tools from inside
+        // the thought, without closing it first. Anything else, as a
+        // tag the model only mentions, is part of the thought, shown
+        // as written.
+        let mut consumed = false;
+        if let Some(pending) = &mut self.held {
+            let settled = if special {
+                self.held.take()
+            } else {
+                consumed = true;
+                pending.push_str(&self.text.push(format.tokenizer.decode(token)));
+                if pending.starts_with(CALL_OPENING) {
+                    self.thinking = false;
+                    self.replied = true;
+                    self.call = self.held.take();
+                    None
+                } else if CALL_OPENING.starts_with(pending.as_str()) {
+                    None
+                } else {
+                    self.held.take()
+                }
+            };
+            if let Some(pending) = settled
+                && on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))).is_break()
+            {
+                return Read::Interrupted;
+            }
+        }
+        if !consumed && (token == format.im_end || token == format.end_of_text) {
+            if self.thinking {
+                // The model sometimes ends its reply while still
+                // thinking, which leaves nothing to show for it: close
+                // the thought instead, so that it goes on to reply.
+                token = format.think_end;
+            } else if self.replied {
+                return Read::End;
+            } else {
+                return Read::Unanswered;
+            }
+        }
+        if self.thinking {
+            self.thought += 1;
+            self.repeats.push(token);
+        }
+        let flow = if consumed {
+            ControlFlow::Continue(())
+        } else if token == format.think {
+            self.thinking = true;
+            self.thought = 0;
+            self.repeats = Repeats::default();
+            ControlFlow::Continue(())
+        } else if token == format.think_end {
+            self.thinking = false;
+            ControlFlow::Continue(())
+        } else if token == format.tool_call && self.thinking {
+            self.held = Some(String::new());
+            ControlFlow::Continue(())
+        } else if token == format.tool_call_end && self.thinking {
+            let chunk = self.text.push(format.tokenizer.decode(token));
+            on_chunk(Chunk::Thought(&chunk))
+        } else if token == format.tool_call {
+            self.replied = true;
+            self.call = Some(String::new());
+            ControlFlow::Continue(())
+        } else if token == format.tool_call_end {
+            self.calls.extend(self.call.take());
+            ControlFlow::Continue(())
+        } else {
+            let chunk = self.text.push(format.tokenizer.decode(token));
+            match &mut self.call {
+                Some(call) => {
+                    call.push_str(&chunk);
+                    ControlFlow::Continue(())
+                }
+                None if chunk.is_empty() => ControlFlow::Continue(()),
+                None if self.thinking => on_chunk(Chunk::Thought(&chunk)),
+                None => {
+                    self.replied |= !chunk.trim().is_empty();
+                    self.shown.push_str(&chunk);
+                    on_chunk(Chunk::Text(&chunk))
+                }
+            }
+        };
+        Read::Token(token, flow)
+    }
+
+    /// Shows `on_chunk` what of the thought was held back, if anything
+    /// was, as a thought that is about to be closed is no longer waiting
+    /// to find out what it is.
+    pub fn flush(&mut self, on_chunk: &mut dyn FnMut(Chunk) -> ControlFlow<()>) -> ControlFlow<()> {
+        match self.held.take() {
+            Some(pending) => on_chunk(Chunk::Thought(&format!("<tool_call>{pending}"))),
+            None => ControlFlow::Continue(()),
+        }
+    }
+
+    /// Takes the thought as closed, by what [`Format::close_thought`]
+    /// wrote into it.
+    pub fn close_thought(&mut self) {
+        self.thinking = false;
+    }
+
+    /// The reply as it was read: its text as shown, and its calls as
+    /// written.
+    pub fn finish(self) -> (String, Vec<String>) {
+        (self.shown, self.calls)
     }
 }
 
