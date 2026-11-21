@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 use crate::{
     gpu::{Cpu, Device as _, Gpu},
     inference::{Gguf, LanguageModel, Result, Sampler, arch},
-    model::{Device, Format, Model, Size, Tokenizer},
+    model::{Device, Format, Model, Size},
 };
 
 /// How far loading the model has got.
@@ -24,7 +24,7 @@ pub enum Progress {
 pub struct Loaded {
     model: Box<dyn LanguageModel>,
     gguf: Arc<Gguf>,
-    format: Format,
+    format: Arc<dyn Format>,
     device: String,
     size: Size,
 }
@@ -67,7 +67,7 @@ impl Loaded {
         let device = Opened::open(device)?;
         let name = device.name();
         on_progress(Progress::Device(name.clone()));
-        let format = Format::new(Tokenizer::from_gguf(&gguf)?)?;
+        let format = model.format(&gguf)?;
         let size = size(&gguf, &device, context, sessions)?;
         on_progress(Progress::Sized(size));
         let model = device.load(gguf.clone(), size.context, |done, total| {
@@ -83,7 +83,7 @@ impl Loaded {
     }
 
     /// The chat format of the model's vocabulary, with its tokenizer.
-    pub fn format(&self) -> &Format {
+    pub fn format(&self) -> &Arc<dyn Format> {
         &self.format
     }
 

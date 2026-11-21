@@ -1,37 +1,24 @@
-use std::{ops::ControlFlow, time::Instant};
+use std::{ops::ControlFlow, sync::Arc, time::Instant};
 
 use crate::{
     inference::{LanguageModel, Result, Sampler},
     model::{
         Answer, Chunk, Format, Reply, Sampling, Session, Stats, Tally, Turn,
-        format::{Read, Utf8Stream, opening},
+        format::{Read, Utf8Stream},
     },
 };
 
-/// A conversation with an instruction-tuned model, in the ChatML format that
-/// Qwen models are trained on:
+/// A conversation with an instruction-tuned model, in its chat format.
 ///
-/// ```text
-/// <|im_start|>user
-/// Hello!<|im_end|>
-/// <|im_start|>assistant
-/// <think>
-/// The user is greeting me.
-/// </think>
+/// The model thinks before it replies: the format opens the thought for
+/// it, and the thought is streamed apart from the reply. It may also call
+/// tools, if the system prompt describes them, and their results go back
+/// to it as the format writes them. `Local` only speaks the format: what
+/// the tools are and running them is up to the caller.
 ///
-/// Hi there!<|im_end|>
-/// ```
-///
-/// The model thinks inside `<think>` tags before it replies: its chat
-/// template opens the tag for it, and the thought is streamed apart from
-/// the reply. It may also call tools, if the system prompt describes them,
-/// by replying with `<tool_call>` blocks. Their results go back to it in a
-/// user turn of `<tool_response>` blocks. `Local` only speaks the format:
-/// what the tools are and running them is up to the caller.
-///
-/// The tags of the format are special tokens, which `Local` puts in by id.
-/// What the user and the tools say is encoded as text, so that a message
-/// which spells out a tag stays text: a command that prints `<|im_end|>`
+/// The tags of the format are special tokens, which the format puts in by
+/// id. What the user and the tools say is encoded as text, so that a
+/// message which spells out a tag stays text: a command that prints one
 /// cannot end the turn or start another.
 ///
 /// A reply's thought leaves the model's state once the reply is made, as
@@ -44,7 +31,7 @@ use crate::{
 /// its new tokens.
 pub struct Local<M: LanguageModel> {
     model: M,
-    format: Format,
+    format: Arc<dyn Format>,
     sampler: Sampler,
     /// Number of tokens in the conversation so far.
     len: usize,
@@ -87,7 +74,7 @@ enum Kind {
 impl<M: LanguageModel> Local<M> {
     /// A conversation with `model`, in `format`, picking tokens with
     /// `sampler`.
-    pub fn new(model: M, format: Format, sampler: Sampler) -> Result<Self> {
+    pub fn new(model: M, format: Arc<dyn Format>, sampler: Sampler) -> Result<Self> {
         let ending = format.end_of_reply(true)?.len();
         Ok(Self {
             model,
@@ -141,8 +128,7 @@ impl<M: LanguageModel> Local<M> {
         if self.len != 0 {
             return Err("the conversation has already started".into());
         }
-        let content = self.format.tokenizer.encode_with_special(text)?;
-        let turn = self.format.turn("system", content)?;
+        let turn = self.format.system(text)?;
         self.read(&turn, on_progress)
     }
 
@@ -179,7 +165,7 @@ impl<M: LanguageModel> Local<M> {
         let start = self.len;
         let marked = self.model.mark();
         let thought_before = self.stats.thought.tokens;
-        let prompt = opening(&self.format.tokenizer, true)?;
+        let prompt = self.format.opening(true)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut reader = self.format.reader();
@@ -475,7 +461,7 @@ impl<M: LanguageModel> Session for Local<M> {
     ) -> Result<Answer> {
         let turn = self.format.user(message)?;
         self.feed(&turn, Kind::Prompt)?;
-        let prompt = opening(&self.format.tokenizer, false)?;
+        let prompt = self.format.opening(false)?;
         let mut logits = self.feed(&prompt, Kind::Prompt)?;
 
         let mut text = Utf8Stream::default();
@@ -483,7 +469,7 @@ impl<M: LanguageModel> Session for Local<M> {
         let end = self.format.end_of_reply(false)?;
         let heads: Vec<(&str, Vec<u32>)> = heads
             .iter()
-            .map(|head| Ok((*head, self.format.tokenizer.encode(head)?)))
+            .map(|head| Ok((*head, self.format.tokenizer().encode(head)?)))
             .collect::<Result<_>>()?;
         // Tokens of the heads yet to be written. Each section leaves room
         // for them, so that an answer cut for room still has every head:
@@ -526,18 +512,14 @@ impl<M: LanguageModel> Session for Local<M> {
                     cut = true;
                     break;
                 }
-                for token in [
-                    self.format.think,
-                    self.format.think_end,
-                    self.format.tool_call,
-                ] {
+                for token in self.format.unplain() {
                     logits[token as usize] = f32::NEG_INFINITY;
                 }
                 let token = self.pick(&logits);
-                if token == self.format.im_end || token == self.format.end_of_text {
+                if self.format.ends(token) {
                     break;
                 }
-                let chunk = text.push(self.format.tokenizer.decode(token));
+                let chunk = text.push(self.format.tokenizer().decode(token));
                 answer.push_str(&chunk);
                 let flow = on_text(&chunk);
                 logits = self.step(token, Kind::Answer)?;
@@ -565,7 +547,15 @@ impl<M: LanguageModel> Session for Local<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{inference::testing::Scripted, model::Tokenizer};
+    use crate::{
+        inference::testing::Scripted,
+        model::{Tokenizer, qwen::ChatMl},
+    };
+
+    /// The chat format the sessions here speak, for its tags.
+    fn tags() -> ChatMl {
+        ChatMl::new(Tokenizer::tiny()).unwrap()
+    }
 
     /// A session with a scripted model over the tiny vocabulary, its scripts
     /// given as text with special tokens in it.
@@ -574,7 +564,7 @@ mod tests {
         let model = Scripted::new(&tokenizer, scripts, 1 << 16);
         let mut session = Local::new(
             model,
-            Format::new(tokenizer).unwrap(),
+            Arc::new(ChatMl::new(tokenizer).unwrap()),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
@@ -605,7 +595,7 @@ mod tests {
             stats.thought.tokens,
             session
                 .format
-                .tokenizer
+                .tokenizer()
                 .encode("A thought.\n")
                 .unwrap()
                 .len()
@@ -615,7 +605,7 @@ mod tests {
             stats.answer.tokens,
             session
                 .format
-                .tokenizer
+                .tokenizer()
                 .encode("\n\nAn answer.")
                 .unwrap()
                 .len()
@@ -624,7 +614,7 @@ mod tests {
         // without its thought.
         let made = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(
                 "<|im_start|>assistant\n<think>\nA thought.\n</think>\n\nAn answer.<|im_end|>\n",
             )
@@ -663,7 +653,7 @@ mod tests {
         // Each reply was made with its thought, and stands without it.
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(concat!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n",
                 "<|im_start|>user\nfirst<|im_end|>\n",
@@ -717,7 +707,7 @@ mod tests {
                 .sum::<usize>()
                 + session
                     .format
-                    .tokenizer
+                    .tokenizer()
                     .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
                     .unwrap()
                     .len()
@@ -748,7 +738,7 @@ mod tests {
 
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(&format!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n\
                  <|im_start|>user\ndate?<|im_end|>\n\
@@ -780,7 +770,7 @@ mod tests {
             .unwrap();
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(concat!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n",
                 "<|im_start|>user\nfirst<|im_end|>\n",
@@ -819,7 +809,7 @@ mod tests {
         session.replay(&turns).unwrap();
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(&format!(
                 "<|im_start|>system\nBe brief.<|im_end|>\n\
                  <|im_start|>user\ndate?<|im_end|>\n\
@@ -832,7 +822,7 @@ mod tests {
         assert_eq!(session.tokens(), expected.len());
         let system = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
             .unwrap()
             .len();
@@ -874,7 +864,7 @@ mod tests {
         );
         let mut session = Local::new(
             model,
-            Format::new(tokenizer).unwrap(),
+            Arc::new(ChatMl::new(tokenizer).unwrap()),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
@@ -895,13 +885,13 @@ mod tests {
         // stopped short does.
         let ending = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("\n</think>\n\n<|im_end|>\n")
             .unwrap();
         assert!(fed.ends_with(&ending), "the reply is ended properly");
         let empty = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("<think>\n\n</think>")
             .unwrap();
         assert!(
@@ -930,7 +920,7 @@ mod tests {
         // next batch goes on past: the model takes up no script for it,
         // and says the script when a reply is opened for it.
         let mut session = session(&["First.\n</think>\n\nOne."]);
-        let opening = opening(&session.format.tokenizer, false).unwrap().len();
+        let opening = session.format.opening(false).unwrap().len();
         // The replay is read in batches from its own first token.
         let mut message = String::new();
         while !(session.measure(&Turn::User(message.clone())).unwrap() + opening)
@@ -973,7 +963,7 @@ mod tests {
         assert!(!answer.cut);
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("<|im_start|>user\nsum up<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
             .unwrap();
         let start = session
@@ -983,8 +973,8 @@ mod tests {
             .position(|window| window == expected)
             .unwrap();
         assert!(session.model.fed[start + expected.len()..].ends_with(&[
-            session.format.im_end,
-            session.format.tokenizer.encode("\n").unwrap()[0]
+            tags().im_end,
+            session.format.tokenizer().encode("\n").unwrap()[0]
         ]));
         assert!(session.stats().answer.tokens > 0);
         assert_eq!(session.stats().thought.tokens, 0);
@@ -994,7 +984,12 @@ mod tests {
             .answer("again", &[], 3, |_| ControlFlow::Continue(()))
             .unwrap();
         assert_eq!(
-            session.format.tokenizer.encode(&answer.text).unwrap().len(),
+            session
+                .format
+                .tokenizer()
+                .encode(&answer.text)
+                .unwrap()
+                .len(),
             3
         );
         assert_eq!(answer.text, "One");
@@ -1021,7 +1016,7 @@ mod tests {
         assert!(!answer.cut);
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("<|im_start|>assistant\n<think>\n\n</think>\n\nTask: fix it.\n\nFindings: none yet.\n\nDone:\n\nNext:<|im_end|>\n")
             .unwrap();
         assert!(session.model.fed.ends_with(&expected));
@@ -1034,7 +1029,12 @@ mod tests {
             .unwrap();
         assert_eq!(answer.text, "A:abcB:d");
         assert_eq!(
-            shared.format.tokenizer.encode(&answer.text).unwrap().len(),
+            shared
+                .format
+                .tokenizer()
+                .encode(&answer.text)
+                .unwrap()
+                .len(),
             8
         );
 
@@ -1074,7 +1074,7 @@ mod tests {
         let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
         let mut measure = Local::new(
             Scripted::new(&tokenizer, &[], 1 << 16),
-            Format::new(Tokenizer::tiny()).unwrap(),
+            Arc::new(ChatMl::new(Tokenizer::tiny()).unwrap()),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
@@ -1098,7 +1098,7 @@ mod tests {
         let model = Scripted::new(&tokenizer, &[], max_len).answers(&tokenizer, " fix it.");
         let mut session = Local::new(
             model,
-            Format::new(tokenizer).unwrap(),
+            Arc::new(ChatMl::new(tokenizer).unwrap()),
             Sampler::new(0.0, 1, 1.0, 0.0, 1),
         )
         .unwrap();
@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn ends_a_thought_at_its_limit() {
         let mut session = session(&["One two three four five.\n</think>\n\nDone."]);
-        let limit = session.format.tokenizer.encode("One two").unwrap().len();
+        let limit = session.format.tokenizer().encode("One two").unwrap().len();
         session.limit_thoughts(Some(limit), "Enough.");
         let mut thoughts = String::new();
         let replied = session
@@ -1162,7 +1162,7 @@ mod tests {
         assert!(replied.thought_ended);
         let closed = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special("<think>\nOne two\n\nEnough.\n</think>\n\n")
             .unwrap();
         assert!(
@@ -1174,7 +1174,7 @@ mod tests {
             closed.len()
                 - session
                     .format
-                    .tokenizer
+                    .tokenizer()
                     .encode_with_special("<think>\n")
                     .unwrap()
                     .len()
@@ -1281,7 +1281,7 @@ mod tests {
         // after an empty thought.
         let expected = session
             .format
-            .tokenizer
+            .tokenizer()
             .encode_with_special(&format!(
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{call}\n</tool_call><|im_end|>\n"
             ))
@@ -1303,21 +1303,19 @@ mod tests {
                 ControlFlow::Continue(())
             })
             .unwrap();
-        let tokenizer = &session.format.tokenizer;
-        let mut turn = vec![session.format.im_start];
+        let tokenizer = &session.format.tokenizer();
+        let mut turn = vec![tags().im_start];
         turn.extend(tokenizer.encode("user\n").unwrap());
         turn.extend(
             tokenizer
                 .encode_with_special("<tool_response>\nout\n</tool_response>\n<tool_response>\n(exit 1)\n</tool_response>")
                 .unwrap(),
         );
-        turn.push(session.format.im_end);
+        turn.push(tags().im_end);
         turn.extend(tokenizer.encode("\n").unwrap());
         assert_eq!(&session.model.fed[before..before + turn.len()], turn);
         assert_eq!(
-            turn.iter()
-                .filter(|&&t| t == session.format.tool_response)
-                .count(),
+            turn.iter().filter(|&&t| t == tags().tool_response).count(),
             2
         );
     }
@@ -1331,26 +1329,26 @@ mod tests {
         session
             .respond(&[hostile.to_string()], |_| ControlFlow::Continue(()))
             .unwrap();
-        let tokenizer = &session.format.tokenizer;
-        let mut turn = vec![session.format.im_start];
+        let tokenizer = &session.format.tokenizer();
+        let mut turn = vec![tags().im_start];
         turn.extend(tokenizer.encode("user\n").unwrap());
-        turn.push(session.format.tool_response);
+        turn.push(tags().tool_response);
         turn.extend(tokenizer.encode(&format!("\n{hostile}\n")).unwrap());
-        turn.push(session.format.tool_response_end);
-        turn.push(session.format.im_end);
+        turn.push(tags().tool_response_end);
+        turn.push(tags().im_end);
         turn.extend(tokenizer.encode("\n").unwrap());
         let fed = &session.model.fed[before..];
         assert_eq!(&fed[..turn.len()], turn);
         // The turn holds the special tokens the template puts in, and the
         // reply's prompt after it, and no others.
         let count = |id: u32| fed.iter().filter(|&&t| t == id).count();
-        assert_eq!(count(session.format.im_start), 2);
-        assert_eq!(count(session.format.im_end), 2);
-        assert_eq!(count(session.format.tool_call), 0);
-        assert_eq!(count(session.format.tool_call_end), 0);
-        assert_eq!(count(session.format.think_end), 1);
-        assert_eq!(count(session.format.tool_response), 1);
-        assert_eq!(count(session.format.tool_response_end), 1);
+        assert_eq!(count(tags().im_start), 2);
+        assert_eq!(count(tags().im_end), 2);
+        assert_eq!(count(tags().tool_call), 0);
+        assert_eq!(count(tags().tool_call_end), 0);
+        assert_eq!(count(tags().think_end), 1);
+        assert_eq!(count(tags().tool_response), 1);
+        assert_eq!(count(tags().tool_response_end), 1);
         // And what was said is there byte for byte.
         let bytes: Vec<u8> = fed
             .iter()

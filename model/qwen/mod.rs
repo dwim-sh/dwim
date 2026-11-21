@@ -1,6 +1,16 @@
-//! The Qwen3.8 models: what is known of them that is theirs alone.
+//! The Qwen3.8 models: what is known of them that is theirs alone. They
+//! are of one family, with one chat format and one way of calling tools,
+//! so a conversation with one reads the same to another.
 
-use crate::model::{File, Weights};
+pub mod format;
+mod tokenizer;
+
+use std::sync::Arc;
+
+use crate::model::{File, Format, Result, Weights, gguf::Metadata};
+
+pub use format::ChatMl;
+pub use tokenizer::tokenizer;
 
 /// The file holding Qwen3.8-27B.
 const FILE: &str = "Qwen3.8-27B-Q4_0.gguf";
@@ -21,3 +31,9 @@ pub const QWEN_27B: Weights = Weights {
         digest: "5eb1de39e9b42aa7f99f1a4fe149d1952cc8103c698cf380b15a43d47e72b7c7",
     }],
 };
+
+/// The chat format of a Qwen model, over the vocabulary its GGUF file
+/// carries.
+pub fn format(gguf: &Metadata) -> Result<Arc<dyn Format>> {
+    Ok(Arc::new(ChatMl::new(tokenizer(gguf)?)?))
+}

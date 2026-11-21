@@ -12,7 +12,7 @@ mod size;
 mod tokenizer;
 mod weights;
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::Arc};
 
 pub use chat::{Chat, Generation, State};
 pub use format::{Format, Turn};
@@ -24,9 +24,9 @@ pub use weights::{File, OnDisk, Weights};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// The models dwim runs: each a network its makers trained and named. They
-/// are of one family, with one chat format and one way of calling tools,
-/// so a conversation with one reads the same to another.
+/// The models dwim runs: each a network its makers trained and named.
+/// This is the one place that tells their families apart: what is a
+/// family's own is in its directory, and is reached through the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Model {
     /// Qwen3.8-27B, which runs on this machine: the model dwim runs unless
@@ -61,6 +61,14 @@ impl Model {
         match self {
             Model::Qwen27b => Some(&qwen::QWEN_27B),
             Model::QwenMax => None,
+        }
+    }
+
+    /// The model's chat format, over the vocabulary a GGUF file of it
+    /// carries.
+    pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {
+        match self {
+            Model::Qwen27b | Model::QwenMax => qwen::format(gguf),
         }
     }
 }

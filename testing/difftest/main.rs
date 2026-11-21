@@ -26,6 +26,7 @@ use std::{
 
 use dwim::gpu::{Cpu, Gpu};
 use dwim::inference::{Gguf, LanguageModel, arch};
+use dwim::model::{Model, Tokenizer};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention
@@ -153,7 +154,8 @@ impl Args {
 fn run() -> Result<bool> {
     let args = Args::parse()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let weights = dwim::model::Model::default()
+    let named = Model::default();
+    let weights = named
         .weights()
         .ok_or("the model does not run on this machine")?;
     let model = weights.path(&weights.dir().ok_or("no home directory")?);
@@ -165,6 +167,7 @@ fn run() -> Result<bool> {
         .into());
     }
     let gguf = Arc::new(Gguf::open(&model)?);
+    let format = named.format(&gguf)?;
     let dir = root
         .join("target/difftest")
         .join(format!("{:016x}", key(root, &model)?));
@@ -182,7 +185,7 @@ fn run() -> Result<bool> {
                     None => cpu.insert(arch::load(gguf.clone(), Cpu, 4096, |_, _| {})?),
                 };
                 let start = Instant::now();
-                let run = Run::record(cpu, &gguf, prompt)?;
+                let run = Run::record(cpu, format.tokenizer(), prompt)?;
                 std::fs::create_dir_all(&dir)?;
                 run.write(&path)?;
                 println!(
@@ -251,8 +254,7 @@ struct Run {
 impl Run {
     /// Has the CPU run `prompt` in the pieces the GPU will, and then write
     /// the continuation a token at a time.
-    fn record(cpu: &mut dyn LanguageModel, gguf: &Gguf, prompt: &str) -> Result<Self> {
-        let tokenizer = dwim::model::Tokenizer::from_gguf(gguf)?;
+    fn record(cpu: &mut dyn LanguageModel, tokenizer: &Tokenizer, prompt: &str) -> Result<Self> {
         let mut run = Self {
             tokens: tokenizer.encode(prompt)?,
             prompt: 0,

@@ -134,7 +134,7 @@ struct Inner {
     build: String,
     peers: Mutex<HashMap<usize, Peer>>,
     /// The chat format, once the model is loaded, for measuring turns.
-    format: OnceLock<Format>,
+    format: OnceLock<Arc<dyn Format>>,
     /// How many sessions are open.
     sessions: AtomicUsize,
     /// Whose request the model is on, if any.
@@ -246,7 +246,7 @@ impl Server {
     pub fn run(
         self,
         mut model: Box<dyn LanguageModel>,
-        format: Format,
+        format: Arc<dyn Format>,
         device: String,
         size: Size,
         sampler: impl Fn(Option<f32>) -> Sampler,
@@ -776,7 +776,7 @@ mod tests {
 
     use crate::{
         inference::testing::Scripted,
-        model::{Session, Tokenizer, Turn},
+        model::{Session, Tokenizer, Turn, qwen::ChatMl},
         providers::{
             Conversation, Provider,
             dwim::{Connection, Remote},
@@ -824,7 +824,7 @@ mod tests {
                     }
                 });
             }
-            let format = Format::new(tokenizer).unwrap();
+            let format = Arc::new(ChatMl::new(tokenizer).unwrap());
             let size = Size {
                 sessions: 2,
                 context: 1 << 12,
@@ -907,7 +907,7 @@ mod tests {
             calls: vec!["<function=bash>\n</function>".to_string()],
             thought: String::new(),
         };
-        let format = Format::new(Tokenizer::tiny()).unwrap();
+        let format = Arc::new(ChatMl::new(Tokenizer::tiny()).unwrap());
         assert_eq!(a.measure(&turn).unwrap(), format.measure(&turn).unwrap());
         assert_eq!(
             a.answer_tokens("note", 100).unwrap(),
@@ -1067,7 +1067,7 @@ mod tests {
             server
                 .run(
                     Box::new(model),
-                    Format::new(tokenizer).unwrap(),
+                    Arc::new(ChatMl::new(tokenizer).unwrap()),
                     "cpu".to_string(),
                     Size {
                         sessions: 1,

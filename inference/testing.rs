@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::{
     inference::{LanguageModel, Result},
-    model::{Tokenizer, format},
+    model::{Format, Tokenizer, qwen::ChatMl},
 };
 
 /// A model that says what it is told to: it records every token fed to it,
@@ -44,10 +44,11 @@ pub struct Scripted {
 }
 
 impl Scripted {
-    /// A model over `tokenizer`'s vocabulary that says `scripts` in turn,
-    /// each given as text with the chat format's tags in it, and has room
-    /// for `max_len` tokens.
+    /// A model over `tokenizer`'s vocabulary, the tiny one, that says
+    /// `scripts` in turn, each given as text with the tags of Qwen's chat
+    /// format in it, and has room for `max_len` tokens.
     pub fn new(tokenizer: &Tokenizer, scripts: &[&str], max_len: usize) -> Self {
+        let format = ChatMl::new(Tokenizer::tiny()).unwrap();
         Self {
             fed: Vec::new(),
             scripts: scripts
@@ -61,9 +62,9 @@ impl Scripted {
             sequence: 0,
             parked: HashMap::new(),
             vocab: tokenizer.vocab_size(),
-            opening: format::opening(tokenizer, true).unwrap(),
-            unthinking: format::opening(tokenizer, false).unwrap(),
-            end: tokenizer.special(format::IM_END).unwrap(),
+            opening: format.opening(true).unwrap(),
+            unthinking: format.opening(false).unwrap(),
+            end: format.im_end,
             max_len,
             hold: None,
             said: 0,

@@ -4,9 +4,6 @@ use fancy_regex::Regex;
 
 use crate::model::{Result, gguf::Metadata};
 
-/// The regular expression Qwen's tokenizers split text into words with.
-const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
 /// Token types in a GGUF vocabulary that stand for special tokens: control
 /// tokens such as `<|im_start|>`, and user-defined ones such as
 /// `<tool_call>`.
@@ -35,12 +32,9 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     /// Loads the vocabulary a GGUF file carries: its tokens, their types,
-    /// and the merges.
-    pub fn from_gguf(gguf: &Metadata) -> Result<Self> {
-        let pre = gguf.str("tokenizer.ggml.pre")?;
-        if !matches!(pre, "qwen2" | "qwen35") {
-            return Err(format!("the '{pre}' pre-tokenizer is not supported").into());
-        }
+    /// and the merges. Text is split into words by `pattern`, a regular
+    /// expression, which is the family's whose vocabulary it is.
+    pub fn from_gguf(gguf: &Metadata, pattern: &str) -> Result<Self> {
         let texts = gguf.array("tokenizer.ggml.tokens")?;
         let types = gguf.array("tokenizer.ggml.token_type")?;
         if texts.len() != types.len() {
@@ -97,7 +91,7 @@ impl Tokenizer {
         }
 
         Ok(Self {
-            pattern: Regex::new(QWEN_PATTERN)?,
+            pattern: Regex::new(pattern)?,
             tokens,
             bytes,
             merges,
@@ -169,9 +163,11 @@ impl Tokenizer {
     }
 
     /// A tokenizer over a tiny vocabulary for tests: a token per byte, one
-    /// merge, and the special tokens of the chat format.
+    /// merge, and `special` as its special tokens, of which the ones
+    /// starting with `<|` are control tokens and the rest user-defined,
+    /// with text split into words by `pattern`.
     #[cfg(test)]
-    pub fn tiny() -> Self {
+    pub fn over(special: &[&str], pattern: &str) -> Self {
         use crate::model::gguf::Value;
 
         let mut tokens: Vec<Value> = byte_chars()
@@ -181,7 +177,7 @@ impl Tokenizer {
         let mut types = vec![Value::I32(1); 256];
         tokens.push(Value::Str("hi".to_string()));
         types.push(Value::I32(1));
-        for special in crate::model::format::SPECIAL_TOKENS {
+        for special in special {
             tokens.push(Value::Str(special.to_string()));
             types.push(Value::I32(if special.starts_with("<|") {
                 CONTROL as i32
@@ -190,7 +186,6 @@ impl Tokenizer {
             }));
         }
         let meta = [
-            ("tokenizer.ggml.pre", Value::Str("qwen2".to_string())),
             ("tokenizer.ggml.tokens", Value::Array(tokens)),
             ("tokenizer.ggml.token_type", Value::Array(types)),
             (
@@ -199,7 +194,7 @@ impl Tokenizer {
             ),
         ];
         let meta = meta.map(|(key, value)| (key.to_string(), value));
-        Self::from_gguf(&Metadata::new(meta)).unwrap()
+        Self::from_gguf(&Metadata::new(meta), pattern).unwrap()
     }
 
     fn merge(&self, word: &[u8], out: &mut Vec<u32>) {
