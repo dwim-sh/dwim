@@ -5,7 +5,7 @@ use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
 use dwim::inference::{Loaded, OnDisk};
-use dwim::model::{Device, Size, Variant};
+use dwim::model::{Device, Model, Size};
 use dwim::providers::{Kind, hosted::Host};
 use dwim::sys;
 use dwim::tools::plan::{Plan, Step};
@@ -94,28 +94,28 @@ pub fn model_listing(
 /// The model at `host`, for the `/model` command: what the host calls
 /// it, and how much conversation the session has room for, as a table of
 /// labels and values.
-pub fn hosted_listing(host: &Host, variant: Variant, context: usize, columns: usize) -> Vec<Line> {
-    let header = vec![span("● "), span(variant.name().to_string()).bold()];
+pub fn hosted_listing(host: &Host, model: Model, context: usize, columns: usize) -> Vec<Line> {
+    let header = vec![span("● "), span(model.name().to_string()).bold()];
     let rows = vec![
         ("provider", host.name.to_string()),
-        ("model", (host.model)(variant).to_string()),
+        ("model", (host.model)(model).to_string()),
         ("context", format!("{context} tokens")),
     ];
     report(header, table(rows), columns)
 }
 
 /// Where the model runs, for the provider picked that the session is on.
-pub fn provider_notice(provider: Kind, variant: Variant) -> String {
+pub fn provider_notice(provider: Kind, model: Model) -> String {
     match provider.host() {
         None => format!(
             "{} runs on this machine, in the dwim server · /server shows it",
-            variant.size()
+            model.size()
         ),
         Some(host) => format!(
             "{} runs at {}, as {}",
-            variant.size(),
+            model.size(),
             host.name,
-            (host.model)(variant)
+            (host.model)(model)
         ),
     }
 }
@@ -152,10 +152,10 @@ pub fn no_provider(key: bool) -> String {
 }
 
 /// How moving the conversation to another model is acknowledged.
-pub fn switched(variant: Variant, provider: Kind) -> String {
+pub fn switched(model: Model, provider: Kind) -> String {
     match provider.host() {
-        None => format!("Switched to {variant}, on this machine"),
-        Some(host) => format!("Switched to {variant}, at {}", host.name),
+        None => format!("Switched to {model}, on this machine"),
+        Some(host) => format!("Switched to {model}, at {}", host.name),
     }
 }
 

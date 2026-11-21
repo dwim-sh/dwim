@@ -41,9 +41,7 @@ use serde_json::{Value, json};
 use ureq::Agent;
 
 use crate::{
-    model::{
-        Answer, Chat, Chunk, Generation, Reply, Result, Sampling, State, Stats, Turn, Variant,
-    },
+    model::{Answer, Chat, Chunk, Generation, Model, Reply, Result, Sampling, State, Stats, Turn},
     providers::{Completion, Kind, Provider},
     tools::ToolCall,
 };
@@ -60,7 +58,7 @@ pub struct Host {
     /// Where a chat is completed.
     pub url: &'static str,
     /// A model as the host names it.
-    pub model: fn(Variant) -> &'static str,
+    pub model: fn(Model) -> &'static str,
     /// Adds to a request for a reply what the host is asked in its own
     /// way: to say what the reply used, how the tokens are sampled beyond
     /// what every host takes, and to limit the thought to a number of
@@ -103,7 +101,7 @@ pub struct Hosted {
     /// Where a chat is completed: the host's address.
     url: String,
     key: String,
-    variant: Variant,
+    model: Model,
     capacity: usize,
     sampling: Sampling,
     stats: Stats,
@@ -112,13 +110,13 @@ pub struct Hosted {
 }
 
 impl Hosted {
-    /// The model `variant` at `host`, asked with `key`, with room for
+    /// `model` at `host`, asked with `key`, with room for
     /// `context` tokens of conversation, or [`CONTEXT`], sampled at
     /// `temperature`, or as the model's makers recommend.
     pub fn new(
         host: &'static Host,
         key: String,
-        variant: Variant,
+        model: Model,
         context: Option<usize>,
         temperature: Option<f32>,
     ) -> Self {
@@ -132,7 +130,7 @@ impl Hosted {
             agent,
             url: host.url.to_string(),
             key,
-            variant,
+            model,
             capacity: context.unwrap_or(CONTEXT),
             sampling: Sampling {
                 temperature: temperature.unwrap_or(0.6),
@@ -153,7 +151,7 @@ impl Hosted {
 
     /// The model as its host names it.
     pub fn model(&self) -> &'static str {
-        (self.host.model)(self.variant)
+        (self.host.model)(self.model)
     }
 
     /// Tokens in `chat`: what the provider counted of it, and an estimate
@@ -668,7 +666,7 @@ mod tests {
         let mut provider = Hosted::new(
             &openrouter::HOST,
             "key".to_string(),
-            Variant::Large,
+            Model::QwenMax,
             None,
             None,
         );

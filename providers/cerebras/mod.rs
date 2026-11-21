@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Result, Sampling, Variant},
+    model::{Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -35,21 +35,21 @@ pub const HOST: Host = Host {
 /// room for `context` tokens of conversation, or as many as a model at a
 /// host has unless told, sampled at `temperature`, or as the model's
 /// makers recommend. The large model does not run there.
-pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
-    if variant == Variant::Large {
-        return Err(format!("{variant} does not run at Cerebras").into());
+pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+    if model == Model::QwenMax {
+        return Err(format!("{model} does not run at Cerebras").into());
     }
     let key = key()
         .ok_or_else(|| format!("there is no key to Cerebras: /login takes one, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, variant, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, context, temperature))
 }
 
-/// `variant` as Cerebras names it. Only the medium model runs there; the
+/// `model` as Cerebras names it. Only the medium model runs there; the
 /// large one is named as it would be, for [`open`] to refuse.
-pub fn model(variant: Variant) -> &'static str {
-    match variant {
-        Variant::Medium => "qwen-3.8-27b",
-        Variant::Large => "qwen-3.8-2.4t-a95b",
+pub fn model(model: Model) -> &'static str {
+    match model {
+        Model::Qwen27b => "qwen-3.8-27b",
+        Model::QwenMax => "qwen-3.8-2.4t-a95b",
     }
 }
 

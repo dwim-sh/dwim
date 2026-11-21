@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env, path::PathBuf};
 
 use argh::{EarlyExit, FromArgs};
 use dwim::inference::Loaded;
-use dwim::model::{Device, Size, Variant};
+use dwim::model::{Device, Model, Size};
 use dwim::providers::Kind;
 
 use crate::{model, session::Settings, tui};
@@ -12,8 +12,8 @@ use crate::{model, session::Settings, tui};
 pub struct Opts {
     /// model to run, by size: medium (default), which is qwen3.8-27b, or
     /// large, qwen3.8-2.4t-a95b
-    #[argh(option, default = "Variant::Medium")]
-    pub model: Variant,
+    #[argh(option, default = "Model::Qwen27b")]
+    pub model: Model,
 
     /// where the model runs: local, on this machine, openrouter, with the
     /// key in OPENROUTER_API_KEY, vercel, Vercel's AI Gateway, with the

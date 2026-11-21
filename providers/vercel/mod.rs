@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Result, Sampling, Variant},
+    model::{Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -30,21 +30,21 @@ pub const HOST: Host = Host {
     refused: "make another in the Vercel dashboard, and give it with /login",
 };
 
-/// The model `variant` at the gateway, with the key in the environment
+/// `model` at the gateway, with the key in the environment
 /// or kept from signing in, with room for `context` tokens of conversation, or as many as a model
 /// at a host has unless told, sampled at `temperature`, or as the model's
 /// makers recommend.
-pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
     let key = key()
         .ok_or_else(|| format!("there is no key to Vercel: /login takes one, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, variant, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, context, temperature))
 }
 
-/// `variant` as the gateway names it.
-pub fn model(variant: Variant) -> &'static str {
-    match variant {
-        Variant::Medium => "alibaba/qwen3.8-27b",
-        Variant::Large => "alibaba/qwen3.8-2.4t-a95b",
+/// `model` as the gateway names it.
+pub fn model(model: Model) -> &'static str {
+    match model {
+        Model::Qwen27b => "alibaba/qwen3.8-27b",
+        Model::QwenMax => "alibaba/qwen3.8-2.4t-a95b",
     }
 }
 

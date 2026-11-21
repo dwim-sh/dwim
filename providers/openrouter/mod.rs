@@ -7,7 +7,7 @@ pub mod login;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Result, Sampling, Variant},
+    model::{Model, Result, Sampling},
     providers::{
         Kind,
         hosted::{self, Host, Hosted},
@@ -29,21 +29,21 @@ pub const HOST: Host = Host {
     refused: "/login signs in again",
 };
 
-/// The model `variant` at OpenRouter, with the key in the environment or
+/// `model` at OpenRouter, with the key in the environment or
 /// kept from a sign-in, with room for `context` tokens of conversation,
 /// or as many as a model at a host has unless told, sampled at
 /// `temperature`, or as the model's makers recommend.
-pub fn open(variant: Variant, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
+pub fn open(model: Model, context: Option<usize>, temperature: Option<f32>) -> Result<Hosted> {
     let key = key()
         .ok_or_else(|| format!("there is no key to OpenRouter: /login signs in, or set {KEY}"))?;
-    Ok(Hosted::new(&HOST, key, variant, context, temperature))
+    Ok(Hosted::new(&HOST, key, model, context, temperature))
 }
 
-/// `variant` as OpenRouter names it.
-pub fn model(variant: Variant) -> &'static str {
-    match variant {
-        Variant::Medium => "qwen/qwen3.8-27b",
-        Variant::Large => "qwen/qwen3.8-2.4t-a95b",
+/// `model` as OpenRouter names it.
+pub fn model(model: Model) -> &'static str {
+    match model {
+        Model::Qwen27b => "qwen/qwen3.8-27b",
+        Model::QwenMax => "qwen/qwen3.8-2.4t-a95b",
     }
 }
 

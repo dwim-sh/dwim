@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::harness::{self, Event, Harness, Log};
-use dwim::model::Variant;
+use dwim::model::Model;
 use dwim::providers::{
     Kind,
     dwim::{Remote, log_path, running, same_build, stop},
@@ -121,7 +121,7 @@ pub enum Request {
     Server(ServerAction),
     /// Go on with the conversation on this model at this provider, as
     /// picked with the `/model` command.
-    Model(Kind, Variant),
+    Model(Kind, Model),
 }
 
 /// What the model thread reports back.
@@ -142,7 +142,7 @@ pub enum Reply {
     /// Auto mode, as now set.
     Auto(bool),
     /// The model the conversation is now on, and where it runs.
-    Model { variant: Variant, provider: Kind },
+    Model { model: Model, provider: Kind },
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
@@ -224,13 +224,13 @@ fn work(
                 harness.set_plan_aside();
                 Ok(())
             }
-            Request::Model(provider, variant) => {
+            Request::Model(provider, model) => {
                 let before = (settings.provider, settings.model);
-                (settings.provider, settings.model) = (Some(provider), variant);
+                (settings.provider, settings.model) = (Some(provider), model);
                 match session::switch(&settings, &mut harness, on_status()) {
                     Ok(provider) => {
                         stopped = false;
-                        let _ = replies.send(Reply::Model { variant, provider });
+                        let _ = replies.send(Reply::Model { model, provider });
                         Ok(())
                     }
                     // The session may be neither model's by now: the next
@@ -279,12 +279,12 @@ fn open(
             }
         }
         match requests.recv_timeout(POLL) {
-            Ok(Request::Model(provider, variant)) => {
+            Ok(Request::Model(provider, model)) => {
                 if let Some(open) = &opening {
                     open.left.store(true, Ordering::Relaxed);
                 }
-                (settings.provider, settings.model) = (Some(provider), variant);
-                let _ = replies.send(Reply::Model { variant, provider });
+                (settings.provider, settings.model) = (Some(provider), model);
+                let _ = replies.send(Reply::Model { model, provider });
                 opening = Some(Opening::start(settings, replies));
             }
             Ok(_) => {

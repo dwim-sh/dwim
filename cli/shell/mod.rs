@@ -25,7 +25,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::harness::{self, Event, Log};
-use dwim::model::{Device, Size, Variant};
+use dwim::model::{Device, Model, Size};
 use dwim::providers::{
     Kind,
     hosted::{self, Host},
@@ -54,10 +54,9 @@ const TICK: Duration = Duration::from_millis(80);
 /// keeping a transcript of the session in `log`.
 pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let transcript = log.path().map(Path::to_path_buf);
-    let variant = settings.model;
-    let provider = session::provider(settings.provider, variant)?;
+    let model = settings.model;
+    let provider = session::provider(settings.provider, model)?;
     let context = settings.context.unwrap_or(hosted::CONTEXT);
-    let model = variant.name().to_string();
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
     let worker = Worker::spawn(settings, log);
@@ -65,7 +64,6 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
     let mut app = App {
         screen: Screen::new()?,
         model,
-        variant,
         provider,
         context,
         device,
@@ -110,7 +108,7 @@ pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Er
         let config = Config::load()?;
         let (columns, _) = app.screen.size();
         let lines = view::nowhere(
-            &session::nowhere(variant, &config),
+            &session::nowhere(model, &config),
             openrouter::key().is_some(),
             columns,
         );
@@ -301,10 +299,9 @@ enum Status {
 
 struct App {
     screen: Screen,
-    model: String,
-    /// The model by size, where it runs, if anywhere yet, and the tokens
+    /// The model, where it runs, if anywhere yet, and the tokens
     /// of conversation a session at a provider has room for.
-    variant: Variant,
+    model: Model,
     provider: Option<Kind>,
     context: usize,
     /// The kind of device the model runs on, and its name once it is open.
@@ -546,13 +543,13 @@ impl App {
                 let picked = picker.picked();
                 self.picker = None;
                 match picked {
-                    Some((provider, variant))
-                        if Some(provider) == self.provider && variant == self.variant =>
+                    Some((provider, model))
+                        if Some(provider) == self.provider && model == self.model =>
                     {
                         let lines = self.model_listing();
                         self.say(&lines);
                     }
-                    Some((provider, variant)) => self.switch(provider, variant),
+                    Some((provider, model)) => self.switch(provider, model),
                     None => {}
                 }
             }
@@ -608,7 +605,7 @@ impl App {
                 }
                 if !disabled && ready && self.provider.is_none() {
                     self.providers = None;
-                    self.switch(provider, self.variant_at(provider));
+                    self.switch(provider, self.model_at(provider));
                 }
             }
             Err(e) => {
@@ -633,20 +630,20 @@ impl App {
     /// The model the session goes on with at `provider`: the one it is on,
     /// but for the large one, which does not run on this machine or at
     /// Cerebras.
-    fn variant_at(&self, provider: Kind) -> Variant {
+    fn model_at(&self, provider: Kind) -> Model {
         match provider {
-            Kind::Local | Kind::Cerebras => Variant::Medium,
-            Kind::OpenRouter | Kind::Vercel => self.variant,
+            Kind::Local | Kind::Cerebras => Model::Qwen27b,
+            Kind::OpenRouter | Kind::Vercel => self.model,
         }
     }
 
-    /// Moves the conversation to `variant` at `provider`.
-    fn switch(&mut self, provider: Kind, variant: Variant) {
+    /// Moves the conversation to `model` at `provider`.
+    fn switch(&mut self, provider: Kind, model: Model) {
         self.reply.clear();
         self.committed = 0;
         self.interrupted = false;
         self.status = Status::Switching(Instant::now());
-        self.worker.send(Request::Model(provider, variant));
+        self.worker.send(Request::Model(provider, model));
     }
 
     /// Handles a key press while the sign-in picker is open: up and down
@@ -773,7 +770,7 @@ impl App {
                 "{name} is disabled · /provider enables it"
             )));
         } else {
-            self.switch(host.kind, self.variant_at(host.kind));
+            self.switch(host.kind, self.model_at(host.kind));
         }
     }
 
@@ -934,7 +931,7 @@ impl App {
                         "No provider a model can run at · /login signs in to one, /provider enables one",
                     ));
                 } else {
-                    self.picker = Some(Picker::new(groups, more, self.provider, self.variant));
+                    self.picker = Some(Picker::new(groups, more, self.provider, self.model));
                 }
                 return;
             }
@@ -1056,13 +1053,12 @@ impl App {
                 ]);
                 self.lines.push(Line::new());
             }
-            Reply::Model { variant, provider } => {
+            Reply::Model { model, provider } => {
                 let notice = match self.provider {
-                    Some(_) => view::switched(variant, provider),
-                    None => view::provider_notice(provider, variant),
+                    Some(_) => view::switched(model, provider),
+                    None => view::provider_notice(provider, model),
                 };
-                self.variant = variant;
-                self.model = variant.name().to_string();
+                self.model = model;
                 self.provider = Some(provider);
                 // Picked while the model was loading: the pick loads now.
                 if !self.ready {
@@ -1371,9 +1367,9 @@ impl App {
             return view::notice(view::no_provider(openrouter::key().is_some()));
         };
         match provider.host() {
-            Some(host) => view::hosted_listing(host, self.variant, self.context, columns),
+            Some(host) => view::hosted_listing(host, self.model, self.context, columns),
             None => view::model_listing(
-                &self.model,
+                self.model.name(),
                 self.device,
                 self.device_name.as_deref(),
                 self.size.as_ref(),
