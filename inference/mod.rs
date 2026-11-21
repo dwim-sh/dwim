@@ -3,8 +3,8 @@
 
 mod fetch;
 pub mod gguf;
+mod loaded;
 mod local;
-mod model;
 pub mod quants;
 pub mod qwen35;
 mod sampler;
@@ -14,8 +14,8 @@ pub mod testing;
 
 pub use fetch::Download;
 pub use gguf::Gguf;
+pub use loaded::{Loaded, OnDisk, Progress};
 pub use local::{DRAFTS, Local};
-pub use model::{Model, OnDisk, Progress};
 pub use sampler::Sampler;
 
 pub use crate::model::Result;

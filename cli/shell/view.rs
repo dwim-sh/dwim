@@ -4,7 +4,7 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::inference::{Model, OnDisk};
+use dwim::inference::{Loaded, OnDisk};
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::{Kind, hosted::Host};
 use dwim::sys;
@@ -45,9 +45,9 @@ pub fn model_listing(
     columns: usize,
 ) -> Vec<Line> {
     let header = vec![span("● "), span(name.to_string()).bold()];
-    let weights = match Model::dir(name) {
+    let weights = match Loaded::dir(name) {
         Ok(dir) => {
-            let OnDisk { files, of, bytes } = Model::on_disk(&dir);
+            let OnDisk { files, of, bytes } = Loaded::on_disk(&dir);
             match files {
                 0 => "not fetched".to_string(),
                 n if n == of => {
@@ -69,7 +69,7 @@ pub fn model_listing(
     let mut rows = vec![
         (
             "source",
-            format!("{} at {}", Model::REPO, &Model::REVISION[..7]),
+            format!("{} at {}", Loaded::REPO, &Loaded::REVISION[..7]),
         ),
         ("weights", weights),
         ("device", on),

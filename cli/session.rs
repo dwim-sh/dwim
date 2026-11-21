@@ -11,7 +11,7 @@ use std::{
 };
 
 use dwim::harness::{self, Harness, Log};
-use dwim::inference::{Model, Progress};
+use dwim::inference::{Loaded, Progress};
 use dwim::model::{Device, Tally, Variant};
 use dwim::providers::{
     Any, Conversation, Kind, cerebras,
@@ -70,7 +70,7 @@ impl Settings {
 pub type Session = Conversation<Any>;
 
 /// The harness around the model, ready for a message.
-pub struct Loaded {
+pub struct Ready {
     pub harness: Harness<Session>,
     /// How long getting the model ready took: reaching the server, the
     /// loading if it was loading, and the system prompt.
@@ -259,8 +259,8 @@ pub fn fetch_model(
     mut on_status: impl FnMut(Status),
 ) -> Result<PathBuf, Box<dyn Error>> {
     memory::check()?;
-    let dir = Model::dir(settings.model.name())?;
-    Model::fetch(&dir, |progress| {
+    let dir = Loaded::dir(settings.model.name())?;
+    Loaded::fetch(&dir, |progress| {
         on_status(Status::Downloading {
             file: progress.file.to_string(),
             done: progress.done,
@@ -277,9 +277,9 @@ pub fn load_model(
     settings: &Settings,
     sessions: usize,
     mut on_status: impl FnMut(Status),
-) -> Result<Model, Box<dyn Error>> {
+) -> Result<Loaded, Box<dyn Error>> {
     let dir = fetch_model(settings, &mut on_status)?;
-    Model::load(
+    Loaded::load(
         &dir,
         settings.device,
         settings.context,
@@ -303,11 +303,11 @@ pub fn load(
     settings: &Settings,
     log: Log,
     on_status: impl FnMut(Status) + Send + 'static,
-) -> Result<Loaded, Box<dyn Error>> {
+) -> Result<Ready, Box<dyn Error>> {
     let loading = Instant::now();
     let (session, system) = open(settings, on_status)?;
     let harness = harness(settings, session, system, log)?;
-    Ok(Loaded {
+    Ok(Ready {
         harness,
         loading: loading.elapsed(),
     })

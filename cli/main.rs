@@ -10,7 +10,7 @@ mod tui;
 
 use std::error::Error;
 
-use dwim::{harness::Log, inference::Model};
+use dwim::{harness::Log, inference::Loaded};
 
 use opts::Opts;
 use session::Stderr;
@@ -35,7 +35,7 @@ fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     if opts.download {
         let mut stderr = Stderr::new();
         let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
-        println!("{}", Model::weights(&dir).display());
+        println!("{}", Loaded::weights(&dir).display());
         return Ok(());
     }
     if opts.bench {

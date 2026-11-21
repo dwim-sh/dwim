@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, env, path::PathBuf};
 
 use argh::{EarlyExit, FromArgs};
-use dwim::inference::Model;
+use dwim::inference::Loaded;
 use dwim::model::{Device, Size, Variant};
 use dwim::providers::Kind;
 
@@ -240,7 +240,7 @@ pub fn help(output: &str, args: &[&str]) -> String {
         .and_then(|i| args.get(i + 1))
         .and_then(|value| device(value).ok())
         .unwrap_or(Device::Gpu(None));
-    layout(output, Model::default_size(device))
+    layout(output, Loaded::default_size(device))
 }
 
 /// The help text laid out from argh's `output`, saying the default context

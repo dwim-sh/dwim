@@ -53,7 +53,7 @@ pub enum Progress {
 }
 
 /// The model on its device, with the chat format of its vocabulary.
-pub struct Model {
+pub struct Loaded {
     model: Box<dyn LanguageModel>,
     gguf: Arc<Gguf>,
     format: Format,
@@ -61,7 +61,7 @@ pub struct Model {
     size: Size,
 }
 
-impl Model {
+impl Loaded {
     /// The model's name.
     pub const NAME: &str = qwen35::NAME;
 
@@ -187,7 +187,7 @@ impl Model {
     }
 }
 
-impl LanguageModel for Model {
+impl LanguageModel for Loaded {
     fn save(&self, len: usize) -> Option<Vec<u8>> {
         self.model.save(len)
     }
