@@ -24,9 +24,11 @@ use std::{
     time::Instant,
 };
 
-use dwim::gpu::{Cpu, Gpu};
-use dwim::inference::{Gguf, LanguageModel, arch};
-use dwim::model::{Model, Tokenizer};
+use dwim::{
+    gpu::{Cpu, Gpu},
+    inference::{Gguf, LanguageModel, arch},
+    model::{Model, Tokenizer},
+};
 
 /// The prompts, by name: of a few tokens, of a few dozen, of more than a
 /// batch of the model, and of more than a chunk of positions attention

@@ -10,8 +10,10 @@
 
 use std::{error::Error, fmt::Write};
 
-use crate::harness::{Entry, Event, Harness, OnEvent, environment};
-use crate::model::{Session, Turn};
+use crate::{
+    harness::{Entry, Event, Harness, OnEvent, environment},
+    model::{Session, Turn},
+};
 
 /// The share of the context past which the conversation is compacted
 /// before more goes into it: four fifths.
@@ -291,11 +293,13 @@ fn note_empty(note: &str) -> bool {
 mod tests {
     use std::ops::ControlFlow;
 
-    use crate::harness::{
-        STEPS_PROMPT,
-        tests::{harness, reply, reply_saying, send},
+    use crate::{
+        harness::{
+            STEPS_PROMPT,
+            tests::{harness, reply, reply_saying, send},
+        },
+        model::Tokenizer,
     };
-    use crate::model::Tokenizer;
 
     use super::*;
 

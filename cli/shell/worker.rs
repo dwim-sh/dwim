@@ -13,11 +13,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim::harness::{self, Event, Harness, Log};
-use dwim::model::Model;
-use dwim::providers::{
-    Kind,
-    dwim::{Remote, log_path, running, same_build, stop},
+use dwim::{
+    harness::{self, Event, Harness, Log},
+    model::Model,
+    providers::{
+        Kind,
+        dwim::{Remote, log_path, running, same_build, stop},
+    },
 };
 
 use crate::{

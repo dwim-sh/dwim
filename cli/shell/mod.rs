@@ -24,15 +24,17 @@ use crossterm::{
     event::{self, Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     style::Stylize,
 };
-use dwim::harness::{self, Event, Log};
-use dwim::model::{Device, Model, Size};
-use dwim::providers::{
-    Kind,
-    hosted::{self, Host},
-    openrouter::{self, login::Login},
+use dwim::{
+    harness::{self, Event, Log},
+    model::{Device, Model, Size},
+    providers::{
+        Kind,
+        hosted::{self, Host},
+        openrouter::{self, login::Login},
+    },
+    sys::browser,
+    tools::plan::Plan,
 };
-use dwim::sys::browser;
-use dwim::tools::plan::Plan;
 
 use crate::{
     config::Config,

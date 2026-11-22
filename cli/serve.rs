@@ -9,8 +9,10 @@
 
 use std::error::Error;
 
-use dwim::inference::Loaded;
-use dwim::server::{self, Hello, Server};
+use dwim::{
+    inference::Loaded,
+    server::{self, Hello, Server},
+};
 
 use crate::session::{self, Settings, Stderr};
 

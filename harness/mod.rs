@@ -48,8 +48,10 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{Chunk, Effort, Session, Turn};
-use crate::tools::{ToolCall, Tools, bash, plan::Plan, read};
+use crate::{
+    model::{Chunk, Effort, Session, Turn},
+    tools::{ToolCall, Tools, bash, plan::Plan, read},
+};
 
 pub use crate::harness::log::Log;
 

@@ -10,16 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dwim::harness::{self, Harness, Log};
-use dwim::inference::{self, Loaded, Progress};
-use dwim::model::{Device, Effort, Model, Tally};
-use dwim::providers::{
-    Any, Conversation, Kind, cerebras,
-    dwim::{self as server},
-    hosted::{self, Host},
-    openrouter, vercel,
+use dwim::{
+    harness::{self, Harness, Log},
+    inference::{self, Loaded, Progress},
+    model::{Device, Effort, Model, Tally},
+    providers::{
+        Any, Conversation, Kind, cerebras,
+        dwim::{self as server},
+        hosted::{self, Host},
+        openrouter, vercel,
+    },
+    sys::memory,
 };
-use dwim::sys::memory;
 
 use crate::{
     config::Config,

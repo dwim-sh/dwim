@@ -4,10 +4,12 @@
 use std::{fmt::Write, path::Path, time::Duration};
 
 use crossterm::style::Stylize;
-use dwim::model::{Device, Model, OnDisk, Size};
-use dwim::providers::{Kind, hosted::Host};
-use dwim::sys;
-use dwim::tools::plan::{Plan, Step};
+use dwim::{
+    model::{Device, Model, OnDisk, Size},
+    providers::{Kind, hosted::Host},
+    sys,
+    tools::plan::{Plan, Step},
+};
 
 use crate::{
     model,

@@ -11,8 +11,10 @@
 //! whether there is a key to it.
 
 use crossterm::style::Stylize;
-use dwim::model::Model;
-use dwim::providers::{Kind, hosted::Host};
+use dwim::{
+    model::Model,
+    providers::{Kind, hosted::Host},
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::{Line, span};

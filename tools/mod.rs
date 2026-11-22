@@ -25,9 +25,8 @@ use std::{
 
 use serde_json::Value;
 
-use crate::tools::bash::Bash;
 pub use crate::tools::call::ToolCall;
-use crate::tools::plan::Plan;
+use crate::tools::{bash::Bash, plan::Plan};
 
 /// A tool: what the model is told of it, and what it does.
 pub struct Tool {

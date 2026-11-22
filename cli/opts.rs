@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, env, path::PathBuf};
 
 use argh::{EarlyExit, FromArgs};
-use dwim::inference::Loaded;
-use dwim::model::{Device, Model, Size};
-use dwim::providers::Kind;
+use dwim::{
+    inference::Loaded,
+    model::{Device, Model, Size},
+    providers::Kind,
+};
 
 use crate::{model, session::Settings, tui};
 
