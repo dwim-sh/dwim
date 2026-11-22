@@ -74,6 +74,7 @@ const TOOL_DECLARE: &str = "tool_declare";
 const fn level(effort: Effort) -> &'static str {
     match effort {
         Effort::Xhigh => "0.99",
+        Effort::High => "0.9",
         Effort::Medium => "0.7",
         Effort::Low => "0.2",
     }
@@ -166,7 +167,7 @@ impl Format for Blocks {
     /// that has none.
     fn system(&self, text: &str) -> Result<Vec<u32>> {
         let (text, tools) = declared(text);
-        let (effort, text) = [Effort::Xhigh, Effort::Low]
+        let (effort, text) = [Effort::Xhigh, Effort::High, Effort::Low]
             .into_iter()
             .find_map(|effort| {
                 let rest = text.strip_prefix(effort.instruction()?)?;
@@ -533,6 +534,12 @@ mod tests {
              <|end_message|>\
              <|message_system|><|content_text|>Be brief.<|end_message|>\
              <|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|>"
+        );
+        let high = [Effort::High.instruction().unwrap(), "\n\nBe brief."].concat();
+        assert_eq!(
+            text(&format, &format.system(&high).unwrap()),
+            "<|message_system|><|content_text|>Be brief.<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
         );
         assert_eq!(
             text(&format, &format.system("Be brief.").unwrap()),
