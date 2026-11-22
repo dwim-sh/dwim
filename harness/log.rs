@@ -215,32 +215,35 @@ impl Log {
 
     /// Records the end of a reply: the calls it made as written, whether its
     /// thought was ended at the thinking budget, whether it was stopped
-    /// short for room, the tokens in the context after it, and what
-    /// generating it took, from the model's stats before and after.
+    /// short for room, who ran the model and what was asked again, where
+    /// there is either to say, the tokens in the context after it, and
+    /// what generating it took, from the model's stats before and after.
     pub fn reply(
         &mut self,
-        calls: &[String],
-        thought_ended: bool,
-        cut: bool,
+        reply: &crate::model::Reply,
         tokens: usize,
         before: &crate::model::Stats,
         after: &crate::model::Stats,
     ) {
         let seconds = (after.prompt.seconds + after.thought.seconds + after.answer.seconds)
             - (before.prompt.seconds + before.thought.seconds + before.answer.seconds);
-        self.write(
-            "reply",
-            json!({
-                "calls": calls,
-                "thought_ended": thought_ended,
-                "cut": cut,
-                "tokens": tokens,
-                "prompt_tokens": after.prompt.tokens - before.prompt.tokens,
-                "thought_tokens": after.thought.tokens - before.thought.tokens,
-                "answer_tokens": after.answer.tokens - before.answer.tokens,
-                "seconds": round(seconds),
-            }),
-        );
+        let mut record = json!({
+            "calls": reply.calls,
+            "thought_ended": reply.thought_ended,
+            "cut": reply.cut,
+            "tokens": tokens,
+            "prompt_tokens": after.prompt.tokens - before.prompt.tokens,
+            "thought_tokens": after.thought.tokens - before.thought.tokens,
+            "answer_tokens": after.answer.tokens - before.answer.tokens,
+            "seconds": round(seconds),
+        });
+        if let Some(provider) = &reply.provider {
+            record["provider"] = json!(provider);
+        }
+        if !reply.retried.is_empty() {
+            record["retried"] = json!(reply.retried);
+        }
+        self.write("reply", record);
     }
 
     /// Records that the most tokens of a thought are now `tokens`, or that

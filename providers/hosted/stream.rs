@@ -8,11 +8,11 @@
 //! out of the text regardless and send the calls as fields; both come to
 //! the same calls here.
 
-use std::{io::BufRead, ops::ControlFlow};
+use std::{error::Error, fmt, io::BufRead, ops::ControlFlow};
 
 use serde_json::{Value, json};
 
-use crate::model::{Chunk, Result};
+use crate::model::Chunk;
 
 /// What a reply came to, as the stream gave it.
 #[derive(Debug, Default, PartialEq)]
@@ -32,7 +32,38 @@ pub struct Outcome {
     pub cut: bool,
     /// What the provider counted and charged, if the stream got that far.
     pub usage: Option<Usage>,
+    /// Who ran the model, where the host passes the request on and says.
+    pub provider: Option<String>,
+    /// What the requests for the reply that were made again failed with.
+    pub retried: Vec<String>,
 }
+
+/// Why a reply did not come: what went wrong, and whether the request
+/// may be answered if it is made again, as one a provider failed at is
+/// and one the host refuses for what it asks is not.
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    pub again: bool,
+}
+
+impl Failure {
+    /// A failure of the stream itself, which another request may not have.
+    fn passing(host: &str, error: impl fmt::Display) -> Self {
+        Self {
+            message: format!("{host}: {error}"),
+            again: true,
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for Failure {}
 
 /// What a request used, as the provider counts it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -54,14 +85,14 @@ pub fn read(
     body: impl BufRead,
     host: &str,
     mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-) -> Result<Outcome> {
+) -> Result<Outcome, Failure> {
     let mut outcome = Outcome::default();
     let mut text = Splitter::default();
     // Calls sent as fields: the name and the arguments of each, as they
     // come in pieces.
     let mut fields: Vec<(String, String)> = Vec::new();
     for line in body.lines() {
-        let line = line?;
+        let line = line.map_err(|e| Failure::passing(host, e))?;
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -69,9 +100,15 @@ pub fn read(
         if data == "[DONE]" {
             break;
         }
-        let event: Value = serde_json::from_str(data)?;
+        let event: Value = serde_json::from_str(data).map_err(|e| Failure::passing(host, e))?;
         if let Some(error) = event.get("error") {
-            return Err(error_message(host, error).into());
+            return Err(Failure {
+                message: error_message(host, error),
+                again: passes(error),
+            });
+        }
+        if let Some(provider) = event["provider"].as_str() {
+            outcome.provider = Some(provider.to_string());
         }
         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
             outcome.usage = Some(Usage::of(usage));
@@ -134,14 +171,32 @@ pub fn read(
     Ok(outcome)
 }
 
-/// What an error says, as `host` writes one: its message, and the
-/// provider's own where the host passes one on.
+/// What an error says, as `host` writes one: its message, with the
+/// provider it is of and the provider's own words where the host passes
+/// them on.
 pub fn error_message(host: &str, error: &Value) -> String {
     let message = error["message"].as_str().unwrap_or("the request failed");
-    match error["metadata"]["raw"].as_str() {
-        Some(raw) => format!("{host}: {message}: {raw}"),
-        None => format!("{host}: {message}"),
+    let metadata = &error["metadata"];
+    let mut said = format!("{host}: {message}");
+    if let Some(provider) = metadata["provider_name"].as_str() {
+        said.push_str(&format!(" ({provider})"));
     }
+    if let Some(raw) = metadata["raw"].as_str() {
+        said.push_str(&format!(": {raw}"));
+    }
+    said
+}
+
+/// Whether an error in a stream may pass if the request is made again:
+/// one with the code of a request refused for now or of a server's
+/// failure, or with none, as a provider that failed mid-reply is passed
+/// on. A code of the request's own fault, such as one too long, is not.
+fn passes(error: &Value) -> bool {
+    let code = match &error["code"] {
+        Value::String(code) => code.parse().ok(),
+        code => code.as_u64(),
+    };
+    code.is_none_or(|code| code == 408 || code == 429 || code >= 500)
 }
 
 impl Usage {
@@ -350,5 +405,12 @@ mod tests {
         );
         let error = read(body, "OpenRouter", |_| ControlFlow::Continue(())).unwrap_err();
         assert!(error.to_string().contains("overloaded"), "{error}");
+        assert!(error.again);
+        // A request refused for what it asks is not worth making again.
+        let body = Cursor::new(
+            "data: {\"error\":{\"code\":400,\"message\":\"the prompt is too long\"}}\n\n",
+        );
+        let error = read(body, "OpenRouter", |_| ControlFlow::Continue(())).unwrap_err();
+        assert!(!error.again, "{error}");
     }
 }
