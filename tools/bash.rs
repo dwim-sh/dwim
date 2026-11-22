@@ -219,8 +219,10 @@ impl Bash {
         }
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
-        // runs the command all the same.
-        let command = format!("set -o pipefail 2>/dev/null\n{command}");
+        // runs the command all the same. Through `command`, because `set`
+        // is a special builtin: an option it does not know ends a shell
+        // such as dash on the spot, with status 2 and the command not run.
+        let command = format!("command set -o pipefail 2>/dev/null\n{command}");
         let mut shell = Command::new(&self.shell);
         shell
             .args(["-c", &command])
@@ -637,9 +639,15 @@ mod tests {
         assert_eq!(sh("exit 3", &mut bash), "[exit code 3]");
         assert_eq!(sh("true", &mut bash), "[exit code 0]");
         assert_eq!(sh("echo; echo", &mut bash), "[exit code 0]");
-        // A pipeline fails when any of its commands does.
-        assert_eq!(sh("false | true", &mut bash), "[exit code 1]");
-        assert_eq!(sh("exit 4 | head -1", &mut bash), "[exit code 4]");
+        // A pipeline fails when any of its commands does, in a shell that
+        // has `pipefail`; one without it, as dash 0.5.12 is, still
+        // runs the command.
+        if sh("(set -o pipefail)", &mut bash) == "[exit code 0]" {
+            assert_eq!(sh("false | true", &mut bash), "[exit code 1]");
+            assert_eq!(sh("exit 4 | head -1", &mut bash), "[exit code 4]");
+        } else {
+            assert_eq!(sh("false | true", &mut bash), "[exit code 0]");
+        }
         assert_eq!(sh("echo hi | head -1", &mut bash), "hi\n[exit code 0]");
         assert_eq!(
             sh("kill -9 $$", &mut bash),
