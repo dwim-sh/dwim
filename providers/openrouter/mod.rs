@@ -32,24 +32,19 @@ pub const HOST: Host = Host {
 /// `model` at OpenRouter, with the key in the environment or kept from a
 /// sign-in, reasoning at `effort`, with room for `context` tokens of
 /// conversation, or as many as a model at a host has unless told, sampled
-/// at `temperature`, or as the model's makers recommend. Inkling is run
-/// on this machine only.
+/// at `temperature`, or as the model's makers recommend.
 pub fn open(
     model: Model,
     effort: Effort,
     context: Option<usize>,
     temperature: Option<f32>,
 ) -> Result<Hosted> {
-    if model == Model::InklingMini {
-        return Err(format!("{model} is not run at OpenRouter").into());
-    }
     let key = key()
         .ok_or_else(|| format!("there is no key to OpenRouter: /login signs in, or set {KEY}"))?;
     Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
-/// `model` as OpenRouter names it. Inkling is named as it is there, for
-/// [`open`] to refuse.
+/// `model` as OpenRouter names it.
 pub fn model(model: Model) -> &'static str {
     match model {
         Model::Qwen27b => "qwen/qwen3.8-27b",
@@ -65,8 +60,10 @@ pub fn key() -> Option<String> {
 }
 
 /// Adds to a request what OpenRouter is asked in its own way: to say what
-/// the reply used and cost, to sample from the likeliest tokens only, and
-/// to reason at `effort`, or not to when there is none.
+/// the reply used and cost, to sample from the likeliest tokens only, or
+/// from all of them where the model's are not cut, which a `top_k` of
+/// zero asks for, and to reason at `effort`, or not to when there is
+/// none.
 fn ask(body: &mut Value, sampling: &Sampling, effort: Option<Effort>) {
     body["usage"] = json!({ "include": true });
     body["top_k"] = json!(sampling.top_k);

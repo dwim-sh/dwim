@@ -629,7 +629,8 @@ impl App {
 
     /// The model the session goes on with at `provider`: the one it is on
     /// if it runs there, as the large one does not on this machine or at
-    /// Cerebras, nor Inkling at a host, and the medium one otherwise.
+    /// Cerebras, nor Inkling at a host but OpenRouter, and the medium one
+    /// otherwise.
     fn model_at(&self, provider: Kind) -> Model {
         if session::runs(provider, self.model) {
             self.model

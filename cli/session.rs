@@ -82,7 +82,7 @@ pub struct Ready {
 /// OpenRouter, or else Vercel's AI Gateway, or else Cerebras, leaving out
 /// the providers the configuration disables. The large model takes more
 /// memory than a machine has, and runs only at OpenRouter or Vercel's AI
-/// Gateway, and Inkling is run only on this machine. Nowhere, if the
+/// Gateway, and Inkling only on this machine or at OpenRouter. Nowhere, if the
 /// command line named no provider and the model
 /// can run neither here nor at a host without a key: the shell starts
 /// without a model then, for `/login` to sign in. A provider the command
@@ -100,8 +100,8 @@ pub fn provider(provider: Option<Kind>, model: Model) -> Result<Option<Kind>, Bo
             Model::QwenMax
         )
         .into()),
-        (Some(kind), Model::InklingMini) if kind != Kind::Local => Err(format!(
-            "{} is not run at {}: it runs on this machine, with --provider local",
+        (Some(kind), Model::InklingMini) if !runs(kind, Model::InklingMini) => Err(format!(
+            "{} is not run at {}: it runs with --provider local, or openrouter",
             Model::InklingMini,
             name(kind)
         )
@@ -138,12 +138,13 @@ fn ready(kind: Kind, model: Model) -> bool {
 
 /// Whether `kind` is a provider of `model`: all are of the medium model,
 /// OpenRouter and Vercel's AI Gateway of the large one, and this machine
-/// alone of Inkling.
+/// and OpenRouter of Inkling.
 pub fn runs(kind: Kind, model: Model) -> bool {
     match kind {
         Kind::Local => model.weights().is_some(),
         Kind::Cerebras => model == Model::Qwen27b,
-        Kind::OpenRouter | Kind::Vercel => model != Model::InklingMini,
+        Kind::OpenRouter => true,
+        Kind::Vercel => model != Model::InklingMini,
     }
 }
 
@@ -167,7 +168,7 @@ pub fn nowhere(model: Model, config: &Config) -> String {
         (Model::Qwen27b, Ok(())) => {
             format!("{model} runs only at OpenRouter, Vercel or Cerebras")
         }
-        (Model::InklingMini, Ok(())) => format!("{model} runs only on this machine"),
+        (Model::InklingMini, Ok(())) => format!("{model} runs only at OpenRouter"),
         (Model::QwenMax, _) => format!("{model} runs only at OpenRouter or Vercel"),
     }
 }
@@ -403,17 +404,15 @@ pub fn open(
     mut on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
     let Some(kind) = provider(settings.provider, settings.model)? else {
-        if settings.model == Model::InklingMini {
-            return Err(nowhere(settings.model, &Config::load()?).into());
-        }
+        let vercel = format!(", or at Vercel by setting {}", vercel::KEY);
         return Err(format!(
-            "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}, or at Vercel by setting {}{}",
+            "{}: run it at OpenRouter by signing in with /login in dwim, or by setting {}{}",
             nowhere(settings.model, &Config::load()?),
             openrouter::KEY,
-            vercel::KEY,
             match settings.model {
-                Model::Qwen27b => format!(", or at Cerebras by setting {}", cerebras::KEY),
-                Model::QwenMax | Model::InklingMini => String::new(),
+                Model::Qwen27b => format!("{vercel}, or at Cerebras by setting {}", cerebras::KEY),
+                Model::QwenMax => vercel,
+                Model::InklingMini => String::new(),
             }
         )
         .into());

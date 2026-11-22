@@ -42,7 +42,7 @@ pub enum Model {
     QwenMax,
     /// Inkling 2 Mini, Thinking Machines' looped model of 26 billion
     /// parameters, of which 3.4 billion are active for a token: it runs on
-    /// this machine, where the GPU takes its weights.
+    /// this machine, where the GPU takes its weights, and at OpenRouter.
     InklingMini,
 }
 
