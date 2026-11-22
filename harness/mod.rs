@@ -2169,13 +2169,17 @@ mod tests {
 
     #[test]
     fn opens_the_prompt_with_the_line_for_the_effort() {
-        // As the model's template does: a line for xhigh and for low, ahead of
-        // the tools, and none for medium.
+        // As the model's template does: a line for xhigh and for low, and
+        // one for high, ahead of the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(system_prompt(dir, Some(Effort::Medium)).starts_with("# Tools\n"));
         // A host writes the line itself, so its prompt is given none.
         assert!(system_prompt(dir, None).starts_with("# Tools\n"));
-        for (effort, word) in [(Effort::Xhigh, "xhigh"), (Effort::Low, "low")] {
+        for (effort, word) in [
+            (Effort::Xhigh, "xhigh"),
+            (Effort::High, "high"),
+            (Effort::Low, "low"),
+        ] {
             let prompt = system_prompt(dir, Some(effort));
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
@@ -2183,7 +2187,7 @@ mod tests {
             assert_eq!(word.parse::<Effort>(), Ok(effort));
         }
         assert_eq!("medium".parse::<Effort>(), Ok(Effort::Medium));
-        assert!("high".parse::<Effort>().is_err());
+        assert!("highest".parse::<Effort>().is_err());
     }
 
     #[test]

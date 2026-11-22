@@ -87,6 +87,20 @@ impl Model {
         }
     }
 
+    /// How much the model reasons before it replies unless told. Qwen
+    /// at `low`, not its default of `xhigh`, at which it thinks at length
+    /// about code it could read. Inkling at `high`, its makers' default:
+    /// at `low` it thought a median of 1,945 tokens an instance on
+    /// SWE-bench Verified Mini, a third of what Qwen did at `low`, and
+    /// its thoughts ran to the thinking budget 7 times in 50 sessions to
+    /// Qwen's 89, so there is no overthinking to hold it from.
+    pub const fn effort(self) -> Effort {
+        match self {
+            Model::Qwen27b | Model::QwenMax => Effort::Low,
+            Model::InklingMini => Effort::High,
+        }
+    }
+
     /// The model's chat format, over the vocabulary a GGUF file of it
     /// carries.
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {
