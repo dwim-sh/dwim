@@ -78,6 +78,15 @@ impl Model {
         }
     }
 
+    /// How the model's tokens are sampled where no file of it says how:
+    /// at a host.
+    pub const fn sampling(self) -> Sampling {
+        match self {
+            Model::Qwen27b | Model::QwenMax => qwen::SAMPLING,
+            Model::InklingMini => inkling::SAMPLING,
+        }
+    }
+
     /// The model's chat format, over the vocabulary a GGUF file of it
     /// carries.
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {

@@ -7,7 +7,7 @@ mod tokenizer;
 
 use std::sync::Arc;
 
-use crate::model::{File, Format, Result, Weights, gguf::Metadata};
+use crate::model::{File, Format, Result, Sampling, Weights, gguf::Metadata};
 
 pub use format::Blocks;
 pub use tokenizer::tokenizer;
@@ -33,6 +33,16 @@ pub const INKLING_MINI: Weights = Weights {
         name: FILE,
         digest: "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
     }],
+};
+
+/// How Inkling's tokens are sampled where no file of it says, at a host:
+/// at a temperature of one with no token cut, as its file recommends.
+pub const SAMPLING: Sampling = Sampling {
+    temperature: 1.0,
+    top_k: 0,
+    top_p: 1.0,
+    min_p: 0.0,
+    seed: 0,
 };
 
 /// The chat format of Inkling 2 Mini, over the vocabulary its GGUF file
