@@ -11,6 +11,7 @@
 use std::{
     cell::{Cell, RefCell},
     error::Error,
+    fmt,
     slice,
     sync::Arc,
 };
@@ -309,6 +310,27 @@ struct Kernels {
     attention_rel_combine: CudaFunction,
 }
 
+/// An error opening a CUDA device.
+#[derive(Debug)]
+pub enum CudaOpenError {
+    /// No CUDA driver, NVRTC, or device: the GPU is not there, so the
+    /// checks of it skip.
+    Missing(String),
+    /// The driver is there but a kernel would not compile or load, so the
+    /// checks of it fail.
+    Broken(String),
+}
+
+impl fmt::Display for CudaOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CudaOpenError::Missing(msg) | CudaOpenError::Broken(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl Error for CudaOpenError {}
+
 pub struct Cuda {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -336,27 +358,36 @@ impl Weight {
 
 impl Cuda {
     /// Opens the first NVIDIA GPU, compiling the kernels for it.
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new() -> Result<Self, CudaOpenError> {
         Self::open(true)
     }
 
     /// Opens the GPU as one without tensor cores is opened, whatever it
     /// has, to check the kernels such a GPU runs.
     #[cfg(test)]
-    fn without_tensor_cores() -> Result<Self, Box<dyn Error>> {
+    fn without_tensor_cores() -> Result<Self, CudaOpenError> {
         Self::open(false)
     }
 
     /// Opens the first NVIDIA GPU, with the tile kernels if `tiles` and
     /// the GPU has the tensor cores for them.
-    fn open(tiles: bool) -> Result<Self, Box<dyn Error>> {
+    fn open(tiles: bool) -> Result<Self, CudaOpenError> {
         if !unsafe { sys::is_culib_present() } {
-            return Err("no CUDA driver".into());
+            return Err(CudaOpenError::Missing("no CUDA driver".into()));
         }
         if !unsafe { nvrtc::sys::is_culib_present() } {
-            return Err("no NVRTC, which the CUDA toolkit has, to compile the kernels".into());
+            return Err(CudaOpenError::Missing(
+                "no NVRTC, which the CUDA toolkit has, to compile the kernels".into(),
+            ));
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("no CUDA device: {e}"))?;
+        let ctx = CudaContext::new(0)
+            .map_err(|e| CudaOpenError::Missing(format!("no CUDA device: {e}")))?;
+        Self::device(ctx, tiles).map_err(|e| CudaOpenError::Broken(e.to_string()))
+    }
+
+    /// Opens a CUDA device that is present: compiles the kernels for it
+    /// and loads them.
+    fn device(ctx: Arc<CudaContext>, tiles: bool) -> Result<Self, Box<dyn Error>> {
         // Everything goes to one stream, so the events that would order
         // several are not needed.
         unsafe { ctx.disable_event_tracking() };
@@ -3044,7 +3075,7 @@ impl Device for Cuda {
 mod tests {
     // With tensor cores, every matmul through block-quantized weights is
     // in half precision; without them, none is.
-    check_against_cpu!(
+    check_cuda!(
         super::Cuda::new();
         write_and_read_round_trip,
         alloc_is_zeroed_and_copy_moves_ranges,
@@ -3081,7 +3112,7 @@ mod tests {
     );
 
     mod without_tensor_cores {
-        check_against_cpu!(
+        check_cuda!(
             super::super::Cuda::without_tensor_cores();
             q4_0_matmul_matches_cpu,
             q8_0_matmul_matches_cpu,

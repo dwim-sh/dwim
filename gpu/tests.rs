@@ -55,6 +55,25 @@ macro_rules! check_against_cpu {
     };
 }
 
+/// Defines a test for each check, run on the CUDA device `$open` returns,
+/// skipped when it reports no CUDA driver, NVRTC, or device, and failed
+/// when a kernel would not compile or load.
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! check_cuda {
+    ($open:expr; $($check:ident),*) => {
+        $(
+            #[test]
+            fn $check() {
+                match $open {
+                    Ok(gpu) => crate::gpu::tests::$check(&gpu),
+                    Err(crate::gpu::cuda::CudaOpenError::Missing(e)) => eprintln!("skipping: {e}"),
+                    Err(e) => panic!("CUDA would not open: {e}"),
+                }
+            }
+        )*
+    };
+}
+
 /// Deterministic pseudo-random values in [-1, 1).
 struct Rng(u64);
 
