@@ -11,7 +11,7 @@ use crate::gpu::metal;
 #[cfg(not(target_vendor = "apple"))]
 use crate::gpu::{cuda, vulkan};
 use crate::{
-    gpu::{Device, Tensor},
+    gpu::{Device, Kept, Tensor},
     model::Api,
 };
 
@@ -191,6 +191,10 @@ impl Device for Gpu {
         dispatch!(self, read([buf]))
     }
 
+    fn read_capped(&self, buf: &mut Buffer, cap: f32) -> Vec<f32> {
+        dispatch!(self, read_capped([buf], cap))
+    }
+
     fn write(&self, buf: &mut Buffer, data: &[f32]) {
         dispatch!(self, write([buf], data))
     }
@@ -270,6 +274,33 @@ impl Device for Gpu {
                 n_kv_heads
             )
         )
+    }
+
+    fn matmuls(&self, jobs: &mut [(&mut Buffer, &Weight, &Buffer)]) {
+        // The jobs are unwrapped one by one, which `dispatch!` cannot.
+        macro_rules! matmuls {
+            ($api:ident, $gpu:expr) => {{
+                let mut jobs: Vec<_> = jobs
+                    .iter_mut()
+                    .map(|(out, w, x)| {
+                        (
+                            unwrap!($api, [&mut **out]),
+                            unwrap!($api, { *w }),
+                            unwrap!($api, [*x]),
+                        )
+                    })
+                    .collect();
+                $gpu.matmuls(&mut jobs)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => matmuls!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => matmuls!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => matmuls!(Metal, gpu),
+        }
     }
 
     fn matmul_add(&self, x: &mut Buffer, w: &Weight, input: &Buffer, scratch: &mut Buffer) {
@@ -371,6 +402,41 @@ impl Device for Gpu {
         }
     }
 
+    fn mixes(
+        &self,
+        outs: &mut [&mut Buffer],
+        states: &[&Buffer],
+        queries: &[&Buffer],
+        eps: f32,
+        norms: Option<(&[&Buffer], f32)>,
+    ) {
+        // The buffers are unwrapped one by one, which `dispatch!` cannot.
+        macro_rules! mixes {
+            ($api:ident, $gpu:expr) => {{
+                let mut outs: Vec<_> = outs
+                    .iter_mut()
+                    .map(|out| unwrap!($api, [&mut **out]))
+                    .collect();
+                let states: Vec<_> = states.iter().map(|state| unwrap!($api, [state])).collect();
+                let queries: Vec<_> = queries.iter().map(|query| unwrap!($api, [query])).collect();
+                let norms = norms.map(|(norms, eps)| {
+                    let norms: Vec<_> = norms.iter().map(|norm| unwrap!($api, [norm])).collect();
+                    (norms, eps)
+                });
+                let norms = norms.as_ref().map(|(norms, eps)| (norms.as_slice(), *eps));
+                $gpu.mixes(&mut outs, &states, &queries, eps, norms)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => mixes!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => mixes!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => mixes!(Metal, gpu),
+        }
+    }
+
     fn gated_update(&self, x: &mut Buffer, forget: &Buffer, gain: &Buffer, message: &Buffer) {
         dispatch!(self, gated_update([x], [forget], [gain], [message]))
     }
@@ -401,6 +467,41 @@ impl Device for Gpu {
                 eps
             )
         )
+    }
+
+    fn gates(
+        &self,
+        xs: &mut [&mut Buffer],
+        messages: &[&Buffer],
+        weights: &[[&Weight; 4]],
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        // The buffers and weights are unwrapped one by one, which
+        // `dispatch!` cannot.
+        macro_rules! gates {
+            ($api:ident, $gpu:expr) => {{
+                let mut xs: Vec<_> = xs.iter_mut().map(|x| unwrap!($api, [&mut **x])).collect();
+                let messages: Vec<_> = messages
+                    .iter()
+                    .map(|message| unwrap!($api, [message]))
+                    .collect();
+                let weights: Vec<_> = weights
+                    .iter()
+                    .map(|weights| weights.map(|weight| unwrap!($api, { weight })))
+                    .collect();
+                $gpu.gates(&mut xs, &messages, &weights, dim, rank, eps)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => gates!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => gates!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => gates!(Metal, gpu),
+        }
     }
 
     fn short_conv(
@@ -435,8 +536,131 @@ impl Device for Gpu {
         }
     }
 
+    fn short_conv_add(
+        &self,
+        x: &mut Buffer,
+        input: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        scratch: &mut Buffer,
+    ) {
+        dispatch!(
+            self,
+            short_conv_add([x], [input], [state], [weight], [scratch])
+        )
+    }
+
+    fn short_conv_store(
+        &self,
+        cache: &mut Cache,
+        pos: usize,
+        rows: usize,
+        n: usize,
+        channels: usize,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+        scale: &Buffer,
+        kept: Kept,
+        scratch: &mut Buffer,
+        wrapped: &mut Buffer,
+    ) {
+        // The heads' taps are unwrapped where there are any, which
+        // `dispatch!` cannot.
+        macro_rules! short_conv_store {
+            ($api:ident, $gpu:expr) => {{
+                let dynamic = dynamic.map(|(taps, heads)| (unwrap!($api, [taps]), heads));
+                $gpu.short_conv_store(
+                    unwrap!($api, (cache)),
+                    pos,
+                    rows,
+                    n,
+                    channels,
+                    unwrap!($api, [x]),
+                    unwrap!($api, [state]),
+                    unwrap!($api, [weight]),
+                    dynamic,
+                    unwrap!($api, [scale]),
+                    kept,
+                    unwrap!($api, [scratch]),
+                    unwrap!($api, [wrapped]),
+                )
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => short_conv_store!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => short_conv_store!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => short_conv_store!(Metal, gpu),
+        }
+    }
+
     fn clip(&self, x: &mut Buffer, scale: &Buffer, dim: usize, threshold: f32) {
         dispatch!(self, clip([x], [scale], dim, threshold))
+    }
+
+    fn clips(&self, jobs: &mut [(&mut Buffer, &Buffer, usize, f32)]) {
+        // The jobs are unwrapped one by one, which `dispatch!` cannot.
+        macro_rules! clips {
+            ($api:ident, $gpu:expr) => {{
+                let mut jobs: Vec<_> = jobs
+                    .iter_mut()
+                    .map(|(x, scale, dim, threshold)| {
+                        (
+                            unwrap!($api, [&mut **x]),
+                            unwrap!($api, [*scale]),
+                            *dim,
+                            *threshold,
+                        )
+                    })
+                    .collect();
+                $gpu.clips(&mut jobs)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => clips!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => clips!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => clips!(Metal, gpu),
+        }
+    }
+
+    fn normalizes(
+        &self,
+        outs: &mut [&mut Buffer],
+        xs: &[&Buffer],
+        weights: &[&Buffer],
+        len: usize,
+        eps: f32,
+    ) {
+        // The buffers are unwrapped one by one, which `dispatch!` cannot.
+        macro_rules! normalizes {
+            ($api:ident, $gpu:expr) => {{
+                let mut outs: Vec<_> = outs
+                    .iter_mut()
+                    .map(|out| unwrap!($api, [&mut **out]))
+                    .collect();
+                let xs: Vec<_> = xs.iter().map(|x| unwrap!($api, [x])).collect();
+                let weights: Vec<_> = weights
+                    .iter()
+                    .map(|weight| unwrap!($api, [weight]))
+                    .collect();
+                $gpu.normalizes(&mut outs, &xs, &weights, len, eps)
+            }};
+        }
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Cuda(gpu) => normalizes!(Cuda, gpu),
+            #[cfg(not(target_vendor = "apple"))]
+            Gpu::Vulkan(gpu) => normalizes!(Vulkan, gpu),
+            #[cfg(target_vendor = "apple")]
+            Gpu::Metal(gpu) => normalizes!(Metal, gpu),
+        }
     }
 
     fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
@@ -501,6 +725,42 @@ impl Device for Gpu {
         k: usize,
     ) {
         dispatch!(self, expert_matmul([out], { w }, [scale], [x], [ids], k))
+    }
+
+    fn expert_ffn(
+        &self,
+        out: &mut Buffer,
+        gate_up: &Weight,
+        gate_up_scale: &Buffer,
+        down: &Weight,
+        down_scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Buffer,
+        act: &mut Buffer,
+    ) {
+        dispatch!(
+            self,
+            expert_ffn(
+                [out],
+                { gate_up },
+                [gate_up_scale],
+                { down },
+                [down_scale],
+                [x],
+                [ids],
+                k,
+                width,
+                beta,
+                linear_beta,
+                [scratch],
+                [act]
+            )
+        )
     }
 
     fn situ(&self, out: &mut Buffer, gate_up: &Buffer, width: usize, beta: f32, linear_beta: f32) {

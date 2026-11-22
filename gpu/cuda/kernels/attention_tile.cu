@@ -1,5 +1,6 @@
 // Causal attention over the 8-bit caches on the tensor cores, for heads of
-// 256: what `attention.cu` computes, with the queries, the keys, the
+// 256, and of 128 with Inkling's bias, sink, window and ring: what
+// `attention.cu` computes, with the queries, the keys, the
 // softmax's weights and the values as half-precision floats and the sums
 // in single precision. The scheme is TensorFold's (`licenses/tensorfold.md`).
 //
@@ -14,12 +15,21 @@
 // each warp for its own elements of the head. A chunk's maximum, sum, and
 // weighted values go to the partials buffer for `attention_tile_combine`
 // to merge, or, when there is one chunk, straight to the output.
+//
+// With `REL`, a line attends no further back than its token's window, the
+// block starting where its first token's does, over caches that hold
+// position `p` in row `p % ring`; the threads that take a line's softmax
+// add each key's bias by its distance to its score first, the dot product
+// of the line's row of `rel` with the distance's row of `bias`; and the
+// sink has its share of the softmax where the chunks are merged.
 
 #if __CUDA_ARCH__ >= 800
 
-// Positions to a step, and elements to a head.
+// Positions to a step, and elements to a head of Qwen's.
 #define ATT_KEYS 32
-#define ATT_DIM 256
+#define ATT_QWEN_DIM 256
+// Most elements of a head's row of `rel`, in fours.
+#define ATT_REL 16
 // What the score of a position a line does not attend to is, and the
 // largest score of a line that has attended to none.
 #define ATT_NONE (-1e30f)
@@ -51,8 +61,8 @@ __device__ __forceinline__ void load_matrix_transposed(u32 (&r)[4], const void* 
 // queries, the keys or the values, and of the weights, four to a line:
 // turned by the row so that the eight rows read as a matrix at once are
 // in different banks.
-__device__ __forceinline__ u32 query_at(u32 line, u32 chunk) {
-    return line * (ATT_DIM * 2) + ((chunk ^ (line & 7)) * 16);
+__device__ __forceinline__ u32 query_at(u32 dim, u32 line, u32 chunk) {
+    return line * (dim * 2) + ((chunk ^ (line & 7)) * 16);
 }
 
 __device__ __forceinline__ u32 weight_at(u32 line, u32 chunk) {
@@ -72,19 +82,19 @@ __device__ __forceinline__ uint2 widen4(u32 bytes, u32 scale) {
 }
 
 // Sixteen of them as two chunks of a row of halves at `to`.
-__device__ __forceinline__ void widen16(unsigned char* row, u32 key, u32 chunk, uint4 bytes, u32 scale) {
+__device__ __forceinline__ void widen16(unsigned char* row, u32 dim, u32 key, u32 chunk, uint4 bytes, u32 scale) {
     scale *= 0x10001u;
     uint2 a = widen4(bytes.x, scale), b = widen4(bytes.y, scale);
     uint2 c = widen4(bytes.z, scale), d = widen4(bytes.w, scale);
-    *(uint4*)(row + query_at(key, 2 * chunk)) = make_uint4(a.x, a.y, b.x, b.y);
-    *(uint4*)(row + query_at(key, 2 * chunk + 1)) = make_uint4(c.x, c.y, d.x, d.y);
+    *(uint4*)(row + query_at(dim, key, 2 * chunk)) = make_uint4(a.x, a.y, b.x, b.y);
+    *(uint4*)(row + query_at(dim, key, 2 * chunk + 1)) = make_uint4(c.x, c.y, d.x, d.y);
 }
 
-template <int MT, int WM>
+template <int MT, int WM, int ATT_DIM, bool REL>
 __device__ __forceinline__ void attention_tile_body(
     float* out, const float* q, const unsigned char* k_quants, const u16* k_scales,
-    const unsigned char* v_quants, const u16* v_scales, float* partials, AttentionTileParams p,
-    unsigned char* buf) {
+    const unsigned char* v_quants, const u16* v_scales, float* partials, const float* rel,
+    const float* bias, const float* sinks, AttentionRelParams p, unsigned char* buf) {
     const u32 LINES = 16 * MT;
     const u32 WARPS = 4 * WM;
     const u32 THREADS = WARPS * 32;
@@ -115,10 +125,16 @@ __device__ __forceinline__ void attention_tile_body(
     const u32 count = min(tokens, p.first + p.count - t0);
     const u32 lines = count * group;
     const u32 kv_dim = p.n_kv_heads * ATT_DIM;
-    // The chunk's positions, up to the last the block's last token
-    // attends to.
-    const u32 k0 = c * p.chunk;
-    const u32 k1 = min(k0 + p.chunk, p.pos + t0 + count);
+    // Where a line's token attends from, and up to.
+    auto from = [&](u32 line) {
+        u32 len = p.pos + t0 + line / group + 1;
+        return REL && len > p.window ? len - p.window : 0;
+    };
+    auto upto = [&](u32 line) { return line < lines ? p.pos + t0 + line / group + 1 : 0; };
+    // The chunk's positions, from the first the block's first token
+    // attends to, up to the last its last token does.
+    const u32 k0 = max(p.base + c * p.chunk, from(0));
+    const u32 k1 = min(p.base + (c + 1) * p.chunk, p.pos + t0 + count);
     const u32 stride = ATT_DIM + 2;
     // Where a line's partials for this chunk go.
     auto partial = [&](u32 line) {
@@ -141,12 +157,27 @@ __device__ __forceinline__ void attention_tile_body(
         uint4 halves = make_uint4(0, 0, 0, 0);
         if (line < lines) {
             const float4* at = (const float4*)(q + ((size_t)(t0 + line / group) * p.n_heads + kvh * group + line % group) * ATT_DIM + chunk * 8);
-            float4 a = scale4(at[0], 0.0625f);
-            float4 b = scale4(at[1], 0.0625f);
+            const float by = ATT_DIM == 256 ? 0.0625f : 0.08838834764831845f;
+            float4 a = scale4(at[0], by);
+            float4 b = scale4(at[1], by);
             halves = make_uint4(half_pair(a.x, a.y), half_pair(a.z, a.w), half_pair(b.x, b.y), half_pair(b.z, b.w));
         }
-        *(uint4*)(queries + query_at(line, chunk)) = halves;
+        *(uint4*)(queries + query_at(ATT_DIM, line, chunk)) = halves;
     }
+    // The thread's line's row of `rel`, and its token's reach.
+    const u32 own = tid / LINE_THREADS;
+    float4 own_rel[ATT_REL / 4];
+    if (REL) {
+#pragma unroll
+        for (u32 j = 0; j < ATT_REL / 4; j++) {
+            own_rel[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (own < lines && j * 4 < p.n_rel) {
+                size_t head = (size_t)(t0 + own / group) * p.n_heads + kvh * group + own % group;
+                own_rel[j] = *(const float4*)(rel + head * p.n_rel + j * 4);
+            }
+        }
+    }
+    const u32 own_len = upto(own);
 
     // A step's keys and values from `first` on, the thread's chunks of
     // them and each chunk's block's scale, into registers: a key past the
@@ -158,7 +189,7 @@ __device__ __forceinline__ void attention_tile_body(
         for (u32 r = 0; r < READS; r++) {
             u32 i = tid + r * THREADS;
             u32 key = first + i / (ATT_DIM / 16);
-            size_t at = key < k1 ? (size_t)key * kv_dim + kvh * ATT_DIM + (i % (ATT_DIM / 16)) * 16 : 0;
+            size_t at = key < k1 ? (size_t)(REL ? key % p.ring : key) * kv_dim + kvh * ATT_DIM + (i % (ATT_DIM / 16)) * 16 : 0;
             key_bytes[r] = *(const uint4*)(k_quants + at);
             value_bytes[r] = *(const uint4*)(v_quants + at);
             key_scale[r] = k_scales[at / CACHE_BLOCK];
@@ -170,8 +201,8 @@ __device__ __forceinline__ void attention_tile_body(
 #pragma unroll
         for (u32 r = 0; r < READS; r++) {
             u32 i = tid + r * THREADS;
-            widen16(keys, i / (ATT_DIM / 16), i % (ATT_DIM / 16), key_bytes[r], key_scale[r]);
-            widen16(values, i / (ATT_DIM / 16), i % (ATT_DIM / 16), value_bytes[r], value_scale[r]);
+            widen16(keys, ATT_DIM, i / (ATT_DIM / 16), i % (ATT_DIM / 16), key_bytes[r], key_scale[r]);
+            widen16(values, ATT_DIM, i / (ATT_DIM / 16), i % (ATT_DIM / 16), value_bytes[r], value_scale[r]);
         }
     };
 
@@ -188,7 +219,6 @@ __device__ __forceinline__ void attention_tile_body(
     }
     // The thread's line's largest score and sum so far, which every thread
     // of the line holds.
-    const u32 own = tid / LINE_THREADS;
     float largest = ATT_NONE;
     float sum = 0.0f;
 
@@ -215,12 +245,12 @@ __device__ __forceinline__ void attention_tile_body(
 #pragma unroll
             for (u32 k = 0; k < ATT_DIM / 16; k++) {
                 u32 b[2];
-                load_matrix2(b, keys + query_at((warp % 4) * 8 + (lane & 7), k * 2 + ((lane >> 3) & 1)));
+                load_matrix2(b, keys + query_at(ATT_DIM, (warp % 4) * 8 + (lane & 7), k * 2 + ((lane >> 3) & 1)));
 #pragma unroll
                 for (u32 i = 0; i < MT / WM; i++) {
                     u32 a[4];
                     u32 line = (m0 + i) * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
-                    load_matrix(a, queries + query_at(line, k * 2 + (lane >> 4)));
+                    load_matrix(a, queries + query_at(ATT_DIM, line, k * 2 + (lane >> 4)));
                     multiply_add(sc[i], a, b[0], b[1]);
                 }
             }
@@ -230,11 +260,15 @@ __device__ __forceinline__ void attention_tile_body(
 #pragma unroll
                 for (u32 h = 0; h < 2; h++) {
                     u32 line = (m0 + i) * 16 + (lane >> 2) + h * 8;
-                    // A line attends up to its token's own position.
-                    u32 len = line < lines ? p.pos + t0 + line / group + 1 : 0;
+                    // A line attends up to its token's own position, from
+                    // where its window starts: of this chunk's positions,
+                    // which a step may run past where the chunk does not
+                    // start on one.
+                    u32 len = min(upto(line), k1);
+                    u32 lo = from(line);
                     float2 pair = make_float2(
-                        first + at < len ? sc[i][2 * h] : ATT_NONE,
-                        first + at + 1 < len ? sc[i][2 * h + 1] : ATT_NONE);
+                        first + at < len && first + at >= lo ? sc[i][2 * h] : ATT_NONE,
+                        first + at + 1 < len && first + at + 1 >= lo ? sc[i][2 * h + 1] : ATT_NONE);
                     *(float2*)(scores + line * ATT_KEYS + at) = pair;
                 }
             }
@@ -249,6 +283,17 @@ __device__ __forceinline__ void attention_tile_body(
 #pragma unroll
             for (u32 i = 0; i < THREAD_KEYS; i++) {
                 score[i] = scores[own * ATT_KEYS + at + i];
+                // The bias by the key's distance, where it has a row.
+                u32 distance = own_len - 1 - (first + at + i);
+                if (REL && score[i] > 0.5f * ATT_NONE && distance < p.extent) {
+                    const float4* by = (const float4*)(bias + (size_t)distance * p.n_rel);
+#pragma unroll
+                    for (u32 j = 0; j < ATT_REL / 4; j++) {
+                        if (j * 4 < p.n_rel) {
+                            score[i] += dot4(own_rel[j], by[j]);
+                        }
+                    }
+                }
                 top = fmaxf(top, score[i]);
             }
 #pragma unroll
@@ -315,7 +360,7 @@ __device__ __forceinline__ void attention_tile_body(
                     u32 b[4];
                     u32 m = lane >> 3;
                     load_matrix_transposed(
-                        b, values + query_at(kk * 16 + 8 * (m % 2) + (lane & 7), warp * WARP_RUNS + n + m / 2));
+                        b, values + query_at(ATT_DIM, kk * 16 + 8 * (m % 2) + (lane & 7), warp * WARP_RUNS + n + m / 2));
 #pragma unroll
                     for (u32 i = 0; i < MT; i++) {
                         multiply_add(o[i][n], pa[i], b[0], b[1]);
@@ -341,8 +386,9 @@ __device__ __forceinline__ void attention_tile_body(
             }
             u32 head = kvh * group + line % group;
             if (p.chunks == 1) {
-                float* at = out + ((size_t)(t0 + line / group) * p.n_heads + head) * ATT_DIM;
-                float scale = 1.0f / line_sum[line];
+                size_t of = (size_t)(t0 + line / group) * p.n_heads + head;
+                float* at = out + of * ATT_DIM;
+                float scale = REL ? with_sink(line_max[line], line_sum[line], sinks[of]) : 1.0f / line_sum[line];
 #pragma unroll
                 for (u32 n = 0; n < WARP_RUNS; n++) {
                     u32 dim = (warp * WARP_RUNS + n) * 8 + 2 * (lane & 3);
@@ -369,27 +415,45 @@ __device__ __forceinline__ void attention_tile_body(
         float* out, const float* q, const unsigned char* k_quants, const u16* k_scales, \
         const unsigned char* v_quants, const u16* v_scales, float* partials, AttentionTileParams p) { \
         extern __shared__ __align__(16) unsigned char buf[]; \
-        attention_tile_body<MT, WM>(out, q, k_quants, k_scales, v_quants, v_scales, partials, p, buf); \
+        AttentionRelParams r = {p.n_heads, ATT_QWEN_DIM, p.n_kv_heads, p.pos, p.first, p.chunks, p.chunk, p.count, 0, 0, 0, 0, 0}; \
+        attention_tile_body<MT, WM, ATT_QWEN_DIM, false>(out, q, k_quants, k_scales, v_quants, v_scales, partials, 0, 0, 0, r, buf); \
     }
 
 ATTENTION_TILE_KERNEL(attention_tile16, 1, 1)
 ATTENTION_TILE_KERNEL(attention_tile64, 4, 2)
 
+// The same for heads of 128 with a bias by distance, a sink, a window
+// and a ring, which Inkling's are.
+#define ATTENTION_REL_TILE_KERNEL(name, MT, WM) \
+    extern "C" __global__ void __launch_bounds__(WM * 4 * 32) name( \
+        float* out, const float* q, const unsigned char* k_quants, const u16* k_scales, \
+        const unsigned char* v_quants, const u16* v_scales, float* partials, const float* rel, \
+        const float* bias, const float* sinks, AttentionRelParams p) { \
+        extern __shared__ __align__(16) unsigned char buf[]; \
+        attention_tile_body<MT, WM, 128, true>(out, q, k_quants, k_scales, v_quants, v_scales, partials, rel, bias, sinks, p, buf); \
+    }
+
+ATTENTION_REL_TILE_KERNEL(attention_rel_tile16, 1, 1)
+ATTENTION_REL_TILE_KERNEL(attention_rel_tile64, 4, 2)
+
 // Merges the chunks: one block per (token, head), each thread taking one
 // element of the head. The chunks' softmaxes were taken against their own
 // maxima, so each is rescaled to the maximum over the chunks before the
 // sums are added; a chunk the token attends to nothing of is left out.
-extern "C" __global__ void __launch_bounds__(ATT_DIM) attention_tile_combine(
-    float* out, const float* partials, AttentionTileParams p) {
+// With `REL`, the sink is one more to the softmax, with no value.
+template <int DIM, bool REL>
+__device__ __forceinline__ void attention_tile_combine_body(
+    float* out, const float* partials, const float* sinks, AttentionRelParams p) {
     u32 t = p.first + blockIdx.x / p.n_heads;
     u32 h = blockIdx.x % p.n_heads;
-    u32 stride = ATT_DIM + 2;
+    u32 stride = DIM + 2;
     const float* base = partials + (size_t)((t - p.first) * p.n_heads + h) * p.chunks * stride;
-    float m = ATT_NONE;
+    float sink = REL ? sinks[(size_t)t * p.n_heads + h] : ATT_NONE;
+    float m = sink;
     for (u32 c = 0; c < p.chunks; c++) {
         m = fmaxf(m, base[c * stride]);
     }
-    float total = 0.0f;
+    float total = REL ? expf(sink - m) : 0.0f;
     float o = 0.0f;
     for (u32 c = 0; c < p.chunks; c++) {
         if (base[c * stride] > 0.5f * ATT_NONE) {
@@ -398,7 +462,18 @@ extern "C" __global__ void __launch_bounds__(ATT_DIM) attention_tile_combine(
             o += scale * base[c * stride + 2 + threadIdx.x];
         }
     }
-    out[((size_t)t * p.n_heads + h) * ATT_DIM + threadIdx.x] = o / total;
+    out[((size_t)t * p.n_heads + h) * DIM + threadIdx.x] = o / total;
+}
+
+extern "C" __global__ void __launch_bounds__(ATT_QWEN_DIM) attention_tile_combine(
+    float* out, const float* partials, AttentionTileParams p) {
+    AttentionRelParams r = {p.n_heads, ATT_QWEN_DIM, p.n_kv_heads, p.pos, p.first, p.chunks, p.chunk, p.count, 0, 0, 0, 0, 0};
+    attention_tile_combine_body<ATT_QWEN_DIM, false>(out, partials, 0, r);
+}
+
+extern "C" __global__ void __launch_bounds__(128) attention_rel_tile_combine(
+    float* out, const float* partials, const float* sinks, AttentionRelParams p) {
+    attention_tile_combine_body<128, true>(out, partials, sinks, p);
 }
 
 #endif

@@ -5,6 +5,23 @@
 // are settled by comparing with the midpoints between them, which are
 // exact, since the division that guesses them is not correctly rounded.
 
+// The multiple of the scale `d` nearest `x`.
+__device__ __forceinline__ signed char quantized(float x, float d) {
+    float a = fabsf(x);
+    float n = 0.0f;
+    if (d > 0.0f) {
+        n = fminf(rintf(a / d), 128.0f);
+        if (a >= (n + 0.5f) * d) {
+            n += 1.0f;
+        } else if (n > 0.0f && a < (n - 0.5f) * d) {
+            n -= 1.0f;
+        }
+        n = fminf(n, 127.0f);
+    }
+    i32 q = (i32)n;
+    return (signed char)(x < 0.0f ? -q : q);
+}
+
 extern "C" __global__ void store_q8(signed char* quants, u16* scales, const float* src, StoreParams p) {
     u32 first = p.offset / CACHE_BLOCK;
     u32 b = first + blockIdx.x * blockDim.x + threadIdx.x;
@@ -20,20 +37,7 @@ extern "C" __global__ void store_q8(signed char* quants, u16* scales, const floa
     u32 bits = f32_to_f16(fminf(amax * (1.0f / 127.0f), 65504.0f));
     float d = f16_to_f32(bits);
     for (u32 i = 0; i < CACHE_BLOCK; i++) {
-        float x = block[i];
-        float a = fabsf(x);
-        float n = 0.0f;
-        if (d > 0.0f) {
-            n = fminf(rintf(a / d), 128.0f);
-            if (a >= (n + 0.5f) * d) {
-                n += 1.0f;
-            } else if (n > 0.0f && a < (n - 0.5f) * d) {
-                n -= 1.0f;
-            }
-            n = fminf(n, 127.0f);
-        }
-        i32 q = (i32)n;
-        quants[b * CACHE_BLOCK + i] = (signed char)(x < 0.0f ? -q : q);
+        quants[b * CACHE_BLOCK + i] = quantized(block[i], d);
     }
     scales[b] = (u16)bits;
 }

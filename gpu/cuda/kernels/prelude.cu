@@ -46,6 +46,30 @@ struct TileParams {
     u32 mode;
 };
 
+// One of the matrix multiplications of a grid that has several: where its
+// products go, its tiled weights and their scales, its tokens' halves, and
+// its shape, with how many groups of rows it is.
+struct TileJob {
+    void* out;
+    const unsigned char* w;
+    const unsigned char* scales;
+    const u16* x;
+    u32 rows;
+    u32 cols;
+    u32 tiles;
+    u32 groups;
+};
+
+// Most multiplications to a grid.
+#define TILE_JOBS 8
+
+// `jobs` multiplications of `count` tokens each.
+struct TileJobs {
+    TileJob job[TILE_JOBS];
+    u32 jobs;
+    u32 count;
+};
+
 struct RmsnormParams {
     u32 dim;
     float eps;
@@ -92,6 +116,94 @@ struct AttentionTileParams {
     u32 count;
     u32 chunks;
     u32 chunk;
+};
+
+// Attention with a bias by distance and a sink: `window` is how far back
+// a token attends, `ring` the rows the caches hold, `n_rel` the width of
+// the bias's projection for a head and `extent` the distances it has rows
+// for. The kernels on the tensor cores take chunks of `chunk` positions
+// from position `base` on, for `count` tokens.
+struct AttentionRelParams {
+    u32 n_heads;
+    u32 head_dim;
+    u32 n_kv_heads;
+    u32 pos;
+    u32 first;
+    u32 chunks;
+    u32 chunk;
+    u32 count;
+    u32 base;
+    u32 window;
+    u32 ring;
+    u32 n_rel;
+    u32 extent;
+};
+
+struct RouteParams {
+    u32 experts;
+    u32 k;
+    float scale;
+};
+
+struct ShortConvParams {
+    u32 n;
+    u32 channels;
+    u32 taps;
+    u32 heads;
+    u32 add;
+};
+
+// A convolution whose heads, `dim` long, are kept in a cache of `rows`
+// rows from position `pos` on, clipped or normalized as `kept` says with
+// `value` for the threshold or the epsilon; `width` is how long what the
+// clipped are scaled by is.
+struct ConvStoreParams {
+    u32 n;
+    u32 channels;
+    u32 taps;
+    u32 heads;
+    u32 dim;
+    u32 width;
+    u32 kept;
+    u32 pos;
+    u32 rows;
+    float value;
+};
+
+struct ClipParams {
+    u32 width;
+    u32 dim;
+    float threshold;
+};
+
+// Rows of `width` in `len` activations, and the experts to a token where
+// the rows are theirs.
+struct RowsParams {
+    u32 len;
+    u32 width;
+    u32 k;
+};
+
+struct SituParams {
+    u32 len;
+    u32 width;
+    float beta;
+    float linear_beta;
+};
+
+// A matmul by the experts' matrices, each `rows` by `cols` in `groups`
+// groups of rows of `tiles` tiles: `share` pairs of a token and an expert
+// share a row of the input, and with `direct` every pair is a tile of its
+// own.
+struct ExpertParams {
+    u32 rows;
+    u32 cols;
+    u32 tiles;
+    u32 groups;
+    u32 share;
+    u32 direct;
+    float beta;
+    float linear_beta;
 };
 
 struct StoreParams {
@@ -174,4 +286,18 @@ __device__ __forceinline__ float4 scale4(float4 a, float s) {
 
 __device__ __forceinline__ float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
+}
+
+// The two bf16 weights of a word, in memory order.
+// The SiTU activation of an expert's gate and up projections.
+__device__ __forceinline__ float situ(float g, float u, float beta, float linear_beta) {
+    return beta * tanhf(g / beta) * sigmoid(g) * linear_beta * tanhf(u / linear_beta);
+}
+
+__device__ __forceinline__ float bf16_lo(u32 pair) {
+    return __uint_as_float(pair << 16);
+}
+
+__device__ __forceinline__ float bf16_hi(u32 pair) {
+    return __uint_as_float(pair & 0xffff0000u);
 }

@@ -108,7 +108,9 @@ const MAX_KL: f64 = 1e-3;
 /// caches differently, and enough of those tip which expert is the
 /// eighth, after which the two runs are of slightly different networks.
 /// On an M5, the GPU is at most 1.9e-2 off, with the same top token at
-/// 171 of 172 checks; a kernel that is wrong is off by far more.
+/// 171 of 172 checks, and a GB10 through CUDA at most 2.1e-2, at 168,
+/// the other four where the CPU's first two are within four points of
+/// each other; a kernel that is wrong is off by far more.
 const MAX_KL_ROUTED: f64 = 5e-2;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;

@@ -203,6 +203,17 @@ impl Tensor {
 /// A device owns the memory the model computes in: weights are uploaded to it
 /// once, activations live in buffers allocated on it, and every operation runs
 /// on it. Operations may run lazily; reading a buffer back waits for them.
+/// What becomes of a head of a convolution's output before it is kept in
+/// a cache.
+#[derive(Clone, Copy)]
+pub enum Kept {
+    /// Scaled, and then down to a length of `threshold` if it is longer,
+    /// a head being `dim` long.
+    Clipped { dim: usize, threshold: f32 },
+    /// Divided by its root mean square, and scaled.
+    Normed { eps: f32 },
+}
+
 pub trait Device {
     /// A vector of f32 activations in device memory. Operations that work
     /// on rows of activations, one per token, take a buffer's length as a
@@ -258,6 +269,17 @@ pub trait Device {
     /// Copies a buffer out of device memory.
     fn read(&self, buf: &Self::Buffer) -> Vec<f32>;
 
+    /// A buffer copied out of device memory with each activation capped
+    /// softly: `cap * tanh(x / cap)`, what a model's logits go through
+    /// where it has a soft cap on them. The buffer is left undefined.
+    fn read_capped(&self, buf: &mut Self::Buffer, cap: f32) -> Vec<f32> {
+        let mut host = self.read(buf);
+        for x in &mut host {
+            *x = cap * (*x / cap).tanh();
+        }
+        host
+    }
+
     /// Copies `data` into a buffer of the same length.
     fn write(&self, buf: &mut Self::Buffer, data: &[f32]);
 
@@ -294,6 +316,15 @@ pub trait Device {
     /// `w` of shape `[rows, cols]`: `x` holds `cols` activations per token,
     /// and `out` `rows` per token.
     fn matmul(&self, out: &mut Self::Buffer, w: &Self::Weight, x: &Self::Buffer);
+
+    /// Several matrix multiplications, each an output, a weight and an
+    /// input as [`Self::matmul`] takes them: for a device that runs them
+    /// faster together than one after another.
+    fn matmuls(&self, jobs: &mut [(&mut Self::Buffer, &Self::Weight, &Self::Buffer)]) {
+        for (out, w, x) in jobs {
+            self.matmul(out, w, x);
+        }
+    }
 
     /// `x += w · input`, a row of `x` for each of `input`: a matrix
     /// multiplication whose result goes to the residual stream. `scratch`
@@ -344,6 +375,22 @@ pub trait Device {
     ) {
         self.copy(out, 0, x, 0, len);
         self.rmsnorm(out, weight, eps);
+    }
+
+    /// Several normalizations as [`Self::normalize`] is one, `outs[j]` of
+    /// `xs[j]` by `weights[j]`: the inputs of a layer's queries, keys and
+    /// values.
+    fn normalizes(
+        &self,
+        outs: &mut [&mut Self::Buffer],
+        xs: &[&Self::Buffer],
+        weights: &[&Self::Buffer],
+        len: usize,
+        eps: f32,
+    ) {
+        for (j, out) in outs.iter_mut().enumerate() {
+            self.normalize(out, xs[j], weights[j], len, eps);
+        }
     }
 
     /// Normalizes each `weight.len()`-long row of `x` by its root mean square,
@@ -524,6 +571,35 @@ pub trait Device {
         self.gated_update(x, &normed, &input, message);
     }
 
+    /// Several gates as [`Self::gate`] is one: `xs[j]` gets `messages[j]`
+    /// through the weights `weights[j]`, the projections down of the
+    /// input and of the message and then the gain and what is forgotten,
+    /// as `gate` takes them.
+    fn gates(
+        &self,
+        xs: &mut [&mut Self::Buffer],
+        messages: &[&Self::Buffer],
+        weights: &[[&Self::Weight; 4]],
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        for (j, x) in xs.iter_mut().enumerate() {
+            let [down_input, down_message, gain, forget] = weights[j];
+            self.gate(
+                x,
+                messages[j],
+                down_input,
+                down_message,
+                gain,
+                forget,
+                dim,
+                rank,
+                eps,
+            );
+        }
+    }
+
     /// A short causal convolution with a residual: each channel of `x`,
     /// which holds a row of channels per token, is convolved over the
     /// token and the `taps - 1` before it with its taps from `weight`,
@@ -556,6 +632,115 @@ pub trait Device {
         self.write(state, &host_state);
     }
 
+    /// Several mixes of the same states as [`Self::mix`] gives, `outs[j]`
+    /// with `queries[j]`; and, with `norms`, each then normalized in place
+    /// as [`Self::rmsnorm`] does, by `norms[j]` and with the epsilon
+    /// beside them: a matrix multiplication's input, which a device may
+    /// keep in half precision.
+    fn mixes(
+        &self,
+        outs: &mut [&mut Self::Buffer],
+        states: &[&Self::Buffer],
+        queries: &[&Self::Buffer],
+        eps: f32,
+        norms: Option<(&[&Self::Buffer], f32)>,
+    ) {
+        for (j, out) in outs.iter_mut().enumerate() {
+            self.mix(out, states, queries[j], eps);
+            if let Some((norms, eps)) = norms {
+                self.rmsnorm(out, norms[j], eps);
+            }
+        }
+    }
+
+    /// The feed-forward networks of each token's experts: `out` gets what
+    /// [`Self::expert_matmul`] gives through `down` of the
+    /// [`Self::situ`] of what it gives through `gate_up` of the token's
+    /// row of `x`, a row per expert of a token; the activation is `width`
+    /// wide. `scratch` is as long as the first matmul's output and `act`
+    /// as the activation, and both are left undefined.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_ffn(
+        &self,
+        out: &mut Self::Buffer,
+        gate_up: &Self::Weight,
+        gate_up_scale: &Self::Buffer,
+        down: &Self::Weight,
+        down_scale: &Self::Buffer,
+        x: &Self::Buffer,
+        ids: &Self::Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Self::Buffer,
+        act: &mut Self::Buffer,
+    ) {
+        expert_ffn(
+            self,
+            out,
+            gate_up,
+            gate_up_scale,
+            down,
+            down_scale,
+            x,
+            ids,
+            k,
+            width,
+            beta,
+            linear_beta,
+            scratch,
+            act,
+        );
+    }
+
+    /// `x += ` the convolution of `input` that [`Self::short_conv`] gives
+    /// without taps of the heads' own: a convolution whose output joins
+    /// the residual stream. `scratch` is as long as `x`, and is left
+    /// undefined.
+    fn short_conv_add(
+        &self,
+        x: &mut Self::Buffer,
+        input: &Self::Buffer,
+        state: &mut Self::Buffer,
+        weight: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+    ) {
+        self.short_conv(scratch, input, state, weight, None);
+        self.add(x, scratch);
+    }
+
+    /// The convolution of `x` that [`Self::short_conv`] gives, each head
+    /// of it clipped or normalized as `kept` says, with `scale` what
+    /// [`Self::clip`] scales by or the weight of [`Self::rmsnorm`], and
+    /// stored in `cache` as [`Self::store`] does: the row of the token at
+    /// position `p` in row `p % rows`, the first of the `n` at `pos`, each
+    /// `channels` wide. What a token's keys and values go through on
+    /// their way to the caches. `scratch` is as long as `x` and `wrapped`
+    /// may be, and both are left undefined.
+    #[allow(clippy::too_many_arguments)]
+    fn short_conv_store(
+        &self,
+        cache: &mut Self::Cache,
+        pos: usize,
+        rows: usize,
+        n: usize,
+        channels: usize,
+        x: &Self::Buffer,
+        state: &mut Self::Buffer,
+        weight: &Self::Buffer,
+        dynamic: Option<(&Self::Buffer, usize)>,
+        scale: &Self::Buffer,
+        kept: Kept,
+        scratch: &mut Self::Buffer,
+        wrapped: &mut Self::Buffer,
+    ) {
+        short_conv_store(
+            self, cache, pos, rows, n, channels, x, state, weight, dynamic, scale, kept, scratch,
+            wrapped,
+        );
+    }
+
     /// Scales each `scale.len()`-long row of `x` by `scale`, then each
     /// `dim`-long head of it down to a length of `threshold`, if it is
     /// longer.
@@ -563,6 +748,14 @@ pub trait Device {
         let mut host = self.read(x);
         Cpu.clip(&mut host, &self.read(scale), dim, threshold);
         self.write(x, &host);
+    }
+
+    /// Several clips as [`Self::clip`] is one: each the activations, what
+    /// scales them, a head's width and the threshold.
+    fn clips(&self, jobs: &mut [(&mut Self::Buffer, &Self::Buffer, usize, f32)]) {
+        for (x, scale, dim, threshold) in jobs {
+            self.clip(x, scale, *dim, *threshold);
+        }
     }
 
     /// Scales each of the `factors.len()` rows of `x` by its factor.
@@ -707,4 +900,65 @@ pub trait Device {
 pub fn cache_bytes(len: usize) -> usize {
     assert!(len.is_multiple_of(CACHE_BLOCK));
     len + len / CACHE_BLOCK * 2
+}
+
+/// [`Device::short_conv_store`] an operation at a time: the convolution,
+/// what `kept` does to it, and the rows stored, in two parts where the
+/// batch runs past the end of the cache's rows, the second from its start.
+#[allow(clippy::too_many_arguments)]
+pub fn short_conv_store<D: Device + ?Sized>(
+    d: &D,
+    cache: &mut D::Cache,
+    pos: usize,
+    rows: usize,
+    n: usize,
+    channels: usize,
+    x: &D::Buffer,
+    state: &mut D::Buffer,
+    weight: &D::Buffer,
+    dynamic: Option<(&D::Buffer, usize)>,
+    scale: &D::Buffer,
+    kept: Kept,
+    scratch: &mut D::Buffer,
+    wrapped: &mut D::Buffer,
+) {
+    d.short_conv(scratch, x, state, weight, dynamic);
+    match kept {
+        Kept::Clipped { dim, threshold } => d.clip(scratch, scale, dim, threshold),
+        Kept::Normed { eps } => d.rmsnorm(scratch, scale, eps),
+    }
+    let at = pos % rows;
+    let first = n.min(rows - at);
+    if first < n {
+        let rest = (n - first) * channels;
+        d.resize(wrapped, rest);
+        d.copy(wrapped, 0, scratch, first * channels, rest);
+        d.store(cache, 0, wrapped);
+        d.resize(scratch, first * channels);
+    }
+    d.store(cache, at * channels, scratch);
+    d.resize(scratch, n * channels);
+}
+
+/// [`Device::expert_ffn`] an operation at a time.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_ffn<D: Device + ?Sized>(
+    d: &D,
+    out: &mut D::Buffer,
+    gate_up: &D::Weight,
+    gate_up_scale: &D::Buffer,
+    down: &D::Weight,
+    down_scale: &D::Buffer,
+    x: &D::Buffer,
+    ids: &D::Buffer,
+    k: usize,
+    width: usize,
+    beta: f32,
+    linear_beta: f32,
+    scratch: &mut D::Buffer,
+    act: &mut D::Buffer,
+) {
+    d.expert_matmul(scratch, gate_up, gate_up_scale, x, ids, k);
+    d.situ(act, scratch, width, beta, linear_beta);
+    d.expert_matmul(out, down, down_scale, act, ids, k);
 }
