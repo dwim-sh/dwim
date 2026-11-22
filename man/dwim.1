@@ -131,16 +131,20 @@ until one ends.
 .BI \-\-reasoning\-effort " effort"
 How much the model reasons before it replies:
 .BR xhigh ,
+.BR high ,
 .BR medium ,
 or
 .B low
 (default).
-The model's chat template asks for it with a line at the start of the
+Qwen's chat template asks for it with a line at the start of the
 system prompt, for
 .B xhigh
 and
 .B low
-only.
+only; the line for
+.B high
+is dwim's own.
+Inkling is told it as a number.
 A host is asked for it with the request, and writes the line itself.
 .B low
 asks for the briefest thoughts, which the thinking budget cuts short
