@@ -1,8 +1,9 @@
 // Normalizes each row of x by its root mean square and scales it by the
 // weight, in place, or into `out` as halves: one block of 256 threads per
-// row. The row is read as vectors of four, a thread looping over its share
-// of them, so that a row of any length is handled; a length not a multiple
-// of four leaves a tail of scalars that the first threads of the block take.
+// row. A row whose length is a multiple of four is read as vectors of
+// four, a thread looping over its share of them; a row whose start is not
+// on a vector, which is the rest when the length is not, is read
+// element by element instead.
 
 template <bool HALVES>
 __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const float4* weight, RmsnormParams p) {
@@ -10,17 +11,21 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
     const u32 lid = threadIdx.x;
     const u32 lane = lid & 31;
     const u32 warp = lid >> 5;
-    const u32 vectors = p.dim / 4;
-    const u32 tail = p.dim - vectors * 4;
-    const u32 base = blockIdx.x * vectors;
     float ss = 0.0f;
-    for (u32 i = lid; i < vectors; i += 256) {
-        float4 v = x[base + i];
-        ss += dot4(v, v);
-    }
-    if (tail && lid < tail) {
-        float v = ((const float*)x)[base * 4 + vectors * 4 + lid];
-        ss += v * v;
+    if (p.dim % 4 == 0) {
+        const u32 vectors = p.dim / 4;
+        const u32 base = blockIdx.x * vectors;
+        for (u32 i = lid; i < vectors; i += 256) {
+            float4 v = x[base + i];
+            ss += dot4(v, v);
+        }
+    } else {
+        const float* xf = (const float*)x;
+        const u32 base = blockIdx.x * p.dim;
+        for (u32 i = lid; i < p.dim; i += 256) {
+            float v = xf[base + i];
+            ss += v * v;
+        }
     }
     float s = warp_sum(ss);
     if (lane == 0) {
@@ -32,22 +37,28 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
         total += partial[i];
     }
     float scale = rsqrtf(total / (float)p.dim + p.eps);
-    for (u32 i = lid; i < vectors; i += 256) {
-        float4 v = mul4(scale4(x[base + i], scale), weight[i]);
-        if (HALVES) {
-            ((uint2*)out)[base + i] = halves4(v);
-        } else {
-            ((float4*)out)[base + i] = v;
+    if (p.dim % 4 == 0) {
+        const u32 vectors = p.dim / 4;
+        const u32 base = blockIdx.x * vectors;
+        for (u32 i = lid; i < vectors; i += 256) {
+            float4 v = mul4(scale4(x[base + i], scale), weight[i]);
+            if (HALVES) {
+                ((uint2*)out)[base + i] = halves4(v);
+            } else {
+                ((float4*)out)[base + i] = v;
+            }
         }
-    }
-    if (tail && lid < tail) {
-        float v = ((const float*)x)[base * 4 + vectors * 4 + lid];
-        float w = ((const float*)weight)[vectors * 4 + lid];
-        float r = v * scale * w;
-        if (HALVES) {
-            ((u16*)out)[base * 4 + vectors * 4 + lid] = (u16)f32_to_finite_f16(r);
-        } else {
-            ((float*)out)[base * 4 + vectors * 4 + lid] = r;
+    } else {
+        const float* xf = (const float*)x;
+        const float* wf = (const float*)weight;
+        const u32 base = blockIdx.x * p.dim;
+        for (u32 i = lid; i < p.dim; i += 256) {
+            float r = xf[base + i] * scale * wf[i];
+            if (HALVES) {
+                ((u16*)out)[base + i] = (u16)f32_to_finite_f16(r);
+            } else {
+                ((float*)out)[base + i] = r;
+            }
         }
     }
 }
