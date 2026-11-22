@@ -34,6 +34,7 @@ use std::{
     env,
     fs::{self, File},
     io::{self, ErrorKind, Read, Write},
+    mem,
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
@@ -162,6 +163,8 @@ pub struct Bash {
     calls: usize,
     /// Most bytes of a stream kept in its file.
     retain: u64,
+    /// Whether the last command changed the files of the project.
+    altered: bool,
 }
 
 /// Tells apart the output directories of the tools of one process.
@@ -177,6 +180,7 @@ impl Default for Bash {
             outputs: tmp.join(format!("dwim-{}-{n}", process::id())),
             calls: 0,
             retain: RETAINED,
+            altered: false,
         }
     }
 }
@@ -187,6 +191,12 @@ impl Bash {
     /// that has what the project needs installed.
     pub fn set_shell(&mut self, shell: PathBuf) {
         self.shell = shell;
+    }
+
+    /// Whether the last command changed the files of the project, as far
+    /// as git tells: asked once of a command, and not so afterwards.
+    pub fn altered(&mut self) -> bool {
+        mem::take(&mut self.altered)
     }
 
     /// The file for the `stream` of the command being run.
@@ -217,6 +227,7 @@ impl Bash {
         if discards(command, dir) && changed(dir) {
             return Err(DISCARDS.to_string());
         }
+        let before = work_tree(dir);
         self.calls += 1;
         // `set -o pipefail` first, by itself, so that a shell without it
         // runs the command all the same.
@@ -271,6 +282,7 @@ impl Bash {
             Ok(status) => ended(status),
             Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
+        self.altered = before.is_some() && work_tree(dir) != before;
         Ok(report(&stdout, &stderr, &status))
     }
 }
@@ -334,6 +346,31 @@ fn changed(dir: &Path) -> bool {
         .current_dir(dir)
         .output()
         .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+/// The state of the git work tree at `dir`, to tell whether a command
+/// changed it: which files differ from the last commit or are new, and
+/// what the tracked ones differ by. None if it is not a work tree. A
+/// command that edits files, as `sed -i` or a script does, is a change to
+/// the project as much as a call of edit is, and a model that works
+/// through the shell alone makes all its changes so: Inkling 2 Mini made
+/// 1,706 of its 1,885 calls on SWE-bench Verified Mini with bash, and 16
+/// with edit. What a command changes in a file that is new and not
+/// tracked, after it is first written, is not seen.
+fn work_tree(dir: &Path) -> Option<Vec<u8>> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+    };
+    let mut state = git(&["status", "--porcelain"])?;
+    state.extend(git(&["diff", "HEAD"]).unwrap_or_default());
+    Some(state)
 }
 
 /// Removes the output directories in `tmp` of dwim processes that are no

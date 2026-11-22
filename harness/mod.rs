@@ -110,7 +110,7 @@ pub const NUDGE_AFTER: usize = 20;
 /// [`NUDGE_AFTER`] calls without a change: a reminder, which it may follow
 /// with a change or with what it still needs to find out, and which takes
 /// nothing from it, neither its thought nor its tools.
-const NUDGE: &str = "<system-reminder>You have made many tool calls since you last changed a file. If you know what to change, make the change now with edit, then run the reproduction or the tests to check it. If you don't, say in a sentence what you still need to find out, and find that out next.</system-reminder>";
+const NUDGE: &str = "<system-reminder>You have made many tool calls since you last changed a file. If you know what to change, make the change now, then run the reproduction or the tests to check it. If you don't, say in a sentence what you still need to find out, and find that out next.</system-reminder>";
 
 /// Most times in a turn the model is told to go on in auto mode: enough
 /// for the status reports of a long task, few enough that one that never

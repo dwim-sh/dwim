@@ -211,7 +211,8 @@ impl Tools {
 
     /// Runs a call, returning what the model should see, and notes for
     /// the step of the plan under way what the call changed, or the
-    /// command it ran and whether that succeeded.
+    /// command it ran and whether that succeeded. A command changed a
+    /// file if the project's files are not as they were before it.
     pub fn run(&mut self, call: &ToolCall) -> Output {
         let Some(tool) = tool(&call.name) else {
             return Output::of(Err(format!("unknown tool '{}'", call.name)), false);
@@ -226,7 +227,8 @@ impl Tools {
                 self.plan.ran(command, bash::succeeded(text));
             }
         }
-        Output::of(result, tool.changes)
+        let changed = tool.changes || self.bash.altered();
+        Output::of(result, changed)
     }
 }
 
@@ -238,7 +240,7 @@ pub struct Output {
 
 impl Output {
     /// What the model sees of a call's result, marked `error:` if it went
-    /// wrong, which changed a file if the tool `changes` one and it did
+    /// wrong, which changed a file if the call `changes` one and it did
     /// not.
     fn of(result: Result<String, String>, changes: bool) -> Self {
         match result {
@@ -415,6 +417,34 @@ mod tests {
         assert!(!refused.changed);
         let read = tools.run(&call(r#"{"name": "read", "arguments": {"path": "a.txt"}}"#));
         assert!(!read.changed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn says_whether_a_command_changed_a_file() {
+        // In a git work tree, a command that changes a tracked file or
+        // adds one has changed a file, each time it does, and one that
+        // only reads has not.
+        let dir = std::env::temp_dir().join(format!("dwim-tools-bash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tools = Tools::new(&dir);
+        let mut bash = |command: &str| {
+            let written =
+                serde_json::json!({ "name": "bash", "arguments": { "command": command } });
+            tools.run(&call(&written.to_string()))
+        };
+        let outside = bash("echo one > a.txt");
+        assert!(!outside.changed, "{}", outside.text);
+        let made = bash(
+            "git init -q && git add a.txt && git -c user.name=t -c user.email=t@t commit -qm a",
+        );
+        assert!(made.text.ends_with("[exit code 0]"), "{}", made.text);
+        assert!(!bash("cat a.txt").changed);
+        assert!(bash("echo two > a.txt").changed);
+        assert!(!bash("git diff").changed);
+        assert!(bash("echo three > a.txt").changed);
+        assert!(bash("echo new > b.txt").changed);
+        assert!(!bash("ls").changed);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
