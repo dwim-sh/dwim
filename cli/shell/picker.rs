@@ -324,38 +324,44 @@ mod tests {
                 Group {
                     provider: Kind::Local,
                     name: "Local",
-                    models: vec![Model::Qwen27b],
+                    models: vec![Model::InklingMini],
                 },
                 Group {
                     provider: Kind::OpenRouter,
                     name: "OpenRouter",
-                    models: vec![Model::Qwen27b, Model::QwenMax],
+                    models: vec![Model::InklingMini, Model::InklingSmall],
                 },
             ],
             false,
             Some(Kind::Local),
-            Model::Qwen27b,
+            Model::InklingMini,
         )
     }
 
     #[test]
     fn picks_a_model_at_the_provider_turned_to() {
         let mut picker = picker();
-        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::InklingMini)));
         picker.turn(true);
-        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Model::Qwen27b)));
+        assert_eq!(
+            picker.picked(),
+            Some((Kind::OpenRouter, Model::InklingMini))
+        );
         picker.step(true);
-        assert_eq!(picker.picked(), Some((Kind::OpenRouter, Model::QwenMax)));
+        assert_eq!(
+            picker.picked(),
+            Some((Kind::OpenRouter, Model::InklingSmall))
+        );
     }
 
     #[test]
     fn does_not_pick_a_model_the_provider_does_not_run() {
         let mut picker = picker();
         picker.step(true);
-        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::InklingMini)));
         picker.turn(true);
         picker.step(true);
         picker.turn(false);
-        assert_eq!(picker.picked(), Some((Kind::Local, Model::Qwen27b)));
+        assert_eq!(picker.picked(), Some((Kind::Local, Model::InklingMini)));
     }
 }

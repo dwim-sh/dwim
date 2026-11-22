@@ -11,8 +11,8 @@ The agent, the model, and the engine that runs it, in one Rust program.
 Local by default: no API key, no cloud, and nothing leaves your machine
 unless you send a session to a bigger model.
 
-[![Model: Qwen3.8-27B](https://img.shields.io/badge/Model-Qwen3.8--27B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-27B)
-[![Model: Qwen3.8-2.4T-A95B](https://img.shields.io/badge/Model-Qwen3.8--2.4T--A95B-3ec98a)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
+[![Model: Inkling-2-Mini](https://img.shields.io/badge/Model-Inkling--2--Mini-3ec98a)](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
+[![Model: Inkling-2-Small](https://img.shields.io/badge/Model-Inkling--2--Small-3ec98a)](https://openrouter.ai/thinkingmachines/inkling-2-small)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
 </div>
@@ -43,7 +43,7 @@ make install                     # in ~/.local
 make install PREFIX=/usr/local   # system-wide, which may need sudo
 ```
 
-Either way, the model (16 GB) is downloaded on first use into your
+Either way, the model (17.6 GB) is downloaded on first use into your
 Hugging Face cache, where `hf download` and other tools would put it, and
 used from there if one of them already did. `dwim --download` fetches it
 ahead of time.
@@ -53,13 +53,11 @@ ahead of time.
 - **Local by default.** Runs commands, reads their output, and keeps
   going, all on your machine.
 - **A bigger model when you need it.** `/provider` signs in to OpenRouter
-  in your browser, and `/model` moves the session to Qwen3.8 Max there,
+  in your browser, and `/model` moves the session to Inkling-2-Small there,
   and back. The conversation goes with it. With a key in
-  `AI_GATEWAY_API_KEY`, Vercel's AI Gateway runs the models too, and with
-  one in `CEREBRAS_API_KEY`, Cerebras runs Qwen3.8-27B.
-- **Qwen3.8-27B.** At four bits, 16 GB, on a machine with 32 GiB of memory
-  or more, decoding several tokens at a time with the drafter its file
-  ships.
+  `AI_GATEWAY_API_KEY`, Vercel's AI Gateway runs the models too.
+- **Inkling-2-Mini.** 26B parameters, 3.4B active, at four bits, 17.6 GB,
+  on a machine with 32 GiB of memory or more.
 - **Fast local inference.** Metal on macOS, CUDA or Vulkan on Linux.
 - **Built-in local inference server.** The model is loaded once, in a
   `dwim` server that every `dwim` you run connects to. The first one starts
@@ -102,14 +100,14 @@ man dwim
 
 ## Performance
 
-How fast the local model, Qwen3.8-27B at four bits, reads a prompt
+How fast the local model, Inkling-2-Mini at four bits, reads a prompt
 (prefill) and writes its reply (decode), measured on the prompt "Summarize
 this repository in one paragraph":
 
-| Machine               |   Prefill |   Decode |
-|-----------------------|----------:|---------:|
-| NVIDIA DGX Spark      | 882 tok/s | 33 tok/s |
-| MacBook Pro, Apple M5 |  88 tok/s | 10 tok/s |
+| Machine               |    Prefill |   Decode |
+|-----------------------|-----------:|---------:|
+| NVIDIA DGX Spark      | 2090 tok/s | 38 tok/s |
+| MacBook Pro, Apple M5 |  240 tok/s | 20 tok/s |
 
 `dwim --bench` measures both on your machine, at several depths of
 context.

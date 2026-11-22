@@ -74,22 +74,22 @@ or
 .TP
 .BI \-\-model " model"
 Model to run, by name:
-.B qwen3.8\-27b
+.B inkling2\-mini
 (default), which
 .B medium
-also names;
-.BR qwen3.8\-2.4t\-a95b ,
-of the same family, which
-.B large
 also names; or
-.BR inkling2\-mini .
-The large model takes more memory than a machine
-has, and runs only at a provider.
+.BR inkling2\-small ,
+which
+.B large
+also names.
 .B inkling2\-mini
 runs at OpenRouter, and on this machine on Metal and on CUDA: its
 experts' weights are in NVFP4, the format they were trained in, which
 Vulkan does not take. It decodes several tokens at a time with its
 drafter, a second file, where the model keeps what is drafted.
+.B inkling2\-small
+takes more memory than a machine has, and runs only at OpenRouter or
+Vercel's AI Gateway.
 .TP
 .BI \-\-provider " provider"
 Where the model runs:
@@ -103,15 +103,14 @@ at Vercel's AI Gateway, with the key in
 .BR AI_GATEWAY_API_KEY ,
 or
 .BR cerebras ,
-at Cerebras, which runs the medium model only, with the key in
+at Cerebras, with the key in
 .BR CEREBRAS_API_KEY ;
 where the variable is not set, the key is the one kept from signing in
 with
 .BR /login .
 Without the option, the model runs on this machine where it can, and
 where it cannot, at OpenRouter if there is a key to it, or else at
-Vercel's AI Gateway if there is a key to that, or else, for the medium
-model, at Cerebras if there is a key to that, passing over a provider
+Vercel's AI Gateway if there is a key to that, passing over a provider
 that is disabled in
 .IR config.json ,
 which the model runs at only when the option names it. A session at any
@@ -394,14 +393,14 @@ on a line with text clears it.
 If present in the working directory, its contents are given to the agent as
 project instructions.
 .TP
-.I ~/.cache/huggingface/hub/models\-\-bartowski\-\-Qwen3.8\-27B\-GGUF/
+.I ~/.cache/huggingface/hub/models\-\-unsloth\-\-Inkling\-2\-Mini\-GGUF/
 The model, downloaded on first use from its repository on Hugging Face at a
 pinned revision, and kept in the Hugging Face cache as the
 .B huggingface_hub
 library and the tools built on it keep theirs, so that a copy any of them
 downloaded is used, and the copy
 .B dwim
-downloads is theirs to use. The weights, 16 GB, are in
+downloads is theirs to use. The weights, 17.6 GB, are in
 .IR snapshots/<revision>/ ,
 each a link to its content in
 .IR blobs/ ,
@@ -525,7 +524,7 @@ The key to Vercel's AI Gateway, for a model that runs there, used
 instead of the one kept from signing in. The Vercel dashboard makes one.
 .TP
 .B CEREBRAS_API_KEY
-The key to Cerebras, for the medium model to run there, used instead of
+The key to Cerebras, for a model that runs there, used instead of
 the one kept from signing in. The Cerebras cloud console makes one. Its free tier has room for 65536 tokens of
 conversation, which
 .B \-\-context

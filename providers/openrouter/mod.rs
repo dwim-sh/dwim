@@ -50,6 +50,7 @@ pub fn model(model: Model) -> &'static str {
         Model::Qwen27b => "qwen/qwen3.8-27b",
         Model::QwenMax => "qwen/qwen3.8-2.4t-a95b",
         Model::InklingMini => "thinkingmachines/inkling-2-mini",
+        Model::InklingSmall => "thinkingmachines/inkling-2-small",
     }
 }
 

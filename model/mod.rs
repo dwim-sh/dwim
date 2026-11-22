@@ -32,49 +32,66 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// family's own is in its directory, and is reached through the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Model {
-    /// Qwen3.8-27B, which runs on this machine: the model dwim runs unless
-    /// told to run another.
+    /// Inkling 2 Mini, Thinking Machines' looped model of 26 billion
+    /// parameters, of which 3.4 billion are active for a token: it runs on
+    /// this machine, where the GPU takes its weights, and at OpenRouter.
+    /// The model dwim runs unless told to run another.
     #[default]
+    InklingMini,
+    /// Inkling 2 Small, the larger of the Inkling 2 models: it takes more
+    /// memory than a machine has, and runs where a provider has it.
+    InklingSmall,
+    /// Qwen3.8-27B, which runs on this machine.
     Qwen27b,
     /// Qwen3.8-2.4T-A95B, the open weights of Qwen3.8 Max: 2.4 trillion
     /// parameters, of which 95 billion are active for a token. It takes
     /// more memory than a machine has, and runs where a provider has it.
     QwenMax,
-    /// Inkling 2 Mini, Thinking Machines' looped model of 26 billion
-    /// parameters, of which 3.4 billion are active for a token: it runs on
-    /// this machine, where the GPU takes its weights, and at OpenRouter.
-    InklingMini,
 }
 
 impl Model {
-    /// Every model there is.
-    pub const ALL: [Model; 3] = [Model::Qwen27b, Model::QwenMax, Model::InklingMini];
+    /// Every model there is, in the order the shell's pickers show them:
+    /// the Inkling 2 models, and the Qwen models, which the pickers do not
+    /// show but the command line still names.
+    pub const ALL: [Model; 4] = [
+        Model::InklingMini,
+        Model::InklingSmall,
+        Model::Qwen27b,
+        Model::QwenMax,
+    ];
+
+    /// The models the shell's pickers show, in the order they are shown:
+    /// the Inkling 2 ones, which go by their sizes too.
+    pub const SHOWN: [Model; 2] = [Model::InklingMini, Model::InklingSmall];
 
     /// The model's name.
     pub const fn name(self) -> &'static str {
         match self {
+            Model::InklingMini => "inkling2-mini",
+            Model::InklingSmall => "inkling2-small",
             Model::Qwen27b => "qwen3.8-27b",
             Model::QwenMax => "qwen3.8-2.4t-a95b",
-            Model::InklingMini => "inkling2-mini",
         }
     }
 
-    /// Another word the model goes by, if it has one: the Qwen models go
-    /// by their sizes too.
+    /// Another word the model goes by, if it has one: the Inkling 2 models
+    /// go by their sizes too.
     pub const fn alias(self) -> Option<&'static str> {
         match self {
-            Model::Qwen27b => Some("medium"),
-            Model::QwenMax => Some("large"),
-            Model::InklingMini => None,
+            Model::InklingMini => Some("medium"),
+            Model::InklingSmall => Some("large"),
+            Model::Qwen27b => None,
+            Model::QwenMax => None,
         }
     }
 
     /// The weights the model runs from on this machine, if it runs here.
     pub fn weights(self) -> Option<&'static Weights> {
         match self {
+            Model::InklingMini => Some(&inkling::INKLING_MINI),
+            Model::InklingSmall => None,
             Model::Qwen27b => Some(&qwen::QWEN_27B),
             Model::QwenMax => None,
-            Model::InklingMini => Some(&inkling::INKLING_MINI),
         }
     }
 
@@ -82,8 +99,8 @@ impl Model {
     /// at a host.
     pub const fn sampling(self) -> Sampling {
         match self {
+            Model::InklingMini | Model::InklingSmall => inkling::SAMPLING,
             Model::Qwen27b | Model::QwenMax => qwen::SAMPLING,
-            Model::InklingMini => inkling::SAMPLING,
         }
     }
 
@@ -91,8 +108,8 @@ impl Model {
     /// carries.
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {
         match self {
+            Model::InklingMini | Model::InklingSmall => inkling::format(gguf),
             Model::Qwen27b | Model::QwenMax => qwen::format(gguf),
-            Model::InklingMini => inkling::format(gguf),
         }
     }
 }
@@ -112,7 +129,7 @@ impl FromStr for Model {
             .into_iter()
             .find(|model| value == model.name() || Some(value) == model.alias())
             .ok_or_else(|| {
-                let models: Vec<String> = Model::ALL
+                let models: Vec<String> = Model::SHOWN
                     .iter()
                     .map(|model| match model.alias() {
                         Some(alias) => format!("{model} or {alias}"),
