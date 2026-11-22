@@ -140,6 +140,14 @@ impl Opts {
             shell: self.shell.clone(),
         }
     }
+
+    /// The prompt to answer without the shell: the words after the
+    /// options, or none when there are none or they are all blank.
+    pub fn prompt(&self) -> Option<String> {
+        let prompt = self.prompt.join(" ");
+        let prompt = prompt.trim();
+        (!prompt.is_empty()).then(|| prompt.to_string())
+    }
 }
 
 /// A thinking budget as the command line and the `/thinking-budget`

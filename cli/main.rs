@@ -29,7 +29,6 @@ fn main() {
 
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let settings = opts.settings();
-    let prompt = opts.prompt.join(" ");
     if opts.download {
         let mut stderr = Stderr::new();
         let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
@@ -45,8 +44,8 @@ fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         return serve::serve(&settings);
     }
     let log = Log::open(opts.transcript.as_deref())?;
-    match prompt.trim() {
-        "" => shell::run(settings, opts.thinking, log),
-        prompt => once::once(&settings, prompt, opts.stats, log),
+    match opts.prompt() {
+        None => shell::run(settings, opts.thinking, log),
+        Some(prompt) => once::once(&settings, &prompt, opts.stats, log),
     }
 }
