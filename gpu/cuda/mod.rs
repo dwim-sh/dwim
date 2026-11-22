@@ -1200,7 +1200,11 @@ fn compile(cc: i32) -> Result<(Ptx, i32), Box<dyn Error>> {
     ];
     let source = format!(
         "#define TILE_STAGES {TILE_STAGES}\n{}",
-        KERNELS.map(|(_, source)| source).join("\n")
+        KERNELS
+            .iter()
+            .map(|(name, source)| format!("#line 1 \"kernels/{name}.cu\"\n{source}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     let mut log = String::new();
     for &(known, arch) in ARCHS.iter().filter(|&&(known, _)| known <= cc) {
