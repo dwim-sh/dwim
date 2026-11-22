@@ -44,7 +44,9 @@ pub struct Settings {
     pub sessions: Option<usize>,
     /// Most tokens of a thought, if they are limited.
     pub thinking_budget: Option<usize>,
-    pub effort: Effort,
+    /// How much the model reasons, or as much as the model does unless
+    /// told.
+    pub effort: Option<Effort>,
     /// The sampling temperature, or the model file's.
     pub temperature: Option<f32>,
     /// Tokens the model drafts after each token picked, or none.
@@ -54,6 +56,13 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// How much the model reasons: as the command line says, or as the
+    /// model does unless told, which goes with the model when another is
+    /// picked.
+    fn effort(&self) -> Effort {
+        self.effort.unwrap_or(self.model.effort())
+    }
+
     /// The server the settings ask for.
     fn server(&self) -> server::Options {
         server::Options {
@@ -351,7 +360,7 @@ pub fn harness(
         log,
         settings.model.name(),
         &device,
-        settings.effort,
+        settings.effort(),
         &system,
     );
     Ok(harness)
@@ -420,7 +429,7 @@ pub fn open(
     // A host writes the effort's line into the prompt itself, as the
     // model's chat template does, so the line is written here only for
     // the model run here.
-    let effort = settings.effort;
+    let effort = settings.effort();
     let system = harness::system_prompt(
         &env::current_dir()?,
         (kind == Kind::Local).then_some(effort),
