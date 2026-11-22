@@ -870,9 +870,7 @@ impl<S: Session> Harness<S> {
                 }
             };
             self.log.reply(
-                &reply.calls,
-                reply.thought_ended,
-                reply.cut,
+                &reply,
                 self.session.tokens(),
                 &before,
                 &self.session.stats(),
@@ -1037,9 +1035,10 @@ impl<S: Session> Harness<S> {
                 on_event(Event::Text(text.to_string()))
             })?;
         self.log.reply(
-            &[],
-            false,
-            answer.cut,
+            &crate::model::Reply {
+                cut: answer.cut,
+                ..Default::default()
+            },
             self.session.tokens(),
             &before,
             &self.session.stats(),
