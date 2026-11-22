@@ -27,8 +27,6 @@ fn main() {
     }
 }
 
-/// What dwim does with its options: download the model, time it, run the
-/// server, or run a session, with the prompt if there is one.
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let settings = opts.settings();
     let prompt = opts.prompt.join(" ");
