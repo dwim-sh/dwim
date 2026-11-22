@@ -26,6 +26,7 @@ pub const QWEN_27B: Weights = Weights {
     repo: "bartowski/Qwen3.8-27B-GGUF",
     revision: "87410e7b9a5c21e6ca70c0c9cc5237de909fe621",
     file: FILE,
+    drafter: None,
     files: &[File {
         name: FILE,
         digest: "5eb1de39e9b42aa7f99f1a4fe149d1952cc8103c698cf380b15a43d47e72b7c7",

@@ -20,6 +20,10 @@ pub struct Weights {
     /// The file holding the model: a GGUF file, which carries the
     /// tokenizer and the sampling settings too.
     pub file: &'static str,
+    /// The file holding the model's drafter, where that is a file of its
+    /// own: a small network that drafts the tokens ahead, for the model
+    /// to verify several of at once.
+    pub drafter: Option<&'static str>,
     /// The files fetched.
     pub files: &'static [File],
 }
@@ -52,6 +56,12 @@ impl Weights {
     /// The file in `dir` that holds the model.
     pub fn path(&self, dir: &Path) -> PathBuf {
         dir.join(self.file)
+    }
+
+    /// The file in `dir` that holds the model's drafter, if it has one of
+    /// its own.
+    pub fn drafter_path(&self, dir: &Path) -> Option<PathBuf> {
+        self.drafter.map(|file| dir.join(file))
     }
 
     /// How much of the model is in `dir`.

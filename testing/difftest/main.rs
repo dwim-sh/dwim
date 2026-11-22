@@ -200,7 +200,7 @@ fn run() -> Result<bool> {
             None => {
                 let cpu = match &mut cpu {
                     Some(cpu) => cpu,
-                    None => cpu.insert(arch::load(gguf.clone(), Cpu, 4096, |_, _| {})?),
+                    None => cpu.insert(arch::load(gguf.clone(), None, Cpu, 4096, |_, _| {})?),
                 };
                 let start = Instant::now();
                 let run = Run::record(cpu, format.tokenizer(), prompt)?;
@@ -222,7 +222,7 @@ fn run() -> Result<bool> {
         Model::InklingMini => MAX_KL_ROUTED,
         Model::Qwen27b | Model::QwenMax => MAX_KL,
     };
-    let mut gpu = arch::load(gguf, Gpu::new()?, 4096, |_, _| {})?;
+    let mut gpu = arch::load(gguf, None, Gpu::new()?, 4096, |_, _| {})?;
     let mut agreed = true;
     for round in 0..args.repeat {
         for (name, want) in &expected {
