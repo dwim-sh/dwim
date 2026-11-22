@@ -55,11 +55,12 @@ pub trait Provider {
     ) -> Result<Completion>;
 
     /// Answers the message `chat` ends with plainly, under `heads` in
-    /// turn, in at most `limit` tokens, streaming the answer to `on_text`.
+    /// turn, each with its section's share of at most `limit` tokens,
+    /// streaming the answer to `on_text`.
     fn answer(
         &mut self,
         chat: &Chat,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         generation: &Generation,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
@@ -204,7 +205,7 @@ impl Provider for Any {
     fn answer(
         &mut self,
         chat: &Chat,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         generation: &Generation,
         on_text: impl FnMut(&str) -> ControlFlow<()>,

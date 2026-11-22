@@ -39,7 +39,20 @@ const NOTE_PROMPT: &str = "The conversation so far is about to be cleared to mak
 /// the next heading has it go on, so every note reaches Next, the section
 /// it acts on. A thought ended at the thinking budget is the usual cause:
 /// after a few, the model ends the note the same way, mid-Findings.
-const NOTE_HEADS: [&str; 4] = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
+///
+/// Each heading has its section's share of the note's tokens, in eighths.
+/// Findings has half: it is what the conversation was spent on, and what
+/// is not in it is read all over again. Next has a quarter. Task and Done
+/// have an eighth each: the note turn carries the user's messages as they
+/// were, and the working tree has what was changed. A small model fills
+/// whatever share a section has, so with a quarter each the findings were
+/// cut off after the facts of the task, before anything it had concluded.
+const NOTE_HEADS: [(&str, usize); 4] = [
+    ("Task:", 1),
+    ("\n\nFindings:", 4),
+    ("\n\nDone:", 1),
+    ("\n\nNext:", 2),
+];
 
 /// How the note turn opens after a compaction.
 const NOTE_HEAD: &str = "The conversation so far was compacted to make room in the context window. This is the note you wrote before it was cleared, to go on from:";
@@ -281,7 +294,7 @@ fn said(text: &mut String, messages: &[&str]) {
 /// Whether the model wrote nothing in `note`: it is blank, or it is the
 /// headings written for the model with nothing under any of them.
 fn note_empty(note: &str) -> bool {
-    let under = NOTE_HEADS.iter().try_fold(note.trim(), |rest, head| {
+    let under = NOTE_HEADS.iter().try_fold(note.trim(), |rest, (head, _)| {
         rest.strip_prefix(head.trim_start()).map(str::trim_start)
     });
     under.unwrap_or(note.trim()).is_empty()
@@ -513,6 +526,34 @@ mod tests {
             head.contains(&format!("<note>\n{written}\n</note>")),
             "{head}"
         );
+    }
+
+    #[test]
+    fn a_note_written_to_its_limit_is_mostly_findings() {
+        // A small model goes on under each heading for as long as it may.
+        // What it learned is under Findings, which has more of the note
+        // than the other three headings together.
+        let scripts = [reply(100, true), reply(100, false)];
+        let mut harness = harness(&scripts, 8000, &"z".repeat(4000));
+        send(&mut harness, "go");
+        let mut note = String::new();
+        harness
+            .compact(|event| {
+                if let Event::Note(text) = event {
+                    note.push_str(&text);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let sections: Vec<usize> = note
+            .split(|c| c != 'z')
+            .filter(|section| !section.is_empty())
+            .map(str::len)
+            .collect();
+        let [task, findings, done, next] = sections[..] else {
+            panic!("{note}")
+        };
+        assert!(findings > task + done + next, "{sections:?}");
     }
 
     #[test]

@@ -559,7 +559,10 @@ fn serve(
             };
             served.catch_up(&chat.system, before, states, progress)?;
             generation.apply(&mut served.session);
-            let heads: Vec<&str> = heads.iter().map(String::as_str).collect();
+            let heads: Vec<(&str, usize)> = heads
+                .iter()
+                .map(|(head, share)| (head.as_str(), *share))
+                .collect();
             let answer = served.session.answer(message, &heads, limit, |text| {
                 stream(Piece::Text(text.to_string()))
             })?;
@@ -917,7 +920,9 @@ mod tests {
         // A plain answer, under heads: the model says its piece under the
         // first and has nothing left for the second.
         let answer = a
-            .answer("note", &["A:", "B:"], 20, |_| ControlFlow::Continue(()))
+            .answer("note", &[("A:", 1), ("B:", 1)], 20, |_| {
+                ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(answer.text, "A:notedB:");
 

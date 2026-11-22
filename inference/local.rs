@@ -455,7 +455,7 @@ impl<M: LanguageModel> Session for Local<M> {
     fn answer(
         &mut self,
         message: &str,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer> {
@@ -467,20 +467,25 @@ impl<M: LanguageModel> Session for Local<M> {
         let mut text = Utf8Stream::default();
         let mut answer = String::new();
         let end = self.format.end_of_answer()?;
-        let heads: Vec<(&str, Vec<u32>)> = heads
+        // The shares of the sections yet to be written, this one's among
+        // them.
+        let mut shares: usize = heads.iter().map(|(_, share)| share).sum();
+        let heads: Vec<(&str, usize, Vec<u32>)> = heads
             .iter()
-            .map(|head| Ok((*head, self.format.tokenizer().encode(head)?)))
+            .map(|(head, share)| Ok((*head, *share, self.format.tokenizer().encode(head)?)))
             .collect::<Result<_>>()?;
         // Tokens of the heads yet to be written. Each section leaves room
         // for them, so that an answer cut for room still has every head:
         // only the sections are cut short.
-        let mut ahead: usize = heads.iter().map(|(_, tokens)| tokens.len()).sum();
+        let mut ahead: usize = heads.iter().map(|(_, _, tokens)| tokens.len()).sum();
         let mut cut = false;
         // A section for each head, or one for the whole answer.
         let sections = heads.len().max(1);
         let mut left = limit;
         'sections: for i in 0..sections {
-            if let Some((head, tokens)) = heads.get(i) {
+            // What is left is all this section's, unless a head says less.
+            let mut share = left;
+            if let Some((head, weight, tokens)) = heads.get(i) {
                 ahead -= tokens.len();
                 // Only the first head can want for room, with the heads
                 // after it and the end: each section leaves room for the
@@ -501,10 +506,13 @@ impl<M: LanguageModel> Session for Local<M> {
                 if flow.is_break() {
                     break;
                 }
+                // The section's share of what is left: as its weight is to
+                // the weights of the sections to come, so that what a
+                // section leaves goes to the ones after it, and the last
+                // has whatever is left.
+                share = left * weight / shares.max(1);
+                shares -= weight;
             }
-            // The section's share of what is left: an even share with the
-            // sections to come, so that the last has whatever is left.
-            let share = left / (sections - i);
             for _ in 0..share {
                 if !self.room(ahead + end.len(), 0) {
                     // The section ends here, and so does each to come,
@@ -1000,7 +1008,12 @@ mod tests {
         // The model ends its answer early, twice: each head pulls it on,
         // and the answer has every head.
         let mut session = session(&[" fix it.<|im_end|> none yet.<|im_end|>"]);
-        let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
+        let heads = [
+            ("Task:", 1),
+            ("\n\nFindings:", 1),
+            ("\n\nDone:", 1),
+            ("\n\nNext:", 1),
+        ];
         let mut streamed = String::new();
         let answer = session
             .answer("note", &heads, 100, |piece| {
@@ -1021,11 +1034,13 @@ mod tests {
             .unwrap();
         assert!(session.model.fed.ends_with(&expected));
 
-        // Each head has an even share of what is left of the limit, heads
-        // included, so the last has whatever is left.
+        // Each head has its share of what is left of the limit, heads
+        // included, so the last has whatever is left: an even share here.
         let mut shared = self::session(&["abcdefghij"]);
         let answer = shared
-            .answer("note", &["A:", "B:"], 8, |_| ControlFlow::Continue(()))
+            .answer("note", &[("A:", 1), ("B:", 1)], 8, |_| {
+                ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(answer.text, "A:abcB:d");
         assert_eq!(
@@ -1042,9 +1057,35 @@ mod tests {
         // from it.
         let mut session = self::session(&[" one.<|im_end|> two."]);
         let answer = session
-            .answer("note", &["A", "\nB"], 100, |_| ControlFlow::Continue(()))
+            .answer("note", &[("A", 1), ("\nB", 1)], 100, |_| {
+                ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(answer.text, "A one.\nB two.");
+    }
+
+    #[test]
+    fn a_section_has_its_share_of_the_answer() {
+        // The model goes on under every head for as long as it may, as a
+        // small one does, a token a letter. The second section's share is
+        // three times the others': of 36 tokens, 6 of them the heads, it
+        // has 19, and the others 6 and 5.
+        let script = "abcdefgjklmnopqrstuvwxyz0123456789";
+        let heads = [("A:", 1), ("B:", 3), ("C:", 1)];
+        let mut session = session(&[script]);
+        let answer = session
+            .answer("note", &heads, 36, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(answer.text, "A:abcdefB:gjklmnopqrstuvwxyz0C:12345");
+
+        // What a section leaves goes to the ones after it by their shares:
+        // the first says a letter and ends, and the other two have 24
+        // tokens and 7.
+        let mut session = self::session(&[&format!("a<|im_end|>{}", &script[1..])]);
+        let answer = session
+            .answer("note", &heads, 38, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(answer.text, "A:aB:bcdefgjklmnopqrstuvwxyz0C:1234567");
     }
 
     #[test]
@@ -1055,7 +1096,7 @@ mod tests {
         let mut session = session(&[" \u{e9}"]);
         let mut streamed = String::new();
         let answer = session
-            .answer("note", &["A:", "B:"], 7, |piece| {
+            .answer("note", &[("A:", 1), ("B:", 1)], 7, |piece| {
                 streamed.push_str(piece);
                 ControlFlow::Continue(())
             })
@@ -1071,7 +1112,12 @@ mod tests {
         // heads to come are written all the same, each with nothing
         // under it.
         let tokenizer = Tokenizer::tiny();
-        let heads = ["Task:", "\n\nFindings:", "\n\nDone:", "\n\nNext:"];
+        let heads = [
+            ("Task:", 1),
+            ("\n\nFindings:", 1),
+            ("\n\nDone:", 1),
+            ("\n\nNext:", 1),
+        ];
         let mut measure = Local::new(
             Scripted::new(&tokenizer, &[], 1 << 16),
             Arc::new(ChatMl::new(Tokenizer::tiny()).unwrap()),
@@ -1088,7 +1134,7 @@ mod tests {
                 .unwrap();
         let heads_len: usize = heads
             .iter()
-            .map(|head| tokenizer.encode(head).unwrap().len())
+            .map(|(head, _)| tokenizer.encode(head).unwrap().len())
             .sum();
         let system = tokenizer
             .encode_with_special("<|im_start|>system\nBe brief.<|im_end|>\n")
