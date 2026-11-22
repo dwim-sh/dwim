@@ -16,7 +16,7 @@ use ash::{
 };
 
 use crate::{
-    gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, quant},
+    gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, cache_bytes, quant},
     sys::memory,
 };
 
@@ -34,6 +34,14 @@ const BF16_TOKENS: usize = 8;
 const RING: usize = 4;
 const SUBMIT_EVERY: usize = 128;
 
+/// Multiply-adds of matrix products and attention recorded into a command
+/// buffer before it is submitted, however few kernels that is: a driver
+/// abandons a submission that runs for seconds as hung, and resets the
+/// GPU under it. A batch through a model's larger matrices is this many
+/// in a few kernels, and one through its experts in one, which is
+/// recorded as several.
+const SUBMIT_WORK: usize = 1 << 30;
+
 /// Positions one workgroup of the attention kernel takes.
 const CHUNK: usize = 128;
 
@@ -42,6 +50,11 @@ const CHUNK: usize = 128;
 /// the partials buffer. Longer batches are dispatched a few tokens at a
 /// time.
 const PARTIALS: usize = 16 << 20;
+
+/// Most storage buffers a kernel binds, and the bytes of the push
+/// constants it takes its sizes as.
+const BINDINGS: usize = 10;
+const PUSH_CONSTANTS: usize = 64;
 
 /// A vector of f32 activations in device memory.
 pub struct Buffer {
@@ -73,6 +86,7 @@ enum Format {
     Bf16,
     Q4_0,
     Q8_0,
+    Nvfp4,
 }
 
 struct Kernels {
@@ -90,20 +104,36 @@ struct Kernels {
     store_q8: vk::Pipeline,
     conv: vk::Pipeline,
     delta_net: vk::Pipeline,
+    expert_matmul_nvfp4: vk::Pipeline,
+    expert_matmul_q8_0: vk::Pipeline,
+    mix: vk::Pipeline,
+    gate: vk::Pipeline,
+    gated_update: vk::Pipeline,
+    short_conv: vk::Pipeline,
+    short_conv_state: vk::Pipeline,
+    clip: vk::Pipeline,
+    scale_rows: vk::Pipeline,
+    attention_rel: vk::Pipeline,
+    attention_rel_combine: vk::Pipeline,
+    route: vk::Pipeline,
+    situ: vk::Pipeline,
+    weighted_sum: vk::Pipeline,
 }
 
 impl Kernels {
     /// The bindings a kernel writes, as bits: the first, and for a few
     /// kernels a partials, state, scales, or cache binding too.
     fn written(&self, pipeline: vk::Pipeline) -> u32 {
-        if pipeline == self.attention {
+        if pipeline == self.attention || pipeline == self.attention_rel {
             0b100_0001
-        } else if pipeline == self.store_q8 {
+        } else if pipeline == self.store_q8 || pipeline == self.route {
             0b11
         } else if pipeline == self.delta_net {
             0b100_0001
         } else if pipeline == self.conv {
             0b1111
+        } else if pipeline == self.short_conv {
+            0b101
         } else {
             0b1
         }
@@ -113,10 +143,18 @@ impl Kernels {
     /// before it to have reached the end of the pipe when a buffer it binds
     /// was written since the last such wait: see `Vulkan::events`.
     fn matmul(&self, pipeline: vk::Pipeline) -> bool {
-        [self.matmul_bf16, self.matmul_q4_0, self.matmul_q8_0].contains(&pipeline)
+        [
+            self.matmul_bf16,
+            self.matmul_q4_0,
+            self.matmul_q8_0,
+            self.expert_matmul_nvfp4,
+            self.expert_matmul_q8_0,
+            self.gate,
+        ]
+        .contains(&pipeline)
     }
 
-    fn all(&self) -> [vk::Pipeline; 14] {
+    fn all(&self) -> [vk::Pipeline; 28] {
         [
             self.matmul_bf16,
             self.matmul_q4_0,
@@ -132,6 +170,20 @@ impl Kernels {
             self.store_q8,
             self.conv,
             self.delta_net,
+            self.expert_matmul_nvfp4,
+            self.expert_matmul_q8_0,
+            self.mix,
+            self.gate,
+            self.gated_update,
+            self.short_conv,
+            self.short_conv_state,
+            self.clip,
+            self.scale_rows,
+            self.attention_rel,
+            self.attention_rel_combine,
+            self.route,
+            self.situ,
+            self.weighted_sum,
         ]
     }
 }
@@ -193,8 +245,10 @@ struct Ring {
     recording: bool,
     /// Which command buffers are submitted and not yet waited for.
     in_flight: [bool; RING],
-    /// Kernels recorded into the current command buffer.
+    /// Kernels recorded into the current command buffer, and the
+    /// multiply-adds of the ones that are counted.
     recorded: usize,
+    work: usize,
     /// Buffers written since the last wait, by kernels and copies.
     written: Vec<vk::Buffer>,
     /// The command buffer of the ring whose submission reads each staging
@@ -315,9 +369,9 @@ impl Vulkan {
             }
             let event = device.create_event(&vk::EventCreateInfo::default(), None)?;
 
-            // Every kernel binds up to eight storage buffers, pushed with each
-            // dispatch, and takes its sizes as push constants.
-            let bindings: Vec<_> = (0..8)
+            // Every kernel binds up to `BINDINGS` storage buffers, pushed
+            // with each dispatch, and takes its sizes as push constants.
+            let bindings: Vec<_> = (0..BINDINGS as u32)
                 .map(|i| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(i)
@@ -336,7 +390,7 @@ impl Vulkan {
             let push_range = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(32)];
+                .size(PUSH_CONSTANTS as u32)];
             let layout = device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -384,6 +438,20 @@ impl Vulkan {
                 store_q8: spv!("store_q8"),
                 conv: spv!("conv"),
                 delta_net: spv!("delta_net"),
+                expert_matmul_nvfp4: spv!("expert_matmul_nvfp4"),
+                expert_matmul_q8_0: spv!("expert_matmul_q8_0"),
+                mix: spv!("mix"),
+                gate: spv!("gate"),
+                gated_update: spv!("gated_update"),
+                short_conv: spv!("short_conv"),
+                short_conv_state: spv!("short_conv_state"),
+                clip: spv!("clip"),
+                scale_rows: spv!("scale_rows"),
+                attention_rel: spv!("attention_rel"),
+                attention_rel_combine: spv!("attention_rel_combine"),
+                route: spv!("route"),
+                situ: spv!("situ"),
+                weighted_sum: spv!("weighted_sum"),
             };
 
             let mut gpu = Self {
@@ -422,6 +490,7 @@ impl Vulkan {
                     recording: false,
                     in_flight: [false; RING],
                     recorded: 0,
+                    work: 0,
                     written: Vec::new(),
                     staging_slot: [None; 2],
                     staging_next: 0,
@@ -518,6 +587,7 @@ impl Vulkan {
             }
             ring.recording = true;
             ring.recorded = 0;
+            ring.work = 0;
         }
         cmd
     }
@@ -651,17 +721,17 @@ impl Vulkan {
     ) {
         let cmd = self.cmd();
         self.wait_for_writes(cmd, pipeline, buffers);
-        // A kernel binds at most eight buffers; a thousand dispatches a token
+        // A kernel binds only so many buffers; a thousand dispatches a token
         // is worth not allocating for.
-        assert!(buffers.len() <= 8);
-        let mut infos = [vk::DescriptorBufferInfo::default(); 8];
+        assert!(buffers.len() <= BINDINGS && size_of::<P>() <= PUSH_CONSTANTS);
+        let mut infos = [vk::DescriptorBufferInfo::default(); BINDINGS];
         for (info, &buf) in infos.iter_mut().zip(buffers) {
             *info = vk::DescriptorBufferInfo::default()
                 .buffer(buf)
                 .offset(0)
                 .range(vk::WHOLE_SIZE);
         }
-        let mut writes = [vk::WriteDescriptorSet::default(); 8];
+        let mut writes = [vk::WriteDescriptorSet::default(); BINDINGS];
         for (i, (write, info)) in writes.iter_mut().zip(&infos).enumerate() {
             *write = vk::WriteDescriptorSet::default()
                 .dst_binding(i as u32)
@@ -694,6 +764,19 @@ impl Vulkan {
             ring.recorded
         };
         if recorded >= SUBMIT_EVERY {
+            self.submit();
+        }
+    }
+
+    /// Counts `work` multiply-adds of the kernel just recorded, and submits
+    /// what is recorded once it comes to [`SUBMIT_WORK`].
+    fn worked(&self, work: usize) {
+        let total = {
+            let mut ring = self.ring.lock().unwrap();
+            ring.work += work;
+            ring.work
+        };
+        if total >= SUBMIT_WORK {
             self.submit();
         }
     }
@@ -862,6 +945,98 @@ struct LenParams {
     len: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertParams {
+    rows: u32,
+    cols: u32,
+    k: u32,
+    per_token: u32,
+    first: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MixParams {
+    dim: u32,
+    count: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GateParams {
+    dim: u32,
+    rank: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShortConvParams {
+    n: u32,
+    channels: u32,
+    taps: u32,
+    heads: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ClipParams {
+    heads: u32,
+    width: u32,
+    dim: u32,
+    threshold: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RowsParams {
+    len: u32,
+    width: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttentionRelParams {
+    n_heads: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
+    pos: u32,
+    first: u32,
+    chunks: u32,
+    window: u32,
+    ring: u32,
+    n_rel: u32,
+    extent: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteParams {
+    n: u32,
+    experts: u32,
+    k: u32,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SituParams {
+    len: u32,
+    width: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WeightedSumParams {
+    len: u32,
+    width: u32,
+    k: u32,
+}
+
 impl Device for Vulkan {
     type Buffer = Buffer;
     type Weight = Weight;
@@ -909,6 +1084,10 @@ impl Device for Vulkan {
             free = free.min(available);
         }
         Some(free)
+    }
+
+    fn takes_nvfp4(&self) -> bool {
+        true
     }
 
     fn upload(&self, tensor: Tensor) -> Weight {
@@ -965,7 +1144,20 @@ impl Device for Vulkan {
                     format: Format::Q8_0,
                 }
             }
-            Tensor::Nvfp4 { .. } => panic!("{} does not take NVFP4 weights", self.name()),
+            Tensor::Nvfp4 {
+                shape,
+                scales,
+                quants,
+            } => {
+                assert_eq!(quants.len(), shape[0] * shape[1] / 2);
+                assert_eq!(scales.len(), shape[0] * shape[1] / quant::NVFP4_BLOCK);
+                Weight {
+                    buf: with_bytes(&quants),
+                    scales: with_bytes(&scales),
+                    shape,
+                    format: Format::Nvfp4,
+                }
+            }
         }
     }
 
@@ -1076,6 +1268,26 @@ impl Device for Vulkan {
         self.upload_bytes(cache.scales, 0, scales);
     }
 
+    fn copy_cache(&self, dst: &mut Cache, src: &Cache, len: usize) {
+        assert!(len <= dst.len && len <= src.len && len.is_multiple_of(CACHE_BLOCK));
+        if len == 0 {
+            return;
+        }
+        // The quants, and the scales after them in what a cache reads
+        // back as.
+        let scales = cache_bytes(len) - len;
+        let cmd = self.cmd();
+        for (from, to, bytes) in [
+            (src.quants, dst.quants, len),
+            (src.scales, dst.scales, scales),
+        ] {
+            let region = vk::BufferCopy::default().size(bytes as u64);
+            unsafe { self.device.cmd_copy_buffer(cmd, from, to, &[region]) };
+            self.wrote(to);
+        }
+        self.barrier(cmd);
+    }
+
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
         let (rows, cols) = (w.shape[0], w.shape[1]);
         let n = x.len / cols;
@@ -1090,6 +1302,7 @@ impl Device for Vulkan {
             Format::Bf16 => (self.kernels.matmul_bf16, 1, BF16_TOKENS, x.buf),
             Format::Q4_0 => (self.kernels.matmul_q4_0, 1, BF16_TOKENS, x.buf),
             Format::Q8_0 => (self.kernels.matmul_q8_0, 1, BF16_TOKENS, x.buf),
+            Format::Nvfp4 => panic!("NVFP4 weights are the experts', which a token picks"),
         };
         let count = rows.div_ceil(per_group);
         let width = count.min(self.max_groups as usize);
@@ -1109,6 +1322,7 @@ impl Device for Vulkan {
         } else {
             self.dispatch(kernel, &[out.buf, w.buf, w.scales, x], &params, groups);
         }
+        self.worked(n * rows * cols);
     }
 
     fn add(&self, x: &mut Buffer, y: &Buffer) {
@@ -1190,7 +1404,10 @@ impl Device for Vulkan {
             "attention over {} positions needs more partials than {PARTIALS}",
             pos + n
         );
-        let per_dispatch = PARTIALS / per_token;
+        // And no more than a submission has work for: a head scores and
+        // weighs every position.
+        let work = n_heads * (pos + n) * head_dim * 2;
+        let per_dispatch = (PARTIALS / per_token).min((SUBMIT_WORK / work).max(1));
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
             let params = AttentionParams {
@@ -1225,6 +1442,7 @@ impl Device for Vulkan {
                     groups,
                 );
             }
+            self.worked(tokens * work);
         }
     }
 
@@ -1319,6 +1537,369 @@ impl Device for Vulkan {
             self.groups(n_v_heads, 1),
         );
     }
+
+    fn mix(&self, out: &mut Buffer, states: &[&Buffer], query: &Buffer, eps: f32) {
+        let dim = query.len;
+        assert!(
+            !states.is_empty() && states.len() <= 6,
+            "the kernel mixes up to six states"
+        );
+        assert!(dim.is_multiple_of(4), "the kernel takes rows in fours");
+        assert!(states.iter().all(|state| state.len == out.len) && out.len.is_multiple_of(dim));
+        let params = MixParams {
+            dim: dim as u32,
+            count: states.len() as u32,
+            eps,
+        };
+        // The kernel binds six states: the ones there are not are the
+        // first again, which it does not read.
+        let state = |i: usize| states[i.min(states.len() - 1)].buf;
+        let buffers = [
+            out.buf,
+            query.buf,
+            state(0),
+            state(1),
+            state(2),
+            state(3),
+            state(4),
+            state(5),
+        ];
+        let groups = self.groups(out.len / dim, 1);
+        self.dispatch(self.kernels.mix, &buffers, &params, groups);
+    }
+
+    fn gated_update(&self, x: &mut Buffer, forget: &Buffer, gain: &Buffer, message: &Buffer) {
+        assert!(forget.len == x.len && gain.len == x.len && message.len == x.len);
+        let params = LenParams { len: x.len as u32 };
+        let groups = self.groups(x.len, 256);
+        self.dispatch(
+            self.kernels.gated_update,
+            &[x.buf, forget.buf, gain.buf, message.buf],
+            &params,
+            groups,
+        );
+    }
+
+    fn gate(
+        &self,
+        x: &mut Buffer,
+        message: &Buffer,
+        down_input: &Weight,
+        down_message: &Weight,
+        gain: &Weight,
+        forget: &Weight,
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        assert!(x.len.is_multiple_of(dim) && message.len == x.len);
+        assert!(
+            dim.is_multiple_of(8) && rank.is_multiple_of(8) && rank <= 64,
+            "the kernel takes a gate of up to 64 dimensions, in eights"
+        );
+        for (w, shape) in [
+            (down_input, [rank, dim]),
+            (down_message, [rank, dim]),
+            (gain, [dim, rank]),
+            (forget, [dim, rank]),
+        ] {
+            assert!(
+                w.format == Format::Bf16 && w.shape == shape,
+                "a gate's weights are bf16"
+            );
+        }
+        let params = GateParams {
+            dim: dim as u32,
+            rank: rank as u32,
+            eps,
+        };
+        let buffers = [
+            x.buf,
+            message.buf,
+            down_input.buf,
+            down_message.buf,
+            gain.buf,
+            forget.buf,
+        ];
+        let groups = self.groups(x.len / dim, 1);
+        self.dispatch(self.kernels.gate, &buffers, &params, groups);
+    }
+
+    fn short_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+    ) {
+        let channels = weight.len - state.len;
+        let taps = weight.len / channels;
+        let n = x.len / channels;
+        assert!(x.len == n * channels && out.len == x.len);
+        assert_eq!(state.len, (taps - 1) * channels);
+        assert!(taps <= 9, "the kernel keeps the state of up to nine taps");
+        let heads = dynamic.map_or(0, |(_, heads)| heads);
+        if let Some((dynamic, heads)) = dynamic {
+            assert!(channels.is_multiple_of(heads) && dynamic.len == n * heads * taps);
+        }
+        let params = ShortConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            taps: taps as u32,
+            heads: heads as u32,
+        };
+        // Without taps of the heads' own the kernel reads none: the
+        // weight stands in for them.
+        let dynamic = dynamic.map_or(weight.buf, |(dynamic, _)| dynamic.buf);
+        let groups = self.groups(n * channels, 256);
+        self.dispatch(
+            self.kernels.short_conv,
+            &[out.buf, x.buf, state.buf, weight.buf, dynamic],
+            &params,
+            groups,
+        );
+        // A token alone has its state moved on by the convolution.
+        if n > 1 && taps > 1 {
+            let groups = self.groups(channels, 256);
+            self.dispatch(
+                self.kernels.short_conv_state,
+                &[state.buf, x.buf],
+                &params,
+                groups,
+            );
+        }
+    }
+
+    fn clip(&self, x: &mut Buffer, scale: &Buffer, dim: usize, threshold: f32) {
+        let width = scale.len;
+        assert!(x.len.is_multiple_of(width) && width.is_multiple_of(dim));
+        let heads = x.len / dim;
+        let params = ClipParams {
+            heads: heads as u32,
+            width: width as u32,
+            dim: dim as u32,
+            threshold,
+        };
+        let groups = self.groups(heads, 64);
+        self.dispatch(self.kernels.clip, &[x.buf, scale.buf], &params, groups);
+    }
+
+    fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
+        assert!(x.len.is_multiple_of(factors.len));
+        let params = RowsParams {
+            len: x.len as u32,
+            width: (x.len / factors.len) as u32,
+        };
+        let groups = self.groups(x.len, 256);
+        self.dispatch(
+            self.kernels.scale_rows,
+            &[x.buf, factors.buf],
+            &params,
+            groups,
+        );
+    }
+
+    fn attention_rel(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+    ) {
+        let n = q.len / (n_heads * head_dim);
+        assert_eq!(q.len, n * n_heads * head_dim);
+        assert_eq!(out.len, q.len);
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= 256);
+        assert!(
+            n_heads / n_kv_heads <= 8,
+            "the kernel holds up to eight query heads per key/value head"
+        );
+        assert!(sinks.len == n * n_heads && rel.len.is_multiple_of(n * n_heads));
+        let n_rel = rel.len / (n * n_heads);
+        assert!(bias.len.is_multiple_of(n_rel));
+        let kv_dim = n_kv_heads * head_dim;
+        let held = (pos + n).min(rows) * kv_dim;
+        assert!(held <= k_cache.len && held <= v_cache.len);
+        // Every token's heads get as many chunks as the last token attends
+        // over, as many tokens to a dispatch as the partials fit.
+        let chunks = (pos + n).min(window).div_ceil(CHUNK);
+        let per_token = n_heads * chunks * (head_dim + 2);
+        assert!(
+            per_token <= PARTIALS,
+            "attention over {} positions needs more partials than {PARTIALS}",
+            pos + n
+        );
+        // And no more than a submission has work for: a head scores and
+        // weighs every position in the window.
+        let work = n_heads * (pos + n).min(window) * head_dim * 2;
+        let per_dispatch = (PARTIALS / per_token).min((SUBMIT_WORK / work).max(1));
+        for first in (0..n).step_by(per_dispatch) {
+            let tokens = per_dispatch.min(n - first);
+            let params = AttentionRelParams {
+                n_heads: n_heads as u32,
+                head_dim: head_dim as u32,
+                n_kv_heads: n_kv_heads as u32,
+                pos: pos as u32,
+                first: first as u32,
+                chunks: chunks as u32,
+                window: window.min(u32::MAX as usize) as u32,
+                ring: rows as u32,
+                n_rel: n_rel as u32,
+                extent: (bias.len / n_rel) as u32,
+            };
+            let groups = self.groups(tokens * n_kv_heads * chunks, 1);
+            self.dispatch(
+                self.kernels.attention_rel,
+                &[
+                    out.buf,
+                    q.buf,
+                    k_cache.quants,
+                    k_cache.scales,
+                    v_cache.quants,
+                    v_cache.scales,
+                    self.partials,
+                    rel.buf,
+                    bias.buf,
+                    sinks.buf,
+                ],
+                &params,
+                groups,
+            );
+            if chunks > 1 {
+                let groups = self.groups(tokens * n_heads, 1);
+                self.dispatch(
+                    self.kernels.attention_rel_combine,
+                    &[out.buf, self.partials, sinks.buf],
+                    &params,
+                    groups,
+                );
+            }
+            self.worked(tokens * work);
+        }
+    }
+
+    fn route(
+        &self,
+        ids: &mut Buffer,
+        weights: &mut Buffer,
+        logits: &Buffer,
+        bias: &Buffer,
+        k: usize,
+        scale: f32,
+    ) {
+        let experts = bias.len;
+        let n = logits.len / experts;
+        assert_eq!(logits.len, n * experts);
+        assert!(ids.len == n * k && weights.len == n * k);
+        assert!(
+            k <= experts && k <= 32,
+            "the kernel picks up to 32 of the experts"
+        );
+        let params = RouteParams {
+            n: n as u32,
+            experts: experts as u32,
+            k: k as u32,
+            scale,
+        };
+        let groups = self.groups(n, 64);
+        self.dispatch(
+            self.kernels.route,
+            &[ids.buf, weights.buf, logits.buf, bias.buf],
+            &params,
+            groups,
+        );
+    }
+
+    fn expert_matmul(
+        &self,
+        out: &mut Buffer,
+        w: &Weight,
+        scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+    ) {
+        let cols = w.shape[1];
+        let rows = w.shape[0] / scale.len;
+        assert_eq!(w.shape[0], rows * scale.len);
+        let pairs = ids.len;
+        assert_eq!(out.len, pairs * rows);
+        // A row of the input per token, or one per expert of a token.
+        let shared = x.len == pairs / k * cols;
+        assert!(shared || x.len == pairs * cols);
+        let kernel = match w.format {
+            Format::Nvfp4 => self.kernels.expert_matmul_nvfp4,
+            Format::Q8_0 => self.kernels.expert_matmul_q8_0,
+            _ => panic!("the experts' weights are NVFP4 or Q8_0"),
+        };
+        // One workgroup per row of a pair's matrix, the pairs down the
+        // grid's second dimension: as many of them to a dispatch as a
+        // submission has work for.
+        let most = self.max_groups as usize;
+        assert!(
+            rows <= most,
+            "{rows} rows is more workgroups than the GPU allows"
+        );
+        let per_dispatch = (SUBMIT_WORK / (rows * cols)).clamp(1, most);
+        for first in (0..pairs).step_by(per_dispatch) {
+            let count = per_dispatch.min(pairs - first);
+            let params = ExpertParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                k: k as u32,
+                per_token: shared as u32,
+                first: first as u32,
+            };
+            self.dispatch(
+                kernel,
+                &[out.buf, w.buf, w.scales, x.buf, ids.buf, scale.buf],
+                &params,
+                (rows as u32, count as u32),
+            );
+            self.worked(count * rows * cols);
+        }
+    }
+
+    fn situ(&self, out: &mut Buffer, gate_up: &Buffer, width: usize, beta: f32, linear_beta: f32) {
+        assert!(out.len.is_multiple_of(width) && gate_up.len == 2 * out.len);
+        let params = SituParams {
+            len: out.len as u32,
+            width: width as u32,
+            beta,
+            linear_beta,
+        };
+        let groups = self.groups(out.len, 256);
+        self.dispatch(self.kernels.situ, &[out.buf, gate_up.buf], &params, groups);
+    }
+
+    fn weighted_sum(&self, out: &mut Buffer, y: &Buffer, weights: &Buffer) {
+        let width = y.len / weights.len;
+        assert!(y.len == weights.len * width && out.len.is_multiple_of(width));
+        let k = weights.len / (out.len / width);
+        assert_eq!(out.len / width * k, weights.len);
+        let params = WeightedSumParams {
+            len: out.len as u32,
+            width: width as u32,
+            k: k as u32,
+        };
+        let groups = self.groups(out.len, 256);
+        self.dispatch(
+            self.kernels.weighted_sum,
+            &[out.buf, y.buf, weights.buf],
+            &params,
+            groups,
+        );
+    }
 }
 
 /// The bytes of a plain struct of 32-bit fields, as push constants.
@@ -1374,6 +1955,17 @@ mod tests {
     fn attention_speed() {
         match super::Vulkan::new() {
             Ok(gpu) => crate::gpu::tests::attention_speed(&gpu, 64),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
+    /// Times the experts' matmul at Inkling's shapes; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn expert_matmul_speed() {
+        match super::Vulkan::new() {
+            Ok(gpu) => crate::gpu::tests::expert_matmul_speed(&gpu),
             Err(e) => eprintln!("skipping: {e}"),
         }
     }
