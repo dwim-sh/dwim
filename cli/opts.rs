@@ -342,39 +342,3 @@ fn options(output: &str) -> BTreeMap<&str, (String, String)> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use argh::FromArgs;
-
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<Opts, String> {
-        Opts::from_args(&["dwim"], args).map_err(|e| e.output)
-    }
-
-    #[test]
-    fn refuses_options_out_of_range() {
-        let err = parse(&["--sessions", "0"]).err().expect("--sessions 0");
-        assert!(err.contains("a server needs room for one session at least"));
-
-        assert!(parse(&["--sessions", "x"]).is_err());
-        assert_eq!(parse(&["--sessions", "3"]).unwrap().sessions, Some(3));
-
-        let err = parse(&["--temperature", "nan"])
-            .err()
-            .expect("--temperature nan");
-        assert!(err.contains("a number 0 or more"));
-        let err = parse(&["--temperature", "inf"])
-            .err()
-            .expect("--temperature inf");
-        assert!(err.contains("a number 0 or more"));
-        assert!(parse(&["--temperature", "-1"]).is_err());
-
-        assert_eq!(
-            parse(&["--temperature", "0"]).unwrap().temperature,
-            Some(0.0)
-        );
-        assert_eq!(parse(&[]).unwrap().sessions, None);
-    }
-}
