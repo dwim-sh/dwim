@@ -25,8 +25,8 @@ anywhere, slowly.
 The weights are downloaded on first use into the Hugging Face cache,
 `~/.cache/huggingface/hub`, in the layout the `huggingface_hub` library
 uses, so a copy that `hf download` or another tool fetched is used as it
-is. Qwen3.8-27B, the one model, is a 16 GB file; an interrupted download
-resumes on the next run, and `dwim --download` fetches it ahead of a
+is. Inkling-2-Mini, the local model, is a 17.6 GB file; an interrupted
+download resumes on the next run, and `dwim --download` fetches it ahead of
 session and prints where it is. `HF_HOME`, `HF_HUB_CACHE`, `HF_HUB_OFFLINE`
 and `HF_ENDPOINT` mean what they mean to the library.
 

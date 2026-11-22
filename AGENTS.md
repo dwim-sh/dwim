@@ -1,6 +1,6 @@
 This is `dwim`, a coding agent harness in Rust: the agent, the model
-(`qwen3.8-27b`, a 16 GB Q4_0 GGUF), and the engine that runs it, in one
-program. One package: `lib.rs` is the library, `cli/` and
+(`inkling2-mini`, a 17.6 GB Q4_K_XL GGUF), and the engine that runs it,
+in one program. One package: `lib.rs` is the library, `cli/` and
 `testing/difftest/` are the binaries.
 
 ## Building and Verifying
@@ -12,7 +12,7 @@ program. One package: `lib.rs` is the library, `cli/` and
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
   `cargo run --bin difftest`
-- **Fetch the weights** (16 GB, into the Hugging Face cache):
+- **Fetch the weights** (17.6 GB, into the Hugging Face cache):
   `dwim --download`
 - Before calling a change done, run `./target/debug/dwim` in a terminal
   and ask the model something.

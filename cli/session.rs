@@ -80,29 +80,26 @@ pub struct Ready {
 /// Where `model` runs: at `provider` if the command line named one, and
 /// otherwise on this machine if it can, or at a host there is a key to:
 /// OpenRouter, or else Vercel's AI Gateway, or else Cerebras, leaving out
-/// the providers the configuration disables. The large model takes more
-/// memory than a machine has, and runs only at OpenRouter or Vercel's AI
-/// Gateway, and Inkling only on this machine or at OpenRouter. Nowhere, if the
-/// command line named no provider and the model
-/// can run neither here nor at a host without a key: the shell starts
-/// without a model then, for `/login` to sign in. A provider the command
-/// line names is only returned if the model can run there: a local one
-/// needs this machine to have the memory for it.
+/// the providers the configuration disables. Inkling 2 Mini runs on this
+/// machine or at OpenRouter, and the large models, Inkling 2 Small and
+/// Qwen Max, only at OpenRouter or Vercel's AI Gateway. Nowhere, if the
+/// command line named no provider and the model can run neither here nor
+/// at a host without a key: the shell starts without a model then, for
+/// `/login` to sign in. A provider the command line names is only returned
+/// if the model can run there: a local one needs this machine to have the
+/// memory for it.
 pub fn provider(provider: Option<Kind>, model: Model) -> Result<Option<Kind>, Box<dyn Error>> {
     match (provider, model) {
-        (Some(Kind::Local), Model::QwenMax) => Err(format!(
-            "{} does not run on this machine: it runs with --provider openrouter, or vercel",
-            Model::QwenMax
+        (Some(Kind::Local), Model::QwenMax | Model::InklingSmall) => Err(format!(
+            "{model} does not run on this machine: it runs with --provider openrouter, or vercel"
         )
         .into()),
-        (Some(Kind::Cerebras), Model::QwenMax) => Err(format!(
-            "{} does not run at Cerebras: it runs with --provider openrouter, or vercel",
-            Model::QwenMax
+        (Some(Kind::Cerebras), Model::QwenMax | Model::InklingSmall) => Err(format!(
+            "{model} does not run at Cerebras: it runs with --provider openrouter, or vercel"
         )
         .into()),
         (Some(kind), Model::InklingMini) if !runs(kind, Model::InklingMini) => Err(format!(
-            "{} is not run at {}: it runs with --provider local, or openrouter",
-            Model::InklingMini,
+            "{model} is not run at {}: it runs with --provider local, or openrouter",
             name(kind)
         )
         .into()),
@@ -136,9 +133,9 @@ fn ready(kind: Kind, model: Model) -> bool {
         }
 }
 
-/// Whether `kind` is a provider of `model`: all are of the medium model,
-/// OpenRouter and Vercel's AI Gateway of the large one, and this machine
-/// and OpenRouter of Inkling.
+/// Whether `kind` is a provider of `model`: on this machine the ones with
+/// weights, at Cerebras the Qwen model, at OpenRouter all of them,
+/// and at Vercel's AI Gateway all but Inkling 2 Mini.
 pub fn runs(kind: Kind, model: Model) -> bool {
     match kind {
         Kind::Local => model.weights().is_some(),
@@ -169,7 +166,9 @@ pub fn nowhere(model: Model, config: &Config) -> String {
             format!("{model} runs only at OpenRouter, Vercel or Cerebras")
         }
         (Model::InklingMini, Ok(())) => format!("{model} runs only at OpenRouter"),
-        (Model::QwenMax, _) => format!("{model} runs only at OpenRouter or Vercel"),
+        (Model::QwenMax | Model::InklingSmall, _) => {
+            format!("{model} runs only at OpenRouter or Vercel")
+        }
     }
 }
 
@@ -186,7 +185,8 @@ fn name(kind: Kind) -> &'static str {
 /// them whatever is said of it, since the model does run there.
 pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
     let usable = |&kind: &Kind| {
-        Some(kind) == current || (!config.disabled(kind) && ready(kind, Model::Qwen27b))
+        Some(kind) == current
+            || (!config.disabled(kind) && Model::SHOWN.iter().any(|&model| ready(kind, model)))
     };
     let groups: Vec<Group> = SHOWN
         .into_iter()
@@ -194,7 +194,7 @@ pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
         .map(|kind| Group {
             provider: kind,
             name: label(kind),
-            models: Model::ALL
+            models: Model::SHOWN
                 .into_iter()
                 .filter(|&model| runs(kind, model))
                 .collect(),
@@ -411,7 +411,7 @@ pub fn open(
             openrouter::KEY,
             match settings.model {
                 Model::Qwen27b => format!("{vercel}, or at Cerebras by setting {}", cerebras::KEY),
-                Model::QwenMax => vercel,
+                Model::QwenMax | Model::InklingSmall => vercel,
                 Model::InklingMini => String::new(),
             }
         )

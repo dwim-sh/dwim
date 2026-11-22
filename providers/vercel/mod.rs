@@ -34,7 +34,7 @@ pub const HOST: Host = Host {
 /// or kept from signing in, reasoning at `effort`, with room for
 /// `context` tokens of conversation, or as many as a model at a host has
 /// unless told, sampled at `temperature`, or as the model's makers
-/// recommend. Inkling is not run there.
+/// recommend. Inkling 2 Mini is not run there.
 pub fn open(
     model: Model,
     effort: Effort,
@@ -49,13 +49,14 @@ pub fn open(
     Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
-/// `model` as the gateway names it. Inkling is named as it would be, for
-/// [`open`] to refuse.
+/// `model` as the gateway names it. Inkling 2 Mini is named as it would
+/// be, for [`open`] to refuse.
 pub fn model(model: Model) -> &'static str {
     match model {
         Model::Qwen27b => "alibaba/qwen3.8-27b",
         Model::QwenMax => "alibaba/qwen3.8-2.4t-a95b",
         Model::InklingMini => "thinkingmachines/inkling-2-mini",
+        Model::InklingSmall => "thinkingmachines/inkling-2-small",
     }
 }
 

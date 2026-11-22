@@ -2,7 +2,7 @@
 //! in its own way, and the key to it, which is the environment's or one
 //! kept from signing in.
 //!
-//! Cerebras runs the medium model only. Its keys are made in its cloud
+//! Cerebras runs Qwen3.8-27B only. Its keys are made in its cloud
 //! console, so signing in to it from here is giving a key made there.
 
 use serde_json::{Value, json};
@@ -30,11 +30,11 @@ pub const HOST: Host = Host {
     refused: "make another in the Cerebras cloud console, and give it with /login",
 };
 
-/// The medium model at Cerebras, with the key in the environment or kept
+/// Qwen3.8-27B at Cerebras, with the key in the environment or kept
 /// from signing in, reasoning at `effort`, with room for `context` tokens
 /// of conversation, or as many as a model at a host has unless told,
-/// sampled at `temperature`, or as the model's makers recommend. The
-/// large model does not run there, nor Inkling.
+/// sampled at `temperature`, or as the model's makers recommend. The large
+/// models do not run there, nor Inkling 2 Mini.
 pub fn open(
     model: Model,
     effort: Effort,
@@ -49,13 +49,14 @@ pub fn open(
     Ok(Hosted::new(&HOST, key, model, effort, context, temperature))
 }
 
-/// `model` as Cerebras names it. Only the medium model runs there; the
+/// `model` as Cerebras names it. Only Qwen3.8-27B runs there; the
 /// others are named as they would be, for [`open`] to refuse.
 pub fn model(model: Model) -> &'static str {
     match model {
         Model::Qwen27b => "qwen-3.8-27b",
         Model::QwenMax => "qwen-3.8-2.4t-a95b",
         Model::InklingMini => "inkling-2-mini",
+        Model::InklingSmall => "inkling-2-small",
     }
 }
 

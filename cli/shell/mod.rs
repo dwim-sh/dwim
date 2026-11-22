@@ -627,15 +627,19 @@ impl App {
         }
     }
 
-    /// The model the session goes on with at `provider`: the one it is on
-    /// if it runs there, as the large one does not on this machine or at
-    /// Cerebras, nor Inkling at a host but OpenRouter, and the medium one
-    /// otherwise.
+    /// The model the session goes on with at `provider`: the one it is on if
+    /// it runs there, as the large one does not on this machine or at Cerebras,
+    /// nor Inkling 2 Mini at a host but OpenRouter, and the first shown model
+    /// that runs there otherwise, or the Qwen model where none does,
+    /// as at Cerebras.
     fn model_at(&self, provider: Kind) -> Model {
         if session::runs(provider, self.model) {
             self.model
         } else {
-            Model::Qwen27b
+            Model::SHOWN
+                .into_iter()
+                .find(|&model| session::runs(provider, model))
+                .unwrap_or(Model::Qwen27b)
         }
     }
 

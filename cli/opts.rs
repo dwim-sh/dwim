@@ -10,17 +10,17 @@ use crate::{model, session::Settings, tui};
 /// A coding agent at the command line
 #[derive(FromArgs)]
 pub struct Opts {
-    /// model to run: qwen3.8-27b (default), which medium also names,
-    /// qwen3.8-2.4t-a95b, which large also names, or inkling2-mini, on
-    /// this machine or at OpenRouter
+    /// model to run: inkling2-mini (default), which medium also names, on
+    /// this machine or at OpenRouter, or inkling2-small, which large also
+    /// names, at OpenRouter or Vercel
     #[argh(option, default = "Model::default()")]
     pub model: Model,
 
     /// where the model runs: local, on this machine, openrouter, with the
     /// key in OPENROUTER_API_KEY, vercel, Vercel's AI Gateway, with the
-    /// key in AI_GATEWAY_API_KEY, or cerebras, the medium model only, with
-    /// the key in CEREBRAS_API_KEY (default: local where the model runs
-    /// here, and a host there is a key to where it does not)
+    /// key in AI_GATEWAY_API_KEY, or cerebras, with the key in
+    /// CEREBRAS_API_KEY (default: local where the model runs here, and a
+    /// host there is a key to where it does not)
     #[argh(option)]
     pub provider: Option<Kind>,
 

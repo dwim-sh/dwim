@@ -219,7 +219,7 @@ fn run() -> Result<bool> {
     drop(cpu);
 
     let max_kl = match named {
-        Model::InklingMini => MAX_KL_ROUTED,
+        Model::InklingMini | Model::InklingSmall => MAX_KL_ROUTED,
         Model::Qwen27b | Model::QwenMax => MAX_KL,
     };
     let mut gpu = arch::load(gguf, None, Gpu::new()?, 4096, |_, _| {})?;
