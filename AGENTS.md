@@ -100,24 +100,29 @@ do not write it.
 - It names the things that change, not the intent: `sys: Move libc, mmap
   and dirs callers behind sys/unix`, not `Move what dwim asks of the
   operating system into sys/`.
-- The body says why, and what was and was not verified.
+- The subject uses the everyday word: `Retry replies that fail
+  mid-stream`, not `Ask again for a reply whose stream fails`.
+- The body says why, and what was and was not verified, in a few
+  sentences.
 - A pull request's title is a subject too, written the same way.
 
-A pull request's description is mandatory and is written for a reader
-who has not seen the code or the commits. It stands on its own, in
-three parts:
+A pull request's description is mandatory, and is written for a reader
+in a hurry who has not seen the code or the commits. It stands on its
+own and fits on one screen, in three parts:
 
-1. **Problem**: a paragraph on what is wrong or missing, and why it
-   matters.
-2. **Solution**: a paragraph or more on what the change does about it,
-   as a whole.
-3. **Results**: numbers for the claims, such as a benchmark, timings,
-   sizes, or tokens, measured before and after where there is a before.
-   Then what was verified and what was not. Say so when a claim cannot
-   be measured.
+1. **Problem**: two or three sentences on what is wrong or missing,
+   with the one number that shows it matters.
+2. **Solution**: what the change does about it, a line for each thing
+   it does.
+3. **Results**: a line for each measurement, such as a benchmark,
+   timings, sizes, or tokens, before and after where there is a before.
+   Then a line on what was verified and what was not. Say so when a
+   claim cannot be measured.
 
-Leave the details of each change to the commits. A description does not
-list the commits, retell their messages, or list every flag and fix. When
-a pull request changes, rewrite its description to match.
+**Never** write a wall of text. Say a thing once, and leave out what the
+reader can do without: how the problem was found, a number that supports
+no claim, a detail the diff already shows. A description does not list
+the commits, retell their messages, or list every flag and fix. When a
+pull request changes, rewrite its description to match.
 
 `CONTRIBUTING.md` has the longer version, and how to run SWE-bench.
