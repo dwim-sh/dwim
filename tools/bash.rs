@@ -218,11 +218,11 @@ impl Bash {
             return Err(DISCARDS.to_string());
         }
         self.calls += 1;
-        // `set -o pipefail` first, by itself, so that a shell without it
-        // runs the command all the same. Through `command`, because `set`
-        // is a special builtin: an option it does not know ends a shell
-        // such as dash on the spot, with status 2 and the command not run.
-        let command = format!("command set -o pipefail 2>/dev/null\n{command}");
+        // `set -o pipefail` first, on its own line, and only in a shell
+        // that has it. `set` is a special builtin: an option it does not
+        // know ends a shell such as dash on the spot, with status 2 and the
+        // command not run, so a subshell tries it first.
+        let command = format!("(set -o pipefail) 2>/dev/null && set -o pipefail\n{command}");
         let mut shell = Command::new(&self.shell);
         shell
             .args(["-c", &command])
@@ -640,8 +640,8 @@ mod tests {
         assert_eq!(sh("true", &mut bash), "[exit code 0]");
         assert_eq!(sh("echo; echo", &mut bash), "[exit code 0]");
         // A pipeline fails when any of its commands does, in a shell that
-        // has `pipefail`; one without it, as dash 0.5.12 is, still
-        // runs the command.
+        // has `pipefail`; one without it, as dash 0.5.12 is, still runs
+        // the command.
         if sh("(set -o pipefail)", &mut bash) == "[exit code 0]" {
             assert_eq!(sh("false | true", &mut bash), "[exit code 1]");
             assert_eq!(sh("exit 4 | head -1", &mut bash), "[exit code 4]");
