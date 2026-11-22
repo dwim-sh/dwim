@@ -42,7 +42,7 @@ pub enum Model {
     QwenMax,
     /// Inkling 2 Mini, Thinking Machines' looped model of 26 billion
     /// parameters, of which 3.4 billion are active for a token: it runs on
-    /// this machine, where the GPU takes its weights.
+    /// this machine, where the GPU takes its weights, and at OpenRouter.
     InklingMini,
 }
 
@@ -75,6 +75,15 @@ impl Model {
             Model::Qwen27b => Some(&qwen::QWEN_27B),
             Model::QwenMax => None,
             Model::InklingMini => Some(&inkling::INKLING_MINI),
+        }
+    }
+
+    /// How the model's tokens are sampled where no file of it says how:
+    /// at a host.
+    pub const fn sampling(self) -> Sampling {
+        match self {
+            Model::Qwen27b | Model::QwenMax => qwen::SAMPLING,
+            Model::InklingMini => inkling::SAMPLING,
         }
     }
 

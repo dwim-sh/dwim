@@ -149,11 +149,8 @@ impl Hosted {
             effort,
             capacity: context.unwrap_or(CONTEXT),
             sampling: Sampling {
-                temperature: temperature.unwrap_or(0.6),
-                top_k: 20,
-                top_p: 0.95,
-                min_p: 0.0,
-                seed: 0,
+                temperature: temperature.unwrap_or(model.sampling().temperature),
+                ..model.sampling()
             },
             stats: Stats::default(),
             counted: None,

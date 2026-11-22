@@ -12,7 +12,7 @@ use crate::{model, session::Settings, tui};
 pub struct Opts {
     /// model to run: qwen3.8-27b (default), which medium also names,
     /// qwen3.8-2.4t-a95b, which large also names, or inkling2-mini, on
-    /// this machine only
+    /// this machine or at OpenRouter
     #[argh(option, default = "Model::default()")]
     pub model: Model,
 

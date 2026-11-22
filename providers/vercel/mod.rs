@@ -34,7 +34,7 @@ pub const HOST: Host = Host {
 /// or kept from signing in, reasoning at `effort`, with room for
 /// `context` tokens of conversation, or as many as a model at a host has
 /// unless told, sampled at `temperature`, or as the model's makers
-/// recommend. Inkling is run on this machine only.
+/// recommend. Inkling is not run there.
 pub fn open(
     model: Model,
     effort: Effort,

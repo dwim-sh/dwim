@@ -7,7 +7,7 @@ mod tokenizer;
 
 use std::sync::Arc;
 
-use crate::model::{File, Format, Result, Weights, gguf::Metadata};
+use crate::model::{File, Format, Result, Sampling, Weights, gguf::Metadata};
 
 pub use format::ChatMl;
 pub use tokenizer::tokenizer;
@@ -30,6 +30,16 @@ pub const QWEN_27B: Weights = Weights {
         name: FILE,
         digest: "5eb1de39e9b42aa7f99f1a4fe149d1952cc8103c698cf380b15a43d47e72b7c7",
     }],
+};
+
+/// How a Qwen model's tokens are sampled where no file of it says, at a
+/// host: as its makers recommend for work with tools.
+pub const SAMPLING: Sampling = Sampling {
+    temperature: 0.6,
+    top_k: 20,
+    top_p: 0.95,
+    min_p: 0.0,
+    seed: 0,
 };
 
 /// The chat format of a Qwen model, over the vocabulary its GGUF file
