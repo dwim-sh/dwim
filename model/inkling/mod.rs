@@ -15,6 +15,10 @@ pub use tokenizer::tokenizer;
 /// The file holding Inkling 2 Mini.
 const FILE: &str = "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file";
 
+/// The file holding its drafter: the three-layer block drafter the model
+/// ships, `dflash` to llama.cpp, with its projections as Q8_0.
+const DRAFTER: &str = "dspark-Inkling-2-Mini-Q8_0.gguf";
+
 /// Where Inkling 2 Mini comes from: Unsloth's conversion of
 /// `thinkingmachines/Inkling-2-Mini`, in the layout mainline llama.cpp
 /// reads, `inkling2_loop`, which names the looped layers once and says how
@@ -29,10 +33,17 @@ pub const INKLING_MINI: Weights = Weights {
     repo: "unsloth/Inkling-2-Mini-GGUF",
     revision: "ea0c79b2ecd73669e774c8519b79bfabfddbc027",
     file: FILE,
-    files: &[File {
-        name: FILE,
-        digest: "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
-    }],
+    drafter: Some(DRAFTER),
+    files: &[
+        File {
+            name: FILE,
+            digest: "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
+        },
+        File {
+            name: DRAFTER,
+            digest: "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773",
+        },
+    ],
 };
 
 /// How Inkling's tokens are sampled where no file of it says, at a host:

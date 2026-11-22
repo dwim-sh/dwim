@@ -88,7 +88,8 @@ has, and runs only at a provider.
 .B inkling2\-mini
 runs at OpenRouter, and on this machine on Metal and on CUDA: its
 experts' weights are in NVFP4, the format they were trained in, which
-Vulkan does not take.
+Vulkan does not take. It decodes several tokens at a time with its
+drafter, a second file, where the model keeps what is drafted.
 .TP
 .BI \-\-provider " provider"
 Where the model runs:

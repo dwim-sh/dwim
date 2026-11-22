@@ -27,12 +27,24 @@
 //! a window of the latest positions, and keep only those. Keys, values,
 //! and the outputs of attention and of the feed-forward network each go
 //! through a short causal convolution.
+//!
+//! Where the model's drafter is there, a file of its own, the model
+//! drafts with it: see [`drafter`]. The drafter reads the stream on its
+//! way into a few of the layers and the model's output, of every token
+//! run, and a batch the model verifies keeps what it takes to drop the
+//! tokens that turn out wrong: each convolution's state from before the
+//! batch, and the batch's input to it.
+
+mod drafter;
 
 use std::{collections::HashMap, mem, sync::Arc};
 
 use crate::{
     gpu::{CACHE_BLOCK, Device, Kept, Tensor, cache_bytes},
-    inference::{Gguf, LanguageModel, Memory, Result, gguf},
+    inference::{
+        Gguf, LanguageModel, Memory, Result, gguf,
+        inkling2::drafter::{Context, Drafter},
+    },
 };
 
 /// What a file of the architecture calls it.
@@ -304,10 +316,32 @@ impl Config {
     /// `per_sequence` is for the windowed layers' keys and values and the
     /// convolutions' states, and `per_token` for the keys and values of
     /// the layers that attend over everything. Fails if the file does not
-    /// say how big one of its tensors is.
-    pub fn memory(&self, gguf: &Gguf, batch: usize) -> Result<Memory> {
+    /// say how big one of its tensors is. With `drafter`, the model's
+    /// drafter's file, the memory is of both.
+    pub fn memory(&self, gguf: &Gguf, drafter: Option<&Gguf>, batch: usize) -> Result<Memory> {
         let c = self;
         let batch = batch * BATCHES;
+        // The drafter, the features it reads of a batch, the logits of a
+        // batch it has verified, and what is kept of one: each
+        // convolution's state and its input.
+        let drafter = match drafter {
+            Some(gguf) => {
+                let config = drafter::Config::load(gguf)?;
+                let mut memory = config.memory(gguf, batch)?;
+                let kept = c.slots()
+                    * (c.taps - 1 + config.block)
+                    * c.conv_channels().iter().sum::<usize>();
+                let features = config.targets.len() * batch * c.hidden;
+                let logits = (config.block - 1) * c.vocab_padded;
+                memory.fixed += 4 * (kept + features + logits) as u64;
+                memory
+            }
+            None => Memory {
+                fixed: 0,
+                per_sequence: 0,
+                per_token: 0,
+            },
+        };
         // Every tensor goes to the device but the embedding table, which
         // stays in the file on the host, in the format the file has it
         // in, but for a matrix of f32, which is rounded to bf16.
@@ -329,11 +363,12 @@ impl Config {
         Ok(Memory {
             // The activations of a batch, the logits, and the copy a mark
             // keeps of a sequence's rings and convolution states.
-            fixed: (weights + 4 * (batch * c.activations() + c.vocab_padded + conv) + rings) as u64,
-            per_sequence: (rings + 4 * conv) as u64,
+            fixed: (weights + 4 * (batch * c.activations() + c.vocab_padded + conv) + rings) as u64
+                + drafter.fixed,
+            per_sequence: (rings + 4 * conv) as u64 + drafter.per_sequence,
             // And what the queries at the position grow by, which the
             // sequences share, counted with each.
-            per_token: (global * kv + 4) as u64,
+            per_token: (global * kv + 4) as u64 + drafter.per_token,
         })
     }
 }
@@ -353,6 +388,10 @@ pub struct Model<D: Device> {
     /// on the CPU: it is half a gigabyte, and a token needs one row of it.
     gguf: Arc<Gguf>,
     embed_norm: D::Buffer,
+    /// The same on the host, for the row the drafter starts a block from.
+    embed_norm_host: Vec<f32>,
+    /// The drafter, where its file is there.
+    drafter: Option<Drafter<D>>,
     layers: Vec<Layer<D>>,
     /// What the core's layers read the pass before with, a layer each.
     loops: Vec<Loop<D>>,
@@ -449,6 +488,7 @@ impl<D: Device> Model<D> {
     /// many of its tensors are loaded, out of how many, as it goes.
     pub fn load(
         gguf: Arc<Gguf>,
+        drafter: Option<Arc<Gguf>>,
         device: D,
         max_len: usize,
         on_progress: impl FnMut(usize, usize),
@@ -488,12 +528,32 @@ impl<D: Device> Model<D> {
             buf
         };
         let (ones_head, ones_kv) = (ones(c.head_dim), ones(c.kv_dim()));
-        let state = State::new(c, &device, max_len);
+        let most = device.batch() * BATCHES;
+        let drafter = match drafter {
+            Some(file) => {
+                let drafter = Drafter::load(file, &device, most)?;
+                let d = &drafter.config;
+                // The drafter reads the model's layers by number, and
+                // writes through its output projection.
+                if d.hidden != c.hidden
+                    || d.vocab != c.vocab
+                    || d.targets.last() != Some(&c.slots())
+                {
+                    return Err("the drafter is of another model".into());
+                }
+                Some(drafter)
+            }
+            None => None,
+        };
+        let state = State::new(c, &device, max_len, drafter.as_ref());
+        let embed_norm_host = gguf.f32s("token_embd_norm.weight")?;
         Ok(Self {
             config,
             device,
             gguf,
             embed_norm,
+            embed_norm_host,
+            drafter,
             layers,
             loops,
             out_query,
@@ -508,14 +568,23 @@ impl<D: Device> Model<D> {
 
     /// Runs a batch of tokens, the first at position `pos`, and returns the
     /// logits after the last, if they are `wanted`: a batch that another
-    /// follows has no use for them.
-    fn forward_batch(&mut self, tokens: &[u32], pos: usize, wanted: bool) -> Vec<f32> {
+    /// follows has no use for them. A batch to `verify` returns the logits
+    /// after each of its tokens, a row each, and leaves what it takes to
+    /// keep only the first of them.
+    fn forward_batch(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        wanted: bool,
+        verify: bool,
+    ) -> Vec<f32> {
         let (c, d) = (&self.config, &self.device);
         let p = Pass {
             c,
             d,
             ones_head: &self.ones_head,
             ones_kv: &self.ones_kv,
+            verify,
         };
         let s = &mut self.state;
         let n = tokens.len();
@@ -532,8 +601,20 @@ impl<D: Device> Model<D> {
         d.write(&mut s.x, &x);
         d.rmsnorm(&mut s.x, &self.embed_norm, c.eps);
 
+        // The layers the drafter reads the input of, counted as they are
+        // run: the stream on its way into each is one of the features.
+        let targets: &[usize] = self.drafter.as_ref().map_or(&[], |d| &d.config.targets);
+        let mut run = 0;
+        let mut feature = |s: &mut State<D>| {
+            if let Some(at) = targets.iter().position(|&target| target == run) {
+                d.copy(&mut s.features[at], 0, &s.x, 0, width);
+            }
+            run += 1;
+        };
+
         s.kept = 0;
         for i in 0..c.core_start {
+            feature(s);
             p.layer(s, &self.layers[i], None, i, i, n, pos);
         }
         // Every pass through the core starts from the prelude's output,
@@ -562,11 +643,52 @@ impl<D: Device> Model<D> {
                     let queries: Vec<&D::Buffer> = looped.queries.iter().collect();
                     d.mixes(&mut messages, &states, &queries, MIX_EPS, None);
                 }
+                feature(s);
                 p.layer(s, &self.layers[i], looped, c.slot_of(i, pass), i, n, pos);
             }
         }
         for i in c.core_end..c.layers {
+            feature(s);
             p.layer(s, &self.layers[i], None, i, i, n, pos);
+        }
+
+        if let Some(drafter) = &mut self.drafter {
+            // The drafter's last feature is every token's output: its row
+            // of the stream and of each block kept, mixed and normalized.
+            let outputs = s.features.len() - 1;
+            {
+                let states: Vec<&D::Buffer> = s.blocks[..s.kept].iter().chain([&s.x]).collect();
+                d.resize(&mut s.features[outputs], width);
+                d.mixes(
+                    &mut [&mut s.features[outputs]],
+                    &states,
+                    &[&self.out_query],
+                    MIX_EPS,
+                    Some((&[&self.out_norm], c.eps)),
+                );
+            }
+            if verify {
+                // The context waits to hear how many tokens are kept.
+                d.resize(&mut s.logits, n * c.vocab_padded);
+                d.matmul(&mut s.logits, &self.head, &s.features[outputs]);
+                let padded = match c.softcap != 0.0 {
+                    true => d.read_capped(&mut s.logits, c.softcap),
+                    false => d.read(&s.logits),
+                };
+                d.resize(&mut s.logits, c.vocab_padded);
+                return padded
+                    .chunks_exact(c.vocab_padded)
+                    .flat_map(|row| &row[..c.vocab])
+                    .copied()
+                    .collect();
+            }
+            if let Some(context) = &mut s.seq.context {
+                // A sequence run from its start, or on from where its
+                // context ends, has context for all of it.
+                if pos == 0 || context.len == pos {
+                    drafter.inject(d, context, &s.features, n, pos);
+                }
+            }
         }
         if !wanted {
             // Waits for the batch, by reading an activation back: a batch
@@ -577,30 +699,37 @@ impl<D: Device> Model<D> {
             return Vec::new();
         }
 
-        // Only the last token's logits are wanted: its row of the stream
-        // and of each block kept, mixed, normalized, and through the head.
-        // A token alone is its states' only row.
+        // Only the last token's logits are wanted: its output through the
+        // head.
         let last = (n - 1) * c.hidden;
-        let mut rows: Vec<&mut D::Buffer> = s.inputs.iter_mut().chain(&mut s.normed).collect();
-        assert!(s.kept < rows.len(), "more blocks than there are rows for");
-        let kept = s.blocks[..s.kept].iter().chain([&s.x]);
-        let states: Vec<&D::Buffer> = if n == 1 {
-            kept.collect()
-        } else {
-            for (row, state) in rows.iter_mut().zip(kept) {
-                d.resize(row, c.hidden);
-                d.copy(row, 0, state, last, c.hidden);
-            }
-            rows[..s.kept + 1].iter().map(|row| &**row).collect()
-        };
         d.resize(&mut s.ffn_normed, c.hidden);
-        d.mixes(
-            &mut [&mut s.ffn_normed],
-            &states,
-            &[&self.out_query],
-            MIX_EPS,
-            Some((&[&self.out_norm], c.eps)),
-        );
+        if let Some(outputs) = s.features.last() {
+            // The drafter's last feature has every token's output.
+            d.copy(&mut s.ffn_normed, 0, outputs, last, c.hidden);
+        } else {
+            // Its row of the stream and of each block kept, mixed and
+            // normalized. A token alone is its states' only row.
+            let mut rows: Vec<&mut D::Buffer> = s.inputs.iter_mut().chain(&mut s.normed).collect();
+            assert!(s.kept < rows.len(), "more blocks than there are rows for");
+            let kept = s.blocks[..s.kept].iter().chain([&s.x]);
+            let states: Vec<&D::Buffer> = if n == 1 {
+                kept.collect()
+            } else {
+                for (row, state) in rows.iter_mut().zip(kept) {
+                    d.resize(row, c.hidden);
+                    d.copy(row, 0, state, last, c.hidden);
+                }
+                rows[..s.kept + 1].iter().map(|row| &**row).collect()
+            };
+            d.mixes(
+                &mut [&mut s.ffn_normed],
+                &states,
+                &[&self.out_query],
+                MIX_EPS,
+                Some((&[&self.out_norm], c.eps)),
+            );
+        }
+        d.resize(&mut s.logits, c.vocab_padded);
         d.matmul(&mut s.logits, &self.head, &s.ffn_normed);
         let mut logits = match c.softcap != 0.0 {
             true => d.read_capped(&mut s.logits, c.softcap),
@@ -619,6 +748,9 @@ struct Pass<'a, D: Device> {
     d: &'a D,
     ones_head: &'a D::Buffer,
     ones_kv: &'a D::Buffer,
+    /// Whether the batch is one to verify, whose convolutions' states and
+    /// inputs are kept for the tokens that are not.
+    verify: bool,
 }
 
 impl<D: Device> Pass<'_, D> {
@@ -732,6 +864,13 @@ impl<D: Device> Pass<'_, D> {
         } else {
             (usize::MAX, s.seq.max_len)
         };
+        if self.verify {
+            let [k_state, v_state, ..] = &s.seq.conv[slot];
+            let at = slot * CONVS;
+            let (kept, states) = (&mut s.verify_inputs, &mut s.verify_states);
+            self.keep(&mut kept[at], &mut states[at], &s.k, k_state, 0, n);
+            self.keep(&mut kept[at + 1], &mut states[at + 1], &s.v, v_state, 1, n);
+        }
         let taps = match (&layer.k_taps, &layer.v_taps) {
             (Some(k_taps), Some(v_taps)) => {
                 d.matmul(&mut s.k_taps, k_taps, k_n);
@@ -796,6 +935,11 @@ impl<D: Device> Pass<'_, D> {
         // The first layer of a block starts the stream anew from its
         // attention's output, convolved, and what the stream held joins
         // the blocks kept; the others add to the stream.
+        if self.verify {
+            let at = slot * CONVS + 2;
+            let (kept, states) = (&mut s.verify_inputs[at], &mut s.verify_states[at]);
+            self.keep(kept, states, &s.out, &s.seq.conv[slot][2], 2, n);
+        }
         let state = &mut s.seq.conv[slot][2];
         if index.is_multiple_of(c.block) {
             mem::swap(&mut s.blocks[s.kept], &mut s.x);
@@ -860,8 +1004,32 @@ impl<D: Device> Pass<'_, D> {
             &mut s.act,
         );
         d.weighted_sum(&mut s.out, &s.down, &s.shares);
+        if self.verify {
+            let at = slot * CONVS + 3;
+            let (kept, states) = (&mut s.verify_inputs[at], &mut s.verify_states[at]);
+            self.keep(kept, states, &s.out, &s.seq.conv[slot][3], 3, n);
+        }
         let state = &mut s.seq.conv[slot][3];
         d.short_conv_add(&mut s.x, &s.out, state, &layer.conv[3], &mut s.out_conv);
+    }
+
+    /// Keeps, of a batch being verified, the state of convolution `conv`
+    /// of a slot as it is before the batch, and the batch's input to it:
+    /// what the state is run on from if only some of the tokens are kept.
+    fn keep(
+        &self,
+        kept: &mut D::Buffer,
+        kept_state: &mut D::Buffer,
+        input: &D::Buffer,
+        state: &D::Buffer,
+        conv: usize,
+        n: usize,
+    ) {
+        let (c, d) = (self.c, self.d);
+        let channels = c.conv_channels()[conv];
+        d.resize(kept, n * channels);
+        d.copy(kept, 0, input, 0, n * channels);
+        d.copy(kept_state, 0, state, 0, (c.taps - 1) * channels);
     }
 }
 
@@ -1062,13 +1230,14 @@ fn load_loop<D: Device, F: FnMut(usize, usize)>(
 
 /// The first bytes of a saved state, and its layout's version.
 const STATE_MAGIC: &[u8; 8] = b"dwimink2";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 impl<D: Device> LanguageModel for Model<D> {
     /// The state after `len` positions: a header of the layout's version
     /// and the model's dimensions, then each slot's keys and values as the
     /// caches hold them, a windowed layer's as its ring has them, then
-    /// each slot's convolution states.
+    /// each slot's convolution states, and then the drafter's context,
+    /// if there is a drafter and the context is whole.
     fn save(&self, len: usize) -> Option<Vec<u8>> {
         let (c, d, s) = (&self.config, &self.device, &self.state);
         let kv_dim = c.kv_dim();
@@ -1086,6 +1255,10 @@ impl<D: Device> LanguageModel for Model<D> {
         }
         for conv in s.seq.conv.iter().flatten() {
             out.extend(d.read(conv).iter().flat_map(|v| v.to_le_bytes()));
+        }
+        match (&self.drafter, &s.seq.context) {
+            (Some(drafter), Some(context)) => drafter.save(d, context, len, &mut out),
+            _ => out.push(0),
         }
         Some(out)
     }
@@ -1138,6 +1311,18 @@ impl<D: Device> LanguageModel for Model<D> {
                 .collect();
             d.write(conv, &floats);
         }
+        // A state saved without a drafter's context leaves the sequence
+        // without one: the drafter drafts nothing after it.
+        match (&self.drafter, &mut s.seq.context) {
+            (Some(drafter), Some(context)) => drafter.restore(d, context, len, &mut take)?,
+            _ => {
+                if take(1)? != [0] {
+                    return Err("a saved state of a model with a drafter".into());
+                }
+            }
+        }
+        s.seq.drafts = 1;
+        s.verified = None;
         if s.marked == Some(s.seq.id) {
             s.marked = None;
         }
@@ -1156,23 +1341,118 @@ impl<D: Device> LanguageModel for Model<D> {
         let most = self.state.most;
         let batches = tokens.len().div_ceil(most);
         for (i, batch) in tokens.chunks(most).enumerate() {
-            logits = self.forward_batch(batch, pos + i * most, i + 1 == batches);
+            logits = self.forward_batch(batch, pos + i * most, i + 1 == batches, false);
         }
         logits
     }
 
-    /// The model's drafter is a file of its own, which is not read: it
-    /// drafts nothing.
-    fn draft(&mut self, _token: u32, _pos: usize, _k: usize) -> Vec<u32> {
-        Vec::new()
+    /// Drafts with the model's drafter, if its file is there and the
+    /// sequence has context for every position before the token.
+    fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        let (Some(drafter), Some(context)) = (&mut self.drafter, &mut s.seq.context) else {
+            return Vec::new();
+        };
+        if k == 0 || s.verified.is_some() || !drafter.ready(context, pos, s.seq.max_len) {
+            return Vec::new();
+        }
+        // No more than the model has lately been keeping, and one.
+        let k = k.min(s.seq.drafts);
+        // The token's embedding, normalized as the model's input is.
+        let mut anchor = vec![0.0; c.hidden];
+        self.gguf
+            .row("token_embd.weight", token as usize, &mut anchor)
+            .expect("checked at load");
+        let mean_square = anchor.iter().map(|v| v * v).sum::<f32>() / c.hidden as f32;
+        let scale = 1.0 / (mean_square + c.eps).sqrt();
+        for (v, w) in anchor.iter_mut().zip(&self.embed_norm_host) {
+            *v *= scale * w;
+        }
+        d.resize(&mut s.logits, c.vocab_padded);
+        drafter
+            .draft(
+                d,
+                context,
+                &anchor,
+                token,
+                pos,
+                k,
+                &self.head,
+                &mut s.logits,
+            )
+            .expect("the drafter's table was checked at load")
     }
 
-    fn verify(&mut self, _tokens: &[u32], _pos: usize) -> Vec<f32> {
-        panic!("the model does not draft");
+    fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
+        let block = self.drafter.as_ref().map(|drafter| drafter.config.block);
+        let block = block.expect("the model does not draft");
+        assert!(
+            self.state.verified.is_none(),
+            "a batch is already being verified"
+        );
+        assert!(
+            !tokens.is_empty() && tokens.len() <= block,
+            "a batch of {} tokens is not one to verify",
+            tokens.len()
+        );
+        assert!(
+            pos + tokens.len() <= self.state.seq.max_len,
+            "tokens past the end of the cache"
+        );
+        self.state.verified = Some((pos, tokens.len()));
+        self.forward_batch(tokens, pos, true, true)
     }
 
-    fn rewind(&mut self, _keep: usize) {
-        panic!("the model does not draft");
+    /// The convolutions' states run through the whole batch are the real
+    /// ones if every token is kept; otherwise they are put back as they
+    /// were and run through the tokens kept, from the inputs kept. The
+    /// caches need nothing: the positions dropped are written over. The
+    /// tokens kept then become context for the drafter.
+    fn rewind(&mut self, keep: usize) {
+        let (c, d, s) = (&self.config, &self.device, &mut self.state);
+        let (pos, n) = s.verified.take().expect("no batch is being verified");
+        assert!(
+            (1..=n).contains(&keep),
+            "keeping {keep} tokens of a batch of {n} being verified"
+        );
+        if keep < n {
+            for slot in 0..c.slots() {
+                let layer = &self.layers[c.layer_of(slot)];
+                for (conv, channels) in c.conv_channels().into_iter().enumerate() {
+                    let at = slot * CONVS + conv;
+                    let state = &mut s.seq.conv[slot][conv];
+                    d.copy(state, 0, &s.verify_states[at], 0, (c.taps - 1) * channels);
+                    d.resize(&mut s.verify_inputs[at], keep * channels);
+                    d.resize(&mut s.out_conv, keep * channels);
+                    d.short_conv(
+                        &mut s.out_conv,
+                        &s.verify_inputs[at],
+                        state,
+                        &layer.conv[conv],
+                        None,
+                    );
+                }
+            }
+        }
+        // A draft costs a pass over the output projection, and a token
+        // verified its experts' weights: one more is drafted after a
+        // batch kept whole, and after another no more than were kept.
+        let block = self
+            .drafter
+            .as_ref()
+            .map_or(1, |drafter| drafter.config.block);
+        s.seq.drafts = match keep == n {
+            true => (s.seq.drafts + 1).min(block - 1),
+            false => (keep - 1).max(1),
+        };
+        if let (Some(drafter), Some(context)) = (&mut self.drafter, &mut s.seq.context) {
+            for feature in &mut s.features {
+                d.resize(feature, keep * c.hidden);
+            }
+            if context.len == pos {
+                drafter.inject(d, context, &s.features, keep, pos);
+            }
+        }
     }
 
     /// Copies the windowed layers' rings aside, on the device, and the
@@ -1197,6 +1477,11 @@ impl<D: Device> LanguageModel for Model<D> {
             .zip(c.conv_channels().into_iter().cycle())
         {
             d.copy(mark, 0, conv, 0, (c.taps - 1) * channels);
+        }
+        if let (Some(drafter), Some(context), Some(mark)) =
+            (&self.drafter, &s.seq.context, &mut s.mark_context)
+        {
+            drafter.keep(d, context, mark);
         }
         s.marked = Some(s.seq.id);
         true
@@ -1223,6 +1508,12 @@ impl<D: Device> LanguageModel for Model<D> {
         {
             d.copy(conv, 0, mark, 0, (c.taps - 1) * channels);
         }
+        if let (Some(drafter), Some(context), Some(mark)) =
+            (&self.drafter, &mut s.seq.context, &s.mark_context)
+        {
+            drafter.put_back(d, context, mark);
+        }
+        s.verified = None;
         Ok(())
     }
 
@@ -1239,6 +1530,12 @@ impl<D: Device> LanguageModel for Model<D> {
         {
             d.write(conv, &vec![0.0; (c.taps - 1) * channels]);
         }
+        // The context starts over with the sequence.
+        if let Some(context) = &mut s.seq.context {
+            context.len = 0;
+        }
+        s.seq.drafts = 1;
+        s.verified = None;
         if s.marked == Some(s.seq.id) {
             s.marked = None;
         }
@@ -1262,6 +1559,7 @@ impl<D: Device> LanguageModel for Model<D> {
             id,
             self.state.seq.max_len,
             self.state.most,
+            self.drafter.as_ref(),
         );
         self.parked.insert(id, seq);
         Ok(id)
@@ -1271,6 +1569,9 @@ impl<D: Device> LanguageModel for Model<D> {
     fn select_sequence(&mut self, id: usize) -> Result<()> {
         if self.state.seq.id == id {
             return Ok(());
+        }
+        if self.state.verified.is_some() {
+            return Err("a batch is being verified".into());
         }
         let mut seq = self
             .parked
@@ -1342,6 +1643,18 @@ struct State<D: Device> {
     mark_rings: Vec<D::Cache>,
     mark_conv: Vec<D::Buffer>,
     marked: Option<usize>,
+    /// What the drafter reads of a batch: a buffer for each of the
+    /// model's layers it reads the input of, a row a token. Empty
+    /// without a drafter, as what is kept of a batch being verified is.
+    features: Vec<D::Buffer>,
+    /// Of a batch being verified, each convolution's state as it was
+    /// before the batch and the batch's input to it, a slot's after
+    /// another's; and where the batch starts and how many tokens it is.
+    verify_states: Vec<D::Buffer>,
+    verify_inputs: Vec<D::Buffer>,
+    verified: Option<(usize, usize)>,
+    /// What a mark keeps of the drafter's context.
+    mark_context: Option<drafter::Mark<D>>,
     seq: Sequence<D>,
 }
 
@@ -1356,10 +1669,21 @@ struct Sequence<D: Device> {
     k_cache: Vec<D::Cache>,
     v_cache: Vec<D::Cache>,
     conv: Vec<[D::Buffer; CONVS]>,
+    /// The drafter's context of the sequence, where there is a drafter,
+    /// and how many tokens it is asked to draft at a time, at most.
+    context: Option<Context<D>>,
+    drafts: usize,
 }
 
 impl<D: Device> Sequence<D> {
-    fn new(c: &Config, device: &D, id: usize, max_len: usize, batch: usize) -> Self {
+    fn new(
+        c: &Config,
+        device: &D,
+        id: usize,
+        max_len: usize,
+        batch: usize,
+        drafter: Option<&Drafter<D>>,
+    ) -> Self {
         let ring = c.ring(batch, max_len);
         let cache = |slot: usize| {
             let rows = if c.local[c.layer_of(slot)] {
@@ -1381,6 +1705,8 @@ impl<D: Device> Sequence<D> {
                         .map(|channels| device.alloc((c.taps - 1) * channels))
                 })
                 .collect(),
+            context: drafter.map(|drafter| drafter.context(device, max_len)),
+            drafts: 1,
         }
     }
 
@@ -1396,12 +1722,18 @@ impl<D: Device> Sequence<D> {
 }
 
 impl<D: Device> State<D> {
-    fn new(c: &Config, device: &D, max_len: usize) -> Self {
+    fn new(c: &Config, device: &D, max_len: usize, drafter: Option<&Drafter<D>>) -> Self {
         let most = device.batch() * BATCHES;
         let k = c.experts_used;
         let buf = |width: usize| device.alloc(most * width);
         let hidden = || buf(c.hidden);
-        let seq = Sequence::new(c, device, 0, max_len, most);
+        let seq = Sequence::new(c, device, 0, max_len, most, drafter);
+        // A batch to verify is no longer than the drafter's block, and
+        // without a drafter nothing is kept of one.
+        let block = drafter.map_or(0, |drafter| drafter.config.block);
+        let targets = drafter.map_or(0, |drafter| drafter.config.targets.len());
+        let kept = drafter.map_or(0, |_| c.slots());
+        let convs = || (0..kept).flat_map(|_| c.conv_channels());
         let local = (0..c.slots()).filter(|&s| c.local[c.layer_of(s)]).count();
         Self {
             most,
@@ -1451,7 +1783,18 @@ impl<D: Device> State<D> {
             gate_up: buf(k * 2 * c.expert_width),
             act: buf(k * c.expert_width),
             down: buf(k * c.hidden),
-            logits: device.alloc(c.vocab_padded),
+            logits: device.alloc(block.max(1) * c.vocab_padded),
+            features: (0..targets).map(|_| hidden()).collect(),
+            verify_states: convs()
+                .map(|channels| device.alloc((c.taps - 1) * channels))
+                .collect(),
+            verify_inputs: convs()
+                .map(|channels| device.alloc(block * channels))
+                .collect(),
+            verified: None,
+            mark_context: drafter
+                .zip(seq.context.as_ref())
+                .map(|(drafter, context)| drafter.mark(device, context)),
             mark_rings: (0..2 * local)
                 .map(|_| device.alloc_cache(seq.ring * c.kv_dim()))
                 .collect(),
@@ -1482,7 +1825,8 @@ impl<D: Device> State<D> {
         .chain(&mut self.bank)
         .chain(&mut self.messages)
         .chain(&mut self.inputs)
-        .chain(&mut self.normed);
+        .chain(&mut self.normed)
+        .chain(&mut self.features);
         for buf in hidden {
             d.resize(buf, n * c.hidden);
         }
@@ -1769,6 +2113,105 @@ mod tests {
         gguf::write(path, &meta, &tensors).unwrap();
     }
 
+    /// Writes a tiny random drafter for the tiny model, in the file format
+    /// its drafter's is: two layers, the first over a window of four, a
+    /// block of four rows, and a head of rank eight, reading the model's
+    /// stream on the way into its second and sixth layers as it runs
+    /// them, and its output.
+    fn synthetic_drafter(path: &Path) {
+        let (hidden, layers, heads, kv_heads, head_dim) = (64, 2, 4, 2, 32);
+        let (ff, block, rank, window) = (128, 4, 8, 4);
+        let (vocab, padded) = (40, 48);
+        let targets = [1, 5, 10];
+        let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+        let mut rng = Rng(3);
+        let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
+        let mut add = |name: String, dims: &[usize], dtype: u32, data: Vec<u8>| {
+            tensors.push((name, dims.to_vec(), dtype, data));
+        };
+        let small = |cols: usize| 1.0 / (cols as f32).sqrt();
+        let floats: &[(&str, &[usize], f32, f32)] = &[
+            ("dspark_fuse.weight", &[targets.len(), layers + 1], 1.0, 0.0),
+            ("dspark_hidden_out.bias", &[hidden], 0.1, 0.0),
+            ("dspark_norm.weight", &[hidden], 0.1, 1.0),
+            ("joint_proj.bias", &[3 * rank], 0.1, 0.0),
+            ("mask_embd.weight", &[hidden], 1.0, 0.0),
+            ("output_norm.weight", &[hidden], 0.1, 1.0),
+        ];
+        for &(name, dims, scale, offset) in floats {
+            let data = rng.floats(dims.iter().product(), scale, offset);
+            add(name.into(), dims, gguf::F32, data);
+        }
+        for (name, rows, cols) in [
+            ("dspark_hidden_out", hidden, rank),
+            ("joint_proj", 3 * rank, 2 * rank + 2 * hidden),
+            ("markov_w1", padded, rank),
+        ] {
+            let data = rng.bf16(rows * cols, small(cols));
+            add(format!("{name}.weight"), &[cols, rows], gguf::BF16, data);
+        }
+        for i in 0..layers {
+            let p = format!("blk.{i}");
+            for (name, rows, cols) in [
+                ("attn_q", q_dim, hidden),
+                ("attn_k", kv_dim, hidden),
+                ("attn_v", kv_dim, hidden),
+                ("attn_k_ctx", kv_dim, hidden),
+                ("attn_v_ctx", kv_dim, hidden),
+                ("attn_output", hidden, q_dim),
+                ("ffn_gate", ff, hidden),
+                ("ffn_up", ff, hidden),
+                ("ffn_down", hidden, ff),
+            ] {
+                let data = rng.q8_0(rows, cols, small(cols));
+                add(
+                    format!("{p}.{name}.weight"),
+                    &[cols, rows],
+                    gguf::Q8_0,
+                    data,
+                );
+            }
+            for (name, len) in [
+                ("attn_q_norm", head_dim),
+                ("attn_k_norm", head_dim),
+                ("attn_k_ctx_norm", head_dim),
+                ("attn_norm", hidden),
+                ("ffn_norm", hidden),
+                ("dflare_norm", hidden),
+            ] {
+                let data = rng.floats(len, 0.1, 1.0);
+                add(format!("{p}.{name}.weight"), &[len], gguf::F32, data);
+            }
+        }
+        let n = |v: usize| Value::U32(v as u32);
+        let meta = vec![
+            ("general.architecture", Value::Str("dflash".into())),
+            ("dflash.block_count", n(layers)),
+            ("dflash.embedding_length", n(hidden)),
+            ("dflash.feed_forward_length", n(ff)),
+            ("dflash.attention.head_count", n(heads)),
+            ("dflash.attention.head_count_kv", n(kv_heads)),
+            ("dflash.attention.key_length", n(head_dim)),
+            ("dflash.rope.dimension_count", n(head_dim)),
+            ("dflash.rope.freq_base", Value::F32(10000.0)),
+            ("dflash.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
+            ("dflash.attention.sliding_window", n(window)),
+            (
+                "dflash.attention.sliding_window_pattern",
+                Value::Array(vec![Value::Bool(true), Value::Bool(false)]),
+            ),
+            (
+                "dflash.target_layers",
+                Value::Array(targets.iter().map(|&t| Value::I32(t)).collect()),
+            ),
+            ("dflash.block_size", n(block)),
+            ("dflash.dspark.markov_rank", n(rank)),
+            ("dflash.vocab_size", n(padded)),
+            ("dflash.vocab_size_unpadded", n(vocab)),
+        ];
+        gguf::write(path, &meta, &tensors).unwrap();
+    }
+
     /// A tiny model's file in a directory of its own, removed when dropped.
     struct File(PathBuf);
 
@@ -1789,7 +2232,18 @@ mod tests {
 
         fn load<D: Device>(&self, device: D, max_len: usize) -> Model<D> {
             let gguf = Arc::new(Gguf::open(&self.0.join("model.gguf")).unwrap());
-            Model::load(gguf, device, max_len, |_, _| {}).unwrap()
+            Model::load(gguf, None, device, max_len, |_, _| {}).unwrap()
+        }
+
+        /// The model with a drafter, whose file is written beside it.
+        fn load_drafting<D: Device>(&self, device: D, max_len: usize) -> Model<D> {
+            let path = self.0.join("drafter.gguf");
+            if !path.exists() {
+                synthetic_drafter(&path);
+            }
+            let gguf = Arc::new(Gguf::open(&self.0.join("model.gguf")).unwrap());
+            let drafter = Arc::new(Gguf::open(&path).unwrap());
+            Model::load(gguf, Some(drafter), device, max_len, |_, _| {}).unwrap()
         }
     }
 
@@ -1849,6 +2303,130 @@ mod tests {
                 .zip(&whole)
                 .any(|(a, b)| (a - b).abs() > 1e-3)
         );
+    }
+
+    /// The likeliest token.
+    fn top(logits: &[f32]) -> u32 {
+        (0..logits.len())
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .unwrap() as u32
+    }
+
+    /// Checks that a batch verified leaves the tokens kept as running
+    /// them one by one does, on a device a model with the drafter and one
+    /// without are loaded on by `load`, to within `tolerance`.
+    fn verified_as_run_one_by_one<M: LanguageModel>(mut plain: M, mut model: M, tolerance: f32) {
+        let prompt = sequence(300);
+        // What the model writes a token at a time, and the logits after
+        // each.
+        let mut want = vec![plain.forward(&prompt, 0)];
+        let mut written = Vec::new();
+        for i in 0..24 {
+            written.push(top(&want[i]));
+            want.push(plain.forward(&[written[i]], 300 + i));
+        }
+        // The same tokens, verified in batches of which all, some and one
+        // are kept: the logits after each token kept are the same, and so
+        // are those of the tokens run after.
+        close(&model.forward(&prompt, 0), &want[0], tolerance);
+        let mut at = 0;
+        for (size, keep) in [(4, 4), (3, 1), (4, 2), (2, 2), (4, 3), (1, 1)] {
+            let mut batch = written[at..at + size].to_vec();
+            // The tokens not kept are other tokens than the model wrote.
+            for token in &mut batch[keep..] {
+                *token = (*token + 1) % 40;
+            }
+            let rows = model.verify(&batch, 300 + at);
+            for (i, row) in rows.chunks_exact(40).take(keep).enumerate() {
+                close(row, &want[at + i + 1], tolerance);
+            }
+            model.rewind(keep);
+            at += keep;
+        }
+        let after = model.forward(&written[at..at + 3], 300 + at);
+        close(&after, &want[at + 3], tolerance);
+    }
+
+    #[test]
+    fn a_batch_verified_leaves_the_tokens_kept_as_run_one_by_one() {
+        let file = File::new("verify");
+        verified_as_run_one_by_one(file.load(Cpu, 400), file.load_drafting(Cpu, 400), 1e-4);
+    }
+
+    #[test]
+    fn gpu_verifies_and_drafts() {
+        let open = || Gpu::new().ok().filter(|gpu| gpu.takes_nvfp4());
+        let (Some(plain), Some(drafting), Some(gpu)) = (open(), open(), open()) else {
+            eprintln!("skipping: no GPU that runs NVFP4");
+            return;
+        };
+        // Every token through every expert, as in `gpu_matches_cpu`: a
+        // batch of a few tokens is multiplied as a token is, so the two
+        // differ by what the convolutions' states do, if anything.
+        let file = File::routing("gpu-verify", 4);
+        verified_as_run_one_by_one(
+            file.load(plain, 400),
+            file.load_drafting(drafting, 400),
+            5e-2,
+        );
+        // And the GPU drafts the tokens the CPU does.
+        let tokens = sequence(300);
+        let drafts = |mut model: Box<dyn LanguageModel>| {
+            model.forward(&tokens[..296], 0);
+            for at in [296, 298] {
+                model.verify(&tokens[at..at + 2], at);
+                model.rewind(2);
+            }
+            model.draft(7, 300, 3)
+        };
+        let want = drafts(Box::new(file.load_drafting(Cpu, 400)));
+        assert_eq!(want.len(), 3);
+        assert_eq!(drafts(Box::new(file.load_drafting(gpu, 400))), want);
+    }
+
+    #[test]
+    fn drafts_from_the_context_of_the_tokens_run() {
+        let file = File::new("drafts");
+        let tokens = sequence(330);
+        let mut model = file.load_drafting(Cpu, 400);
+        // Nothing is drafted before any token is run; then one token at
+        // a time, and one more after each batch that is kept whole.
+        assert_eq!(model.draft(1, 0, 3), Vec::<u32>::new());
+        model.forward(&tokens[..296], 0);
+        assert_eq!(model.draft(tokens[296], 296, 3).len(), 1);
+        for at in [296, 298] {
+            model.verify(&tokens[at..at + 2], at);
+            model.rewind(2);
+        }
+        let drafts = model.draft(tokens[300], 300, 3);
+        assert_eq!(drafts.len(), 3);
+        assert!(drafts.iter().all(|&token| token < 40));
+        assert_eq!(model.draft(tokens[300], 300, 2), drafts[..2]);
+        // The drafts depend on the token drafted after, and on what was
+        // run before it.
+        assert_ne!(model.draft((tokens[300] + 1) % 40, 300, 3), drafts);
+        let mut other = file.load_drafting(Cpu, 400);
+        let mut changed = tokens.clone();
+        changed[290] = (changed[290] + 1) % 40;
+        other.forward(&changed[..300], 0);
+        assert_ne!(other.draft(tokens[300], 300, 3), drafts);
+
+        // A model that takes up a saved state drafts as the one that
+        // saved it, a token at a time again, and so does one put back at
+        // a mark.
+        let state = model.save(300).unwrap();
+        let mut resumed = file.load_drafting(Cpu, 400);
+        assert_eq!(resumed.restore(&state).unwrap(), 300);
+        assert_eq!(resumed.draft(tokens[300], 300, 3), drafts[..1]);
+        assert!(model.mark());
+        model.forward(&tokens[300..], 300);
+        assert_ne!(model.draft(tokens[300], 330, 3), drafts);
+        model.rewind_to_mark().unwrap();
+        assert_eq!(model.draft(tokens[300], 300, 3), drafts);
+        // A model without the drafter takes the state of no model with
+        // one, and drafts nothing.
+        assert!(file.load(Cpu, 400).restore(&state).is_err());
+        assert_eq!(file.load(Cpu, 400).draft(1, 0, 3), Vec::<u32>::new());
     }
 
     #[test]
@@ -1958,6 +2536,87 @@ mod tests {
         close(&last, &want_last, 5e-2);
     }
 
+    /// Writes on from three kinds of text with the real model and its
+    /// drafter, greedily: how fast, how many of the drafts the model keeps,
+    /// and that it writes what it does a token at a time. Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_model_drafts() {
+        let weights = crate::model::Model::InklingMini.weights().unwrap();
+        let dir = weights.dir().unwrap();
+        let (path, drafter) = (weights.path(&dir), weights.drafter_path(&dir).unwrap());
+        if !path.exists() || !drafter.exists() {
+            eprintln!("skipping: no model and drafter at {}", dir.display());
+            return;
+        }
+        let gguf = Arc::new(Gguf::open(&path).unwrap());
+        let drafter = Arc::new(Gguf::open(&drafter).unwrap());
+        let format = crate::model::Model::InklingMini.format(&gguf).unwrap();
+        let tokenizer = format.tokenizer();
+        let mut model =
+            Model::load(gguf, Some(drafter), Gpu::new().unwrap(), 4096, |_, _| {}).unwrap();
+        let texts = [
+            "The history of the Roman Empire is usually told as a story of rise and fall. In this essay I want to argue that",
+            "use std::collections::HashMap;\n\n/// Counts how often each word occurs in `text`, ignoring case.\npub fn word_counts(text: &str) -> HashMap<String, usize> {\n",
+            "Q: My Python script crashes with `KeyError: 'name'` when I read rows from a CSV file with csv.DictReader. What is going on and how do I fix it?\n\nA:",
+        ];
+        let total = 160;
+        for text in texts {
+            let prompt = tokenizer.encode(text).unwrap();
+            // A token at a time.
+            model.reset();
+            let mut logits = model.forward(&prompt, 0);
+            let mut plain = Vec::new();
+            let start = std::time::Instant::now();
+            for i in 0..total {
+                plain.push(top(&logits));
+                logits = model.forward(&plain[i..], prompt.len() + i);
+            }
+            let alone = total as f64 / start.elapsed().as_secs_f64();
+            // And drafted.
+            model.reset();
+            let mut logits = model.forward(&prompt, 0);
+            let (mut written, mut drafted, mut kept, mut passes) = (Vec::new(), 0, 0, 0);
+            let start = std::time::Instant::now();
+            while written.len() < total {
+                let pos = prompt.len() + written.len();
+                let token = top(&logits);
+                written.push(token);
+                let drafts = model.draft(token, pos, 7);
+                passes += 1;
+                if drafts.is_empty() {
+                    logits = model.forward(&[token], pos);
+                    continue;
+                }
+                let mut batch = vec![token];
+                batch.extend(&drafts);
+                let rows = model.verify(&batch, pos);
+                let rows: Vec<&[f32]> = rows.chunks_exact(rows.len() / batch.len()).collect();
+                let agreed = (0..drafts.len())
+                    .take_while(|&i| top(rows[i]) == drafts[i])
+                    .count();
+                model.rewind(agreed + 1);
+                written.extend(&drafts[..agreed]);
+                logits = rows[agreed].to_vec();
+                drafted += drafts.len();
+                kept += agreed;
+            }
+            let speed = written.len() as f64 / start.elapsed().as_secs_f64();
+            let same = written
+                .iter()
+                .zip(&plain)
+                .take_while(|(a, b)| a == b)
+                .count();
+            eprintln!(
+                "{alone:.1} tok/s a token at a time, {speed:.1} drafted: {} tokens in {passes} \
+                 passes, {kept} of {drafted} drafts kept; the same as a token at a time for \
+                 {same} tokens",
+                written.len()
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn real_model_completes_a_prompt() {
@@ -1972,7 +2631,7 @@ mod tests {
         let tokenizer = format.tokenizer();
         let device = Gpu::new().unwrap();
         let start = std::time::Instant::now();
-        let mut model = Model::load(gguf, device, 2048, |_, _| {}).unwrap();
+        let mut model = Model::load(gguf, None, device, 2048, |_, _| {}).unwrap();
         eprintln!("loaded in {:.1}s", start.elapsed().as_secs_f32());
         let mut tokens = tokenizer.encode("The capital of France is").unwrap();
         let decode = 16;

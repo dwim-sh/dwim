@@ -22,8 +22,9 @@ pub struct Plan {
 }
 
 /// What the model in `gguf` takes on a device that runs `batch` tokens at
-/// once. Fails if the file names an architecture dwim does not run.
-pub fn plan(gguf: &Gguf, batch: usize) -> Result<Plan> {
+/// once, with its drafter where that is a file of its own and is there.
+/// Fails if the file names an architecture dwim does not run.
+pub fn plan(gguf: &Gguf, drafter: Option<&Gguf>, batch: usize) -> Result<Plan> {
     match gguf.str("general.architecture")? {
         qwen35::ARCHITECTURE => {
             let config = qwen35::Config::load(gguf)?;
@@ -35,7 +36,7 @@ pub fn plan(gguf: &Gguf, batch: usize) -> Result<Plan> {
         inkling2::ARCHITECTURE => {
             let config = inkling2::Config::load(gguf)?;
             Ok(Plan {
-                memory: config.memory(gguf, batch)?,
+                memory: config.memory(gguf, drafter, batch)?,
                 trained: config.context_length,
             })
         }
@@ -43,11 +44,13 @@ pub fn plan(gguf: &Gguf, batch: usize) -> Result<Plan> {
     }
 }
 
-/// Loads the model in `gguf` onto `device`, with room for `context` tokens
-/// of conversation, reporting how many of its tensors are loaded, out of
+/// Loads the model in `gguf` onto `device`, with its drafter where that is
+/// a file of its own and is there, and with room for `context` tokens of
+/// conversation, reporting how many of its tensors are loaded, out of
 /// how many, as it goes.
 pub fn load<D: Device + 'static>(
     gguf: Arc<Gguf>,
+    drafter: Option<Arc<Gguf>>,
     device: D,
     context: usize,
     on_progress: impl FnMut(usize, usize),
@@ -61,6 +64,7 @@ pub fn load<D: Device + 'static>(
         )?)),
         inkling2::ARCHITECTURE => Ok(Box::new(inkling2::Model::load(
             gguf,
+            drafter,
             device,
             context,
             on_progress,

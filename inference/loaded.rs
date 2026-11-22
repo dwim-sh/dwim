@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 use crate::{
     gpu::{Cpu, Device as _, Gpu},
     inference::{Gguf, LanguageModel, Result, Sampler, arch},
-    model::{Device, Format, Model, Size},
+    model::{Device, Format, Model, Size, Weights},
 };
 
 /// How far loading the model has got.
@@ -45,7 +45,9 @@ impl Loaded {
             return None;
         }
         let gguf = Gguf::open(&path).ok()?;
-        size(&gguf, &Opened::open(device).ok()?, None, Self::SESSIONS).ok()
+        let drafter = drafter(weights, &weights.dir()?).ok()?;
+        let device = Opened::open(device).ok()?;
+        size(&gguf, drafter.as_deref(), &device, None, Self::SESSIONS).ok()
     }
 
     /// Opens `device` and loads `model`, whose files are in `dir`, onto
@@ -68,9 +70,10 @@ impl Loaded {
         let name = device.name();
         on_progress(Progress::Device(name.clone()));
         let format = model.format(&gguf)?;
-        let size = size(&gguf, &device, context, sessions)?;
+        let drafter = drafter(weights, dir)?;
+        let size = size(&gguf, drafter.as_deref(), &device, context, sessions)?;
         on_progress(Progress::Sized(size));
-        let model = device.load(gguf.clone(), size.context, |done, total| {
+        let model = device.load(gguf.clone(), drafter, size.context, |done, total| {
             on_progress(Progress::Weights { done, total })
         })?;
         Ok(Self {
@@ -220,12 +223,13 @@ impl Opened {
     fn load(
         self,
         gguf: Arc<Gguf>,
+        drafter: Option<Arc<Gguf>>,
         context: usize,
         on_progress: impl FnMut(usize, usize),
     ) -> Result<Box<dyn LanguageModel>> {
         match self {
-            Opened::Cpu(device) => arch::load(gguf, device, context, on_progress),
-            Opened::Gpu(device) => arch::load(gguf, *device, context, on_progress),
+            Opened::Cpu(device) => arch::load(gguf, drafter, device, context, on_progress),
+            Opened::Gpu(device) => arch::load(gguf, drafter, *device, context, on_progress),
         }
     }
 }
@@ -233,8 +237,14 @@ impl Opened {
 /// The size of the model on `device`, with room for `sessions` sessions
 /// of `context` tokens of conversation each, or as many as fit in the
 /// memory it has free.
-fn size(gguf: &Gguf, device: &Opened, context: Option<usize>, sessions: usize) -> Result<Size> {
-    let arch::Plan { memory, trained } = arch::plan(gguf, device.batch())?;
+fn size(
+    gguf: &Gguf,
+    drafter: Option<&Gguf>,
+    device: &Opened,
+    context: Option<usize>,
+    sessions: usize,
+) -> Result<Size> {
+    let arch::Plan { memory, trained } = arch::plan(gguf, drafter, device.batch())?;
     let context = match context {
         Some(context) => context,
         None => memory.fit(device.memory(), trained, sessions),
@@ -251,6 +261,16 @@ fn size(gguf: &Gguf, device: &Opened, context: Option<usize>, sessions: usize) -
         model: memory.fixed,
         conversation: memory.per_sequence + memory.per_token * context as u64,
     })
+}
+
+/// The file of the drafter of the model whose files are in `dir`, where
+/// the model has one of its own and it is there: a model without it runs
+/// as it does, a token at a time.
+fn drafter(weights: &Weights, dir: &Path) -> Result<Option<Arc<Gguf>>> {
+    match weights.drafter_path(dir).filter(|path| path.exists()) {
+        Some(path) => Ok(Some(Arc::new(Gguf::open(&path)?))),
+        None => Ok(None),
+    }
 }
 
 /// Seed for sampling, different on every run.
