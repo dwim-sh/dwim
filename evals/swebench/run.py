@@ -297,9 +297,9 @@ def directory(args, agent):
     now = manifest(args, agent)
     name = "gold"
     if agent and args.agent == "dwim":
-        name = f"dwim-{now['agent']['commit'][:12]}{'-dirty' if now['agent']['dirty'] else ''}"
+        name = f"{named(now['agent'])}-{now['agent']['commit'][:12]}{'-dirty' if now['agent']['dirty'] else ''}"
     elif agent:
-        name = f"{args.agent}-{now['agent']['version']}"
+        name = f"{named(now['agent'])}-{now['agent']['version']}"
     run = pathlib.Path(args.runs).resolve() / (args.run_id or f"{args.dataset}-{name}")
     run.mkdir(parents=True, exist_ok=True)
     path = run / "manifest.json"
@@ -311,6 +311,14 @@ def directory(args, agent):
     else:
         write(path, json.dumps(now, indent=2) + "\n")
     return run
+
+
+def named(agent):
+    """The agent as a run and its report are named for it: by its name,
+    and by its model where that is not the one it runs unasked, so that a
+    run on another model is kept beside the run on that one."""
+    name = agent.get("name", "dwim")
+    return name if agent["model"] == MODELS[name] else f"{name}-{agent['model'].replace('/', '-')}"
 
 
 def manifest(args, agent):
@@ -689,7 +697,8 @@ def report(run, rows, keep):
     came of it, and each instance. A run of a whole dataset is one to
     `keep`, and its report goes to evals/results/ as well, which git has,
     where the runs themselves are too large for it. The report kept is
-    named for the agent and the dataset, as dwim-swebench-mini.md is, so
+    named for the agent, its model if that is not its usual one, and the
+    dataset, as dwim-swebench-mini.md is, so
     that a later run's takes the place of an earlier one's: which `dwim`
     it was is the commit the report names."""
     said = json.loads((run / "manifest.json").read_text())
@@ -698,7 +707,7 @@ def report(run, rows, keep):
     known = [facts(agent, run / row["instance_id"] / "transcript.jsonl") for row in rows]
     served = sorted({fact["served"] for fact in known if fact.get("served")})
     resolved = sum(1 for r in results if r.get("verdict") == "resolved")
-    name = f"{'gold' if agent == 'gold' else agent.get('name', 'dwim')}-{KEPT[said['dataset']]}"
+    name = f"{'gold' if agent == 'gold' else named(agent)}-{KEPT[said['dataset']]}"
     lines = [f"# {name}", "", "| | |", "|---|---|", f"| Dataset | {said['dataset']}, {len(rows)} instances |"]
     if agent == "gold":
         lines += ["| Agent | none: the dataset's own fixes |"]
