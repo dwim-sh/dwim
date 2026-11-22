@@ -91,12 +91,19 @@ pub enum Chunk<'a> {
 /// What a reply came to: the tool calls it made, as the model wrote them,
 /// whether it was stopped short because the context was full, but for the
 /// reserve, and whether its thought was ended at the limit
-/// [`Session::limit_thoughts`] sets, rather than by the model.
+/// [`Session::limit_thoughts`] sets, rather than by the model. Of a model
+/// at a host, also who ran it, where the host passes requests on and
+/// says, and what each request for the reply that was made again failed
+/// with.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Reply {
     pub calls: Vec<String>,
     pub cut: bool,
     pub thought_ended: bool,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub retried: Vec<String>,
 }
 
 /// A plain answer, and whether it was stopped short for room.
