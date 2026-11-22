@@ -50,7 +50,7 @@ use crate::{
     tools::{ToolCall, declared},
 };
 
-use stream::{Outcome, Usage};
+use stream::{Failure, Outcome, Usage};
 
 /// Who a model is hosted by: where it is asked, and what is asked there
 /// in the host's own way.
@@ -102,7 +102,10 @@ const ENDINGS: usize = 3;
 const THOUGHT_BYTES: usize = 4;
 
 /// How often a request that was refused for now, or did not get through,
-/// is made again, and how long it waits first.
+/// is made again, and how long it waits first. A reply whose stream
+/// fails is asked for again as often: on SWE-bench Verified Mini three
+/// of Inkling 2 Mini's first five sessions at OpenRouter ended on
+/// "Provider returned error" or "The operation was aborted" in a stream.
 const RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
 /// A model at a host.
@@ -264,28 +267,50 @@ impl Hosted {
 
     /// Asks for a reply as [`Hosted::ask`] does, and drops it where its
     /// thought runs to `most` bytes, if they are limited: what there was
-    /// of the reply, and whether it was dropped there.
+    /// of the reply, and whether it was dropped there. A reply whose
+    /// stream fails in a way that may pass is asked for again, after a
+    /// wait, unless text of it has been passed on, which cannot be taken
+    /// back: a thought so far is thought over again.
     fn ask_within(
         &mut self,
         body: &Value,
         most: Option<usize>,
         on_chunk: &mut impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<(Outcome, bool)> {
-        let mut bytes = 0;
-        let mut over = false;
-        let outcome = self.ask(body, |chunk| {
-            let thinking = matches!(chunk, Chunk::Thought(_));
-            if let Chunk::Thought(piece) = &chunk {
-                bytes += piece.len();
+        let mut retries = RETRIES.iter();
+        let mut retried = Vec::new();
+        loop {
+            let mut bytes = 0;
+            let mut over = false;
+            let mut shown = false;
+            let asked = self.ask(body, |chunk| {
+                let thinking = matches!(chunk, Chunk::Thought(_));
+                if let Chunk::Thought(piece) = &chunk {
+                    bytes += piece.len();
+                }
+                shown |= matches!(chunk, Chunk::Text(_));
+                on_chunk(chunk)?;
+                if thinking && most.is_some_and(|most| bytes >= most) {
+                    over = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            match asked {
+                Ok(mut outcome) => {
+                    outcome.retried = retried;
+                    return Ok((outcome, over));
+                }
+                Err(failure) if failure.again && !shown => match retries.next() {
+                    Some(wait) => {
+                        retried.push(failure.message);
+                        thread::sleep(*wait);
+                    }
+                    None => return Err(failure.into()),
+                },
+                Err(failure) => return Err(failure.into()),
             }
-            on_chunk(chunk)?;
-            if thinking && most.is_some_and(|most| bytes >= most) {
-                over = true;
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        })?;
-        Ok((outcome, over))
+        }
     }
 
     /// Posts a request for a reply, reads the reply as it streams to
@@ -295,9 +320,14 @@ impl Hosted {
         &mut self,
         body: &Value,
         on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
-    ) -> Result<Outcome> {
+    ) -> std::result::Result<Outcome, Failure> {
         let started = Instant::now();
-        let response = self.post(&body.to_string())?;
+        // A request that does not get through has been made again by
+        // the time it fails.
+        let response = self.post(&body.to_string()).map_err(|e| Failure {
+            message: e.to_string(),
+            again: false,
+        })?;
         let waited = started.elapsed().as_secs_f64();
         let outcome = stream::read(BufReader::new(response), self.host.name, on_chunk)?;
         if let Some(usage) = outcome.usage {
@@ -456,6 +486,8 @@ impl Provider for Hosted {
                 calls: outcome.calls,
                 cut: outcome.cut,
                 thought_ended: outcome.thought_ended,
+                provider: outcome.provider,
+                retried: outcome.retried,
             },
             text: outcome.text,
             thought: outcome.thought,
@@ -717,6 +749,50 @@ mod tests {
 
         assert_eq!(asked[0]["reasoning"], json!({ "effort": "xhigh" }));
         assert_eq!(asked[1]["reasoning"], json!({ "effort": "low" }));
+    }
+
+    #[test]
+    fn a_reply_whose_stream_fails_is_asked_for_again() {
+        // The provider fails in the middle of a thought, as OpenRouter
+        // passes it on: the reply is asked for again, and says who ran
+        // it and what was made again. Once text has been passed on, the
+        // failure is the reply's.
+        let failed = |delta: Value| {
+            let event = json!({ "choices": [{ "delta": delta }] });
+            let error = json!({ "error": { "code": 502, "message": "Provider returned error" } });
+            format!("data: {event}\n\ndata: {error}\n\n")
+        };
+        let good =
+            json!({ "provider": "Somewhere", "choices": [{ "delta": { "content": "Done." } }] });
+        let (mut provider, serving) = provider(vec![
+            failed(json!({ "reasoning": "Let me see." })),
+            format!("data: {good}\n\ndata: [DONE]\n\n"),
+            failed(json!({ "content": "It is" })),
+        ]);
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        let generation = Generation {
+            reserve: 0,
+            thought_limit: None,
+            closing: None,
+        };
+        let completion = provider
+            .reply(&chat, &generation, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(completion.text, "Done.");
+        assert_eq!(completion.reply.provider.as_deref(), Some("Somewhere"));
+        assert_eq!(completion.reply.retried.len(), 1, "{:?}", completion.reply);
+        let error = provider
+            .reply(&chat, &generation, |_| ControlFlow::Continue(()))
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("Provider returned error"),
+            "{error}"
+        );
+        assert_eq!(serving.join().unwrap().len(), 3);
     }
 
     #[test]
