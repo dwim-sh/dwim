@@ -37,7 +37,8 @@ __device__ __forceinline__ float short_conv_channel(
             acc += dynamic[((size_t)t * p.heads + head) * p.taps + lag] * short_conv_input(x, state, p, t, lag, c);
         }
     }
-    if (p.n == 1) {
+    // A convolution with one tap has no state to move on.
+    if (p.n == 1 && p.taps > 1) {
         for (u32 s = 0; s + 2 < p.taps; s++) {
             state[s * p.channels + c] = state[(s + 1) * p.channels + c];
         }

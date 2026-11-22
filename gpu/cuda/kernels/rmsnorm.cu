@@ -1,12 +1,9 @@
 // Normalizes each row of x by its root mean square and scales it by the
 // weight, in place, or into `out` as halves: one block of 256 threads per
-// row. The row is read as vectors of
-// four, a fixed number per thread with the index clamped rather than the
-// load skipped, so that the loads go out together instead of one round
-// trip after another.
-
-// Vectors a thread reads: rows of up to 8192 elements.
-#define RMSNORM_PER_THREAD 8
+// row. A row whose length is a multiple of four is read as vectors of
+// four, a thread looping over its share of them; a row whose start is not
+// on a vector, which is the rest when the length is not, is read
+// element by element instead.
 
 template <bool HALVES>
 __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const float4* weight, RmsnormParams p) {
@@ -14,15 +11,21 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
     const u32 lid = threadIdx.x;
     const u32 lane = lid & 31;
     const u32 warp = lid >> 5;
-    u32 vectors = p.dim / 4;
-    u32 base = blockIdx.x * vectors;
-    float4 vs[RMSNORM_PER_THREAD];
     float ss = 0.0f;
-#pragma unroll
-    for (u32 k = 0; k < RMSNORM_PER_THREAD; k++) {
-        u32 i = lid + k * 256;
-        vs[k] = x[base + min(i, vectors - 1)];
-        ss += i < vectors ? dot4(vs[k], vs[k]) : 0.0f;
+    if (p.dim % 4 == 0) {
+        const u32 vectors = p.dim / 4;
+        const u32 base = blockIdx.x * vectors;
+        for (u32 i = lid; i < vectors; i += 256) {
+            float4 v = x[base + i];
+            ss += dot4(v, v);
+        }
+    } else {
+        const float* xf = (const float*)x;
+        const u32 base = blockIdx.x * p.dim;
+        for (u32 i = lid; i < p.dim; i += 256) {
+            float v = xf[base + i];
+            ss += v * v;
+        }
     }
     float s = warp_sum(ss);
     if (lane == 0) {
@@ -34,15 +37,27 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
         total += partial[i];
     }
     float scale = rsqrtf(total / (float)p.dim + p.eps);
-#pragma unroll
-    for (u32 k = 0; k < RMSNORM_PER_THREAD; k++) {
-        u32 i = lid + k * 256;
-        if (i < vectors) {
-            float4 v = mul4(scale4(vs[k], scale), weight[i]);
+    if (p.dim % 4 == 0) {
+        const u32 vectors = p.dim / 4;
+        const u32 base = blockIdx.x * vectors;
+        for (u32 i = lid; i < vectors; i += 256) {
+            float4 v = mul4(scale4(x[base + i], scale), weight[i]);
             if (HALVES) {
                 ((uint2*)out)[base + i] = halves4(v);
             } else {
                 ((float4*)out)[base + i] = v;
+            }
+        }
+    } else {
+        const float* xf = (const float*)x;
+        const float* wf = (const float*)weight;
+        const u32 base = blockIdx.x * p.dim;
+        for (u32 i = lid; i < p.dim; i += 256) {
+            float r = xf[base + i] * scale * wf[i];
+            if (HALVES) {
+                ((u16*)out)[base + i] = (u16)f32_to_finite_f16(r);
+            } else {
+                ((float*)out)[base + i] = r;
             }
         }
     }

@@ -55,6 +55,25 @@ macro_rules! check_against_cpu {
     };
 }
 
+/// Defines a test for each check, run on the CUDA device `$open` returns,
+/// skipped when it reports no CUDA driver, NVRTC, or device, and failed
+/// when a kernel would not compile or load.
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! check_cuda {
+    ($open:expr; $($check:ident),*) => {
+        $(
+            #[test]
+            fn $check() {
+                match $open {
+                    Ok(gpu) => crate::gpu::tests::$check(&gpu),
+                    Err(crate::gpu::cuda::CudaOpenError::Missing(e)) => eprintln!("skipping: {e}"),
+                    Err(e) => panic!("CUDA would not open: {e}"),
+                }
+            }
+        )*
+    };
+}
+
 /// Deterministic pseudo-random values in [-1, 1).
 struct Rng(u64);
 
@@ -775,7 +794,11 @@ pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
 
 pub fn rmsnorm_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(5);
-    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+    // The widths of 8196 and 8193 go past the kernel's old limit of eight
+    // vectors per thread; 8193 is not a multiple of four, so it has a tail,
+    // and 129 is a width not a multiple of four with several rows, so that
+    // a row's start is not on a vector.
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1), (8196, 1), (8193, 1), (129, 5)] {
         let w = rng.floats(dim);
         let x = rng.floats(dim * rows);
         let mut want = x.clone();
@@ -952,7 +975,7 @@ pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
 /// after it take, whichever way the device holds it.
 pub fn normalize_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(21);
-    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1), (8196, 1), (8193, 1), (129, 5)] {
         let w = rng.floats(dim);
         let x = rng.floats(dim * (rows + 1));
         let y = rng.floats(dim * rows);
@@ -1344,7 +1367,14 @@ pub fn mixes_match_cpu<D: Device>(gpu: &D) {
 /// to the next.
 pub fn short_conv_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(61);
-    for (channels, taps, heads) in [(1024, 4, 0), (1024, 4, 8), (2304, 4, 0), (48, 3, 4)] {
+    for (channels, taps, heads) in [
+        (1024, 4, 0),
+        (1024, 4, 8),
+        (2304, 4, 0),
+        (48, 3, 4),
+        (48, 1, 0),
+        (48, 1, 4),
+    ] {
         let weight = rng.floats(taps * channels);
         let mut cpu_state = rng.floats((taps - 1) * channels);
         let mut state = buffer(gpu, &cpu_state);

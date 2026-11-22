@@ -1381,10 +1381,6 @@ impl Device for Metal {
     fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
         let dim = weight.len;
         assert_eq!(x.len % dim, 0);
-        assert!(
-            dim.is_multiple_of(4) && dim <= 8192,
-            "the kernel takes rows of up to 8192 in fours"
-        );
         x.touch();
         let params = RmsnormParams {
             dim: dim as u32,

@@ -53,7 +53,8 @@ kernel void short_conv(
         }
     }
     out[i] = acc * rsqrt(float((p.heads != 0 ? 2 : 1) * p.taps + 1));
-    if (p.n == 1) {
+    // A convolution with one tap has no state to move on.
+    if (p.n == 1 && p.taps > 1) {
         for (uint s = 0; s + 2 < p.taps; s++) {
             state[s * p.channels + c] = state[(s + 1) * p.channels + c];
         }
