@@ -1,5 +1,6 @@
 mod bench;
 mod config;
+mod download;
 mod model;
 mod once;
 mod opts;
@@ -13,7 +14,6 @@ use std::error::Error;
 use dwim::harness::Log;
 
 use opts::Opts;
-use session::Stderr;
 
 fn main() {
     let opts = Opts::parse();
@@ -30,12 +30,7 @@ fn main() {
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let settings = opts.settings();
     if opts.download {
-        let mut stderr = Stderr::new();
-        let dir = session::fetch_model(&settings, |loading| stderr.report(&loading))?;
-        if let Some(weights) = settings.model.weights() {
-            println!("{}", weights.path(&dir).display());
-        }
-        return Ok(());
+        return download::download(&settings);
     }
     if opts.bench {
         return bench::bench(&settings);
