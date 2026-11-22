@@ -27,6 +27,7 @@ with no command that does not end with
 on a line of its own, and the account the model gives after a hundred
 tool calls, are answered with word to go on, with the tools on, up to ten
 times in a turn.
+The model is told with the prompt to end its last reply so.
 A reply to a prompt for which the model has run no command, as the answer
 to a question is, ends the run as it is.
 .SH OPTIONS
@@ -336,6 +337,7 @@ given on the command line: a reply that does not end with
 .B DONE
 on a line of its own, and the account it gives after a hundred tool
 calls, are answered with word to go on, up to ten times in a turn.
+The model is told with each message to end its last reply so.
 A turn in which the model has made no tool call ends at its reply.
 It is off in the shell unless turned on.
 .TP
