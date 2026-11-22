@@ -775,7 +775,9 @@ pub fn kernel_speed<D: Device>(gpu: &D, n: usize) {
 
 pub fn rmsnorm_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(5);
-    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+    // The widths of 8196 and 8193 go past the kernel's old limit of eight
+    // vectors per thread; 8193 is not a multiple of four, so it has a tail.
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1), (8196, 1), (8193, 1)] {
         let w = rng.floats(dim);
         let x = rng.floats(dim * rows);
         let mut want = x.clone();
@@ -952,7 +954,7 @@ pub fn elementwise_match_cpu<D: Device>(gpu: &D) {
 /// after it take, whichever way the device holds it.
 pub fn normalize_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(21);
-    for (dim, rows) in [(128, 5), (1024, 3), (8, 1)] {
+    for (dim, rows) in [(128, 5), (1024, 3), (8, 1), (8196, 1), (8193, 1)] {
         let w = rng.floats(dim);
         let x = rng.floats(dim * (rows + 1));
         let y = rng.floats(dim * rows);

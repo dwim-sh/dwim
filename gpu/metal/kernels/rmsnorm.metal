@@ -1,8 +1,6 @@
 // Normalizes each row of x by its root mean square and scales it by the
-// weight: one threadgroup per row. The row is read as vectors of four, a
-// fixed number per thread with the index clamped rather than the load
-// skipped, so that the loads go out together instead of one round trip
-// after another.
+// weight: one threadgroup per row. The row is read in a loop, so that a row
+// of any length is handled.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -12,13 +10,9 @@ struct Params {
     float eps;
 };
 
-constant uint THREADS = 256;
-// Vectors a thread reads: rows of up to 8192 elements.
-constant uint PER_THREAD = 8;
-
 kernel void rmsnorm(
-    device float4* x [[buffer(0)]],
-    const device float4* weight [[buffer(1)]],
+    device float* x [[buffer(0)]],
+    const device float* weight [[buffer(1)]],
     constant Params& p [[buffer(2)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
@@ -27,14 +21,11 @@ kernel void rmsnorm(
     uint lane [[thread_index_in_simdgroup]])
 {
     threadgroup float partial[32];
-    uint vectors = p.dim / 4;
-    device float4* v = x + row * vectors;
-    float4 vs[PER_THREAD];
+    device float* v = x + row * p.dim;
     float ss = 0.0f;
-    for (uint k = 0; k < PER_THREAD; k++) {
-        uint i = lid + k * THREADS;
-        vs[k] = v[min(i, vectors - 1)];
-        ss += i < vectors ? dot(vs[k], vs[k]) : 0.0f;
+    for (uint i = lid; i < p.dim; i += 256) {
+        float a = v[i];
+        ss += a * a;
     }
     ss = simd_sum(ss);
     if (lane == 0) {
@@ -46,10 +37,7 @@ kernel void rmsnorm(
         total += partial[i];
     }
     float scale = rsqrt(total / float(p.dim) + p.eps);
-    for (uint k = 0; k < PER_THREAD; k++) {
-        uint i = lid + k * THREADS;
-        if (i < vectors) {
-            v[i] = vs[k] * scale * weight[i];
-        }
+    for (uint i = lid; i < p.dim; i += 256) {
+        v[i] *= scale * weight[i];
     }
 }

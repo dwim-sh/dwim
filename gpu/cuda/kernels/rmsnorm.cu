@@ -1,12 +1,8 @@
 // Normalizes each row of x by its root mean square and scales it by the
 // weight, in place, or into `out` as halves: one block of 256 threads per
-// row. The row is read as vectors of
-// four, a fixed number per thread with the index clamped rather than the
-// load skipped, so that the loads go out together instead of one round
-// trip after another.
-
-// Vectors a thread reads: rows of up to 8192 elements.
-#define RMSNORM_PER_THREAD 8
+// row. The row is read as vectors of four, a thread looping over its share
+// of them, so that a row of any length is handled; a length not a multiple
+// of four leaves a tail of scalars that the first threads of the block take.
 
 template <bool HALVES>
 __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const float4* weight, RmsnormParams p) {
@@ -14,15 +10,17 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
     const u32 lid = threadIdx.x;
     const u32 lane = lid & 31;
     const u32 warp = lid >> 5;
-    u32 vectors = p.dim / 4;
-    u32 base = blockIdx.x * vectors;
-    float4 vs[RMSNORM_PER_THREAD];
+    const u32 vectors = p.dim / 4;
+    const u32 tail = p.dim - vectors * 4;
+    const u32 base = blockIdx.x * vectors;
     float ss = 0.0f;
-#pragma unroll
-    for (u32 k = 0; k < RMSNORM_PER_THREAD; k++) {
-        u32 i = lid + k * 256;
-        vs[k] = x[base + min(i, vectors - 1)];
-        ss += i < vectors ? dot4(vs[k], vs[k]) : 0.0f;
+    for (u32 i = lid; i < vectors; i += 256) {
+        float4 v = x[base + i];
+        ss += dot4(v, v);
+    }
+    if (tail && lid < tail) {
+        float v = ((const float*)x)[base * 4 + vectors * 4 + lid];
+        ss += v * v;
     }
     float s = warp_sum(ss);
     if (lane == 0) {
@@ -34,16 +32,22 @@ __device__ __forceinline__ void rmsnorm_body(void* out, const float4* x, const f
         total += partial[i];
     }
     float scale = rsqrtf(total / (float)p.dim + p.eps);
-#pragma unroll
-    for (u32 k = 0; k < RMSNORM_PER_THREAD; k++) {
-        u32 i = lid + k * 256;
-        if (i < vectors) {
-            float4 v = mul4(scale4(vs[k], scale), weight[i]);
-            if (HALVES) {
-                ((uint2*)out)[base + i] = halves4(v);
-            } else {
-                ((float4*)out)[base + i] = v;
-            }
+    for (u32 i = lid; i < vectors; i += 256) {
+        float4 v = mul4(scale4(x[base + i], scale), weight[i]);
+        if (HALVES) {
+            ((uint2*)out)[base + i] = halves4(v);
+        } else {
+            ((float4*)out)[base + i] = v;
+        }
+    }
+    if (tail && lid < tail) {
+        float v = ((const float*)x)[base * 4 + vectors * 4 + lid];
+        float w = ((const float*)weight)[vectors * 4 + lid];
+        float r = v * scale * w;
+        if (HALVES) {
+            ((u16*)out)[base * 4 + vectors * 4 + lid] = (u16)f32_to_finite_f16(r);
+        } else {
+            ((float*)out)[base * 4 + vectors * 4 + lid] = r;
         }
     }
 }
