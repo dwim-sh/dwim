@@ -1034,9 +1034,11 @@ fn short_conv_params(
 
 /// Bytes of shared memory a block of a tile kernel of `tokens` tokens
 /// takes, for weights of `bytes` bytes to a pair: a stage holds the
-/// tokens' halves for a tile's columns, the tile, and its scales.
+/// tokens' halves for a tile's columns, the tile, and its scales, which
+/// the halves have none of.
 fn tile_shared(tokens: usize, bytes: usize) -> usize {
-    let stage = tokens * TILE_COLS * 2 + TILE_ROWS * TILE_COLS / 2 * bytes + 2 * TILE_ROWS * 2;
+    let scales = if bytes == HALVES_BYTES { 0 } else { 2 * TILE_ROWS * 2 };
+    let stage = tokens * TILE_COLS * 2 + TILE_ROWS * TILE_COLS / 2 * bytes + scales;
     TILE_STAGES * stage
 }
 
