@@ -47,9 +47,9 @@ program. One package: `lib.rs` is the library, `cli/` and
   carries it), `format` (the chat format), `tokenizer`, `gguf` (a file's
   header), `hub` (the Hugging Face cache), and a directory for each
   family of models with what is its own: `qwen`, and `inkling` (Inkling
-  2 Mini, which `--model inkling2-mini` runs, on Metal). It takes
-  nothing from the directories above, and `providers/` take nothing from
-  `inference/`
+  2 Mini, which `--model inkling2-mini` runs, on Metal and CUDA). It
+  takes nothing from the directories above, and `providers/` take nothing
+  from `inference/`
 - `tools/` - the tools, one file each; `call` parses a call
 - `gpu/` - the `Device` trait; `cpu` is the reference, `cuda` (CUDA C
   kernels, compiled by NVRTC when the device opens), `vulkan` (WGSL

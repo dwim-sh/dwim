@@ -2308,6 +2308,17 @@ mod tests {
         }
     }
 
+    /// Times the experts' matmul at Inkling's shapes; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn expert_matmul_speed() {
+        match super::Metal::new() {
+            Ok(gpu) => crate::gpu::tests::expert_matmul_speed(&gpu),
+            Err(e) => eprintln!("skipping: {e}"),
+        }
+    }
+
     /// Times attention for one token, as a step of decoding takes it, at
     /// depths of context: it reads the caches once, so its speed is a
     /// rate of reading them. Run with `--ignored --nocapture`.

@@ -8,14 +8,6 @@
 // Tokens a block takes.
 #define BF16_TOKENS 8
 
-__device__ __forceinline__ float bf16_lo(u32 pair) {
-    return __uint_as_float(pair << 16);
-}
-
-__device__ __forceinline__ float bf16_hi(u32 pair) {
-    return __uint_as_float(pair & 0xffff0000u);
-}
-
 template <bool HALVES>
 __device__ __forceinline__ void bf16_body(float* out, const uint4* w, const void* x, MatmulParams p) {
     __shared__ float partial[2][BF16_TOKENS];

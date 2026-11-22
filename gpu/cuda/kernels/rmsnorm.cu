@@ -56,3 +56,20 @@ extern "C" __global__ void __launch_bounds__(256) normalize_f16(
     uint2* out, const float4* x, const float4* weight, RmsnormParams p) {
     rmsnorm_body<true>(out, x, weight, p);
 }
+
+// Several rows of `normalize_f16` in one grid, each job's own input,
+// weight and output: the rows across the grid and the jobs down it.
+#define NORM_JOBS 4
+
+struct NormJobs {
+    uint2* out[NORM_JOBS];
+    const float4* x[NORM_JOBS];
+    const float4* weight[NORM_JOBS];
+    u32 dim;
+    float eps;
+};
+
+extern "C" __global__ void __launch_bounds__(256) normalizes_f16(NormJobs p) {
+    RmsnormParams one = {p.dim, p.eps};
+    rmsnorm_body<true>(p.out[blockIdx.y], p.x[blockIdx.y], p.weight[blockIdx.y], one);
+}

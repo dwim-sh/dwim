@@ -27,3 +27,31 @@ extern "C" __global__ void __launch_bounds__(256) attention_combine(float* out, 
     }
     out[(t * p.n_heads + h) * p.head_dim + lid] = o / total;
 }
+
+// The same for `attention_rel`, whose tokens attend over their windows,
+// and whose softmax includes each head's sink.
+extern "C" __global__ void __launch_bounds__(256) attention_rel_combine(
+    float* out, const float* partials, const float* sinks, AttentionRelParams p) {
+    const u32 lid = threadIdx.x;
+    u32 t = p.first + blockIdx.x / p.n_heads;
+    u32 h = blockIdx.x % p.n_heads;
+    if (lid >= p.head_dim) {
+        return;
+    }
+    u32 len = min(p.pos + t + 1, p.window);
+    u32 chunks = (len + CHUNK - 1) / CHUNK;
+    u32 stride = p.head_dim + 2;
+    size_t base = ((size_t)(t - p.first) * p.n_heads + h) * p.chunks * stride;
+    float m = sinks[t * p.n_heads + h];
+    for (u32 c = 0; c < chunks; c++) {
+        m = fmaxf(m, partials[base + c * stride]);
+    }
+    float total = expf(sinks[t * p.n_heads + h] - m);
+    float o = 0.0f;
+    for (u32 c = 0; c < chunks; c++) {
+        float scale = expf(partials[base + c * stride] - m);
+        total += scale * partials[base + c * stride + 1];
+        o += scale * partials[base + c * stride + 2 + lid];
+    }
+    out[((size_t)t * p.n_heads + h) * p.head_dim + lid] = o / total;
+}
