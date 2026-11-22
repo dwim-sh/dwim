@@ -1346,7 +1346,14 @@ pub fn mixes_match_cpu<D: Device>(gpu: &D) {
 /// to the next.
 pub fn short_conv_matches_cpu<D: Device>(gpu: &D) {
     let mut rng = Rng(61);
-    for (channels, taps, heads) in [(1024, 4, 0), (1024, 4, 8), (2304, 4, 0), (48, 3, 4)] {
+    for (channels, taps, heads) in [
+        (1024, 4, 0),
+        (1024, 4, 8),
+        (2304, 4, 0),
+        (48, 3, 4),
+        (48, 1, 0),
+        (48, 1, 4),
+    ] {
         let weight = rng.floats(taps * channels);
         let mut cpu_state = rng.floats((taps - 1) * channels);
         let mut state = buffer(gpu, &cpu_state);
