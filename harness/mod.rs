@@ -127,6 +127,14 @@ const GO_ON: &str = "Go on with the work: no one will read this until you are do
 /// How a reply says, in auto mode, that the work is done: its last line.
 const DONE: &str = "DONE";
 
+/// What follows a message from the user in auto mode: that no one is
+/// there, and how a reply says the work is done. Told of it only by
+/// [`GO_ON`], a model that had finished was sent back to its work once in
+/// nearly every session, since its first account of it could not end as
+/// asked: on SWE-bench Verified Mini, in 46 of 50 sessions of Inkling 2
+/// Mini, which then checked its change over again for up to six calls.
+const UNATTENDED: &str = "<system-reminder>No one will read your replies until the work is done, and the tools stay on. Keep going until what the message above asks is done and checked. Then reply with what you found or did, and end that reply with DONE on a line of its own.</system-reminder>";
+
 /// What the model is asked with once it has made [`MAX_CALLS`] calls in a
 /// turn: a message it answers without tools, which ends the turn.
 const STEPS_PROMPT: &str = "You have made many tool calls in this turn without replying, and the tools are off until the user's next message. Reply now with what you have done, what you found, and what remains, in a few sentences.";
@@ -554,7 +562,9 @@ impl<S: Session> Harness<S> {
     }
 
     /// Turns auto mode on or off, for when the model runs with no one to
-    /// answer it: in it, a reply with no call that doesn't end with DONE,
+    /// answer it: in it, a message is followed by word that no one is
+    /// there and that the work ends with DONE, and a reply with no call
+    /// that doesn't end with DONE,
     /// and the account it gives at the call cap, are answered with word to
     /// go on, with the tools on, up to [`AUTO_ROUNDS`] times a turn. A
     /// turn in which the model has called no tool ends at its reply, as
@@ -723,6 +733,11 @@ impl<S: Session> Harness<S> {
             prompt: false,
         });
         let after = self.plan_so_far(on_event);
+        let after = match (after, self.auto) {
+            (Some(plan), true) => Some(format!("{plan}\n\n{UNATTENDED}")),
+            (None, true) => Some(UNATTENDED.to_string()),
+            (after, false) => after,
+        };
         let mut outcome = self.run(
             Turn::User(message.to_string()),
             false,
@@ -1485,6 +1500,19 @@ mod tests {
 
     /// A reply that calls `bash` twice, to make a file in `dir` and then
     /// another.
+    /// What the model of `harness` has been fed, as text.
+    fn fed(harness: &Harness<Local<Scripted>>) -> String {
+        let tokenizer = Tokenizer::tiny();
+        let fed: Vec<u8> = harness
+            .session
+            .model()
+            .fed
+            .iter()
+            .flat_map(|&token| tokenizer.decode(token).to_vec())
+            .collect();
+        String::from_utf8(fed).unwrap()
+    }
+
     fn reply_making_two(dir: &Path) -> String {
         let call = |file: &str| {
             format!(
@@ -1547,15 +1575,7 @@ mod tests {
             outputs.iter().all(|output| output == NOT_RUN),
             "{outputs:?}"
         );
-        let tokenizer = Tokenizer::tiny();
-        let fed: Vec<u8> = harness
-            .session
-            .model()
-            .fed
-            .iter()
-            .flat_map(|&token| tokenizer.decode(token).to_vec())
-            .collect();
-        let fed = String::from_utf8(fed).unwrap();
+        let fed = fed(&harness);
         let results = fed.find("<tool_response>").expect("no results were fed");
         assert_eq!(fed.matches("<tool_response>").count(), 2, "{fed}");
         assert!(results < fed.find("what happened?").unwrap(), "{fed}");
@@ -1923,6 +1943,10 @@ mod tests {
         let mut plain = harness(&scripts, 100_000, "");
         send(&mut plain, "go");
         assert_eq!(plain.transcript().count(), 4);
+        // Only in auto mode is the model told, with the message, how to
+        // say it is done.
+        assert!(fed(&auto).contains(UNATTENDED));
+        assert!(!fed(&plain).contains(DONE));
 
         // A model that never says it is done is told to go on no more
         // than AUTO_ROUNDS times.
