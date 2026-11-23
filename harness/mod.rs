@@ -36,7 +36,7 @@
 //! it, thoughts and compactions included, for finding out afterwards where
 //! a session's tokens went.
 
-mod compaction;
+pub mod compaction;
 mod log;
 
 use std::{
@@ -420,10 +420,10 @@ enum Outcome {
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
 #[derive(Clone)]
-struct Entry {
-    turn: Turn,
-    tokens: usize,
-    prompt: bool,
+pub struct Entry {
+    pub turn: Turn,
+    pub tokens: usize,
+    pub prompt: bool,
 }
 
 /// The loop around a [`Session`] that runs the tools the model calls
@@ -664,8 +664,7 @@ impl<S: Session> Harness<S> {
 
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
-    #[cfg(test)]
-    fn transcript(&self) -> impl Iterator<Item = &Turn> {
+    pub fn transcript(&self) -> impl Iterator<Item = &Turn> {
         self.transcript.iter().map(|entry| &entry.turn)
     }
 

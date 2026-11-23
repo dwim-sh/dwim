@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 575 216" width="575" height="216" role="img" aria-label="A turn: a message has the harness wait for the model; a reply that calls tools has the tools run, and their results go back to the model; a reply that calls none ends the turn; a turn interrupted while the tools run, or at the cap on calls, ends after their results are recorded. The conversation may be compacted between turns and before results.">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="head"/></marker></defs>
+<style>
+  text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .box { fill: #f1f5f9; stroke: #475569; stroke-width: 1.5; }
+  .t { font-size: 13px; fill: #1e293b; }
+  .l { font-size: 12px; fill: #475569; }
+  .line { fill: none; stroke: #64748b; stroke-width: 1.5; }
+  .dash { stroke-dasharray: 4 3; }
+  .head { fill: #64748b; }
+  @media (prefers-color-scheme: dark) {
+    .l { fill: #cbd5e1; }
+    .line { stroke: #94a3b8; }
+    .head { fill: #94a3b8; }
+  }
+</style>
+<g transform="translate(0 14)">
+<rect x="46" y="46" width="134" height="52" rx="8" class="box"/>
+<text x="113.0" y="68" text-anchor="middle" class="t">waiting for</text>
+<text x="113.0" y="85" text-anchor="middle" class="t">a message</text>
+<rect x="220" y="46" width="134" height="52" rx="8" class="box"/>
+<text x="287.0" y="68" text-anchor="middle" class="t">waiting for</text>
+<text x="287.0" y="85" text-anchor="middle" class="t">the model</text>
+<rect x="394" y="46" width="134" height="52" rx="8" class="box"/>
+<text x="461.0" y="68" text-anchor="middle" class="t">tools</text>
+<text x="461.0" y="85" text-anchor="middle" class="t">running</text>
+<path d="M135.0 46 C135.0 12 265.0 12 265.0 46" class="line" marker-end="url(#a)"/>
+<text x="200.0" y="6" text-anchor="middle" class="l">a message</text>
+<path d="M309.0 46 C309.0 12 439.0 12 439.0 46" class="line" marker-end="url(#a)"/>
+<text x="374.0" y="6" text-anchor="middle" class="l">a reply that calls tools</text>
+<path d="M265.0 98 C265.0 132 135.0 132 135.0 98" class="line" marker-end="url(#a)"/>
+<text x="200.0" y="142" text-anchor="middle" class="l">a reply that calls none</text>
+<path d="M439.0 98 C439.0 132 309.0 132 309.0 98" class="line" marker-end="url(#a)"/>
+<text x="374.0" y="142" text-anchor="middle" class="l">their results</text>
+<path d="M501.0 98 C501.0 194 73.0 194 73.0 98" class="line" marker-end="url(#a)"/>
+<text x="287.0" y="188" text-anchor="middle" class="l">their results, and the turn ends: interrupted, or at the cap</text>
+<path d="M46 60 C6 52 6 92 46 84" class="line dash" marker-end="url(#a)"/>
+<text x="22" y="120" text-anchor="middle" class="l">compact</text>
+<path d="M528 60 C568 52 568 92 528 84" class="line dash" marker-end="url(#a)"/>
+<text x="552" y="120" text-anchor="middle" class="l">compact</text>
+</g>
+</svg>

@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compaction, played</title>
+<!-- Draws the steps `lake exe compaction-trace` writes from the spec in
+     Dwim/Harness/Compaction.lean. Nothing here decides what a compaction
+     keeps: the trace says it. -->
+<script src="compaction-trace.js"></script>
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e4e1da;
+  --msg: #e8a23a; --head: #8a5cf6; --call: #3b82c4; --res: #9fb3c2; --answer: #3aa57a;
+  --alert: #d9483b; --glow: rgba(232, 162, 58, .35);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121316; --panel: #1a1c20; --ink: #ecebe7; --muted: #9a9993; --line: #2c2f35;
+    --msg: #f0b14f; --head: #a07bff; --call: #5aa2e6; --res: #50606d; --answer: #4cc08f;
+    --alert: #ff6b5e; --glow: rgba(240, 177, 79, .3);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1100px; margin: 0 auto; padding: 28px 16px 48px; }
+h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -.01em; }
+.lede { color: var(--muted); margin: 0 0 24px; max-width: 70ch; }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .92em; }
+a { color: var(--call); }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+
+/* The window */
+.meter { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; gap: 12px; flex-wrap: wrap; }
+.meter .tokens { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.meter .tokens small { color: var(--muted); font-weight: 400; font-size: 14px; }
+.phase { font-size: 13px; padding: 3px 10px; border-radius: 99px; background: var(--line); color: var(--muted); transition: background .3s, color .3s; }
+.phase.on { background: var(--alert); color: #fff; }
+.window { position: relative; height: 96px; margin: 26px 0 30px; border-radius: 8px;
+  background: repeating-linear-gradient(90deg, transparent 0 calc(6.25% - 1px), var(--line) calc(6.25% - 1px) 6.25%);
+  outline: 1px solid var(--line); }
+.seg { position: absolute; top: 8px; bottom: 8px; border-radius: 4px; min-width: 4px;
+  transition: left .7s cubic-bezier(.4,.1,.2,1), width .7s cubic-bezier(.4,.1,.2,1), opacity .6s, transform .7s, top .7s, bottom .7s, filter .4s, box-shadow .4s;
+  cursor: default; overflow: hidden; }
+.seg span { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); font-size: 11px; color: #fff; white-space: nowrap; font-weight: 600; text-shadow: 0 1px 1px rgba(0,0,0,.25); pointer-events: none; }
+.seg.msg { background: var(--msg); } .seg.head { background: var(--head); }
+.seg.call { background: var(--call); } .seg.res { background: var(--res); }
+.seg.answer { background: var(--answer); }
+.seg.res span { color: var(--ink); text-shadow: none; }
+.seg.new { top: 2px; bottom: 2px; box-shadow: 0 0 0 2px var(--ink); }
+.seg.dim { opacity: .25; filter: saturate(.3); }
+.seg.tail { box-shadow: 0 0 0 2px var(--head) inset, 0 0 12px var(--head); }
+.seg.gone { opacity: 0; transform: translateY(60px) rotate(4deg); }
+.seg.over { box-shadow: 0 0 0 2px var(--alert); }
+.seg.born { animation: born .9s ease-out; }
+@keyframes born { from { transform: scaleX(.2); transform-origin: left; filter: brightness(1.8); } }
+
+.mark { position: absolute; top: -20px; bottom: -6px; border-left: 2px dashed var(--muted); transition: border-color .3s, left .7s; pointer-events: none; }
+.mark b { position: absolute; top: -2px; left: 6px; font-size: 11px; font-weight: 500; color: var(--muted); white-space: nowrap; }
+.mark.hot { border-color: var(--alert); } .mark.hot b { color: var(--alert); }
+.bracket { position: absolute; bottom: -24px; height: 14px; border: 2px solid var(--head); border-top: 0; border-radius: 0 0 6px 6px; opacity: 0; transition: opacity .4s, left .7s, width .7s; pointer-events: none; }
+.bracket b { position: absolute; top: 12px; right: 0; font-size: 11px; color: var(--head); white-space: nowrap; }
+.bracket.show { opacity: 1; }
+
+/* What the user said */
+.said-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-height: 34px; }
+.said-row .label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); width: 100%; }
+.chip { display: flex; font-size: 12.5px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); max-width: 300px; white-space: nowrap; transition: all .4s; background: var(--panel); }
+.chip .x { overflow: hidden; text-overflow: ellipsis; }
+.chip .n { font-variant-numeric: tabular-nums; color: var(--muted); margin-left: 6px; font-size: 11px; }
+.chip.cand { border-color: var(--msg); }
+.chip.carried { background: var(--msg); color: #1d1d1b; border-color: var(--msg); box-shadow: 0 0 0 4px var(--glow); }
+.chip.carried .n { color: #1d1d1b; }
+.chip.blocked { border-color: var(--alert); color: var(--alert); text-decoration: line-through; }
+.chip.left { opacity: .45; }
+.chip.intail { border-style: dashed; }
+.flyer { position: fixed; z-index: 10; pointer-events: none; transition: left .8s cubic-bezier(.5,0,.2,1), top .8s cubic-bezier(.5,0,.2,1), opacity .8s, transform .8s; }
+
+/* Caption, controls, transcript */
+.grid { display: grid; grid-template-columns: 1fr 320px; gap: 16px; margin-top: 16px; }
+@media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+.caption h2 { font-size: 16px; margin: 0 0 6px; }
+.caption p { margin: 0 0 8px; color: var(--muted); }
+.caption p strong { color: var(--ink); }
+.controls { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 6px 12px; cursor: pointer; min-width: 40px; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); min-width: 84px; }
+select { font: inherit; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+.scrub { position: relative; flex: 1 1 240px; height: 28px; cursor: pointer; }
+.scrub .track { position: absolute; left: 0; right: 0; top: 13px; height: 3px; background: var(--line); border-radius: 2px; }
+.scrub .fill { position: absolute; left: 0; top: 13px; height: 3px; background: var(--ink); border-radius: 2px; }
+.scrub .tick { position: absolute; top: 6px; width: 3px; height: 17px; background: var(--alert); border-radius: 2px; }
+.scrub .knob { position: absolute; top: 7px; width: 15px; height: 15px; margin-left: -7px; border-radius: 50%; background: var(--ink); }
+.transcript { max-height: 360px; overflow: auto; font-size: 13px; padding: 10px; }
+.transcript .row { display: flex; gap: 8px; padding: 5px 6px; border-radius: 6px; align-items: baseline; transition: background .4s, opacity .4s; }
+.transcript .row .dot { width: 8px; height: 8px; border-radius: 2px; flex: none; transform: translateY(1px); }
+.transcript .row .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transcript .row .k { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+.transcript .row.new { background: var(--line); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.tip { position: fixed; z-index: 20; background: var(--ink); color: var(--bg); font-size: 12.5px; padding: 6px 9px; border-radius: 6px; max-width: 320px; pointer-events: none; opacity: 0; transition: opacity .15s; }
+.stats { display: flex; gap: 18px; font-size: 13px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
+.stats b { color: var(--ink); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Compaction, played</h1>
+  <p class="lede">A session of a coding agent, played a turn at a time through the Lean spec in
+    <a href="Dwim/Harness/Compaction/index.html"><code>Dwim/Harness/Compaction.lean</code></a>. Every frame is
+    the spec's <code>add</code>; where the tail starts and which messages the head carries are its
+    <code>select</code>. The page only draws them.</p>
+
+  <section class="card">
+    <div class="meter">
+      <div class="tokens"><span id="tokens">0</span> <small>of <span id="cap"></span> tokens</small></div>
+      <div class="phase" id="phase">adding turns</div>
+    </div>
+    <div class="window" id="window">
+      <div class="mark" id="hw"><b></b></div>
+      <div class="bracket" id="tailb"><b></b></div>
+    </div>
+    <div class="said-row" id="said"><div class="label">What the user has said: <code>said</code></div></div>
+    <div class="legend">
+      <span><i style="background:var(--msg)"></i>user message</span>
+      <span><i style="background:var(--head)"></i>head: note, plan, carried messages</span>
+      <span><i style="background:var(--call)"></i>reply with calls</span>
+      <span><i style="background:var(--res)"></i>tool results</span>
+      <span><i style="background:var(--answer)"></i>reply</span>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card caption">
+      <h2 id="title"></h2>
+      <div id="text"></div>
+      <div class="controls">
+        <button id="prev" title="Back (←)">◀</button>
+        <button id="play" class="primary" title="Play (space)">Play</button>
+        <button id="next" title="Forward (→)">▶</button>
+        <select id="speed" title="Speed">
+          <option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
+        </select>
+        <div class="scrub" id="scrub"><div class="track"></div><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>
+      </div>
+      <div class="stats" id="stats"></div>
+    </section>
+    <section class="card transcript" id="transcript"></section>
+  </div>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+if (typeof TRACE === "undefined") {
+  document.querySelector("main").innerHTML = "<h1>No trace</h1><p class=lede>This page draws <code>compaction-trace.js</code>, which <code>make spec</code> writes next to the built copy of this page. Run it, then open <code>specs/.lake/build/literate-html/compaction.html</code>.</p>";
+  throw new Error("no compaction-trace.js");
+}
+const T = TRACE;
+const turn = Object.fromEntries(T.turns.map(t => [t.id, t]));
+const fmt = n => n.toLocaleString("en-US");
+const pct = n => (100 * n / T.capacity) + "%";
+const sum = ids => ids.reduce((a, id) => a + turn[id].tokens, 0);
+const names = { msg: "User message", head: "Head", call: "Reply with calls", res: "Tool results", answer: "Reply" };
+
+// The frames: one for each turn added, and for a compaction, the stages
+// of it first. Each says what is drawn, and why.
+const frames = [];
+T.steps.forEach((s, i) => {
+  const prev = i ? T.steps[i - 1] : { conversation: [], said: [], size: 0 };
+  const t = turn[s.add];
+  const c = s.compaction;
+  if (c) {
+    const tail = c.before.slice(c.start), gone = c.before.slice(0, c.start);
+    const inTail = prev.said.slice(c.candidates.length);
+    const blocked = c.candidates.length > c.carried.length ? c.candidates[c.candidates.length - c.carried.length - 1] : null;
+    const base = { step: i, said: prev.said, cand: c.candidates, inTail };
+    frames.push({ ...base, stage: "over", conv: c.before, incoming: s.add,
+      title: `${names[t.kind]} of ${fmt(t.tokens)} tokens would not fit under the high-water mark`,
+      text: `<p>The conversation takes <strong>${fmt(c.size)}</strong> tokens; with this turn it would take <strong>${fmt(c.size + t.tokens)}</strong>, past the high-water mark of ${fmt(T.highWater)}, four fifths of the window. It is compacted first: <code>full</code> is true.</p>` });
+    frames.push({ ...base, stage: "tail", conv: c.before, tail,
+      title: `The tail: the latest exchanges within C/8 = ${fmt(T.tailBudget)} tokens`,
+      text: `<p><code>tail</code> keeps the longest suffix that starts at a reply and fits: <strong>${tail.length}</strong> turns of <strong>${fmt(sum(tail))}</strong> tokens. ${sum(tail) > T.tailBudget ? "It is over the budget: the last exchange is kept whatever it takes, since its results must follow the call." : "It starts at a reply, so no results lose their call."}</p>` });
+    const carriedText = c.carried.length
+      ? `It carries <strong>${c.carried.length}</strong> of them, ${fmt(sum(c.carried))} tokens, word for word.`
+      : "It carries <strong>none</strong>.";
+    const why = blocked != null && sum([blocked]) > T.messageBudget - sum(c.carried)
+      ? ` The message of ${fmt(turn[blocked].tokens)} tokens does not fit, and the run of the most recent stops there: the head carries an unbroken run, never one with gaps, so the shorter messages before it are left to the note.`
+      : (c.carried.length < c.candidates.length ? " Older ones do not fit, and are left to the note." : "");
+    const forced = c.carried.length && sum(c.carried) > T.messageBudget
+      ? " That is over the budget: the tail holds none of the user's messages, so the latest is carried whatever it takes." : "";
+    frames.push({ ...base, stage: "messages", conv: c.before, tail, carried: c.carried, blocked,
+      title: `The messages: the most recent of said within C/16 = ${fmt(T.messageBudget)} tokens`,
+      text: `<p><code>messages</code> chooses from everything the user has sent, not from the conversation: a message an earlier head carried is still in <code>said</code>. Those the tail holds (dashed) need no carrying, so the candidates are the rest. ${carriedText}${why}${forced}</p>` });
+    const after = [c.head, ...tail];
+    frames.push({ ...base, stage: "head", conv: after, fresh: c.head, carried: c.carried, fly: c.carried, gone,
+      title: `A head of ${fmt(turn[c.head].tokens)} tokens in place of ${fmt(sum(gone))}`,
+      text: `<p>The turns before the tail are gone. In their place the head: the model's note and the plan (${fmt(turn[c.head].tokens - sum(c.carried))} tokens) and the messages it carries. The conversation goes from ${fmt(c.size)} to <strong>${fmt(sum(after))}</strong> tokens, whatever came before: that bound is <code>compact_size</code>.</p>` });
+  }
+  frames.push({ step: i, stage: "add", conv: s.conversation, said: s.said, fresh: s.add,
+    title: c ? `Then the ${names[t.kind].toLowerCase()} goes in` : `${names[t.kind]}, ${fmt(t.tokens)} tokens`,
+    text: `<p class="mono" style="color:var(--ink)">${escape(t.text)}</p>` +
+      (c && t.kind === "msg" ? `<p>The message joins <code>said</code> only now that it is in the conversation, so the head did not carry it too.</p>` : "") });
+});
+
+function escape(s) { return s.replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[ch]); }
+
+// Drawing
+const win = document.getElementById("window"), saidRow = document.getElementById("said");
+const segs = new Map(), chips = new Map();
+document.getElementById("cap").textContent = fmt(T.capacity);
+const hw = document.getElementById("hw");
+hw.style.left = pct(T.highWater);
+hw.querySelector("b").textContent = `high water ${fmt(T.highWater)}`;
+const tailb = document.getElementById("tailb");
+
+function seg(id) {
+  if (!segs.has(id)) {
+    const t = turn[id], el = document.createElement("div");
+    el.className = "seg " + t.kind;
+    el.innerHTML = `<span>${t.kind === "head" ? "head" : ""}</span>`;
+    el.style.left = "100%"; el.style.width = "0";
+    el.dataset.id = id;
+    win.appendChild(el);
+    segs.set(id, el);
+  }
+  return segs.get(id);
+}
+function chip(id) {
+  if (!chips.has(id)) {
+    const el = document.createElement("div");
+    el.className = "chip";
+    el.innerHTML = `<span class="x">${escape(turn[id].text)}</span><span class="n">${fmt(turn[id].tokens)}</span>`;
+    el.dataset.id = id;
+    saidRow.appendChild(el);
+    chips.set(id, el);
+  }
+  return chips.get(id);
+}
+
+let shown = 0;
+function draw(f, animate) {
+  const conv = f.conv, fresh = f.fresh;
+  const live = new Set(conv);
+  if (f.incoming != null) live.add(f.incoming);
+  let x = 0;
+  for (const id of conv) {
+    const el = seg(id), w = turn[id].tokens;
+    el.style.left = pct(x); el.style.width = pct(w);
+    x += w;
+    el.classList.remove("gone", "dim", "tail", "new", "over", "born");
+    if (f.tail) el.classList.toggle(f.tail.includes(id) ? "tail" : "dim", true);
+    if (id === fresh) { el.classList.add("new"); if (animate && f.stage === "head") { void el.offsetWidth; el.classList.add("born"); } }
+    el.querySelector("span").textContent = el.offsetWidth > 70 || turn[id].kind === "head" ? label(id) : "";
+  }
+  if (f.incoming != null) {
+    const el = seg(f.incoming);
+    el.classList.remove("gone", "dim", "tail");
+    el.classList.add("new", "over");
+    el.style.left = pct(x); el.style.width = pct(Math.min(turn[f.incoming].tokens, T.capacity - x));
+  }
+  for (const [id, el] of segs) if (!live.has(id)) {
+    el.classList.add("gone");
+    if (!animate || !(f.gone || []).includes(id)) { el.style.left = "100%"; el.style.width = "0"; }
+  }
+  const total = sum(conv);
+  countTo(total + (f.incoming != null ? turn[f.incoming].tokens : 0), animate);
+  hw.classList.toggle("hot", f.stage === "over");
+  document.getElementById("phase").textContent = { over: "past high water", tail: "compacting: tail", messages: "compacting: messages", head: "compacted", add: "adding turns" }[f.stage];
+  document.getElementById("phase").classList.toggle("on", f.stage !== "add");
+  // The tail's budget, measured back from the end.
+  if (f.stage === "tail" || f.stage === "messages") {
+    tailb.style.left = pct(Math.max(0, total - T.tailBudget)); tailb.style.width = pct(Math.min(total, T.tailBudget));
+    tailb.querySelector("b").textContent = `C/8 = ${fmt(T.tailBudget)}`;
+    tailb.classList.add("show");
+  } else tailb.classList.remove("show");
+
+  // said
+  const saidIds = new Set(f.said);
+  for (const id of f.said) chip(id);
+  for (const [id, el] of chips) {
+    el.style.display = saidIds.has(id) ? "" : "none";
+    el.className = "chip";
+    if (f.stage === "messages" || f.stage === "tail") {
+      if (f.cand.includes(id)) el.classList.add(f.stage === "messages" ? (f.carried.includes(id) ? "carried" : id === f.blocked ? "blocked" : "left") : "cand");
+      if (f.inTail.includes(id)) el.classList.add("intail");
+    }
+    if (f.stage === "head" && f.carried.includes(id)) el.classList.add("carried");
+  }
+  if (animate && f.fly && f.fly.length) fly(f.fly, segs.get(fresh));
+
+  // Transcript
+  const tr = document.getElementById("transcript");
+  tr.innerHTML = `<div class="said-row"><div class="label">The conversation, ${conv.length} turns</div></div>` + conv.map(id => {
+    const t = turn[id];
+    return `<div class="row ${id === fresh ? "new" : ""}"><i class="dot" style="background:var(--${t.kind})"></i><span class="t" title="${escape(t.text)}">${escape(t.text)}</span><span class="k">${fmt(t.tokens)}</span></div>`;
+  }).join("");
+  const row = tr.querySelector(".row.new"); if (row) row.scrollIntoView({ block: "nearest" });
+
+  document.getElementById("title").textContent = f.title;
+  document.getElementById("text").innerHTML = f.text;
+  const compactions = frames.slice(0, shown + 1).filter(g => g.stage === "head").length;
+  document.getElementById("stats").innerHTML = `<span>turn <b>${f.step + 1}</b> of ${T.steps.length}</span><span>compactions <b>${compactions}</b></span><span>said <b>${f.said.length}</b> messages</span>`;
+  scrubber();
+}
+function label(id) {
+  const t = turn[id];
+  return t.kind === "head" ? `head ${fmt(t.tokens)}` : fmt(t.tokens);
+}
+function fly(ids, target) {
+  if (!target) return;
+  const to = target.getBoundingClientRect();
+  ids.forEach((id, k) => {
+    const from = chips.get(id).getBoundingClientRect();
+    const el = chips.get(id).cloneNode(true);
+    el.classList.add("flyer", "carried");
+    Object.assign(el.style, { left: from.left + "px", top: from.top + "px", width: from.width + "px" });
+    document.body.appendChild(el);
+    setTimeout(() => {
+      Object.assign(el.style, { left: (to.left + 8 + k * 10) + "px", top: (to.top + to.height / 2 - 12) + "px", opacity: "0", transform: "scale(.5)" });
+    }, 60 + k * 120);
+    setTimeout(() => el.remove(), 1200 + k * 120);
+  });
+}
+let counted = 0, countAnim;
+function countTo(n, animate) {
+  cancelAnimationFrame(countAnim);
+  const el = document.getElementById("tokens"), from = counted, start = performance.now();
+  const tick = now => {
+    const p = animate ? Math.min(1, (now - start) / 600) : 1;
+    counted = Math.round(from + (n - from) * (1 - Math.pow(1 - p, 3)));
+    el.textContent = fmt(counted);
+    if (p < 1) countAnim = requestAnimationFrame(tick);
+  };
+  tick(start);
+}
+
+// Controls
+const scrub = document.getElementById("scrub");
+const marks = frames.map((f, i) => f.stage === "over" ? i : -1).filter(i => i >= 0);
+for (const i of marks) {
+  const m = document.createElement("div");
+  m.className = "tick"; m.style.left = (100 * i / (frames.length - 1)) + "%";
+  scrub.appendChild(m);
+}
+function scrubber() {
+  const p = 100 * shown / (frames.length - 1);
+  document.getElementById("fill").style.width = p + "%";
+  document.getElementById("knob").style.left = p + "%";
+}
+function go(i, animate = true) { shown = Math.max(0, Math.min(frames.length - 1, i)); draw(frames[shown], animate); }
+let timer = null;
+const playBtn = document.getElementById("play");
+function delay() {
+  const f = frames[shown], speed = +document.getElementById("speed").value;
+  return (f.stage === "add" ? 650 : f.stage === "messages" ? 3600 : 2800) / speed;
+}
+function loop() {
+  if (shown >= frames.length - 1) return stop();
+  go(shown + 1);
+  timer = setTimeout(loop, delay());
+}
+function start() { if (shown >= frames.length - 1) go(0, false); playBtn.textContent = "Pause"; timer = setTimeout(loop, 300); }
+function stop() { clearTimeout(timer); timer = null; playBtn.textContent = "Play"; }
+playBtn.onclick = () => timer ? stop() : start();
+document.getElementById("next").onclick = () => { stop(); go(shown + 1); };
+document.getElementById("prev").onclick = () => { stop(); go(shown - 1, false); };
+const seek = e => {
+  const r = scrub.getBoundingClientRect();
+  stop(); go(Math.round((e.clientX - r.left) / r.width * (frames.length - 1)), false);
+};
+scrub.addEventListener("pointerdown", e => { seek(e); scrub.setPointerCapture(e.pointerId); scrub.onpointermove = seek; });
+scrub.addEventListener("pointerup", () => { scrub.onpointermove = null; });
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") { stop(); go(shown + 1); }
+  else if (e.key === "ArrowLeft") { stop(); go(shown - 1, false); }
+  else if (e.key === " ") { e.preventDefault(); playBtn.click(); }
+});
+// Tooltips
+const tip = document.getElementById("tip");
+win.addEventListener("pointermove", e => {
+  const el = e.target.closest(".seg");
+  if (!el) { tip.style.opacity = 0; return; }
+  const t = turn[el.dataset.id];
+  tip.innerHTML = `<b>${names[t.kind]}</b>, ${fmt(t.tokens)} tokens<br>${escape(t.text)}`;
+  tip.style.left = Math.min(e.clientX + 12, innerWidth - 330) + "px"; tip.style.top = (e.clientY + 14) + "px";
+  tip.style.opacity = 1;
+});
+win.addEventListener("pointerleave", () => tip.style.opacity = 0);
+
+go(0, false);
+</script>
+</body>
+</html>

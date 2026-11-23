@@ -19,7 +19,6 @@ pub fn tokenizer(gguf: &Metadata) -> Result<Tokenizer> {
 impl Tokenizer {
     /// A tokenizer over a tiny vocabulary for tests: a token per byte, one
     /// merge, and the special tokens of Qwen's chat format.
-    #[cfg(test)]
     pub fn tiny() -> Self {
         Self::over(&crate::model::qwen::format::SPECIAL_TOKENS, PATTERN)
     }

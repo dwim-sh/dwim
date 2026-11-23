@@ -196,7 +196,11 @@ fn restart<S: Session>(
 /// What a compaction keeps of `transcript` in a context of `capacity`
 /// tokens, when the user has said `said`: where the exchanges read back
 /// start, and the user's messages the note turn carries.
-fn select<'a>(said: &'a [Entry], transcript: &[Entry], capacity: usize) -> (usize, Vec<&'a str>) {
+pub fn select<'a>(
+    said: &'a [Entry],
+    transcript: &[Entry],
+    capacity: usize,
+) -> (usize, Vec<&'a str>) {
     let start = tail(transcript, capacity / TAIL);
     (
         start,
@@ -209,7 +213,7 @@ fn select<'a>(said: &'a [Entry], transcript: &[Entry], capacity: usize) -> (usiz
 /// tokens, each starting at a reply, and always the last reply, which any
 /// pending tool results answer. The whole transcript's length if there is
 /// no reply yet.
-fn tail(transcript: &[Entry], budget: usize) -> usize {
+pub fn tail(transcript: &[Entry], budget: usize) -> usize {
     let replies: Vec<usize> = (0..transcript.len())
         .filter(|&i| matches!(transcript[i].turn, Turn::Reply { .. }))
         .collect();
@@ -235,7 +239,7 @@ fn tail(transcript: &[Entry], budget: usize) -> usize {
 /// does not; and, when `tail` holds none of the user's, at least the
 /// latest the user sent, whatever it takes. Never the harness's prompts,
 /// such as the notes of earlier compactions.
-fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
+pub fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
     let in_tail = tail.iter().filter_map(own).count();
     let mut candidates: Vec<(&str, usize)> = said.iter().filter_map(own).collect();
     candidates.truncate(candidates.len().saturating_sub(in_tail));

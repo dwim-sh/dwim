@@ -12,7 +12,6 @@ pub mod quants;
 pub mod qwen35;
 mod sampler;
 mod states;
-#[cfg(test)]
 pub mod testing;
 
 pub use fetch::{Download, fetch};

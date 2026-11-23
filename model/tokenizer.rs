@@ -187,7 +187,6 @@ impl Tokenizer {
     /// merge, and `special` as its special tokens, of which the ones
     /// starting with `<|` are control tokens and the rest user-defined,
     /// with text split into words by `pattern`.
-    #[cfg(test)]
     pub fn over(special: &[&str], pattern: &str) -> Self {
         use crate::model::gguf::Value;
 

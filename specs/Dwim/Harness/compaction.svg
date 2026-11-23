@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 575 192" width="575" height="192" role="img" aria-label="Compaction: the turns before the tail are replaced by the head, which holds the note, the plan and the user messages; the tail is kept unchanged.">
+<style>
+  text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .t { font-size: 13px; fill: #1e293b; }
+  .l { font-size: 13px; fill: #475569; }
+  .r { font-size: 13px; font-weight: 600; fill: #334155; }
+  .line { stroke: #64748b; stroke-width: 1.5; }
+  @media (prefers-color-scheme: dark) {
+    .l { fill: #cbd5e1; }
+    .r { fill: #e2e8f0; }
+    .line { stroke: #94a3b8; }
+  }
+</style>
+<rect x="58" y="8" width="60" height="38" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+<text x="88.0" y="32.0" text-anchor="middle" class="t">msg</text>
+<rect x="123" y="8" width="60" height="38" rx="6" fill="#ffedd5" stroke="#ea580c" stroke-width="1.5"/>
+<text x="153.0" y="32.0" text-anchor="middle" class="t">call</text>
+<rect x="188" y="8" width="60" height="38" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+<text x="218.0" y="32.0" text-anchor="middle" class="t">res</text>
+<rect x="253" y="8" width="60" height="38" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="283.0" y="32.0" text-anchor="middle" class="t">answer</text>
+<rect x="318" y="8" width="60" height="38" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+<text x="348.0" y="32.0" text-anchor="middle" class="t">msg</text>
+<rect x="383" y="8" width="60" height="38" rx="6" fill="#ffedd5" stroke="#ea580c" stroke-width="1.5"/>
+<text x="413.0" y="32.0" text-anchor="middle" class="t">call</text>
+<rect x="448" y="8" width="60" height="38" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+<text x="478.0" y="32.0" text-anchor="middle" class="t">res</text>
+<rect x="513" y="8" width="60" height="38" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="543.0" y="32.0" text-anchor="middle" class="t">answer</text>
+<path d="M58 53 v7 H378 v-7" fill="none" class="line"/>
+<text x="218.0" y="78" text-anchor="middle" class="l">replaced by the head</text>
+<path d="M383 53 v7 H573 v-7" fill="none" class="line"/>
+<text x="478.0" y="78" text-anchor="middle" class="l">kept as the tail</text>
+<rect x="58" y="124" width="320" height="38" rx="6" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="106.0" y="148.0" text-anchor="middle" class="t">note</text>
+<line x1="154.0" y1="131" x2="154.0" y2="155" stroke="#475569" stroke-dasharray="3 3"/>
+<text x="194.0" y="148.0" text-anchor="middle" class="t">plan</text>
+<line x1="234.0" y1="131" x2="234.0" y2="155" stroke="#475569" stroke-dasharray="3 3"/>
+<text x="306.0" y="148.0" text-anchor="middle" class="t">user messages</text>
+<text x="218.0" y="184" text-anchor="middle" class="l">the head: one prompt from the harness</text>
+<rect x="383" y="124" width="60" height="38" rx="6" fill="#ffedd5" stroke="#ea580c" stroke-width="1.5"/>
+<text x="413.0" y="148.0" text-anchor="middle" class="t">call</text>
+<rect x="448" y="124" width="60" height="38" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+<text x="478.0" y="148.0" text-anchor="middle" class="t">res</text>
+<rect x="513" y="124" width="60" height="38" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="543.0" y="148.0" text-anchor="middle" class="t">answer</text>
+<text x="478.0" y="184" text-anchor="middle" class="l">the tail, unchanged</text>
+<text x="0" y="32.0" class="r">before</text>
+<text x="0" y="148.0" class="r">after</text>
+</svg>
