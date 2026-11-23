@@ -71,14 +71,11 @@ KEPT = {"verified-mini": "swebench-mini", "verified": "swebench-verified", "lite
 # under Rosetta or QEMU, if asked for that platform.
 PLATFORM = "linux/amd64"
 
-# How the issue is put to the model. SWE-bench leaves that to the scaffold,
-# and given the raw issue of a project it knows, the model takes it for the
-# commit that closed it and spends its turns recalling that commit's tests
-# and trying to fetch the project's history to reproduce them, rather than
-# making the fix: on pallets__flask-4045 it had the change worked out in
-# four minutes and had not made it after thirteen. So say what is wanted,
-# as the leaderboard's scaffolds do.
-TASK = """Fix the issue below in this checkout. Make the smallest change that fixes it, update the tests the change breaks, and run them. Don't try to recall or reproduce how the project fixed it upstream; make the fix from this code.
+# How the issue is put to the model, which SWE-bench leaves to the scaffold.
+# Given the raw issue, the model tries to recall the upstream fix instead of
+# making one; told to update the tests its change breaks, it rewrites them
+# to fit a wrong fix.
+TASK = """Fix the issue below in this checkout. Make the smallest change that fixes it, and run the project's tests to check it. Leave the tests that are already there as they are: if one fails after your change, the change is wrong, unless the issue asks for what that test checks to change, and then say so in your reply instead of changing the test. Don't try to recall or reproduce how the project fixed it upstream; make the fix from this code.
 
 <issue>
 {issue}
@@ -131,9 +128,9 @@ each instance: the model's sampling is not seeded, so the count moves by a
 few from one run to the next.
 
 - **The task.** The agent is given the issue's text, asked to make the
-  smallest change that fixes it in the checkout, to update the tests the
-  change breaks, and to run them. It is not given the tests the fix is
-  scored by.
+  smallest change that fixes it in the checkout, to run the project's
+  tests to check it, and to leave the tests that are already there as
+  they are. It is not given the tests the fix is scored by.
 - **The checkout.** The repository is copied out of the instance's
   SWE-bench evaluation image, at the commit before the fix, with the
   project installed. The agent's shell commands run in a container of that
