@@ -8,6 +8,8 @@
 #
 # Each step prints one line such as `  INSTALL ~/.local/bin/dwim`.
 # `make V=1` prints the commands instead.
+#
+# To see a list of the targets execute "make help".
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -31,6 +33,14 @@ ifneq ($(findstring s,$(firstword -$(MAKEFLAGS))),)
 endif
 
 all: $(BINARY)
+
+# Brief documentation of the targets, shown by `make help`.
+help:
+	@echo '  all       - Build the binary (release)'
+	@echo '  install   - Install the binary and the man page under PREFIX'
+	@echo '  uninstall - Remove what `make install` installed'
+	@echo '  test      - Run the test suite'
+	@echo '  clean     - Remove build artifacts'
 
 $(BINARY): $(SOURCES)
 	$(call msg,CARGO,$@)
@@ -59,4 +69,4 @@ clean:
 	$(call msg,CLEAN,target)
 	$(Q)cargo clean
 
-.PHONY: all install uninstall test clean
+.PHONY: help all install uninstall test clean
