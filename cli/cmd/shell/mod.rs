@@ -3,7 +3,8 @@
 //! stays responsive while it downloads, loads, and generates.
 
 mod cmd;
-pub mod picker;
+mod picker;
+mod providers;
 mod view;
 mod worker;
 
@@ -933,7 +934,7 @@ impl App {
                 let Some(config) = self.config() else {
                     return;
                 };
-                let (groups, more) = session::providers(&config, self.provider);
+                let (groups, more) = providers::providers(&config, self.provider);
                 if groups.is_empty() {
                     self.say(&view::notice(
                         "No provider a model can run at · /login signs in to one, /provider enables one",
@@ -948,13 +949,13 @@ impl App {
                     return;
                 };
                 self.providers = Some(Providers::new(
-                    session::provider_choices(&config),
+                    providers::provider_choices(&config),
                     self.provider,
                 ));
                 return;
             }
             Some(Ok(Command::Login)) => {
-                self.logins = Some(Logins::new(session::accounts()));
+                self.logins = Some(Logins::new(providers::accounts()));
                 return;
             }
             Some(Ok(command)) => {
