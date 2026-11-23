@@ -43,6 +43,7 @@ use std::{
     cmp::Reverse,
     error::Error,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
@@ -165,6 +166,15 @@ const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need 
 /// the last step tends to reply without saying the step is done, and the
 /// plan the user reads would say the work stopped short of it.
 const STEPS_LEFT: &str = "The plan has steps that are not done. If the step under way is finished, call done with what it came to, and go on with the next. If you cannot go on without the user, reply with what you need from them.";
+
+/// What the model is asked when it replies without a call in a turn in
+/// which it has changed a file, once a turn, before the turn ends: on
+/// SWE-bench Verified Mini, Inkling 2 Mini wrote a test of its own for
+/// each fix, saw it pass and stopped, and of sixteen fixes six failed the
+/// tests they were scored by: on a case of the issue its test had not
+/// tried, at a caller the issue named when the fault was in what it
+/// called, or with tests that were there before changed to fit the fix.
+const REVIEW: &str = "<system-reminder>You have changed files in this turn. Before you finish, read what you changed over once against the request, as someone who did not write it would. Does it fix what makes the problem, or only the case you tried: try the request's example another way than your check did, such as another input, or another caller of the code you changed. Did you change a test that was there before, and does the request ask for that? If something is off, fix it and check it again. If nothing is, reply as you were about to.</system-reminder>";
 
 /// The share of the context past which a step of the plan starts in a
 /// conversation cleared down to the plan: half. A step's end is where the
@@ -472,6 +482,13 @@ pub struct Harness<S: Session> {
     /// this turn, and whether it has been asked after the steps left.
     planned: bool,
     asked: bool,
+    /// Whether a call has said it changed a file this turn, the state of
+    /// the git repository the agent works in as the turn started, if it
+    /// works in one, and whether the model has been asked to read the
+    /// change over.
+    edited: bool,
+    tree: Option<u64>,
+    reviewed: bool,
     /// The user's messages of the session, as the transcript has recorded
     /// them, which a compacted conversation reads back.
     said: Vec<Entry>,
@@ -520,6 +537,9 @@ impl<S: Session> Harness<S> {
             shown: Plan::default(),
             planned: false,
             asked: false,
+            edited: false,
+            tree: None,
+            reviewed: false,
             said: Vec::new(),
             log: Log::none(),
         };
@@ -729,6 +749,9 @@ impl<S: Session> Harness<S> {
         self.called = false;
         self.planned = false;
         self.asked = false;
+        self.edited = false;
+        self.tree = tree(&self.dir);
+        self.reviewed = false;
         let after = self.plan_so_far(on_event);
         let after = match (after, self.auto) {
             (Some(plan), true) => Some(format!("{plan}\n\n{UNATTENDED}")),
@@ -930,6 +953,9 @@ impl<S: Session> Harness<S> {
                 {
                     self.asked = true;
                     input = Turn::User(STEPS_LEFT.to_string());
+                } else if !stopped && !self.reviewed && self.changed() {
+                    self.reviewed = true;
+                    input = Turn::User(REVIEW.to_string());
                 } else {
                     return Ok(Outcome::Done);
                 }
@@ -982,6 +1008,7 @@ impl<S: Session> Harness<S> {
                 interrupted = interrupted || on_event(Event::Output(output.clone())).is_break();
                 if changed {
                     self.unchanged = 0;
+                    self.edited = true;
                 } else {
                     self.unchanged += 1;
                 }
@@ -1072,6 +1099,15 @@ impl<S: Session> Harness<S> {
             outputs[i] = too_large(sizes[i].take().unwrap_or(0));
             self.log.nudge(&outputs[i]);
         }
+    }
+
+    /// Whether the turn has changed a file: a call said it did, as edit
+    /// and write do, or the git repository the agent works in is not as
+    /// the turn found it, which is how a change made through bash shows.
+    /// On SWE-bench Verified Mini, Inkling 2 Mini made its changes through
+    /// bash alone in sessions of ninety calls.
+    fn changed(&self) -> bool {
+        self.edited || tree(&self.dir) != self.tree
     }
 
     /// Whether the model, in auto mode, is to be told to go on after the
@@ -1172,6 +1208,30 @@ fn too_large(tokens: usize) -> String {
     format!(
         "not shown: this output took {tokens} tokens, more than there is room for in the context window. Ask for less of it at a time, such as a range of lines or a filtered command."
     )
+}
+
+/// The state of the git repository `dir` is in, if it is in one: the commit
+/// it is at, which files differ from it, and how the tracked ones do.
+fn tree(dir: &Path) -> Option<u64> {
+    let mut state = DefaultHasher::new();
+    for args in [
+        &["rev-parse", "HEAD"][..],
+        &["status", "--porcelain"],
+        &["diff"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .ok()?;
+        // A repository with no commit yet has no HEAD, and still has a
+        // state.
+        if !output.status.success() && args[0] != "rev-parse" {
+            return None;
+        }
+        output.stdout.hash(&mut state);
+    }
+    Some(state.finish())
 }
 
 /// Whether a reply says the work is done: its last line is [`DONE`], with
@@ -1869,6 +1929,106 @@ mod tests {
             })
             .unwrap();
         assert_eq!(asked(&harness), 0);
+    }
+
+    /// A reply after a short thought that writes `file`.
+    fn writing(file: &Path) -> String {
+        calling(
+            "write",
+            &[("path", &file.display().to_string()), ("content", "made")],
+        )
+    }
+
+    #[test]
+    fn asks_the_model_to_read_its_change_over_before_the_turn_ends() {
+        // The model changes a file and replies: it is asked once to read
+        // the change over, changes the file again, and its next reply
+        // ends the turn.
+        let dir = scratch();
+        let file = dir.join("a.txt");
+        let scripts = [
+            writing(&file),
+            reply(10, false),
+            writing(&file),
+            reply(10, false),
+            reply(10, false),
+        ];
+        let mut harness = harness(&scripts, 100_000, "");
+        send(&mut harness, "go");
+        let asked = |harness: &Harness<Local<Scripted>>| {
+            harness
+                .transcript()
+                .filter(|turn| matches!(turn, Turn::User(text) if text == REVIEW))
+                .count()
+        };
+        assert_eq!(asked(&harness), 1);
+        assert_eq!(shape(&harness), "urtrurtr");
+
+        // A turn that changed nothing ends at the reply, even after one
+        // that did: only a change of the turn is read over.
+        send(&mut harness, "what did you do?");
+        assert_eq!(asked(&harness), 1);
+        assert_eq!(shape(&harness), "urtrurtrur");
+
+        // A change made through bash, which does not say it made one,
+        // shows in the git repository the agent works in.
+        let repository = scratch();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&repository)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let touch = format!("touch {}", repository.join("a.txt").display());
+        let scripts = [
+            reply_calling(10, "bash", "command", &touch),
+            reply(10, false),
+            reply(10, false),
+            reply_calling(10, "bash", "command", "true"),
+            reply(10, false),
+        ];
+        let log = repository.join("log.jsonl");
+        git(&["add", "-A"]);
+        let mut through_bash = harness_in(&repository, &scripts, &log);
+        send(&mut through_bash, "go");
+        assert_eq!(asked(&through_bash), 1);
+        // The file is there from then on: a turn that leaves the
+        // repository as it found it is not asked.
+        send(&mut through_bash, "go");
+        assert_eq!(asked(&through_bash), 1);
+        fs::remove_dir_all(repository).unwrap();
+
+        // In auto mode, the model is asked once it says it is done, not
+        // at a reply that only reports where it is.
+        let scripts = [
+            writing(&file),
+            reply(10, false),
+            format!("{}\n</think>\n\nChanged it.\nDONE", filler(10)),
+            format!("{}\n</think>\n\nRead it over.\nDONE", filler(10)),
+            reply(10, false),
+        ];
+        let mut auto = self::harness(&scripts, 100_000, "");
+        auto.set_auto(true);
+        send(&mut auto, "go");
+        let turns: Vec<&Turn> = auto.transcript().collect();
+        let users: Vec<&str> = turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["go", GO_ON, REVIEW], "{turns:?}");
+        assert!(
+            matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.contains("Read it over"))
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
