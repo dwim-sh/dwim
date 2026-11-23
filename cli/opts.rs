@@ -143,13 +143,42 @@ impl Opts {
         }
     }
 
-    /// The prompt to answer without the shell: the words after the
-    /// options, or none when there are none or they are all blank.
-    pub fn prompt(&self) -> Option<String> {
+    /// What the options ask dwim to do. A switch that does something
+    /// instead of a session wins over a prompt, and `--version` over the
+    /// rest.
+    pub fn command(&self) -> Command {
         let prompt = self.prompt.join(" ");
         let prompt = prompt.trim();
-        (!prompt.is_empty()).then(|| prompt.to_string())
+        if self.version {
+            Command::Version
+        } else if self.download {
+            Command::Download
+        } else if self.bench {
+            Command::Bench
+        } else if self.serve {
+            Command::Serve
+        } else if prompt.is_empty() {
+            Command::Shell
+        } else {
+            Command::Once(prompt.to_string())
+        }
     }
+}
+
+/// What dwim is asked to do.
+pub enum Command {
+    /// Print the version.
+    Version,
+    /// Download the model and print the path of its weights.
+    Download,
+    /// Time the model and print tokens a second.
+    Bench,
+    /// Run the server that has the model.
+    Serve,
+    /// Start an interactive session.
+    Shell,
+    /// Answer a prompt without the shell.
+    Once(String),
 }
 
 /// A thinking budget as the command line and the `/thinking-budget`
