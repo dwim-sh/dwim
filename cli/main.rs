@@ -1,11 +1,7 @@
-mod bench;
+mod cmd;
 mod config;
-mod download;
-mod once;
 mod opts;
-mod serve;
 mod session;
-mod shell;
 mod tui;
 mod units;
 
@@ -13,7 +9,10 @@ use std::error::Error;
 
 use dwim::harness::Log;
 
-use opts::{Command, Opts};
+use crate::{
+    cmd::{bench, download, once, serve, shell},
+    opts::{Command, Opts},
+};
 
 fn main() {
     let opts = Opts::parse();

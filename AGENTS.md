@@ -22,8 +22,9 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 
 ## Layout
 
-- `cli/` - the `dwim` command: options, the shell, `serve`, `bench`,
-  `config` (what is kept in `config.json`)
+- `cli/` - the `dwim` command: options, `config` (what is kept in
+  `config.json`), and `cmd/`, what it does, a module each: the shell,
+  `once`, `serve`, `bench`, `download`
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   the plan of the work, compaction, thinking budget, transcript
 - `providers/` - where a session's model runs: `Provider` is a model

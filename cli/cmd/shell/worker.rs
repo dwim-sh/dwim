@@ -23,8 +23,8 @@ use dwim::{
 };
 
 use crate::{
+    cmd::shell::{cmd::ServerAction, view},
     session::{self, Session, Settings},
-    shell::{cmd::ServerAction, view},
 };
 
 /// Longest the shell waits, on quitting, for the model's thread to stop

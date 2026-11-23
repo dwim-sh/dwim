@@ -24,8 +24,8 @@ use dwim::{
 };
 
 use crate::{
+    cmd::shell::picker::{Account, Choice, Group},
     config::Config,
-    shell::picker::{Account, Choice, Group},
     units,
 };
 
