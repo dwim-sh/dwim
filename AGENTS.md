@@ -105,17 +105,22 @@ do not write it.
 - A pull request's title is a subject too, written the same way.
 
 A pull request's description is mandatory and is written for a reader
-who has not seen the code or the commits. It stands on its own, in
-three parts:
+who has not seen the code or the commits, and does not know how the
+part being changed works. It stands on its own, in four parts:
 
-1. **Problem**: a paragraph on what is wrong or missing, and why it
-   matters.
-2. **Solution**: a paragraph or more on what the change does about it,
-   as a whole.
-3. **Results**: numbers for the claims, such as a benchmark, timings,
+1. **Background**: how the part being changed works today, as far as
+   the problem needs it. A few sentences.
+2. **Problem**: what is wrong or missing, and why it matters, with the
+   case that showed it.
+3. **Solution**: what the change does about it, as a whole. When most
+   of the files changed are plumbing, say which have the logic.
+4. **Results**: numbers for the claims, such as a benchmark, timings,
    sizes, or tokens, measured before and after where there is a before.
    Then what was verified and what was not. Say so when a claim cannot
    be measured.
+
+Write it as it would be explained aloud: short sentences, plain words,
+a number or an example for a claim, a table for before and after.
 
 Leave the details of each change to the commits. A description does not
 list the commits, retell their messages, or list every flag and fix. When
