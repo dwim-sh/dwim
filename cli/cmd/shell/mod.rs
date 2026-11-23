@@ -2,9 +2,9 @@
 //! answering above it. The model runs on a thread of its own so the screen
 //! stays responsive while it downloads, loads, and generates.
 
-mod cmd;
 mod picker;
 mod providers;
+mod slash;
 mod view;
 mod worker;
 
@@ -43,8 +43,8 @@ use crate::{
     tui::{self, Input, Line, Screen, span},
 };
 
-use cmd::Command;
 use picker::{Logins, Picker, Providers};
+use slash::Command;
 use view::Segment;
 use worker::{Reply, Request, Worker};
 

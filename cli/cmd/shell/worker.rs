@@ -23,7 +23,7 @@ use dwim::{
 };
 
 use crate::{
-    cmd::shell::{cmd::ServerAction, view},
+    cmd::shell::{slash::ServerAction, view},
     session::{self, Session, Settings},
 };
 

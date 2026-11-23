@@ -12,7 +12,7 @@ use dwim::{
 };
 
 use crate::{
-    cmd::shell::cmd::COMMANDS,
+    cmd::shell::slash::COMMANDS,
     tui::{self, Line, span},
     units,
 };
