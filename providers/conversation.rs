@@ -141,7 +141,7 @@ impl<P: Provider> Session for Conversation<P> {
     fn answer(
         &mut self,
         message: &str,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer> {
@@ -227,7 +227,7 @@ mod tests {
         fn answer(
             &mut self,
             chat: &Chat,
-            _: &[&str],
+            _: &[(&str, usize)],
             _: usize,
             _: &Generation,
             _: impl FnMut(&str) -> ControlFlow<()>,

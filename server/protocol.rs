@@ -52,12 +52,13 @@ pub enum Request {
     /// [`Response::Reply`].
     Reply { chat: Chat, generation: Generation },
     /// Has the model answer the message the conversation ends with
-    /// plainly, under `heads` in turn, in at most `limit` tokens: the
-    /// answer's text is streamed as [`Response::Chunk`]s of text, and then
-    /// it is answered with [`Response::Answered`].
+    /// plainly, under `heads` in turn, each with its section's share of
+    /// at most `limit` tokens: the answer's text is streamed as
+    /// [`Response::Chunk`]s of text, and then it is answered with
+    /// [`Response::Answered`].
     Answer {
         chat: Chat,
-        heads: Vec<String>,
+        heads: Vec<(String, usize)>,
         limit: usize,
         generation: Generation,
     },

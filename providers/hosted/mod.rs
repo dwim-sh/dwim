@@ -498,7 +498,7 @@ impl Provider for Hosted {
     fn answer(
         &mut self,
         chat: &Chat,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         _: &Generation,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
@@ -506,11 +506,12 @@ impl Provider for Hosted {
         // A plain answer calls no tools, so none are declared.
         let (mut messages, _) = messages(chat);
         // The headings cannot be written into the answer for the model, so
-        // it is asked to write them.
+        // it is asked to write them, and how much goes under each is its
+        // own to judge.
         if !heads.is_empty()
             && let Some(last) = messages.last_mut()
         {
-            let heads: Vec<&str> = heads.iter().map(|head| head.trim()).collect();
+            let heads: Vec<&str> = heads.iter().map(|(head, _)| head.trim()).collect();
             let asked = format!(
                 "{}\n\nWrite each of these headings yourself, at the start of a line, in this order, each followed by its section: {}",
                 last["content"].as_str().unwrap_or(""),

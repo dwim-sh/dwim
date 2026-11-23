@@ -66,11 +66,13 @@ pub trait Session {
     ) -> Result<Reply>;
 
     /// Has the model answer `message` plainly, under `heads` in turn, in
-    /// at most `limit` tokens, streaming the answer to `on_text`.
+    /// at most `limit` tokens, streaming the answer to `on_text`. A head
+    /// comes with its section's share of the tokens, as a weight among
+    /// the heads': of shares 1 and 3, a quarter and three quarters.
     fn answer(
         &mut self,
         message: &str,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Answer>;

@@ -264,14 +264,17 @@ impl Provider for Remote {
     fn answer(
         &mut self,
         chat: &Chat,
-        heads: &[&str],
+        heads: &[(&str, usize)],
         limit: usize,
         generation: &Generation,
         mut on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<(Answer, State)> {
         let request = Request::Answer {
             chat: chat.clone(),
-            heads: heads.iter().map(|head| head.to_string()).collect(),
+            heads: heads
+                .iter()
+                .map(|(head, share)| (head.to_string(), *share))
+                .collect(),
             limit,
             generation: generation.clone(),
         };
