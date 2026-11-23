@@ -419,6 +419,7 @@ enum Outcome {
 /// A turn as the transcript keeps it: the turn, the tokens it takes read
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
+#[derive(Clone)]
 struct Entry {
     turn: Turn,
     tokens: usize,
@@ -471,8 +472,8 @@ pub struct Harness<S: Session> {
     /// this turn, and whether it has been asked after the steps left.
     planned: bool,
     asked: bool,
-    /// The user's messages of the session, which a conversation cleared at
-    /// a step's end reads back.
+    /// The user's messages of the session, as the transcript has recorded
+    /// them, which a compacted conversation reads back.
     said: Vec<Entry>,
     /// The transcript of the whole session.
     log: Log,
@@ -728,13 +729,6 @@ impl<S: Session> Harness<S> {
         self.called = false;
         self.planned = false;
         self.asked = false;
-        let turn = Turn::User(message.to_string());
-        let tokens = self.session.measure(&turn)?;
-        self.said.push(Entry {
-            turn,
-            tokens,
-            prompt: false,
-        });
         let after = self.plan_so_far(on_event);
         let after = match (after, self.auto) {
             (Some(plan), true) => Some(format!("{plan}\n\n{UNATTENDED}")),
@@ -1147,14 +1141,19 @@ impl<S: Session> Harness<S> {
     }
 
     /// Adds a turn to the transcript, a user turn as the harness's own
-    /// `prompt` or the user's message.
+    /// `prompt` or the user's message; the user's are kept among what they
+    /// said too.
     fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
         let tokens = self.session.measure(&turn)?;
-        self.transcript.push(Entry {
+        let entry = Entry {
             turn,
             tokens,
             prompt,
-        });
+        };
+        if matches!(entry.turn, Turn::User(_)) && !prompt {
+            self.said.push(entry.clone());
+        }
+        self.transcript.push(entry);
         Ok(())
     }
 }
