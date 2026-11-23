@@ -25,8 +25,8 @@ use dwim::{
 
 use crate::{
     config::Config,
-    model,
     shell::picker::{Account, Choice, Group},
+    units,
 };
 
 pub use dwim::server::protocol::Status;
@@ -573,13 +573,13 @@ impl Stderr {
                 format!("downloading {file}"),
                 &format!(
                     "{}/{}",
-                    model::bytes(*done),
-                    model::bytes(total.unwrap_or(*done))
+                    units::bytes(*done),
+                    units::bytes(total.unwrap_or(*done))
                 ),
                 total.is_some_and(|total| *done >= total),
             ),
             Status::Device(name) => self.device.clone_from(name),
-            Status::Sized(size) => eprintln!("{}", model::describe(size)),
+            Status::Sized(size) => eprintln!("{}", units::describe(size)),
             Status::Weights { done, total } if self.starting => self.stage(
                 "starting dwim server".to_string(),
                 &format!("{}%", done * 100 / (*total).max(1)),

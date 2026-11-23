@@ -12,9 +12,9 @@ use dwim::{
 };
 
 use crate::{
-    model,
     shell::cmd::COMMANDS,
     tui::{self, Line, span},
+    units,
 };
 
 /// What the `/help` command says: the commands, and the keys.
@@ -53,9 +53,9 @@ pub fn model_listing(
             match files {
                 0 => "not fetched".to_string(),
                 n if n == of => {
-                    format!("{} in {}", model::bytes(bytes), tilde(&dir))
+                    format!("{} in {}", units::bytes(bytes), tilde(&dir))
                 }
-                n => format!("{n}/{of} files, {} in {}", model::bytes(bytes), tilde(&dir)),
+                n => format!("{n}/{of} files, {} in {}", units::bytes(bytes), tilde(&dir)),
             }
         }
         Some((_, None)) => "cannot determine the home directory".to_string(),
@@ -67,7 +67,7 @@ pub fn model_listing(
         (Device::Gpu(_), Some(name)) => format!("GPU · {name}"),
     };
     if let Some(size) = size {
-        on.push_str(&format!(" · {}", model::bytes(size.model)));
+        on.push_str(&format!(" · {}", units::bytes(size.model)));
     }
     let mut rows = Vec::new();
     if let Some(weights) = weights {
@@ -84,7 +84,7 @@ pub fn model_listing(
             format!(
                 "{} tokens ({})",
                 size.context,
-                model::bytes(size.conversation)
+                units::bytes(size.conversation)
             ),
         ));
         rows.push((
@@ -167,17 +167,17 @@ pub fn switched(model: Model, provider: Kind) -> String {
 /// much, at what speed, and the time left once the file's size is known.
 /// The fields are padded to fixed widths, as the status line's are.
 pub fn download_details(done: u64, total: Option<u64>, elapsed: Duration) -> String {
-    let mut details = format!("{:>8}", model::bytes(done));
+    let mut details = format!("{:>8}", units::bytes(done));
     if let Some(total) = total {
         details.push_str(&format!(
             " / {:>8} ({:>3}%)",
-            model::bytes(total),
+            units::bytes(total),
             done * 100 / total.max(1)
         ));
     }
     let rate = rate(done as f64, elapsed);
     let speed = rate.map_or(String::new(), |rate| {
-        format!("{}/s", model::bytes(rate as u64))
+        format!("{}/s", units::bytes(rate as u64))
     });
     write!(details, " · {speed:>10}").expect("a String takes any write");
     if let Some(total) = total {

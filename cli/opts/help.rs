@@ -9,7 +9,7 @@ use dwim::{
 };
 
 use super::device;
-use crate::{model, tui};
+use crate::{tui, units};
 
 /// The headings `--help` lists the options under, each with its options by
 /// name. An option under none of them is left out of the help.
@@ -91,8 +91,8 @@ fn layout(output: &str, size: Option<Size>) -> String {
             "tokens of conversation each session has room for (default: {} on this machine, \
              taking {} a session beside the model's {}, with room for {} sessions)",
             size.context,
-            model::bytes(size.conversation),
-            model::bytes(size.model),
+            units::bytes(size.conversation),
+            units::bytes(size.model),
             size.sessions
         );
     }

@@ -1,13 +1,13 @@
 mod bench;
 mod config;
 mod download;
-mod model;
 mod once;
 mod opts;
 mod serve;
 mod session;
 mod shell;
 mod tui;
+mod units;
 
 use std::error::Error;
 

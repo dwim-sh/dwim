@@ -1,4 +1,5 @@
-//! The model's size as the command line shows it, in words.
+//! Sizes as the command line shows them, in words: bytes, and the
+//! model's size and its context.
 
 use dwim::model::Size;
 
