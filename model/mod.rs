@@ -95,6 +95,15 @@ impl Model {
         }
     }
 
+    /// The effort the model is asked to reason at when none is given:
+    /// medium for Inkling 2 Mini, low for the rest.
+    pub const fn default_effort(self) -> Effort {
+        match self {
+            Model::InklingMini => Effort::Medium,
+            _ => Effort::Low,
+        }
+    }
+
     /// How the model's tokens are sampled where no file of it says how:
     /// at a host.
     pub const fn sampling(self) -> Sampling {
