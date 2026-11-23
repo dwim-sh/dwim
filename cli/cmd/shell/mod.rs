@@ -54,8 +54,14 @@ const TICK: Duration = Duration::from_millis(80);
 
 /// Runs the shell until the user quits, showing the model's thinking and
 /// what it reads if `verbose` is set, or once ctrl+o is pressed, and
-/// keeping a transcript of the session in `log`.
-pub fn run(settings: Settings, verbose: bool, log: Log) -> Result<(), Box<dyn Error>> {
+/// keeping a transcript of the session in `transcript`, or a new file in
+/// the user's state directory.
+pub fn run(
+    settings: Settings,
+    verbose: bool,
+    transcript: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let log = Log::open(transcript)?;
     let transcript = log.path().map(Path::to_path_buf);
     let model = settings.model;
     let provider = session::provider(settings.provider, model)?;

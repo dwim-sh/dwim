@@ -21,10 +21,17 @@ use crate::{
 };
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
-/// once it replies with text alone, keeping a transcript of it in `log`;
-/// then reports where the time went, if `stats` asks for it.
-pub fn run(settings: &Settings, prompt: &str, stats: bool, log: Log) -> Result<(), Box<dyn Error>> {
+/// once it replies with text alone, keeping a transcript of it in
+/// `transcript`, or a new file in the user's state directory; then reports
+/// where the time went, if `stats` asks for it.
+pub fn run(
+    settings: &Settings,
+    prompt: &str,
+    stats: bool,
+    transcript: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
+    let log = Log::open(transcript)?;
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
     let mut loaded = session::load(settings, log, move |status| stderr.report(&status))?;

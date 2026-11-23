@@ -8,8 +8,6 @@ mod units;
 
 use std::error::Error;
 
-use dwim::harness::Log;
-
 use crate::{
     cmd::{bench, download, once, serve, shell},
     opts::{Command, Opts},
@@ -25,7 +23,6 @@ fn main() {
 
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let settings = opts.settings();
-    let log = || Log::open(opts.transcript.as_deref());
     match opts.command() {
         Command::Version => {
             println!("dwim {}", env!("CARGO_PKG_VERSION"));
@@ -34,7 +31,9 @@ fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         Command::Download => download::run(&settings),
         Command::Bench => bench::run(&settings),
         Command::Serve => serve::run(&settings),
-        Command::Shell => shell::run(settings, opts.thinking, log()?),
-        Command::Once(prompt) => once::run(&settings, &prompt, opts.stats, log()?),
+        Command::Shell => shell::run(settings, opts.thinking, opts.transcript.as_deref()),
+        Command::Once(prompt) => {
+            once::run(&settings, &prompt, opts.stats, opts.transcript.as_deref())
+        }
     }
 }
