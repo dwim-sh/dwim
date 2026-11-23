@@ -30,10 +30,10 @@ fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
             println!("dwim {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Download => download::download(&settings),
-        Command::Bench => bench::bench(&settings),
-        Command::Serve => serve::serve(&settings),
+        Command::Download => download::run(&settings),
+        Command::Bench => bench::run(&settings),
+        Command::Serve => serve::run(&settings),
         Command::Shell => shell::run(settings, opts.thinking, log()?),
-        Command::Once(prompt) => once::once(&settings, &prompt, opts.stats, log()?),
+        Command::Once(prompt) => once::run(&settings, &prompt, opts.stats, log()?),
     }
 }

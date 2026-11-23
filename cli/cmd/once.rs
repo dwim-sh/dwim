@@ -20,12 +20,7 @@ use crate::session::{self, Settings, Stderr};
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone, keeping a transcript of it in `log`;
 /// then reports where the time went, if `stats` asks for it.
-pub fn once(
-    settings: &Settings,
-    prompt: &str,
-    stats: bool,
-    log: Log,
-) -> Result<(), Box<dyn Error>> {
+pub fn run(settings: &Settings, prompt: &str, stats: bool, log: Log) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();

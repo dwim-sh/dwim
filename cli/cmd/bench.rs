@@ -34,7 +34,7 @@ const FILLER: &str = include_str!("bench.rs");
 
 /// Times the model at each depth of context and prints a table of tokens
 /// a second, reading and generating, on standard output.
-pub fn bench(settings: &Settings) -> Result<(), Box<dyn Error>> {
+pub fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let mut stderr = Stderr::new();
     let mut model = session::load_model(settings, 1, |status| stderr.report(&status))?;
     let depths = depths(model.max_len());

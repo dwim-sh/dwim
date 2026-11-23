@@ -17,7 +17,7 @@ use dwim::{
 use crate::session::{self, Settings, Stderr};
 
 /// Runs the server with the model as `settings` have it, until it exits.
-pub fn serve(settings: &Settings) -> Result<(), Box<dyn Error>> {
+pub fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let path = server::socket_path();
     let sessions = settings.sessions.unwrap_or(Loaded::SESSIONS);
     if sessions == 0 {
