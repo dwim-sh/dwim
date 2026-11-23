@@ -2,6 +2,7 @@ mod cmd;
 mod config;
 mod opts;
 mod session;
+mod stderr;
 mod tui;
 mod units;
 

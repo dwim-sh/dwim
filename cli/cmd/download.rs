@@ -2,7 +2,10 @@
 
 use std::error::Error;
 
-use crate::session::{self, Settings, Stderr};
+use crate::{
+    session::{self, Settings},
+    stderr::Stderr,
+};
 
 /// Downloads the model `settings` name if it is not in the cache yet, and
 /// prints the path of its weights.

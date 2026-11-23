@@ -15,7 +15,10 @@ use std::{
 
 use dwim::harness::{Event, Log};
 
-use crate::session::{self, Settings, Stderr};
+use crate::{
+    session::{self, Settings},
+    stderr::Stderr,
+};
 
 /// Answers `prompt` with the model, running the tools it calls, and returns
 /// once it replies with text alone, keeping a transcript of it in `log`;

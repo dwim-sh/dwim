@@ -11,7 +11,10 @@ use std::{error::Error, time::Instant};
 
 use dwim::inference::LanguageModel as _;
 
-use crate::session::{self, Settings, Stderr};
+use crate::{
+    session::{self, Settings},
+    stderr::Stderr,
+};
 
 /// The depths of context, in tokens, at which the model is timed: those
 /// the context has room for, with the page and the generated tokens after.

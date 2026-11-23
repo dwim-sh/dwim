@@ -14,7 +14,10 @@ use dwim::{
     server::{self, Hello, Server},
 };
 
-use crate::session::{self, Settings, Stderr};
+use crate::{
+    session::{self, Settings},
+    stderr::Stderr,
+};
 
 /// Runs the server with the model as `settings` have it, until it exits.
 pub fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
