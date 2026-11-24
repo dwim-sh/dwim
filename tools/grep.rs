@@ -198,7 +198,7 @@ mod tests {
     /// Runs the call in `arguments` with `dir` as the working directory,
     /// as the model sees the result.
     fn run(dir: &Path, arguments: &Value) -> String {
-        crate::tools::Output::of(super::run(dir, arguments), false).text
+        crate::tools::shown(super::run(dir, arguments))
     }
 
     /// A directory of its own with a few files in it.

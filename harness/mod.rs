@@ -38,6 +38,7 @@
 
 mod compaction;
 mod log;
+mod snapshot;
 
 use std::{
     cmp::Reverse,
@@ -50,6 +51,7 @@ use std::{
 };
 
 use crate::{
+    harness::snapshot::Snapshot,
     model::{Chunk, Effort, Session, Turn},
     tools::{ToolCall, Tools, bash, plan::Plan, read},
 };
@@ -965,14 +967,23 @@ impl<S: Session> Harness<S> {
                         } else {
                             last = this;
                             let start = Instant::now();
+                            // What the call changed is what differs in
+                            // the files once it has run, whichever tool
+                            // it is.
+                            let before = self.tools.changes(&call).then(|| Snapshot::of(&self.dir));
                             let output = self.tools.run(&call);
+                            if let Some(before) = before {
+                                for path in Snapshot::of(&self.dir).changed(&before) {
+                                    self.tools.changed(&path);
+                                    changed = true;
+                                }
+                            }
                             self.calls += 1;
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            changed = output.changed;
                             self.planned |= self.show_plan(on_event);
-                            output.text
+                            output
                         }
                     }
                     Err(_) if interrupted => NOT_RUN.to_string(),
@@ -1702,21 +1713,21 @@ mod tests {
     fn reminds_the_model_to_change_a_file_after_many_calls_without() {
         // Under a nudge of three: the results of the third call without a
         // change carry the reminder, and the count starts over after it;
-        // a file written starts it over too.
+        // a file changed starts it over too, whether write changed it or
+        // a command bash ran did.
         let dir = scratch();
-        let file = dir.join("a.txt");
-        let write = format!(
-            "{}\n</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\n{}\n</parameter>\n<parameter=content>\nmade\n</parameter>\n</function>\n</tool_call>",
-            filler(10),
-            file.display()
-        );
-        let mut scripts: Vec<String> = (0..3)
-            .map(|i| reply_calling(10, "bash", "command", &format!("echo {i}")))
-            .collect();
-        scripts.push(write);
-        scripts.extend((3..5).map(|i| reply_calling(10, "bash", "command", &format!("echo {i}"))));
+        let path = dir.join("log.jsonl");
+        let echo = |i: usize| calling("bash", &[("command", &format!("echo {i}"))]);
+        let mut scripts: Vec<String> = (0..3).map(echo).collect();
+        scripts.push(calling("write", &[("path", "a.txt"), ("content", "made")]));
+        scripts.extend((3..5).map(echo));
+        scripts.push(calling(
+            "bash",
+            &[("command", "sed -i.bak s/made/done/ DIR/a.txt")],
+        ));
+        scripts.extend((5..7).map(echo));
         scripts.push(reply(10, false));
-        let mut harness = harness(&scripts, 100_000, "");
+        let mut harness = harness_in(&dir, &scripts, &path);
         harness.set_nudge_after(3);
         send(&mut harness, "go");
         let results: Vec<&String> = harness
@@ -1726,14 +1737,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(results.len(), 6, "{results:?}");
         let nudged: Vec<bool> = results.iter().map(|r| r.ends_with(NUDGE)).collect();
         assert_eq!(
             nudged,
-            [false, false, true, false, false, false],
+            [false, false, true, false, false, false, false, false, false],
             "{results:?}"
         );
-        assert_eq!(fs::read_to_string(&file).unwrap(), "made\n");
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "done\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1765,9 +1775,10 @@ mod tests {
 
     #[test]
     fn keeps_the_plan_the_model_lays_out_and_what_each_step_rests_on() {
-        // The model lays out two steps, changes a file, runs a command, and
-        // says each step is done: the plan is reported as it changes, the
-        // first step with the file it changed and the command run after.
+        // The model lays out two steps, changes a file with write and one
+        // with bash, runs a command, and says each step is done: the plan
+        // is reported as it changes, the first step with the files it
+        // changed and the command run after.
         let dir = scratch();
         let path = dir.join("log.jsonl");
         let scripts = [
@@ -1779,6 +1790,7 @@ mod tests {
                 ],
             ),
             calling("write", &[("path", "a.txt"), ("content", "made")]),
+            calling("bash", &[("command", "echo made > DIR/b.txt")]),
             calling("bash", &[("command", "cat DIR/a.txt")]),
             calling("done", &[("result", "a.txt holds made")]),
             calling("done", &[("result", "it reads well")]),
@@ -1794,7 +1806,7 @@ mod tests {
         assert!(last.finished(), "{last:?}");
         let step = &last.steps()[0];
         assert_eq!(step.result, "a.txt holds made");
-        assert_eq!(step.changed, ["a.txt"]);
+        assert_eq!(step.changed, ["a.txt", "b.txt"]);
         let check = step.check.as_ref().unwrap();
         assert!(
             check.passed && check.command.starts_with("cat "),
@@ -1810,8 +1822,8 @@ mod tests {
             })
             .collect();
         assert!(results[0].contains("Step 1 of 2 is under way: write the file"));
-        assert!(results[3].contains("Step 2 of 2 is under way: look it over"));
-        assert!(results[4].contains("Every step of the plan is done"));
+        assert!(results[4].contains("Step 2 of 2 is under way: look it over"));
+        assert!(results[5].contains("Every step of the plan is done"));
         fs::remove_dir_all(dir).unwrap();
     }
 

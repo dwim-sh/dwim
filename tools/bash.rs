@@ -71,7 +71,7 @@ const ENVIRONMENT: &[(&str, &str)] = &[
 pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
-    changes: false,
+    changes: true,
     describe,
     run,
 };
@@ -621,7 +621,7 @@ mod tests {
     /// Runs the call in `arguments` in the working directory, as the model
     /// sees the result.
     fn run(bash: &mut Bash, arguments: &Value) -> String {
-        crate::tools::Output::of(bash.run(Path::new("."), arguments), false).text
+        crate::tools::shown(bash.run(Path::new("."), arguments))
     }
 
     /// Runs `command` through the tool.
@@ -864,12 +864,10 @@ mod tests {
         );
         // And the read tool, from the line the marker names, starts on the
         // first line left out.
-        let page = Tools::new(Path::new("."))
-            .run(&ToolCall {
-                name: "read".to_string(),
-                arguments: serde_json::json!({ "path": path.to_str().unwrap(), "start": first }),
-            })
-            .text;
+        let page = Tools::new(Path::new(".")).run(&ToolCall {
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": path.to_str().unwrap(), "start": first }),
+        });
         assert!(page.starts_with(&format!("{first}\t{first}\n")), "{page}");
         assert_eq!(
             sh(&format!("sed -n '500,502p' {}", path.display()), &mut bash),
