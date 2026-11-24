@@ -24,10 +24,16 @@
 //! `less`, `sudo`, or `ssh` at a new host, would too. With no terminal to
 //! ask on, they fail, and the model sees the error.
 //!
-//! A command that would take away changes the model has made to the
-//! project's tracked files is not run: on SWE-bench's django-11797 the
-//! model made the fix, then ran `git stash` to see its new test fail
-//! without it, and the run ended with nothing changed.
+//! A command that would take away for good the changes the model has made
+//! to the project's tracked files is not run: a checkout or restore of
+//! files, a hard reset, a clean. `git stash` is run, since it keeps the
+//! changes and is how the model finds out whether a test failed before
+//! them: of 28 commands refused over a run of SWE-bench Verified Mini, 22
+//! were a stash with its pop and 6 a checkout tried once the stash was
+//! refused. While changes stashed in the session are still in the stash,
+//! the result of every command says so: on SWE-bench's django-11797 the
+//! model made the fix, ran `git stash` to see its new test fail without
+//! it, and the run ended with nothing changed.
 
 use std::{
     collections::VecDeque,
@@ -126,7 +132,12 @@ pub const TIMEOUT: u64 = 300;
 
 /// What the model is told for a command that would take away changes it
 /// has made to the project's tracked files.
-const DISCARDS: &str = "not run: this would take away the changes you have made to the project's files (git stash, checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your change, undo it with edit, run what you want, and then make the change again with edit. git diff shows your changes.";
+const DISCARDS: &str = "not run: this would take away for good the changes you have made to the project's files (git checkout or restore of files, reset --hard, or clean), and those changes are the work. To run the code without your changes, run git stash, then what you want, then git stash pop, which puts them back. git diff shows your changes.";
+
+/// What the result of a command says while changes stashed in the session
+/// are still in the stash.
+const STASHED: &str =
+    "[your changes are in git's stash, not in the files: run git stash pop to put them back]";
 
 /// Most of one stream of a command's output that goes back to the model as
 /// it is, so that a chatty command can't fill the context window. A longer
@@ -162,6 +173,9 @@ pub struct Bash {
     calls: usize,
     /// Most bytes of a stream kept in its file.
     retain: u64,
+    /// How many entries git's stash had before the first command that
+    /// named it, once one has.
+    stashes: Option<usize>,
 }
 
 /// Tells apart the output directories of the tools of one process.
@@ -177,6 +191,7 @@ impl Default for Bash {
             outputs: tmp.join(format!("dwim-{}-{n}", process::id())),
             calls: 0,
             retain: RETAINED,
+            stashes: None,
         }
     }
 }
@@ -216,6 +231,9 @@ impl Bash {
         }
         if discards(command, dir) && changed(dir) {
             return Err(DISCARDS.to_string());
+        }
+        if self.stashes.is_none() && command.contains("stash") {
+            self.stashes = Some(stashes(dir));
         }
         self.calls += 1;
         // `set -o pipefail` first, on its own line, and only in a shell
@@ -273,6 +291,10 @@ impl Bash {
             Ok(status) => ended(status),
             Err(e) => format!("[error: could not wait for {}: {e}]", self.shell.display()),
         };
+        let status = match self.stashes {
+            Some(before) if stashes(dir) > before => format!("{STASHED}\n{status}"),
+            _ => status,
+        };
         Ok(report(&stdout, &stderr, &status))
     }
 }
@@ -283,11 +305,11 @@ impl Drop for Bash {
     }
 }
 
-/// Whether a shell command would take away changes to the files of the git
-/// work tree at `dir`: `git stash` that saves them, `git checkout` of files,
-/// named with `--`, as `.`, or by a path that is there, or forced, `git
-/// restore` of files, `git reset --hard`, or `git clean` with force, in any
-/// of the commands it chains.
+/// Whether a shell command would take away for good changes to the files
+/// of the git work tree at `dir`: `git checkout` of files, named with
+/// `--`, as `.`, or by a path that is there, or forced, `git restore` of
+/// files, `git reset --hard`, or `git clean` with force, in any of the
+/// commands it chains.
 fn discards(command: &str, dir: &Path) -> bool {
     command.split(['\n', ';', '&', '|', '(', ')']).any(|part| {
         let words: Vec<&str> = part.split_whitespace().collect();
@@ -307,9 +329,6 @@ fn discards(command: &str, dir: &Path) -> bool {
         };
         let args: Vec<&str> = rest.collect();
         match subcommand {
-            Some("stash") => args
-                .first()
-                .is_none_or(|first| ["push", "save"].contains(first) || first.starts_with('-')),
             Some("checkout") => args.iter().any(|arg| {
                 ["--", ".", "-f", "--force"].contains(arg)
                     || !arg.starts_with('-') && dir.join(arg).exists()
@@ -336,6 +355,22 @@ fn changed(dir: &Path) -> bool {
         .current_dir(dir)
         .output()
         .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+/// How many entries the stash of the git work tree at `dir` has; none if
+/// it is not one.
+fn stashes(dir: &Path) -> usize {
+    Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(dir)
+        .output()
+        .map_or(0, |output| {
+            output
+                .stdout
+                .split(|&b| b == b'\n')
+                .filter(|line| !line.is_empty())
+                .count()
+        })
 }
 
 /// Removes the output directories in `tmp` of dwim processes that are no
@@ -992,11 +1027,6 @@ mod tests {
         fs::create_dir_all(dir.join("django/db/models")).unwrap();
         fs::write(dir.join("django/db/models/lookups.py"), "").unwrap();
         for command in [
-            "git stash",
-            "cd /x && git stash && python3 tests/runtests.py lookup",
-            "git stash push -m wip",
-            "git stash -u",
-            "git -C /x stash",
             "git checkout -- django/db/models/lookups.py",
             "git checkout .",
             "git checkout -f main",
@@ -1014,9 +1044,9 @@ mod tests {
         for command in [
             "git status",
             "git diff",
-            "git stash list",
-            "git stash show -p",
-            "git stash pop",
+            "git stash",
+            "git stash && python3 tests/runtests.py lookup; git stash pop",
+            "git stash -u",
             "git checkout -b fix",
             "git checkout main",
             "git restore --staged lookups.py",
@@ -1030,11 +1060,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn refuses_to_discard_changes_to_the_project() {
-        // With a tracked file changed, git stash is refused and the change
-        // stays; with none changed, it runs.
-        let dir = env::temp_dir().join(format!("dwim-refuses-{}", process::id()));
+    /// A git repository of its own, called `name`, with `a.txt` committed
+    /// as `old` and then changed to `new`.
+    fn changed_repository(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("dwim-{name}-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
             assert!(
@@ -1055,15 +1084,41 @@ mod tests {
         assert!(!changed(&dir));
         fs::write(dir.join("a.txt"), "new\n").unwrap();
         assert!(changed(&dir));
+        dir
+    }
+
+    #[test]
+    fn refuses_to_discard_changes_to_the_project() {
+        // With a tracked file changed, a checkout of it is refused and the
+        // change stays; with none changed, it runs.
+        let dir = changed_repository("refuses");
         let mut bash = Bash::default();
-        let stash = serde_json::json!({ "command": "git stash" });
-        assert_eq!(bash.run(&dir, &stash), Err(DISCARDS.to_string()));
+        let checkout = serde_json::json!({ "command": "git checkout -- a.txt" });
+        assert_eq!(bash.run(&dir, &checkout), Err(DISCARDS.to_string()));
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
         fs::write(dir.join("a.txt"), "old\n").unwrap();
-        assert_eq!(
-            bash.run(&dir, &stash),
-            Ok("No local changes to save\n[exit code 0]".to_string())
-        );
+        assert_eq!(bash.run(&dir, &checkout), Ok("[exit code 0]".to_string()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stashes_changes_and_says_so_until_they_are_back() {
+        // A command run between a stash and its pop sees the file as it
+        // was, and the change is back after; a stash without its pop is
+        // said in the result of every command until the pop.
+        let dir = changed_repository("stashes");
+        let mut bash = Bash::default();
+        let mut run = |command: &str| {
+            bash.run(&dir, &serde_json::json!({ "command": command }))
+                .unwrap()
+        };
+        let between = run("git stash -q && cat a.txt; git stash pop -q");
+        assert_eq!(between, "old\n[exit code 0]");
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        let left = run("git stash -q");
+        assert_eq!(left, format!("{STASHED}\n[exit code 0]"));
+        assert_eq!(run("cat a.txt"), format!("old\n{STASHED}\n[exit code 0]"));
+        assert_eq!(run("git stash pop -q && cat a.txt"), "new\n[exit code 0]");
         fs::remove_dir_all(dir).unwrap();
     }
 
