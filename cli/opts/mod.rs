@@ -14,8 +14,8 @@ use crate::session::Settings;
 #[derive(FromArgs)]
 pub struct Opts {
     /// model to run: inkling2-mini (default), which medium also names, on
-    /// this machine or at OpenRouter, or inkling2-small, which large also
-    /// names, at OpenRouter or Vercel
+    /// this machine, at OpenRouter or at Vercel, or inkling2-small, which
+    /// large also names, at OpenRouter or Vercel
     #[argh(option, default = "Model::default()")]
     pub model: Model,
 
