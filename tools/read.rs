@@ -221,7 +221,7 @@ mod tests {
 
     /// Runs the call in `arguments`, as the model sees the result.
     fn run(arguments: &Value) -> String {
-        crate::tools::Output::of(super::run(Path::new("."), arguments), false).text
+        crate::tools::shown(super::run(Path::new("."), arguments))
     }
 
     fn read(path: &str, start: Option<u64>) -> String {

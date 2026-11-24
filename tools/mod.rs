@@ -4,7 +4,7 @@
 //! `grep`, which searches files for a pattern, `glob`, which lists the
 //! files whose paths match one, and `plan` and `done`, which lay out the
 //! plan of the work and finish a step of it. Each is a [`Tool`]: the signature the
-//! system prompt declares it with, whether it changes a file, how a call
+//! system prompt declares it with, whether it can change files, how a call
 //! reads on screen, and what it does. The tools work in the directory the
 //! agent does: a path a call gives is taken from there.
 
@@ -33,7 +33,7 @@ pub struct Tool {
     name: &'static str,
     /// The signature the system prompt declares it with.
     signature: fn() -> Signature,
-    /// Whether a call that succeeds changes a file.
+    /// Whether a call can change files.
     changes: bool,
     /// How a call reads on screen, if its arguments make sense.
     describe: fn(&Value) -> Option<String>,
@@ -208,48 +208,41 @@ impl Tools {
         self.bash.set_shell(shell);
     }
 
+    /// Whether a call can change files, as one of `bash`, `edit` or
+    /// `write` can: what it did change, the files tell.
+    pub fn changes(&self, call: &ToolCall) -> bool {
+        tool(&call.name).is_some_and(|tool| tool.changes)
+    }
+
     /// Runs a call, returning what the model should see, and notes for
-    /// the step of the plan under way what the call changed, or the
-    /// command it ran and whether that succeeded.
-    pub fn run(&mut self, call: &ToolCall) -> Output {
+    /// the step of the plan under way the command it ran, if it ran one,
+    /// and whether that succeeded.
+    pub fn run(&mut self, call: &ToolCall) -> String {
         let Some(tool) = tool(&call.name) else {
-            return Output::of(Err(format!("unknown tool '{}'", call.name)), false);
+            return shown(Err(format!("unknown tool '{}'", call.name)));
         };
         let result = (tool.run)(self, &call.arguments);
-        if let Ok(text) = &result {
-            if tool.changes {
-                if let Some(path) = string(&call.arguments, "path") {
-                    self.plan.changed(path);
-                }
-            } else if let Some(command) = bash::command(tool, &call.arguments) {
-                self.plan.ran(command, bash::succeeded(text));
-            }
+        if let Ok(text) = &result
+            && let Some(command) = bash::command(tool, &call.arguments)
+        {
+            self.plan.ran(command, bash::succeeded(text));
         }
-        Output::of(result, tool.changes)
+        shown(result)
+    }
+
+    /// Notes for the step of the plan under way that the file at `path`
+    /// was changed.
+    pub fn changed(&mut self, path: &str) {
+        self.plan.changed(path);
     }
 }
 
-/// What a call gives the model, and whether it changed a file.
-pub struct Output {
-    pub text: String,
-    pub changed: bool,
-}
-
-impl Output {
-    /// What the model sees of a call's result, marked `error:` if it went
-    /// wrong, which changed a file if the tool `changes` one and it did
-    /// not.
-    fn of(result: Result<String, String>, changes: bool) -> Self {
-        match result {
-            Ok(text) => Self {
-                text,
-                changed: changes,
-            },
-            Err(error) => Self {
-                text: format!("error: {error}"),
-                changed: false,
-            },
-        }
+/// What the model sees of a call's result, marked `error:` if it went
+/// wrong.
+fn shown(result: Result<String, String>) -> String {
+    match result {
+        Ok(text) => text,
+        Err(error) => format!("error: {error}"),
     }
 }
 
@@ -371,50 +364,26 @@ mod tests {
         let hi = tools.run(&call(
             r#"{"name": "bash", "arguments": {"command": "echo hi"}}"#,
         ));
-        assert_eq!(hi.text, "hi\n[exit code 0]");
-        assert!(!hi.changed);
+        assert_eq!(hi, "hi\n[exit code 0]");
         let read = tools.run(&call(
             r#"{"name": "read", "arguments": {"path": "Cargo.toml"}}"#,
         ));
-        assert!(read.text.starts_with("1\t[package]\n"), "{}", read.text);
+        assert!(read.starts_with("1\t[package]\n"), "{read}");
         assert!(
             tools
                 .run(&call(r#"{"name": "rm", "arguments": {}}"#))
-                .text
                 .starts_with("error: unknown tool")
         );
         assert!(
             tools
                 .run(&call(r#"{"name": "bash", "arguments": {}}"#))
-                .text
                 .starts_with("error: bash needs")
         );
         assert!(
             tools
                 .run(&call(r#"{"name": "read", "arguments": {}}"#))
-                .text
                 .starts_with("error: read needs")
         );
-    }
-
-    #[test]
-    fn says_whether_a_call_changed_a_file() {
-        let dir = std::env::temp_dir().join(format!("dwim-tools-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut tools = Tools::new(&dir);
-        let written = tools.run(&call(
-            r#"{"name": "write", "arguments": {"path": "a.txt", "content": "x"}}"#,
-        ));
-        assert!(written.changed, "{}", written.text);
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "x\n");
-        let refused = tools.run(&call(
-            r#"{"name": "edit", "arguments": {"path": "a.txt", "old_string": "y", "new_string": "z"}}"#,
-        ));
-        assert!(refused.text.starts_with("error: "), "{}", refused.text);
-        assert!(!refused.changed);
-        let read = tools.run(&call(r#"{"name": "read", "arguments": {"path": "a.txt"}}"#));
-        assert!(!read.changed);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
