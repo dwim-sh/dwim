@@ -844,7 +844,6 @@ impl App {
                     span("● ").red(),
                     span(format!("error: signing in to OpenRouter: {e}")),
                 ]);
-                self.lines.push(Line::new());
             }
         }
         true
@@ -1050,7 +1049,6 @@ impl App {
             Reply::Notice(text) => {
                 self.finish();
                 self.lines.push(vec![span(format!("● {text}")).dark_grey()]);
-                self.lines.push(Line::new());
             }
             Reply::ThinkingBudget(tokens) => {
                 self.thinking_budget = tokens;
@@ -1058,7 +1056,6 @@ impl App {
                 self.lines.push(vec![
                     span(format!("● {}", view::budget_set(tokens))).dark_grey(),
                 ]);
-                self.lines.push(Line::new());
             }
             Reply::Auto(auto) => {
                 self.auto = auto;
@@ -1066,7 +1063,6 @@ impl App {
                 self.lines.push(vec![
                     span(format!("● {}", view::auto_notice(auto))).dark_grey(),
                 ]);
-                self.lines.push(Line::new());
             }
             Reply::Model { model, provider } => {
                 let notice = match self.provider {
@@ -1082,19 +1078,16 @@ impl App {
                 self.finish();
                 self.lines
                     .push(vec![span(format!("● {notice}")).dark_grey()]);
-                self.lines.push(Line::new());
             }
             Reply::Error(e) => {
                 self.finish();
                 self.lines
                     .push(vec![span("● ").red(), span(format!("error: {e}"))]);
-                self.lines.push(Line::new());
             }
             Reply::Unopened(e) => {
                 self.finish();
                 self.lines
                     .push(vec![span("● ").red(), span(format!("error: {e}"))]);
-                self.lines.push(Line::new());
                 self.provider = None;
                 self.device_name = None;
                 self.size = None;
@@ -1393,13 +1386,11 @@ impl App {
         }
     }
 
-    /// Prints `lines` above the live region, cut to the terminal's width,
-    /// with a blank line after them.
+    /// Prints `lines` above the live region, cut to the terminal's width.
     fn say(&mut self, lines: &[Line]) {
         let (columns, _) = self.screen.size();
         self.lines
             .extend(lines.iter().map(|line| tui::truncate(line, columns)));
-        self.lines.push(Line::new());
     }
 
     fn draw(&mut self) -> Result<(), Box<dyn Error>> {
