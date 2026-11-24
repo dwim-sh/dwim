@@ -60,9 +60,10 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   with the same modules, `unix/` for what both do the same way, all
   re-exported as `sys::memory` and so on
 - `evals/` - the benchmarks `dwim` is run over, a directory each with its
-  `run.py`: `swebench` (Lite, Verified, Verified Mini); `results/` is
-  the report of each run over a whole dataset, and `runs/` what the runs
-  leave, which is not kept in git
+  `run.py`: `swebench` (Lite, Verified, Verified Mini), and
+  `terminalbench` (Terminal-Bench, with Harbor, `dwim` in each task's
+  container); `results/` is the report of each run over a whole
+  dataset, and `runs/` what the runs leave, which is not kept in git
 - `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built

@@ -187,6 +187,50 @@ done with a dataset.
 its read and edit tools work on the checkout as you, on an untrusted
 issue.** Run it in a virtual machine, not on a machine you care about.
 
+## Terminal-Bench
+
+[Terminal-Bench](https://www.tbench.ai) gives an agent an instruction and a
+container to carry it out in, such as building a program, fixing a server's
+configuration or recovering a file, and its tests then check what the
+container has become. `evals/terminalbench/run.py` runs `dwim` over it with
+[Harbor](https://harborframework.com), its harness: Terminal-Bench 4.1, 66
+tasks, unless `--dataset` names another, such as `terminal-bench@2.0`.
+
+```
+evals/terminalbench/run.py --task fix-git              # one task, or a glob
+evals/terminalbench/run.py --limit 10                  # the first ten
+evals/terminalbench/run.py                             # all of them
+evals/terminalbench/run.py --workers 4                 # four at once
+evals/terminalbench/run.py --provider openrouter -- --model large
+```
+
+Unlike in the SWE-bench runner, `dwim` runs in the task's container, since
+the tests look at the whole container and `dwim`'s tools have to see what
+they see. The model still runs here: the script starts a `dwim` server
+with room for `--workers` sessions and keeps it running for the run, and
+Harbor mounts the server's socket's directory and the program into each
+container. A session will only use a server of its own build, so the
+containers run the very program the server runs from. It is built with
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) for glibc
+2.28, which the tasks' images have or newer, so it needs that and zig as
+well as Docker; [uv](https://docs.astral.sh/uv/) runs the script and
+installs Harbor for it. With `--provider` and a host, `dwim` asks the host
+from the container with the key from your environment, and no server is
+started. The model runs here for the containers only on Linux.
+
+A run is a directory under `evals/runs/`, named for the dataset and the
+commit of `dwim`: `manifest.json` says what was run, `report.md` what came
+of it, `server.log` what the server said, and `job/` is Harbor's, with a
+directory for each task with its `result.json`, and in `agent/` the
+transcript and what `dwim` printed. A run over a whole dataset writes its
+report to `evals/results/` too, as `dwim-terminal-bench.md`. The same
+command again takes the run up where it stopped, with `harbor jobs
+resume`.
+
+**The tasks' containers have the network, and some of their images are
+built from Dockerfiles that fetch what they need.** Run it in a virtual
+machine, not on a machine you care about.
+
 ## Releasing
 
 The version is in `Cargo.toml`.
