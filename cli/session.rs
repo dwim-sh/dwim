@@ -257,6 +257,7 @@ pub fn harness(
         move |session: &mut Session| session.start(&system, |_, _| {})
     })?;
     harness.set_thinking_budget(settings.thinking_budget);
+    harness.set_model(settings.model);
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);
     }
@@ -293,6 +294,7 @@ pub fn switch(
     harness: &mut Harness<Session>,
     on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<Kind, Box<dyn Error>> {
+    harness.set_model(settings.model);
     reopen(settings, harness, on_status)?;
     let device = device(harness.session());
     harness.note_model(settings.model.name(), &device);

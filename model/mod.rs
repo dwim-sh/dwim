@@ -104,6 +104,20 @@ impl Model {
         }
     }
 
+    /// Whether the model has to be told how to work in the user's message
+    /// to work so. Inkling 2 Mini does much of what its system prompt
+    /// says: told there to reply in French, or to read files with the read
+    /// tool, it did in every trial. Told there to lay out a plan first, or
+    /// to change files with edit and not sed, it did in none of 8 trials
+    /// each, and went on through bash; told the same in the message, it
+    /// did in 7 of 8 and 5 of 8. Qwen3.8-27B does both from the prompt.
+    pub const fn needs_rules_in_message(self) -> bool {
+        match self {
+            Model::InklingMini | Model::InklingSmall => true,
+            Model::Qwen27b | Model::QwenMax => false,
+        }
+    }
+
     /// The model's chat format, over the vocabulary a GGUF file of it
     /// carries.
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {

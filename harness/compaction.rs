@@ -11,7 +11,7 @@
 use std::{error::Error, fmt::Write};
 
 use crate::{
-    harness::{Entry, Event, Harness, OnEvent, environment},
+    harness::{Entry, Event, Harness, OnEvent},
     model::{Session, Turn},
 };
 
@@ -126,7 +126,7 @@ pub fn compact<S: Session>(
     let capacity = harness.session.capacity();
     let (start, messages) = select(&harness.said, &harness.transcript, capacity);
     let head = note_turn(
-        &environment(&harness.dir),
+        &harness.preamble(),
         &note,
         &harness.tools.plan().brief(),
         &messages,
@@ -154,7 +154,7 @@ pub fn start_over<S: Session>(
         harness.session.capacity() / MESSAGES,
     );
     let head = step_turn(
-        &environment(&harness.dir),
+        &harness.preamble(),
         &harness.tools.plan().brief(),
         &messages,
     );

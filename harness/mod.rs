@@ -52,7 +52,7 @@ use std::{
 
 use crate::{
     harness::snapshot::Snapshot,
-    model::{Chunk, Effort, Session, Turn},
+    model::{Chunk, Effort, Model, Session, Turn},
     tools::{ToolCall, Tools, bash, plan::Plan, read},
 };
 
@@ -167,6 +167,14 @@ const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need 
 /// the last step tends to reply without saying the step is done, and the
 /// plan the user reads would say the work stopped short of it.
 const STEPS_LEFT: &str = "The plan has steps that are not done. If the step under way is finished, call done with what it came to, and go on with the next. If you cannot go on without the user, reply with what you need from them.";
+
+/// The system prompt's rules on planning and on the file tools, in short,
+/// for a model that follows them only from the user's message. They are
+/// flat orders because Inkling 2 Mini skips them otherwise: under a
+/// heading, or with "if the message asks for a change" before the plan,
+/// it planned in none of three sessions. The cost is a plan for some
+/// plain questions.
+const RULES: &str = "Before anything else, call plan with the steps you see. Read files with the read tool, not cat, sed or awk through bash. Search with the grep tool, not grep through bash. Change files with the edit tool, not a script, sed or a heredoc through bash. Use bash only to run code and tests.";
 
 /// The share of the context past which a step of the plan starts in a
 /// conversation cleared down to the plan: half. A step's end is where the
@@ -438,6 +446,8 @@ pub struct Harness<S: Session> {
     /// The directory the agent works in, to say where it is afresh after
     /// a compaction.
     dir: PathBuf,
+    /// The model the conversation is on, once the harness is told.
+    model: Option<Model>,
     calls: usize,
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
@@ -506,6 +516,7 @@ impl<S: Session> Harness<S> {
             tools: Tools::new(dir),
             environment: Some(environment(dir)),
             dir: dir.to_path_buf(),
+            model: None,
             calls: 0,
             tool_seconds: 0.0,
             transcript: Vec::new(),
@@ -620,6 +631,23 @@ impl<S: Session> Harness<S> {
         self.log = log;
     }
 
+    /// Tells the harness which model the conversation is on.
+    pub fn set_model(&mut self, model: Model) {
+        self.model = Some(model);
+    }
+
+    /// What goes ahead of the user's first message, and again after a
+    /// compaction: the environment, then the rules if the model needs
+    /// them in the message.
+    fn preamble(&self) -> String {
+        let environment = environment(&self.dir);
+        if self.model.is_some_and(Model::needs_rules_in_message) {
+            format!("{environment}\n\n{RULES}")
+        } else {
+            environment
+        }
+    }
+
     /// Records in the transcript that the conversation goes on with
     /// `model`, on `device`, as it does after [`Harness::reopen`] on a
     /// session with another model.
@@ -649,7 +677,7 @@ impl<S: Session> Harness<S> {
                 (turns.first_mut(), self.transcript.first())
             && !first.prompt
         {
-            *message = format!("{}\n\n{message}", environment(&self.dir));
+            *message = format!("{}\n\n{message}", self.preamble());
         }
         self.session.replay(&turns)?;
         Ok(())
@@ -724,7 +752,7 @@ impl<S: Session> Harness<S> {
 
     /// Sends a message from the user, as [`Harness::send`] does.
     fn converse(&mut self, message: &str, on_event: OnEvent) -> Result<(), Box<dyn Error>> {
-        let ahead = self.environment.take();
+        let ahead = self.environment.take().map(|_| self.preamble());
         self.steps = 0;
         self.unchanged = 0;
         self.went_on = 0;
@@ -1881,6 +1909,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(asked(&harness), 0);
+    }
+
+    #[test]
+    fn gives_inkling_the_rules_ahead_of_the_first_message() {
+        // With Inkling, the harness says how to work with where the agent
+        // is, once, ahead of the first message, and the transcript keeps
+        // the messages alone; with Qwen, it says only where the agent is.
+        let scripts = [reply(10, false), reply(10, false)];
+        let mut told = harness(&scripts, 100_000, "");
+        told.set_model(Model::InklingMini);
+        send(&mut told, "first message");
+        send(&mut told, "on");
+        let read = fed(&told);
+        assert_eq!(read.matches(RULES).count(), 1);
+        assert!(read.find("# Environment").unwrap() < read.find(RULES).unwrap());
+        assert!(read.find(RULES).unwrap() < read.find("first message").unwrap());
+        assert!(
+            matches!(told.transcript().next(), Some(Turn::User(text)) if text == "first message")
+        );
+
+        let mut plain = harness(&scripts, 100_000, "");
+        plain.set_model(Model::Qwen27b);
+        send(&mut plain, "go");
+        assert!(fed(&plain).contains("# Environment"));
+        assert!(!fed(&plain).contains(RULES));
     }
 
     #[test]
