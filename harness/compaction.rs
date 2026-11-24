@@ -181,9 +181,16 @@ fn restart<S: Session>(
     harness.session.clear()?;
     (harness.restart)(&mut harness.session)?;
     harness.session.replay(&turns)?;
+    // The turns read back are not said again: the user's among them are in
+    // `said` already, and the head is the harness's own.
     harness.transcript.clear();
     for (turn, prompt) in kept {
-        harness.record(turn, prompt)?;
+        let tokens = harness.session.measure(&turn)?;
+        harness.transcript.push(Entry {
+            turn,
+            tokens,
+            prompt,
+        });
     }
     let after = harness.session.tokens();
     harness
@@ -586,6 +593,41 @@ mod tests {
             panic!("{note}")
         };
         assert!(findings > task + done + next, "{sections:?}");
+    }
+
+    #[test]
+    fn carries_or_keeps_each_message_once_across_compactions() {
+        // Short exchanges, so that the most recent read back after each
+        // compaction hold some of the user's messages.
+        let scripts: Vec<String> = (0..12).map(|_| reply(10, false)).collect();
+        let mut harness = harness(&scripts, 8000, " keep going.<|im_end|>");
+        let mut sent = Vec::new();
+        for round in 0..3 {
+            for i in 0..4 {
+                let message = format!("message {round}.{i}");
+                send(&mut harness, &message);
+                sent.push(message);
+            }
+            assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
+            let Some(Turn::User(head)) = harness.transcript().next() else {
+                panic!()
+            };
+            for message in &sent {
+                let carried = head
+                    .matches(&format!("<message>\n{message}\n</message>"))
+                    .count();
+                let kept = harness
+                    .transcript()
+                    .skip(1)
+                    .filter(|turn| matches!(turn, Turn::User(m) if m == message))
+                    .count();
+                assert_eq!(
+                    carried + kept,
+                    1,
+                    "{message} after compaction {round}: {head}"
+                );
+            }
+        }
     }
 
     #[test]
