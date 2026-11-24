@@ -31,6 +31,11 @@ impl Snapshot {
         Self { files }
     }
 
+    /// Whether the file at `path` is among them.
+    pub fn has(&self, path: &str) -> bool {
+        self.files.contains_key(path)
+    }
+
     /// The paths of the files that are not in `before` as they are here:
     /// those made, changed or deleted since, in order.
     pub fn changed(&self, before: &Snapshot) -> Vec<String> {

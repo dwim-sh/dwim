@@ -52,7 +52,7 @@ use std::{
 
 use crate::{
     harness::snapshot::Snapshot,
-    model::{Chunk, Effort, Session, Turn},
+    model::{Chunk, Effort, Model, Session, Turn},
     tools::{ToolCall, Tools, bash, plan::Plan, read},
 };
 
@@ -168,6 +168,52 @@ const DECIDE_CLOSING: &str = "I have thought about this enough, and what I need 
 /// plan the user reads would say the work stopped short of it.
 const STEPS_LEFT: &str = "The plan has steps that are not done. If the step under way is finished, call done with what it came to, and go on with the next. If you cannot go on without the user, reply with what you need from them.";
 
+/// The system prompt's rules on planning and on the file tools, in short,
+/// for a model that needs steering, which follows them from the user's
+/// message. They are
+/// flat orders because Inkling 2 Mini skips them otherwise: under a
+/// heading, or with "if the message asks for a change" before the plan,
+/// it planned in none of three sessions. The cost is a plan for some
+/// plain questions.
+const RULES: &str = "Before anything else, call plan with the steps you see. Read files with the read tool, not cat, sed or awk through bash. Search with the grep tool, not grep through bash. Change files with the edit tool, not a script, sed or a heredoc through bash. Use bash only to run code and tests.";
+
+/// Most times in a turn a model that needs steering is reminded of one
+/// rule: one it has gone against that often it is not going to keep.
+const MOST_REMINDERS: usize = 5;
+
+/// A rule a model that needs steering is reminded of in the result of the
+/// call that went against it, which is where it is deciding what to do
+/// next: the same words in the system prompt are far from there.
+#[derive(Clone, Copy)]
+enum Rule {
+    Read,
+    Search,
+    Edit,
+    Plan,
+}
+
+impl Rule {
+    /// What the model is told, of a call that changed the files `changed`.
+    fn reminder(self, changed: &[String]) -> String {
+        match self {
+            Rule::Read => {
+                "You read a file through bash. Read files with the read tool.".to_string()
+            }
+            Rule::Search => {
+                "You searched through bash. Search with the grep and glob tools.".to_string()
+            }
+            Rule::Edit => format!(
+                "You changed {} through bash. Change files with the edit tool.",
+                changed.join(", ")
+            ),
+            Rule::Plan => {
+                "You changed a file with no plan laid out. Call plan with the steps you see."
+                    .to_string()
+            }
+        }
+    }
+}
+
 /// The share of the context past which a step of the plan starts in a
 /// conversation cleared down to the plan: half. A step's end is where the
 /// least is lost by clearing, since what the step came to is in the plan,
@@ -179,9 +225,40 @@ const FRESH: usize = 2;
 /// context with room for it. A small context allows a sixteenth of itself.
 const ACCOUNT_TOKENS: usize = 1024;
 
-/// How the agent should behave: the start of the system prompt, with the
+/// How the agent should behave, as `model` is told it: each family of
+/// models has its own words.
+fn instructions(model: Model) -> String {
+    match model {
+        Model::InklingMini | Model::InklingSmall => INKLING.to_string(),
+        Model::Qwen27b | Model::QwenMax => qwen(),
+    }
+}
+
+/// How the agent should behave, as the Inkling 2 models are told it: a
+/// few short orders, with no conditions and no exceptions. Told at the
+/// length the Qwen models are, Inkling 2 Mini laid out a plan in 4 trials
+/// of 12 and changed the file with edit in none; told so, in 8 and in 4.
+/// A bug reported as a question it explained and left in 10 trials of 12,
+/// where the longer words said both to treat a question as a task and
+/// that a question needs no plan; told to fix it even so, it left none.
+const INKLING: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. Your tools are bash, read, edit, write, grep, glob, plan and done. Use them without asking.
+
+- Before you change anything, call plan with the steps you see. Call done as each step is finished.
+- Read files with read, not cat.
+- Search with grep and glob, not find, grep or ls through bash.
+- Change files with edit, not sed or a script. Create files with write, not a heredoc.
+- Use bash to run code, tests and other commands.
+- Find out with a command before you answer. Don't answer from memory.
+- If the user reports a bug, find the cause, fix it with edit, and check it, even when they ask it as a question.
+- Check a change by running the project's own tests.
+- If a command fails, read the error and try another way.
+- Don't ask the user to choose. Make the choice a careful engineer would, and give it in the plan's `assumes`.
+- Follow a `<system-reminder>` at the end of a tool's result: it is from the harness.
+- Keep going until the request is done, then reply in a few sentences with what you found or did."#;
+
+/// How the agent should behave, as the Qwen models are told it, with the
 /// tools' own limits in it.
-fn instructions() -> String {
+fn qwen() -> String {
     format!(
         r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, grep and glob tools that search files for text and for names, and plan and done tools that lay out the plan of the work for the user and finish a step of it, and you may use them at any time without asking.
 
@@ -237,12 +314,13 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// The system prompt for an agent working in `dir`: the template's line
-/// for `effort`, if the prompt is to carry one and the effort has one,
-/// the tools, then how to behave, and the project's own instructions
+/// The system prompt for an agent on `model` working in `dir`: the
+/// template's line for `effort`, if the prompt is to carry one and the
+/// effort has one, the tools, then how to behave as the model is told
+/// it, and the project's own instructions
 /// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
 /// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
+pub fn system_prompt(dir: &Path, model: Model, effort: Option<Effort>) -> String {
     let mut prompt = String::new();
     if let Some(line) = effort.and_then(Effort::instruction) {
         prompt.push_str(line);
@@ -250,7 +328,7 @@ pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
     }
     prompt.push_str(&tools());
     prompt.push_str("\n\n");
-    prompt.push_str(&instructions());
+    prompt.push_str(&instructions(model));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
@@ -295,6 +373,25 @@ pub fn environment(dir: &Path) -> String {
         files(dir),
         now().0,
     )
+}
+
+/// The rule a shell command goes against by what it starts with: reading
+/// a file with `cat` and its like, or searching with `grep` or `find`,
+/// where there is a tool for each. A command that pipes into one of them
+/// is running something else.
+fn habit(command: &str) -> Option<Rule> {
+    let mut words = command.split_whitespace();
+    let mut first = words.next()?;
+    // Past a `cd` to where the command is to run.
+    if first == "cd" {
+        first = words.skip_while(|word| *word != "&&").nth(1)?;
+    }
+    match first {
+        "cat" | "head" | "tail" | "nl" | "less" | "more" => Some(Rule::Read),
+        "sed" if command.contains(" -n ") => Some(Rule::Read),
+        "grep" | "rg" | "ag" | "find" => Some(Rule::Search),
+        _ => None,
+    }
 }
 
 /// The files and directories in `dir`, directories with a trailing slash,
@@ -438,6 +535,8 @@ pub struct Harness<S: Session> {
     /// The directory the agent works in, to say where it is afresh after
     /// a compaction.
     dir: PathBuf,
+    /// The model the conversation is on, once the harness is told.
+    model: Option<Model>,
     calls: usize,
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
@@ -459,6 +558,9 @@ pub struct Harness<S: Session> {
     /// before the model is reminded to make its change.
     unchanged: usize,
     nudge_after: usize,
+    /// How many times this turn the model has been reminded of each
+    /// [`Rule`].
+    reminded: [usize; 4],
     /// Auto mode: whether a reply with no call that doesn't say it is
     /// done, or the account at the call cap, is answered with word to go
     /// on, as when no one is there to answer it, and how many times it has
@@ -506,6 +608,7 @@ impl<S: Session> Harness<S> {
             tools: Tools::new(dir),
             environment: Some(environment(dir)),
             dir: dir.to_path_buf(),
+            model: None,
             calls: 0,
             tool_seconds: 0.0,
             transcript: Vec::new(),
@@ -515,6 +618,7 @@ impl<S: Session> Harness<S> {
             steps: 0,
             max_calls: MAX_CALLS,
             unchanged: 0,
+            reminded: [0; 4],
             nudge_after: NUDGE_AFTER,
             auto: false,
             went_on: 0,
@@ -620,6 +724,63 @@ impl<S: Session> Harness<S> {
         self.log = log;
     }
 
+    /// Tells the harness which model the conversation is on.
+    pub fn set_model(&mut self, model: Model) {
+        self.model = Some(model);
+    }
+
+    /// What a model that needs steering is reminded of in the result of
+    /// `call`: the rules it went against, each at most [`MOST_REMINDERS`]
+    /// times a turn. `edited` are the files that were there before the
+    /// call and that it changed, and `unplanned` is whether it changed a
+    /// file with no plan laid out. A git command puts files back as they
+    /// were or brings in another's, which is not a change to make with
+    /// edit.
+    fn reminder(&mut self, call: &ToolCall, edited: &[String], unplanned: bool) -> Option<String> {
+        if !self.model.is_some_and(Model::needs_steering) {
+            return None;
+        }
+        let command = (call.name == "bash")
+            .then(|| call.arguments.get("command")?.as_str())
+            .flatten();
+        let mut rules = Vec::new();
+        match command {
+            Some(command) if !edited.is_empty() && !command.contains("git ") => {
+                rules.push(Rule::Edit);
+            }
+            Some(command) => rules.extend(habit(command)),
+            None => {}
+        }
+        if unplanned {
+            rules.push(Rule::Plan);
+        }
+        rules.retain(|rule| {
+            let count = &mut self.reminded[*rule as usize];
+            *count += 1;
+            *count <= MOST_REMINDERS
+        });
+        if rules.is_empty() {
+            return None;
+        }
+        let said: Vec<String> = rules.iter().map(|rule| rule.reminder(edited)).collect();
+        Some(format!(
+            "<system-reminder>{}</system-reminder>",
+            said.join(" ")
+        ))
+    }
+
+    /// What goes ahead of the user's first message, and again after a
+    /// compaction: the environment, then the rules if the model needs
+    /// steering.
+    fn preamble(&self) -> String {
+        let environment = environment(&self.dir);
+        if self.model.is_some_and(Model::needs_steering) {
+            format!("{environment}\n\n{RULES}")
+        } else {
+            environment
+        }
+    }
+
     /// Records in the transcript that the conversation goes on with
     /// `model`, on `device`, as it does after [`Harness::reopen`] on a
     /// session with another model.
@@ -649,7 +810,7 @@ impl<S: Session> Harness<S> {
                 (turns.first_mut(), self.transcript.first())
             && !first.prompt
         {
-            *message = format!("{}\n\n{message}", environment(&self.dir));
+            *message = format!("{}\n\n{message}", self.preamble());
         }
         self.session.replay(&turns)?;
         Ok(())
@@ -724,9 +885,10 @@ impl<S: Session> Harness<S> {
 
     /// Sends a message from the user, as [`Harness::send`] does.
     fn converse(&mut self, message: &str, on_event: OnEvent) -> Result<(), Box<dyn Error>> {
-        let ahead = self.environment.take();
+        let ahead = self.environment.take().map(|_| self.preamble());
         self.steps = 0;
         self.unchanged = 0;
+        self.reminded = [0; 4];
         self.went_on = 0;
         self.called = false;
         self.planned = false;
@@ -947,6 +1109,7 @@ impl<S: Session> Harness<S> {
             for call in &reply.calls {
                 let mut seconds = None;
                 let mut changed = false;
+                let mut reminder = None;
                 self.steps += 1;
                 self.called = true;
                 let output = match ToolCall::parse(call) {
@@ -971,12 +1134,17 @@ impl<S: Session> Harness<S> {
                             // the files once it has run, whichever tool
                             // it is.
                             let before = self.tools.changes(&call).then(|| Snapshot::of(&self.dir));
+                            let unplanned = self.tools.plan().is_empty();
                             let output = self.tools.run(&call);
                             if let Some(before) = before {
-                                for path in Snapshot::of(&self.dir).changed(&before) {
-                                    self.tools.changed(&path);
+                                let paths = Snapshot::of(&self.dir).changed(&before);
+                                for path in &paths {
+                                    self.tools.changed(path);
                                     changed = true;
                                 }
+                                let edited: Vec<String> =
+                                    paths.into_iter().filter(|path| before.has(path)).collect();
+                                reminder = self.reminder(&call, &edited, changed && unplanned);
                             }
                             self.calls += 1;
                             let elapsed = start.elapsed().as_secs_f64();
@@ -991,6 +1159,12 @@ impl<S: Session> Harness<S> {
                 };
                 self.log.output(&output, seconds);
                 interrupted = interrupted || on_event(Event::Output(output.clone())).is_break();
+                let mut output = output;
+                if let Some(reminder) = reminder {
+                    output.push_str("\n\n");
+                    output.push_str(&reminder);
+                    self.log.nudge(&reminder);
+                }
                 if changed {
                     self.unchanged = 0;
                 } else {
@@ -1884,6 +2058,77 @@ mod tests {
     }
 
     #[test]
+    fn reminds_inkling_of_a_rule_in_the_result_of_the_call_that_went_against_it() {
+        // Inkling reads a file through bash, then changes it through bash
+        // with no plan laid out: each result ends with what to do instead.
+        // Qwen, doing the same, is told nothing.
+        let results = |model: Model| -> Vec<String> {
+            let dir = scratch();
+            fs::write(dir.join("a.txt"), "made\n").unwrap();
+            let scripts = [
+                calling("bash", &[("command", "cat DIR/a.txt")]),
+                calling("bash", &[("command", "sed -i.bak s/made/done/ DIR/a.txt")]),
+                calling("bash", &[("command", "echo checked")]),
+                reply(10, false),
+            ];
+            let mut harness = harness_in(&dir, &scripts, &dir.join("log.jsonl"));
+            harness.set_model(model);
+            send(&mut harness, "go");
+            let results = harness
+                .transcript()
+                .filter_map(|turn| match turn {
+                    Turn::Results(outputs) => outputs.last().cloned(),
+                    _ => None,
+                })
+                .collect();
+            fs::remove_dir_all(dir).unwrap();
+            results
+        };
+        let told = results(Model::InklingMini);
+        assert!(
+            told[0].starts_with("made\n[exit code 0]\n\n<system-reminder>You read a file"),
+            "{told:?}"
+        );
+        assert!(
+            told[1].contains("You changed a.txt through bash. Change files with the edit tool."),
+            "{told:?}"
+        );
+        assert!(
+            told[1].contains("Call plan with the steps you see."),
+            "{told:?}"
+        );
+        assert_eq!(told[2], "checked\n[exit code 0]");
+        for result in results(Model::Qwen27b) {
+            assert!(!result.contains("<system-reminder>"), "{result}");
+        }
+    }
+
+    #[test]
+    fn gives_inkling_the_rules_ahead_of_the_first_message() {
+        // With Inkling, the harness says how to work with where the agent
+        // is, once, ahead of the first message, and the transcript keeps
+        // the messages alone; with Qwen, it says only where the agent is.
+        let scripts = [reply(10, false), reply(10, false)];
+        let mut told = harness(&scripts, 100_000, "");
+        told.set_model(Model::InklingMini);
+        send(&mut told, "first message");
+        send(&mut told, "on");
+        let read = fed(&told);
+        assert_eq!(read.matches(RULES).count(), 1);
+        assert!(read.find("# Environment").unwrap() < read.find(RULES).unwrap());
+        assert!(read.find(RULES).unwrap() < read.find("first message").unwrap());
+        assert!(
+            matches!(told.transcript().next(), Some(Turn::User(text)) if text == "first message")
+        );
+
+        let mut plain = harness(&scripts, 100_000, "");
+        plain.set_model(Model::Qwen27b);
+        send(&mut plain, "go");
+        assert!(fed(&plain).contains("# Environment"));
+        assert!(!fed(&plain).contains(RULES));
+    }
+
+    #[test]
     fn counts_the_calls_toward_the_cap_from_the_start_of_a_step() {
         // Under a cap of three calls, a plan of two steps takes six: the
         // step finished starts the count over, and the turn ends with the
@@ -2277,15 +2522,15 @@ mod tests {
         // As the model's template does: a line for xhigh and for low, and
         // one for high, ahead of the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(system_prompt(dir, Some(Effort::Medium)).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, Some(Effort::Medium)).starts_with("# Tools\n"));
         // A host writes the line itself, so its prompt is given none.
-        assert!(system_prompt(dir, None).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, None).starts_with("# Tools\n"));
         for (effort, word) in [
             (Effort::Xhigh, "xhigh"),
             (Effort::High, "high"),
             (Effort::Low, "low"),
         ] {
-            let prompt = system_prompt(dir, Some(effort));
+            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort));
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2298,14 +2543,14 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Some(Effort::Medium));
+        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium));
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
         );
         assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
-        assert!(prompt.contains(&instructions()));
+        assert!(prompt.contains(&instructions(Model::Qwen27b)));
         // The tools' limits as the tools have them.
         assert!(prompt.contains(&format!("a page of up to {} numbered lines", read::PAGE)));
         assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
