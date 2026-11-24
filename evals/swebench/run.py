@@ -74,8 +74,10 @@ PLATFORM = "linux/amd64"
 # How the issue is put to the model, which SWE-bench leaves to the scaffold.
 # Given the raw issue, the model tries to recall the upstream fix instead of
 # making one; told to update the tests its change breaks, it rewrites them
-# to fit a wrong fix.
-TASK = """Fix the issue below in this checkout. Make the smallest change that fixes it, and run the project's tests to check it. Leave the tests that are already there as they are: if one fails after your change, the change is wrong, unless the issue asks for what that test checks to change, and then say so in your reply instead of changing the test. Don't try to recall or reproduce how the project fixed it upstream; make the fix from this code.
+# to fit a wrong fix; and told that a failing test may stand where "the
+# issue asks for what that test checks to change", it keeps a fix that
+# breaks tests the issue says nothing of.
+TASK = """Fix the issue below in this checkout. Make the smallest change that fixes it, and run the project's tests to check it. Leave the tests that are already there as they are. If one of them fails after your change, your change broke it: change your fix until it passes. Only a test that checks the exact wrong behavior the issue describes may be left failing, and then say so in your reply. Don't try to recall or reproduce how the project fixed it upstream; make the fix from this code.
 
 <issue>
 {issue}
@@ -129,8 +131,10 @@ few from one run to the next.
 
 - **The task.** The agent is given the issue's text, asked to make the
   smallest change that fixes it in the checkout, to run the project's
-  tests to check it, and to leave the tests that are already there as
-  they are. It is not given the tests the fix is scored by.
+  tests to check it, to leave the tests that are already there as they
+  are, and to change its fix until they pass, but for one that checks
+  the wrong behavior the issue describes. It is not given the tests the
+  fix is scored by.
 - **The checkout.** The repository is copied out of the instance's
   SWE-bench evaluation image, at the commit before the fix, with the
   project installed. The agent's shell commands run in a container of that
