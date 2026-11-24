@@ -332,6 +332,7 @@ pub fn open(
     let effort = settings.effort;
     let system = harness::system_prompt(
         &env::current_dir()?,
+        settings.model,
         (kind == Kind::Local).then_some(effort),
     );
     let (model, context, temperature) = (settings.model, settings.context, settings.temperature);

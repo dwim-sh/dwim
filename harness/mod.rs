@@ -52,7 +52,7 @@ use std::{
 
 use crate::{
     harness::snapshot::Snapshot,
-    model::{Chunk, Effort, Session, Turn},
+    model::{Chunk, Effort, Model, Session, Turn},
     tools::{ToolCall, Tools, bash, plan::Plan, read},
 };
 
@@ -179,9 +179,40 @@ const FRESH: usize = 2;
 /// context with room for it. A small context allows a sixteenth of itself.
 const ACCOUNT_TOKENS: usize = 1024;
 
-/// How the agent should behave: the start of the system prompt, with the
+/// How the agent should behave, as `model` is told it: each family of
+/// models has its own words.
+fn instructions(model: Model) -> String {
+    match model {
+        Model::InklingMini | Model::InklingSmall => INKLING.to_string(),
+        Model::Qwen27b | Model::QwenMax => qwen(),
+    }
+}
+
+/// How the agent should behave, as the Inkling 2 models are told it: a
+/// few short orders, with no conditions and no exceptions. Told at the
+/// length the Qwen models are, Inkling 2 Mini laid out a plan in 4 trials
+/// of 12 and changed the file with edit in none; told so, in 8 and in 4.
+/// A bug reported as a question it explained and left in 10 trials of 12,
+/// where the longer words said both to treat a question as a task and
+/// that a question needs no plan; told to fix it even so, it left none.
+const INKLING: &str = r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. Your tools are bash, read, edit, write, grep, glob, plan and done. Use them without asking.
+
+- Before you change anything, call plan with the steps you see. Call done as each step is finished.
+- Read files with read, not cat.
+- Search with grep and glob, not find, grep or ls through bash.
+- Change files with edit, not sed or a script. Create files with write, not a heredoc.
+- Use bash to run code, tests and other commands.
+- Find out with a command before you answer. Don't answer from memory.
+- If the user reports a bug, find the cause, fix it with edit, and check it, even when they ask it as a question.
+- Check a change by running the project's own tests.
+- If a command fails, read the error and try another way.
+- Don't ask the user to choose. Make the choice a careful engineer would, and give it in the plan's `assumes`.
+- Follow a `<system-reminder>` at the end of a tool's result: it is from the harness.
+- Keep going until the request is done, then reply in a few sentences with what you found or did."#;
+
+/// How the agent should behave, as the Qwen models are told it, with the
 /// tools' own limits in it.
-fn instructions() -> String {
+fn qwen() -> String {
     format!(
         r#"You are `dwim`, a coding agent working in the user's project directory at a Unix command line. You have a bash tool that runs shell commands there, a read tool that reads files, an edit tool that replaces a string in a file and shows the lines as they now stand, a write tool that writes a file whole, grep and glob tools that search files for text and for names, and plan and done tools that lay out the plan of the work for the user and finish a step of it, and you may use them at any time without asking.
 
@@ -237,12 +268,13 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"#;
 
-/// The system prompt for an agent working in `dir`: the template's line
-/// for `effort`, if the prompt is to carry one and the effort has one,
-/// the tools, then how to behave, and the project's own instructions
+/// The system prompt for an agent on `model` working in `dir`: the
+/// template's line for `effort`, if the prompt is to carry one and the
+/// effort has one, the tools, then how to behave as the model is told
+/// it, and the project's own instructions
 /// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
 /// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
+pub fn system_prompt(dir: &Path, model: Model, effort: Option<Effort>) -> String {
     let mut prompt = String::new();
     if let Some(line) = effort.and_then(Effort::instruction) {
         prompt.push_str(line);
@@ -250,7 +282,7 @@ pub fn system_prompt(dir: &Path, effort: Option<Effort>) -> String {
     }
     prompt.push_str(&tools());
     prompt.push_str("\n\n");
-    prompt.push_str(&instructions());
+    prompt.push_str(&instructions(model));
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
@@ -2277,15 +2309,15 @@ mod tests {
         // As the model's template does: a line for xhigh and for low, and
         // one for high, ahead of the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(system_prompt(dir, Some(Effort::Medium)).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, Some(Effort::Medium)).starts_with("# Tools\n"));
         // A host writes the line itself, so its prompt is given none.
-        assert!(system_prompt(dir, None).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, None).starts_with("# Tools\n"));
         for (effort, word) in [
             (Effort::Xhigh, "xhigh"),
             (Effort::High, "high"),
             (Effort::Low, "low"),
         ] {
-            let prompt = system_prompt(dir, Some(effort));
+            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort));
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2298,14 +2330,14 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Some(Effort::Medium));
+        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium));
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
         );
         assert!(prompt.contains("\n{\"type\": \"function\", \"function\": {\"name\": \"read\""));
         assert!(prompt.contains(CALLING));
-        assert!(prompt.contains(&instructions()));
+        assert!(prompt.contains(&instructions(Model::Qwen27b)));
         // The tools' limits as the tools have them.
         assert!(prompt.contains(&format!("a page of up to {} numbered lines", read::PAGE)));
         assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
