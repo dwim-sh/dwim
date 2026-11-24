@@ -113,6 +113,23 @@ impl Model {
         }
     }
 
+    /// Whether the model has to be steered as it works to keep to the
+    /// rules of its system prompt: told them in the user's message, and
+    /// reminded of one where it has just gone another way. Inkling 2
+    /// Mini's makers say of it that "when using tools, it is less reliable
+    /// than larger models at following detailed instructions", and they
+    /// run it with a shell alone. Told in the system prompt to lay out a
+    /// plan first, or to change files with edit and not sed, it did in
+    /// none of 8 trials each, and went on through bash; told the same in
+    /// the message, it did in 7 of 8 and 5 of 8. Qwen3.8-27B does both
+    /// from the prompt.
+    pub const fn needs_steering(self) -> bool {
+        match self {
+            Model::InklingMini | Model::InklingSmall => true,
+            Model::Qwen27b | Model::QwenMax => false,
+        }
+    }
+
     /// The model's chat format, over the vocabulary a GGUF file of it
     /// carries.
     pub fn format(self, gguf: &gguf::Metadata) -> Result<Arc<dyn Format>> {
