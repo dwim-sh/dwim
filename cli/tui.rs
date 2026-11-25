@@ -3,13 +3,14 @@
 //! program's, while a live region at the bottom is redrawn in place.
 
 use std::{
-    io::{self, Stdout, Write},
+    fs::File,
+    io::{self, Write},
     mem,
     ops::Range,
 };
 
 use crossterm::{
-    cursor::{MoveToColumn, MoveUp},
+    cursor::{MoveDown, MoveToColumn, MoveUp},
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -18,6 +19,7 @@ use crossterm::{
     style::{Print, PrintStyledContent, StyledContent, Stylize},
     terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
+use dwim::sys;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A line of styled text.
@@ -93,12 +95,19 @@ pub fn span(text: impl Into<String>) -> StyledContent<String> {
 /// The terminal: finished lines are printed into the scrollback, and a live
 /// region below them (the line being generated, a status line, and the input
 /// box) is redrawn in place.
+///
+/// A draw never blanks the live region first: it writes over only the rows
+/// that changed, and sends the whole frame at once, so the terminal never
+/// shows a frame half drawn, whether or not it supports synchronized updates.
 pub struct Screen {
-    out: Stdout,
-    /// Display width of each line of the live region, as last drawn.
-    widths: Vec<usize>,
+    /// Standard output, unbuffered, so that a frame is written whole.
+    out: File,
+    /// The live region as last drawn, a row each.
+    drawn: Vec<Line>,
     /// Row and column the cursor was left at within the live region.
     cursor: (usize, usize),
+    /// Terminal width at the last draw, or 0 before the first.
+    columns: usize,
     /// Whether keyboard enhancement was pushed, and must be popped on exit.
     enhanced: bool,
 }
@@ -106,7 +115,7 @@ pub struct Screen {
 impl Screen {
     pub fn new() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let mut out = io::stdout();
+        let mut out = sys::terminal::unbuffered(&io::stdout())?;
         execute!(out, EnableBracketedPaste)?;
         // Lets Shift+Enter be told apart from Enter, where supported.
         let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -118,8 +127,9 @@ impl Screen {
         }
         Ok(Self {
             out,
-            widths: Vec::new(),
+            drawn: Vec::new(),
             cursor: (0, 0),
+            columns: 0,
             enhanced,
         })
     }
@@ -138,54 +148,84 @@ impl Screen {
         live: &[Line],
         cursor: (usize, usize),
     ) -> io::Result<()> {
-        let (columns, _) = self.size();
+        let (columns, rows) = self.size();
         // A line of the live region that wrapped would push it out of place
-        // for the next draw, so they are cut to the terminal's width.
-        let live: Vec<Line> = live.iter().map(|line| truncate(line, columns)).collect();
-        // If the terminal narrowed since the last draw, it has rewrapped
-        // lines that no longer fit onto more rows.
-        let rows = |width: usize| width.div_ceil(columns).max(1);
-        let up = self.widths[..self.cursor.0]
+        // for the next draw, so they are cut to the terminal's width. A
+        // region taller than the screen could not be moved back to its top,
+        // so it loses rows from the top, where the cursor is not.
+        let mut live: Vec<Line> = live.iter().map(|line| truncate(line, columns)).collect();
+        if live.is_empty() {
+            live.push(Line::new());
+        }
+        let cut = live.len().saturating_sub(rows);
+        live.drain(..cut);
+        let cursor = (
+            cursor.0.saturating_sub(cut).min(live.len() - 1),
+            cursor.1.min(columns - 1),
+        );
+
+        // If the terminal was resized, it may have rewrapped what was drawn
+        // onto more rows, so the region is cleared and drawn whole, as it is
+        // the first time.
+        let resized = columns != self.columns;
+        let row_count = |width: usize| width.div_ceil(columns).max(1);
+        let up = self.drawn[..self.cursor.0]
             .iter()
-            .map(|&w| rows(w))
+            .map(|line| row_count(width(line)))
             .sum::<usize>()
             + self.cursor.1 / columns;
 
-        queue!(self.out, BeginSynchronizedUpdate, MoveToColumn(0))?;
+        let mut frame = Vec::new();
+        queue!(frame, BeginSynchronizedUpdate, MoveToColumn(0))?;
         if up > 0 {
-            queue!(self.out, MoveUp(up as u16))?;
+            queue!(frame, MoveUp(up as u16))?;
         }
-        queue!(self.out, Clear(ClearType::FromCursorDown))?;
-        for line in lines {
-            self.print(line)?;
-            queue!(self.out, Print("\r\n"))?;
+        if resized {
+            queue!(frame, Clear(ClearType::FromCursorDown))?;
         }
-        for (i, line) in live.iter().enumerate() {
+        let before: &[Line] = if resized { &[] } else { &self.drawn };
+        // The row of the screen being written, counted from the region's top.
+        let mut row = 0;
+        for (i, line) in lines.iter().chain(&live).enumerate() {
             if i > 0 {
-                queue!(self.out, Print("\r\n"))?;
+                queue!(frame, Print("\r\n"))?;
             }
-            self.print(line)?;
+            if before.get(row) == Some(line) {
+                row += 1;
+                continue;
+            }
+            let line_width = width(line);
+            for span in line {
+                queue!(frame, PrintStyledContent(span.clone()))?;
+            }
+            // A line as wide as the screen leaves the cursor on its last
+            // column, where clearing would erase that column.
+            if !line_width.is_multiple_of(columns) || line_width == 0 {
+                queue!(frame, Clear(ClearType::UntilNewLine))?;
+            }
+            row += row_count(line_width);
         }
-        let below = live.len().saturating_sub(1).saturating_sub(cursor.0);
+        // Rows of a region taller than this one are left below it.
+        if before.len() > row {
+            queue!(
+                frame,
+                MoveDown(1),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown),
+                MoveUp(1)
+            )?;
+        }
+        let below = live.len() - 1 - cursor.0;
         if below > 0 {
-            queue!(self.out, MoveUp(below as u16))?;
+            queue!(frame, MoveUp(below as u16))?;
         }
-        queue!(
-            self.out,
-            MoveToColumn(cursor.1 as u16),
-            EndSynchronizedUpdate
-        )?;
+        queue!(frame, MoveToColumn(cursor.1 as u16), EndSynchronizedUpdate)?;
+        self.out.write_all(&frame)?;
         self.out.flush()?;
 
-        self.widths = live.iter().map(width).collect();
+        self.drawn = live;
         self.cursor = cursor;
-        Ok(())
-    }
-
-    fn print(&mut self, line: &Line) -> io::Result<()> {
-        for span in line {
-            queue!(self.out, PrintStyledContent(span.clone()))?;
-        }
+        self.columns = columns;
         Ok(())
     }
 }
