@@ -15,4 +15,4 @@ pub use darwin::{browser, memory};
 #[cfg(not(target_vendor = "apple"))]
 pub use linux::{browser, memory};
 
-pub use unix::{dirs, fs, mmap, net, process, user};
+pub use unix::{dirs, fs, mmap, net, process, terminal, user};
