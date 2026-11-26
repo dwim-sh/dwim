@@ -26,7 +26,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::{
-    harness::{self, Event, Log},
+    harness::{self, Event, Transcript},
     model::{Device, Model, Size},
     providers::{
         Kind,
@@ -61,7 +61,7 @@ pub fn run(
     verbose: bool,
     transcript: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
-    let log = Log::open(transcript)?;
+    let log = Transcript::open(transcript)?;
     let transcript = log.path().map(Path::to_path_buf);
     let model = settings.model;
     let provider = session::provider(settings.provider, model)?;

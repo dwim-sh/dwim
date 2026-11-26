@@ -14,7 +14,7 @@ use std::{
 };
 
 use dwim::{
-    harness::{self, Event, Harness, Log},
+    harness::{self, Event, Harness, Transcript},
     model::Model,
     providers::{
         Kind,
@@ -47,8 +47,8 @@ pub struct Worker {
 
 impl Worker {
     /// Starts the thread, which loads the model as `settings` have it and
-    /// keeps a transcript in `log`.
-    pub fn spawn(settings: Settings, log: Log) -> Self {
+    /// keeps the session in `transcript`.
+    pub fn spawn(settings: Settings, transcript: Transcript) -> Self {
         let (requests, requests_rx) = mpsc::channel();
         let (replies_tx, replies) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -57,7 +57,7 @@ impl Worker {
             let stop = stop.clone();
             move || {
                 let _done = done;
-                if let Err(e) = work(settings, log, requests_rx, &replies_tx, &stop) {
+                if let Err(e) = work(settings, transcript, requests_rx, &replies_tx, &stop) {
                     let _ = replies_tx.send(Reply::Failed(e.to_string()));
                 }
             }
@@ -157,11 +157,11 @@ pub enum Reply {
 }
 
 /// Loads the model as `settings` have it and answers messages until the UI
-/// hangs up, keeping a transcript in `log`. While the model loads, another
-/// can be picked, and is loaded instead.
+/// hangs up, keeping the session in `transcript`. While the model loads,
+/// another can be picked, and is loaded instead.
 fn work(
     mut settings: Settings,
-    log: Log,
+    transcript: Transcript,
     requests: Receiver<Request>,
     replies: &Sender<Reply>,
     stop: &AtomicBool,
@@ -170,7 +170,7 @@ fn work(
     let Some((session, system)) = open(&mut settings, &requests, replies)? else {
         return Ok(());
     };
-    let mut harness = session::harness(&settings, session, system, log)?;
+    let mut harness = session::harness(&settings, session, system, transcript)?;
     let _ = replies.send(Reply::Ready(loading.elapsed()));
     // Whether the session's server was stopped, so the next request that
     // needs the model opens it on another.

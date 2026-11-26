@@ -20,10 +20,10 @@
 //! directories.
 //!
 //! The harness also keeps the conversation within the context window: it
-//! keeps a transcript of the turns since the system prompt, and when the
-//! next message or tool result would take the context past a high-water
-//! mark, `compaction` has the model write a note and starts the
-//! conversation over from it.
+//! keeps the conversation since the system prompt, and when the next
+//! message or tool result would take the context past a high-water mark,
+//! `compaction` has the model write a note and starts the conversation
+//! over from a briefing that holds it.
 //!
 //! The model lays out the work as a plan, with the `plan` tool, and the
 //! tools keep it from then on: the harness reports it as it changes, for
@@ -32,13 +32,13 @@
 //! steps left when the model stops short of them, and, once the conversation has grown long, starts each
 //! step in a conversation cleared down to the plan.
 //!
-//! Given a [`Log`], the harness keeps a transcript of the whole session in
-//! it, thoughts and compactions included, for finding out afterwards where
-//! a session's tokens went.
+//! Given a [`Transcript`], the harness keeps the whole session in it,
+//! thoughts and compactions included, for finding out afterwards where a
+//! session's tokens went.
 
 mod compaction;
-mod log;
 mod snapshot;
+mod transcript;
 
 use std::{
     cmp::Reverse,
@@ -56,7 +56,7 @@ use crate::{
     tools::{ToolCall, Tools, bash, plan::Plan, read},
 };
 
-pub use crate::harness::log::Log;
+pub use crate::harness::transcript::Transcript;
 
 /// Most of a project's `AGENTS.md` that goes into the system prompt.
 const MAX_INSTRUCTIONS: usize = 32 << 10;
@@ -515,7 +515,7 @@ enum Outcome {
     Cut,
 }
 
-/// A turn as the transcript keeps it: the turn, the tokens it takes read
+/// A turn as the conversation keeps it: the turn, the tokens it takes read
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
 #[derive(Clone)]
@@ -541,7 +541,7 @@ pub struct Harness<S: Session> {
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
     /// compacted.
-    transcript: Vec<Entry>,
+    conversation: Vec<Entry>,
     /// Opens the conversation over with the system prompt, once the session
     /// is cleared.
     restart: Restart<S>,
@@ -576,11 +576,11 @@ pub struct Harness<S: Session> {
     /// this turn, and whether it has been asked after the steps left.
     planned: bool,
     asked: bool,
-    /// The user's messages of the session, as the transcript has recorded
+    /// The user's messages of the session, as the conversation has recorded
     /// them, which a compacted conversation reads back.
     said: Vec<Entry>,
     /// The transcript of the whole session.
-    log: Log,
+    transcript: Transcript,
 }
 
 /// Where a conversation's time has gone: the model's, by what it was
@@ -611,7 +611,7 @@ impl<S: Session> Harness<S> {
             model: None,
             calls: 0,
             tool_seconds: 0.0,
-            transcript: Vec::new(),
+            conversation: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
             thinking_budget: None,
@@ -627,7 +627,7 @@ impl<S: Session> Harness<S> {
             planned: false,
             asked: false,
             said: Vec::new(),
-            log: Log::none(),
+            transcript: Transcript::none(),
         };
         harness.limit_thoughts(THINKING_BUDGET);
         Ok(harness)
@@ -638,7 +638,7 @@ impl<S: Session> Harness<S> {
     /// and the model goes on to act on what it has thought so far.
     pub fn set_thinking_budget(&mut self, tokens: Option<usize>) {
         self.limit_thoughts(tokens);
-        self.log.thinking_budget(tokens);
+        self.transcript.thinking_budget(tokens);
     }
 
     /// Has the session end a thought at `tokens`, the thinking budget, if
@@ -688,7 +688,7 @@ impl<S: Session> Harness<S> {
     pub fn set_plan_aside(&mut self) {
         self.tools.clear_plan();
         self.shown = Plan::default();
-        self.log.plan("");
+        self.transcript.plan("");
     }
 
     /// Sets how many tool calls the model may make in one turn before it
@@ -698,20 +698,20 @@ impl<S: Session> Harness<S> {
         self.max_calls = calls;
     }
 
-    /// Keeps a transcript of the session in `log`, starting with what the
+    /// Keeps the session in `transcript`, starting with what the
     /// model was given before the first message: `model`, the `device` it
     /// runs on, where it is, the room it has, how it samples, its thinking
     /// budget, the `effort` it is asked to reason at, and the `system`
     /// prompt.
-    pub fn keep_log(
+    pub fn keep_transcript(
         &mut self,
-        mut log: Log,
+        mut transcript: Transcript,
         model: &str,
         device: &str,
         effort: Effort,
         system: &str,
     ) {
-        log.start(
+        transcript.start(
             model,
             device,
             &self.dir,
@@ -721,7 +721,7 @@ impl<S: Session> Harness<S> {
             effort,
             system,
         );
-        self.log = log;
+        self.transcript = transcript;
     }
 
     /// Tells the harness which model the conversation is on.
@@ -785,7 +785,8 @@ impl<S: Session> Harness<S> {
     /// `model`, on `device`, as it does after [`Harness::reopen`] on a
     /// session with another model.
     pub fn note_model(&mut self, model: &str, device: &str) {
-        self.log.model(model, device, self.session.capacity());
+        self.transcript
+            .model(model, device, self.session.capacity());
     }
 
     /// The conversation the harness runs on.
@@ -801,13 +802,13 @@ impl<S: Session> Harness<S> {
         self.session = session;
         self.note_tokens = compaction::reserve(&mut self.session)?;
         let mut turns: Vec<Turn> = self
-            .transcript
+            .conversation
             .iter()
             .map(|entry| entry.turn.clone())
             .collect();
         if self.environment.is_none()
             && let (Some(Turn::User(message)), Some(first)) =
-                (turns.first_mut(), self.transcript.first())
+                (turns.first_mut(), self.conversation.first())
             && !first.prompt
         {
             *message = format!("{}\n\n{message}", self.preamble());
@@ -828,8 +829,8 @@ impl<S: Session> Harness<S> {
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
     #[cfg(test)]
-    fn transcript(&self) -> impl Iterator<Item = &Turn> {
-        self.transcript.iter().map(|entry| &entry.turn)
+    fn conversation(&self) -> impl Iterator<Item = &Turn> {
+        self.conversation.iter().map(|entry| &entry.turn)
     }
 
     /// Sends a message from the user, with where the agent is ahead of the
@@ -865,8 +866,8 @@ impl<S: Session> Harness<S> {
         })
     }
 
-    /// Runs `work`, reporting to `on_event`, and records in the log how it
-    /// ended, if not on its own: with an error, or interrupted.
+    /// Runs `work`, reporting to `on_event`, and records in the transcript
+    /// how it ended, if not on its own: with an error, or interrupted.
     fn ended<T>(
         &mut self,
         mut on_event: impl FnMut(Event) -> ControlFlow<()>,
@@ -878,7 +879,7 @@ impl<S: Session> Harness<S> {
             interrupted |= flow.is_break();
             flow
         });
-        self.log
+        self.transcript
             .end(result.as_ref().err().map(|e| e as _), interrupted);
         result
     }
@@ -950,7 +951,7 @@ impl<S: Session> Harness<S> {
         if changed {
             let brief = self.tools.plan().brief();
             if brief != self.shown.brief() {
-                self.log.plan(&brief);
+                self.transcript.plan(&brief);
             }
             self.shown = self.tools.plan().clone();
             let _ = on_event(Event::Plan(self.shown.clone()));
@@ -977,17 +978,17 @@ impl<S: Session> Harness<S> {
         let mut last = None;
         loop {
             if let Turn::User(message) = &input {
-                self.log
+                self.transcript
                     .user(message, ahead.as_deref(), self.session.tokens());
             }
             // Where the agent is goes ahead of the first message as fed,
             // and the plan as it stands after one that comes while steps
-            // are left; the transcript keeps the message alone, since a
+            // are left; the conversation keeps the message alone, since a
             // compaction says where the agent is, and the plan, afresh.
             let fed = match (&input, ahead.take(), after.take()) {
                 (Turn::User(message), ahead, after) if ahead.is_some() || after.is_some() => {
                     if let Some(after) = &after {
-                        self.log.nudge(after);
+                        self.transcript.nudge(after);
                     }
                     let parts = [ahead.as_deref(), Some(message.as_str()), after.as_deref()];
                     Turn::User(parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n"))
@@ -1049,9 +1050,9 @@ impl<S: Session> Harness<S> {
             let reply = {
                 let collect = |chunk: Chunk| {
                     match chunk {
-                        Chunk::Thought(piece) => self.log.stream("thought", piece),
+                        Chunk::Thought(piece) => self.transcript.stream("thought", piece),
                         Chunk::Text(piece) => {
-                            self.log.stream("text", piece);
+                            self.transcript.stream("text", piece);
                             text.push_str(piece);
                         }
                         Chunk::Token => {}
@@ -1066,7 +1067,7 @@ impl<S: Session> Harness<S> {
                     Turn::Reply { .. } => return Err("a reply is the model's to make".into()),
                 }
             };
-            self.log.reply(
+            self.transcript.reply(
                 &reply,
                 self.session.tokens(),
                 &before,
@@ -1115,7 +1116,7 @@ impl<S: Session> Harness<S> {
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = crate::tools::describe(&call);
-                        self.log.call(&call.name, &detail);
+                        self.transcript.call(&call.name, &detail);
                         interrupted = interrupted
                             || on_event(Event::Call {
                                 name: call.name.clone(),
@@ -1157,13 +1158,13 @@ impl<S: Session> Harness<S> {
                     Err(_) if interrupted => NOT_RUN.to_string(),
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
-                self.log.output(&output, seconds);
+                self.transcript.output(&output, seconds);
                 interrupted = interrupted || on_event(Event::Output(output.clone())).is_break();
                 let mut output = output;
                 if let Some(reminder) = reminder {
                     output.push_str("\n\n");
                     output.push_str(&reminder);
-                    self.log.nudge(&reminder);
+                    self.transcript.nudge(&reminder);
                 }
                 if changed {
                     self.unchanged = 0;
@@ -1197,7 +1198,7 @@ impl<S: Session> Harness<S> {
             {
                 last.push_str("\n\n");
                 last.push_str(NUDGE);
-                self.log.nudge(NUDGE);
+                self.transcript.nudge(NUDGE);
                 self.unchanged = 0;
             }
             input = Turn::Results(outputs);
@@ -1255,7 +1256,7 @@ impl<S: Session> Harness<S> {
                 );
             };
             outputs[i] = too_large(sizes[i].take().unwrap_or(0));
-            self.log.nudge(&outputs[i]);
+            self.transcript.nudge(&outputs[i]);
         }
     }
 
@@ -1266,7 +1267,7 @@ impl<S: Session> Harness<S> {
     /// times this turn. Counts it if so.
     fn go_on(&mut self) -> bool {
         let done = matches!(
-            self.transcript.last(),
+            self.conversation.last(),
             Some(Entry { turn: Turn::Reply { text, .. }, .. }) if said_done(text)
         );
         if !self.auto || done || !self.called || self.went_on >= AUTO_ROUNDS {
@@ -1280,15 +1281,16 @@ impl<S: Session> Harness<S> {
     /// an account of the turn, which it gives without tools, reported as
     /// `Text` pieces, and records the exchange. The turn ends with it.
     fn account(&mut self, on_event: OnEvent) -> Result<Outcome, Box<dyn Error>> {
-        self.log.user(STEPS_PROMPT, None, self.session.tokens());
+        self.transcript
+            .user(STEPS_PROMPT, None, self.session.tokens());
         let before = self.session.stats();
         let answer = self
             .session
             .answer(STEPS_PROMPT, &[], self.account_limit(), |text| {
-                self.log.stream("text", text);
+                self.transcript.stream("text", text);
                 on_event(Event::Text(text.to_string()))
             })?;
-        self.log.reply(
+        self.transcript.reply(
             &crate::model::Reply {
                 cut: answer.cut,
                 ..Default::default()
@@ -1325,7 +1327,7 @@ impl<S: Session> Harness<S> {
             .answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
-    /// Adds a turn to the transcript, a user turn as the harness's own
+    /// Adds a turn to the conversation, a user turn as the harness's own
     /// `prompt` or the user's message; the user's are kept among what they
     /// said too.
     fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
@@ -1338,7 +1340,7 @@ impl<S: Session> Harness<S> {
         if matches!(entry.turn, Turn::User(_)) && !prompt {
             self.said.push(entry.clone());
         }
-        self.transcript.push(entry);
+        self.conversation.push(entry);
         Ok(())
     }
 }
@@ -1347,7 +1349,7 @@ impl<S: Session> Drop for Harness<S> {
     /// Ends the transcript: the session finished.
     fn drop(&mut self) {
         let stats = self.stats();
-        self.log.finish(self.session.tokens(), &stats);
+        self.transcript.finish(self.session.tokens(), &stats);
     }
 }
 
@@ -1502,7 +1504,7 @@ mod tests {
         assert!(thought.len() < 1000, "{}", thought.len());
     }
 
-    /// The records of the log at `path`, which is removed.
+    /// The records of the transcript at `path`, which is removed.
     fn records(path: &Path) -> Vec<serde_json::Value> {
         let text = fs::read_to_string(path).unwrap();
         fs::remove_file(path).unwrap();
@@ -1552,8 +1554,8 @@ mod tests {
         assert_eq!(limited.thinking_budget, THINKING_BUDGET);
         assert_eq!(THINKING_BUDGET, Some(2048));
         let path = std::env::temp_dir().join(format!("dwim-budget-{}.jsonl", std::process::id()));
-        limited.keep_log(
-            Log::create(&path).unwrap(),
+        limited.keep_transcript(
+            Transcript::create(&path).unwrap(),
             "tiny",
             "cpu",
             Effort::Low,
@@ -1591,14 +1593,14 @@ mod tests {
         assert!(recall < decide, "{thought}");
         assert_eq!(thought.matches(RECALL_CLOSING).count(), 1, "{thought}");
         assert!(thought.len() < 1000, "{}", thought.len());
-        let turns: Vec<&Turn> = limited.transcript().collect();
+        let turns: Vec<&Turn> = limited.conversation().collect();
         assert!(
             matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim().ends_with("Ok.")),
             "{:?}",
             turns.last()
         );
         drop(limited);
-        // The log has the budget, its change, and the thought it ended.
+        // The transcript has the budget, its change, and the thought it ended.
         let records = records(&path);
         assert_eq!(records[0]["thinking_budget"], 2048);
         assert_eq!(records[0]["reasoning_effort"], "low");
@@ -1655,7 +1657,7 @@ mod tests {
     }
 
     /// A harness around a scripted model working in `dir`, under a budget
-    /// of 100, keeping a log at `path`. `DIR` in a script stands for the
+    /// of 100, keeping a transcript at `path`. `DIR` in a script stands for the
     /// directory.
     fn harness_in(dir: &Path, scripts: &[String], path: &Path) -> Harness<Local<Scripted>> {
         harness_within(dir, scripts, path, 100_000)
@@ -1686,8 +1688,8 @@ mod tests {
         })
         .unwrap();
         harness.set_thinking_budget(Some(100));
-        harness.keep_log(
-            Log::create(path).unwrap(),
+        harness.keep_transcript(
+            Transcript::create(path).unwrap(),
             "tiny",
             "cpu",
             Effort::Low,
@@ -1696,8 +1698,8 @@ mod tests {
         harness
     }
 
-    /// The replies of the log at `path`, as thought tokens and whether the
-    /// thought was ended at the budget.
+    /// The replies of the transcript at `path`, as thought tokens and
+    /// whether the thought was ended at the budget.
     fn replies(path: &Path) -> Vec<(u64, bool)> {
         records(path)
             .iter()
@@ -1791,10 +1793,10 @@ mod tests {
             .unwrap();
     }
 
-    /// The transcript's turns as a letter each: a user's, a reply, results.
+    /// The conversation's turns as a letter each: a user's, a reply, results.
     fn shape(harness: &Harness<Local<Scripted>>) -> String {
         harness
-            .transcript()
+            .conversation()
             .map(|turn| match turn {
                 Turn::User(_) => 'u',
                 Turn::Reply { .. } => 'r',
@@ -1815,9 +1817,9 @@ mod tests {
         send(&mut harness, "what happened?");
 
         // The reply's two calls are answered before the next message, and
-        // the model was fed what the transcript has.
+        // the model was fed what the conversation has.
         assert_eq!(shape(&harness), "urtur");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1849,7 +1851,7 @@ mod tests {
         let mut harness = harness(&scripts, 4000, " go on.");
         send(&mut harness, "go");
         assert_eq!(shape(&harness), "urtr");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1873,7 +1875,7 @@ mod tests {
 
         // The call that ran keeps its output, and the other was not run.
         assert_eq!(shape(&harness), "urtur");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1905,7 +1907,7 @@ mod tests {
         harness.set_nudge_after(3);
         send(&mut harness, "go");
         let results: Vec<&String> = harness
-            .transcript()
+            .conversation()
             .filter_map(|turn| match turn {
                 Turn::Results(outputs) => outputs.last(),
                 _ => None,
@@ -1989,7 +1991,7 @@ mod tests {
         assert_eq!(last.steps()[1].changed, Vec::<String>::new());
         // The model is told the step under way as each is finished.
         let results: Vec<&String> = harness
-            .transcript()
+            .conversation()
             .filter_map(|turn| match turn {
                 Turn::Results(outputs) => outputs.last(),
                 _ => None,
@@ -2017,7 +2019,7 @@ mod tests {
         assert!(plans.last().unwrap().finished());
         let asked = |harness: &Harness<Local<Scripted>>| {
             harness
-                .transcript()
+                .conversation()
                 .filter(|turn| matches!(turn, Turn::User(text) if text == STEPS_LEFT))
                 .count()
         };
@@ -2075,7 +2077,7 @@ mod tests {
             harness.set_model(model);
             send(&mut harness, "go");
             let results = harness
-                .transcript()
+                .conversation()
                 .filter_map(|turn| match turn {
                     Turn::Results(outputs) => outputs.last().cloned(),
                     _ => None,
@@ -2106,7 +2108,7 @@ mod tests {
     #[test]
     fn gives_inkling_the_rules_ahead_of_the_first_message() {
         // With Inkling, the harness says how to work with where the agent
-        // is, once, ahead of the first message, and the transcript keeps
+        // is, once, ahead of the first message, and the conversation keeps
         // the messages alone; with Qwen, it says only where the agent is.
         let scripts = [reply(10, false), reply(10, false)];
         let mut told = harness(&scripts, 100_000, "");
@@ -2118,7 +2120,7 @@ mod tests {
         assert!(read.find("# Environment").unwrap() < read.find(RULES).unwrap());
         assert!(read.find(RULES).unwrap() < read.find("first message").unwrap());
         assert!(
-            matches!(told.transcript().next(), Some(Turn::User(text)) if text == "first message")
+            matches!(told.conversation().next(), Some(Turn::User(text)) if text == "first message")
         );
 
         let mut plain = harness(&scripts, 100_000, "");
@@ -2147,7 +2149,7 @@ mod tests {
         assert!(plans.last().unwrap().finished());
         assert!(
             !harness
-                .transcript()
+                .conversation()
                 .any(|turn| matches!(turn, Turn::User(text) if text == STEPS_PROMPT))
         );
     }
@@ -2235,19 +2237,19 @@ mod tests {
             "{}",
             harness.session.tokens()
         );
-        let turns: Vec<&Turn> = harness.transcript().collect();
-        let Turn::User(head) = turns[0] else {
+        let turns: Vec<&Turn> = harness.conversation().collect();
+        let Turn::User(briefing) = turns[0] else {
             panic!("{:?}", turns[0])
         };
-        assert!(head.starts_with("# Environment\n"), "{head}");
+        assert!(briefing.starts_with("# Environment\n"), "{briefing}");
         assert!(
-            head.contains("<plan>\n1. [done] find it: it is in send(), stream.rs:120\n2. [under way] fix it\n3. [to come] check it\n</plan>"),
-            "{head}"
+            briefing.contains("<plan>\n1. [done] find it: it is in send(), stream.rs:120\n2. [under way] fix it\n3. [to come] check it\n</plan>"),
+            "{briefing}"
         );
-        assert!(!head.contains(&filler(100)), "{head}");
+        assert!(!briefing.contains(&filler(100)), "{briefing}");
         assert!(
-            head.contains("<message>\nfix the retries\n</message>"),
-            "{head}"
+            briefing.contains("<message>\nfix the retries\n</message>"),
+            "{briefing}"
         );
         assert!(
             matches!(turns[1], Turn::Reply { calls, .. } if calls.len() == 1),
@@ -2281,7 +2283,7 @@ mod tests {
         let mut auto = harness(&scripts, 100_000, "");
         auto.set_auto(true);
         send(&mut auto, "go");
-        let turns: Vec<&Turn> = auto.transcript().collect();
+        let turns: Vec<&Turn> = auto.conversation().collect();
         let told = turns
             .iter()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
@@ -2292,7 +2294,7 @@ mod tests {
 
         let mut plain = harness(&scripts, 100_000, "");
         send(&mut plain, "go");
-        assert_eq!(plain.transcript().count(), 4);
+        assert_eq!(plain.conversation().count(), 4);
         // Only in auto mode is the model told, with the message, how to
         // say it is done.
         assert!(fed(&auto).contains(UNATTENDED));
@@ -2307,7 +2309,7 @@ mod tests {
         endless.set_auto(true);
         send(&mut endless, "go");
         let told = endless
-            .transcript()
+            .conversation()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
             .count();
         assert_eq!(told, AUTO_ROUNDS);
@@ -2328,10 +2330,10 @@ mod tests {
         let mut harness = harness(&scripts, 100_000, "");
         harness.set_auto(true);
         send(&mut harness, "say hello");
-        assert_eq!(harness.transcript().count(), 2);
+        assert_eq!(harness.conversation().count(), 2);
         send(&mut harness, "go");
         let told = harness
-            .transcript()
+            .conversation()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
             .count();
         assert_eq!(told, 1);
@@ -2360,7 +2362,7 @@ mod tests {
         harness.set_call_limit(2);
         harness.set_auto(true);
         send(&mut harness, "go");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let at = turns
             .iter()
             .position(|turn| matches!(turn, Turn::User(m) if m == STEPS_PROMPT))
@@ -2393,7 +2395,7 @@ mod tests {
             ],
             "{events:?}"
         );
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         assert!(
             matches!(&turns[turns.len() - 2], Turn::User(m) if m == STEPS_PROMPT),
             "{:?}",
@@ -2420,8 +2422,8 @@ mod tests {
         // at the budget.
         harness.set_thinking_budget(None);
         let path = std::env::temp_dir().join(format!("dwim-log-{}.jsonl", std::process::id()));
-        harness.keep_log(
-            Log::create(&path).unwrap(),
+        harness.keep_transcript(
+            Transcript::create(&path).unwrap(),
             "tiny",
             "cpu",
             Effort::Low,
@@ -2492,10 +2494,10 @@ mod tests {
             "Task: go on.\n\nFindings:\n\nDone:\n\nNext:"
         );
         assert!(records[cut + 3]["after"].as_u64() < records[cut + 3]["before"].as_u64());
-        let head = records[cut + 3]["head"].as_str().unwrap();
-        assert!(head.starts_with("# Environment"), "{head}");
-        assert!(head.contains("Task: go on."), "{head}");
-        assert!(head.contains("message 0"), "{head}");
+        let briefing = records[cut + 3]["briefing"].as_str().unwrap();
+        assert!(briefing.starts_with("# Environment"), "{briefing}");
+        assert!(briefing.contains("Task: go on."), "{briefing}");
+        assert!(briefing.contains("message 0"), "{briefing}");
         assert!(records[cut + 3]["turns"].as_u64().unwrap() > 0);
         assert_eq!(records[cut + 4]["text"], compaction::CONTINUE);
         let times: Vec<f64> = records

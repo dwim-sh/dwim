@@ -10,7 +10,7 @@ use std::{
 };
 
 use dwim::{
-    harness::{self, Harness, Log},
+    harness::{self, Harness, Transcript},
     inference::{self, Loaded, Progress},
     model::{Device, Effort, Model, Tally},
     providers::{
@@ -222,17 +222,17 @@ pub fn load_model(
 
 /// Reaches the server, starting one if none is running, opens a session
 /// with the system prompt for the working directory, and builds the
-/// harness around it with `settings`, keeping a transcript in `log`.
+/// harness around it with `settings`, keeping the session in `transcript`.
 /// `on_status` is told what the server is doing meanwhile, and after, when
 /// the session waits for another's request.
 pub fn load(
     settings: &Settings,
-    log: Log,
+    transcript: Transcript,
     on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<Ready, Box<dyn Error>> {
     let loading = Instant::now();
     let (session, system) = open(settings, on_status)?;
-    let harness = harness(settings, session, system, log)?;
+    let harness = harness(settings, session, system, transcript)?;
     Ok(Ready {
         harness,
         loading: loading.elapsed(),
@@ -240,12 +240,12 @@ pub fn load(
 }
 
 /// Builds the harness around `session`, opened with the system prompt
-/// `system`, with `settings`, keeping a transcript in `log`.
+/// `system`, with `settings`, keeping the session in `transcript`.
 pub fn harness(
     settings: &Settings,
     mut session: Session,
     system: String,
-    log: Log,
+    transcript: Transcript,
 ) -> Result<Harness<Session>, Box<dyn Error>> {
     let device = device(&mut session);
     let cwd = env::current_dir()?;
@@ -258,8 +258,8 @@ pub fn harness(
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);
     }
-    harness.keep_log(
-        log,
+    harness.keep_transcript(
+        transcript,
         settings.model.name(),
         &device,
         settings.effort,

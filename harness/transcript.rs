@@ -44,7 +44,7 @@ struct Record<'a> {
 }
 
 /// The transcript of a session, written to a file as it goes; or nowhere.
-pub struct Log {
+pub struct Transcript {
     file: Option<File>,
     path: Option<PathBuf>,
     start: Instant,
@@ -63,7 +63,7 @@ struct Pending {
     written: Instant,
 }
 
-impl Log {
+impl Transcript {
     /// The session's transcript, opened before anything else so that a file
     /// it cannot be written to is found out at once: in `path`, if the
     /// options name one, or in a new file in the working directory's folder
@@ -293,13 +293,14 @@ impl Log {
     }
 
     /// Records that the conversation was compacted: how many tokens it took
-    /// before, and how many it takes now; the message it starts over from,
-    /// with where the agent is, the note, and the user's earlier messages;
-    /// and how many of the most recent turns were read back after it.
-    pub fn compacted(&mut self, before: usize, after: usize, head: &str, turns: usize) {
+    /// before, and how many it takes now; the briefing it starts over
+    /// from, with where the agent is, the note, and the user's most recent
+    /// messages; and how many of the most recent turns were read back
+    /// after it.
+    pub fn compacted(&mut self, before: usize, after: usize, briefing: &str, turns: usize) {
         self.write(
             "compacted",
-            json!({ "before": before, "after": after, "head": head, "turns": turns }),
+            json!({ "before": before, "after": after, "briefing": briefing, "turns": turns }),
         );
     }
 
@@ -384,7 +385,7 @@ impl Log {
     }
 }
 
-impl Drop for Log {
+impl Drop for Transcript {
     /// Writes the streamed text gathered last.
     fn drop(&mut self) {
         self.flush();
@@ -445,7 +446,7 @@ mod tests {
     #[test]
     fn keeps_streamed_text_of_a_killed_session() {
         let path = env::temp_dir().join(format!("dwim-log-test-{}.jsonl", process::id()));
-        let mut log = Log::create(&path).unwrap();
+        let mut log = Transcript::create(&path).unwrap();
         log.stream("thought", "Let me ");
         assert_eq!(records(&path), [("thought".into(), "Let me ".into())]);
         log.stream("thought", "look.");
