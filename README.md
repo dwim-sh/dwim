@@ -50,23 +50,14 @@ ahead of time.
 
 ## Features
 
-- **Local by default.** Runs commands, reads their output, and keeps
-  going, all on your machine.
-- **A bigger model when you need it.** `/provider` signs in to OpenRouter
-  in your browser, and `/model` moves the session to Inkling-2-Small there,
-  and back. The conversation goes with it. With a key in
-  `AI_GATEWAY_API_KEY`, Vercel's AI Gateway runs the models too.
-- **Inkling-2-Mini.** 26B parameters, 3.4B active, at four bits, 17.6 GB,
-  on a machine with 32 GiB of memory or more.
-- **Fast local inference.** Metal on macOS, CUDA or Vulkan on Linux.
-- **Built-in local inference server.** The model is loaded once, in a
-  `dwim` server that every `dwim` you run connects to. The first one starts
-  it in the background, and it exits when idle. Sessions share the weights,
-  and each has its own context on the GPU, so you can run several at once.
-- **Bring your own sandbox.** `dwim` expects to run inside a sandbox, such as
-  a container or a virtual machine, and does not confine the model itself.
-  Commands run without confirmation and without a time limit, until they
-  finish.
+- **Runs on your machine by default.** Inkling-2-Mini, 26B parameters
+  with 3.4B active, on Metal, CUDA or Vulkan. It takes 17.6 GB, so it
+  needs 32 GiB of memory.
+- **Or in the cloud.** Any model can run at a host instead, such as
+  OpenRouter or Vercel's AI Gateway, and a session moves between your
+  machine and the cloud without losing the conversation.
+- **Doesn't ask before running commands.** Run it in a sandbox, such as a
+  container or a virtual machine.
 
 ## Getting started
 
