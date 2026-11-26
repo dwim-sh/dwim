@@ -139,10 +139,13 @@ enum Message {
 
 /// What every thread of the server shares.
 struct Inner {
-    path: PathBuf,
+    /// The socket the server listens on, if it has one.
+    path: Option<PathBuf>,
     hello: Hello,
     build: String,
     peers: Mutex<HashMap<usize, Peer>>,
+    /// How many connections there have been, which numbers the next.
+    connections: AtomicUsize,
     /// The chat format, once the model is loaded, for measuring turns.
     format: OnceLock<Arc<dyn Format>>,
     /// How many sessions are open.
@@ -161,11 +164,14 @@ struct Served {
     read: Option<Chat>,
 }
 
-/// The server: listening on its socket, with the model loading or loaded.
+/// The server: taking connections, with the model loading or loaded.
 pub struct Server {
     inner: Arc<Inner>,
     inbox: Receiver<(usize, Message)>,
     idle: Duration,
+    /// Whether the server says what it does on standard error, which is
+    /// its log when it is a process of its own.
+    log: bool,
     /// Whether the state after a system prompt is saved, and taken up
     /// from by the next conversation that opens with the prompt.
     states: bool,
@@ -192,27 +198,52 @@ impl Server {
             }
             Err(e) => return Err(e),
         };
+        let (server, connector) = Self::with(Some(path.to_path_buf()), hello, IDLE, true);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = connector.attach(stream);
+            }
+        });
+        Ok(server)
+    }
+
+    /// A server with no socket, for the program it is in alone, and what
+    /// makes connections to it. It says nothing on standard error, which
+    /// is the program's, and goes on, however long it has no session,
+    /// until every connector and connection is gone, unless an idle time
+    /// is set.
+    pub fn unbound(hello: Hello) -> (Self, Connector) {
+        Self::with(None, hello, Duration::MAX, false)
+    }
+
+    /// A server listening at `path`, if it listens, that exits after
+    /// `idle` without a session and reports on standard error if `log` is
+    /// set, and what gives it its connections.
+    fn with(path: Option<PathBuf>, hello: Hello, idle: Duration, log: bool) -> (Self, Connector) {
         let inner = Arc::new(Inner {
-            path: path.to_path_buf(),
+            path,
             hello,
             build: build(),
             peers: Mutex::new(HashMap::new()),
+            connections: AtomicUsize::new(0),
             format: OnceLock::new(),
             sessions: AtomicUsize::new(0),
             serving: Mutex::new(None),
             retiring: AtomicBool::new(false),
         });
-        let (inbox_tx, inbox) = mpsc::channel();
-        thread::spawn({
-            let inner = inner.clone();
-            move || accept(&listener, &inner, &inbox_tx)
-        });
-        Ok(Self {
+        let (outbox, inbox) = mpsc::channel();
+        let connector = Connector {
+            inner: inner.clone(),
+            inbox: outbox,
+        };
+        let server = Self {
             inner,
             inbox,
-            idle: IDLE,
+            idle,
+            log,
             states: true,
-        })
+        };
+        (server, connector)
     }
 
     /// Sets how long the server goes without a session before it exits,
@@ -262,6 +293,12 @@ impl Server {
         sampler: impl Fn(Option<f32>) -> Sampler,
     ) -> Result<(), Box<dyn Error>> {
         let inner = &self.inner;
+        let log = self.log;
+        let say = |text: String| {
+            if log {
+                eprintln!("{text}");
+            }
+        };
         if inner.format.set(format.clone()).is_err() {
             return Err("the server has run already".into());
         }
@@ -274,23 +311,24 @@ impl Server {
         let mut sessions: HashMap<usize, Served> = HashMap::new();
         loop {
             if inner.retiring.load(Ordering::Relaxed) && sessions.is_empty() {
-                eprintln!("retired: exiting");
+                say("retired: exiting".to_string());
                 break;
             }
             let (id, message) = match self.inbox.recv_timeout(self.idle) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) if sessions.is_empty() => {
-                    eprintln!("idle for {} s: exiting", self.idle.as_secs());
+                    say(format!("idle for {} s: exiting", self.idle.as_secs()));
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
+                // No one is left who could connect, and no connection.
                 Err(RecvTimeoutError::Disconnected) => break,
             };
             let request = match message {
                 Message::Request(request) => request,
                 Message::Closed => {
                     if sessions.remove(&id).is_some() {
-                        eprintln!("session {id} closed");
+                        say(format!("session {id} closed"));
                     }
                     inner.sessions.store(sessions.len(), Ordering::Relaxed);
                     continue;
@@ -318,10 +356,10 @@ impl Server {
                                     capacity: session.capacity(),
                                     sampling: session.sampling(),
                                 };
-                                eprintln!(
+                                say(format!(
                                     "session {id} opened on sequence {}",
                                     shared_id(&session)
-                                );
+                                ));
                                 entry.insert(Served {
                                     session,
                                     read: None,
@@ -363,11 +401,55 @@ impl Server {
 }
 
 impl Drop for Server {
-    /// Gives up the socket, unless it was given up already.
+    /// Gives up the socket, if there is one, unless it was given up
+    /// already.
     fn drop(&mut self) {
-        if !self.inner.retiring.load(Ordering::Relaxed) {
-            let _ = fs::remove_file(&self.inner.path);
+        if let Some(path) = &self.inner.path
+            && !self.inner.retiring.load(Ordering::Relaxed)
+        {
+            let _ = fs::remove_file(path);
         }
+    }
+}
+
+/// What gives a server its connections: the thread that listens on its
+/// socket, or, for a server without one, the program it is in.
+#[derive(Clone)]
+pub struct Connector {
+    inner: Arc<Inner>,
+    inbox: Sender<(usize, Message)>,
+}
+
+impl Connector {
+    /// Connects to the server from the program it is in: returns this end
+    /// of a connection the server reads the other end of, as it reads one
+    /// made to its socket.
+    pub fn connect(&self) -> io::Result<Stream> {
+        let (ours, theirs) = Stream::pair()?;
+        self.attach(theirs)?;
+        Ok(ours)
+    }
+
+    /// Has the server take `stream` as a connection, and read it on a
+    /// thread of its own.
+    fn attach(&self, stream: Stream) -> io::Result<()> {
+        let reading = stream.try_clone()?;
+        let id = self.inner.connections.fetch_add(1, Ordering::Relaxed);
+        let peer = Peer {
+            writer: Arc::new(Mutex::new(stream)),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        };
+        self.inner.peers().insert(id, peer.clone());
+        thread::spawn({
+            let inner = self.inner.clone();
+            let inbox = self.inbox.clone();
+            move || {
+                read(id, reading, &peer, &inner, &inbox);
+                inner.peers().remove(&id);
+                let _ = inbox.send((id, Message::Closed));
+            }
+        });
+        Ok(())
     }
 }
 
@@ -382,32 +464,6 @@ impl Inner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|serving| serving != id)
-    }
-}
-
-/// Takes connections as they come, and reads each on a thread of its own.
-fn accept(listener: &Listener, inner: &Arc<Inner>, inbox: &Sender<(usize, Message)>) {
-    for (id, stream) in listener.incoming().enumerate() {
-        let Ok(stream) = stream else {
-            continue;
-        };
-        let Ok(reading) = stream.try_clone() else {
-            continue;
-        };
-        let peer = Peer {
-            writer: Arc::new(Mutex::new(stream)),
-            interrupted: Arc::new(AtomicBool::new(false)),
-        };
-        inner.peers().insert(id, peer.clone());
-        thread::spawn({
-            let inner = inner.clone();
-            let inbox = inbox.clone();
-            move || {
-                read(id, reading, &peer, &inner, &inbox);
-                inner.peers().remove(&id);
-                let _ = inbox.send((id, Message::Closed));
-            }
-        });
     }
 }
 
@@ -440,7 +496,9 @@ fn read(id: usize, stream: Stream, peer: &Peer, inner: &Inner, inbox: &Sender<(u
             }),
             Request::Retire => {
                 inner.retiring.store(true, Ordering::Relaxed);
-                let _ = fs::remove_file(&inner.path);
+                if let Some(path) = &inner.path {
+                    let _ = fs::remove_file(path);
+                }
                 Response::Retired {
                     sessions: inner.sessions.load(Ordering::Relaxed),
                 }
@@ -1104,5 +1162,58 @@ mod tests {
         handle.join().unwrap();
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_server_without_a_socket_serves_its_program_until_no_one_is_left() {
+        let hello = Hello {
+            model: "tiny".to_string(),
+            device: "cpu".to_string(),
+            context: None,
+            room: 1,
+        };
+        let (mut server, connector) = Server::unbound(hello);
+        server.keep_no_states();
+        // A connection made before the model is loaded is told how the
+        // loading goes, as one made to a socket is.
+        let connection = Connection::over(connector.connect().unwrap()).unwrap();
+        server.status(&Status::Weights { done: 1, total: 2 });
+        let handle = thread::spawn(move || {
+            let tokenizer = Tokenizer::tiny();
+            let model = Scripted::new(&tokenizer, &["</think>\n\nHello there."], 1 << 12);
+            server
+                .run(
+                    Box::new(model),
+                    Arc::new(ChatMl::new(tokenizer).unwrap()),
+                    "cpu".to_string(),
+                    Size {
+                        sessions: 1,
+                        context: 1 << 12,
+                        model: 0,
+                        conversation: 0,
+                    },
+                    |_| Sampler::new(0.0, 1, 1.0, 0.0, 1),
+                )
+                .unwrap();
+        });
+        let mut seen = Vec::new();
+        let mut session = Conversation::new(
+            connection
+                .open(None, 0, |status| seen.push(status))
+                .unwrap(),
+        );
+        assert_eq!(seen, [Status::Weights { done: 1, total: 2 }]);
+        session.start("Be brief.", |_, _| {}).unwrap();
+        let (text, _) = ask(&mut session, "Hi.");
+        assert_eq!(text.trim(), "Hello there.");
+        // The server goes on while there is a way to connect to it, with
+        // no session, and while it has one, with no way to connect.
+        drop(session);
+        let connection = Connection::over(connector.connect().unwrap()).unwrap();
+        drop(connector);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!handle.is_finished());
+        drop(connection);
+        handle.join().unwrap();
     }
 }
