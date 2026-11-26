@@ -272,6 +272,7 @@ mod tests {
             temperature: None,
             speculate: 0,
             shell: None,
+            tools: Vec::new(),
         }
     }
 

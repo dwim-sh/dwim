@@ -7,6 +7,10 @@
 //! system prompt declares it with, whether it can change files, how a call
 //! reads on screen, and what it does. The tools work in the directory the
 //! agent does: a path a call gives is taken from there.
+//!
+//! A program that has the agent in it can give it tools of its own beside
+//! these, each a [`Custom`]: the model is told of them in the same list,
+//! and a call of one runs what the program gave.
 
 pub mod bash;
 mod call;
@@ -21,6 +25,7 @@ mod write;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde_json::Value;
@@ -59,13 +64,34 @@ fn tool(name: &str) -> Option<&'static Tool> {
     TOOLS.iter().find(|tool| tool.name == name)
 }
 
-/// The tools' signatures, one per line, as the system prompt lists them.
-pub fn signatures() -> String {
-    TOOLS
-        .iter()
-        .map(|tool| (tool.signature)().json(tool.name))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The tools' signatures, one per line, as the system prompt lists them:
+/// the agent's own, then the `custom` ones a program gives it.
+pub fn signatures(custom: &[Custom]) -> String {
+    let own = TOOLS.iter().map(|tool| (tool.signature)().json(tool.name));
+    let custom = custom.iter().map(|tool| tool.signature.json(&tool.name));
+    own.chain(custom).collect::<Vec<_>>().join("\n")
+}
+
+/// Checks that `custom` can be told from the agent's own tools and from
+/// each other, and called as the model writes a call: each has a name of
+/// letters, digits, `_` and `-` that no other tool has.
+pub fn distinct(custom: &[Custom]) -> Result<(), String> {
+    for (i, tool) in custom.iter().enumerate() {
+        let name = tool.name.as_str();
+        let written = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if name.is_empty() || !name.chars().all(written) {
+            return Err(format!(
+                "a tool's name is letters, digits, _ and -, and '{name}' is not"
+            ));
+        }
+        if self::tool(name).is_some() {
+            return Err(format!("the agent has a tool called '{name}' of its own"));
+        }
+        if custom[..i].iter().any(|other| other.name == name) {
+            return Err(format!("two tools are called '{name}'"));
+        }
+    }
+    Ok(())
 }
 
 /// What opens and closes the harness's declaration of the tools in a
@@ -96,6 +122,7 @@ pub fn declared(system: &str) -> (String, Vec<Value>) {
 }
 
 /// A tool's signature: what it does, and its parameters.
+#[derive(Clone)]
 struct Signature {
     description: String,
     parameters: Vec<Parameter>,
@@ -103,8 +130,9 @@ struct Signature {
 
 /// A parameter of a tool: its name, its JSON type, what it is, and
 /// whether a call must give it.
-struct Parameter {
-    name: &'static str,
+#[derive(Clone)]
+pub struct Parameter {
+    name: String,
     kind: &'static str,
     description: String,
     required: bool,
@@ -112,9 +140,9 @@ struct Parameter {
 
 impl Parameter {
     /// A string parameter.
-    fn string(name: &'static str, description: impl Into<String>) -> Self {
+    pub fn string(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             kind: "string",
             description: description.into(),
             required: true,
@@ -122,7 +150,7 @@ impl Parameter {
     }
 
     /// An integer parameter.
-    fn integer(name: &'static str, description: impl Into<String>) -> Self {
+    pub fn integer(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             kind: "integer",
             ..Self::string(name, description)
@@ -130,7 +158,7 @@ impl Parameter {
     }
 
     /// The parameter, which a call may leave out.
-    fn optional(self) -> Self {
+    pub fn optional(self) -> Self {
         Self {
             required: false,
             ..self
@@ -151,7 +179,7 @@ impl Signature {
             .map(|p| {
                 format!(
                     "{}: {{\"type\": {}, \"description\": {}}}",
-                    quoted(p.name),
+                    quoted(&p.name),
                     quoted(p.kind),
                     quoted(&p.description)
                 )
@@ -161,7 +189,7 @@ impl Signature {
             .parameters
             .iter()
             .filter(|p| p.required)
-            .map(|p| quoted(p.name))
+            .map(|p| quoted(&p.name))
             .collect();
         format!(
             "{{\"type\": \"function\", \"function\": {{\"name\": {}, \"description\": {}, \"parameters\": {{\"type\": \"object\", \"properties\": {{{}}}, \"required\": [{}]}}}}}}",
@@ -173,12 +201,73 @@ impl Signature {
     }
 }
 
+/// A tool a program gives the agent beside the agent's own: what the
+/// model is told of it, and what a call of it runs, which is the
+/// program's.
+#[derive(Clone)]
+pub struct Custom {
+    name: String,
+    signature: Signature,
+    /// Whether a call can change files in the directory the agent works
+    /// in.
+    changes: bool,
+    run: Run,
+}
+
+/// What a call of a [`Custom`] tool runs.
+type Run = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+
+impl Custom {
+    /// A tool called `name`, which the model is told does what
+    /// `description` says. A call runs `run` with the arguments the model
+    /// gave, a JSON object, and the model sees what it returns, or, marked
+    /// as an error, what it says went wrong. The arguments are as the
+    /// model wrote them: `run` checks them, and a number may come as a
+    /// string.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        run: impl Fn(&Value) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            signature: Signature {
+                description: description.into(),
+                parameters: Vec::new(),
+            },
+            changes: false,
+            run: Arc::new(run),
+        }
+    }
+
+    /// The tool, taking `parameter` after the parameters it has.
+    pub fn parameter(mut self, parameter: Parameter) -> Self {
+        self.signature.parameters.push(parameter);
+        self
+    }
+
+    /// The tool, said to change files in the directory the agent works
+    /// in: the harness then looks for what a call changed, as it does
+    /// after `bash`, `edit` and `write`.
+    pub fn changes_files(mut self) -> Self {
+        self.changes = true;
+        self
+    }
+
+    /// What the tool is called.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// The tools, working in a directory, with what they keep between calls.
 pub struct Tools {
     dir: PathBuf,
     bash: Bash,
     /// The plan of the work, as the model has laid it out.
     plan: Plan,
+    /// The tools the program gave beside the agent's own.
+    custom: Vec<Custom>,
 }
 
 impl Tools {
@@ -189,7 +278,16 @@ impl Tools {
             dir: dir.to_path_buf(),
             bash: Bash::default(),
             plan: Plan::default(),
+            custom: Vec::new(),
         }
+    }
+
+    /// Gives the agent `custom` tools beside its own, which
+    /// [`distinct`] has checked: a call of one runs what the program
+    /// gave. The system prompt declares them, as [`signatures`] lists
+    /// them.
+    pub fn add(&mut self, custom: Vec<Custom>) {
+        self.custom.extend(custom);
     }
 
     /// The plan of the work, as it stands.
@@ -209,9 +307,18 @@ impl Tools {
     }
 
     /// Whether a call can change files, as one of `bash`, `edit` or
-    /// `write` can: what it did change, the files tell.
+    /// `write` can, or of a tool the program gave and said can: what it
+    /// did change, the files tell.
     pub fn changes(&self, call: &ToolCall) -> bool {
-        tool(&call.name).is_some_and(|tool| tool.changes)
+        match tool(&call.name) {
+            Some(tool) => tool.changes,
+            None => self.custom(&call.name).is_some_and(|tool| tool.changes),
+        }
+    }
+
+    /// The tool the program gave that is called `name`.
+    fn custom(&self, name: &str) -> Option<&Custom> {
+        self.custom.iter().find(|tool| tool.name == name)
     }
 
     /// Runs a call, returning what the model should see, and notes for
@@ -219,7 +326,10 @@ impl Tools {
     /// and whether that succeeded.
     pub fn run(&mut self, call: &ToolCall) -> String {
         let Some(tool) = tool(&call.name) else {
-            return shown(Err(format!("unknown tool '{}'", call.name)));
+            return shown(match self.custom(&call.name) {
+                Some(tool) => (tool.run)(&call.arguments),
+                None => Err(format!("unknown tool '{}'", call.name)),
+            });
         };
         let result = (tool.run)(self, &call.arguments);
         if let Ok(text) = &result
@@ -388,7 +498,7 @@ mod tests {
 
     #[test]
     fn lists_the_tools() {
-        let signatures = signatures();
+        let signatures = signatures(&[]);
         assert_eq!(signatures.lines().count(), TOOLS.len());
         for (line, tool) in signatures.lines().zip(&TOOLS) {
             let signature: Value = serde_json::from_str(line).unwrap();
@@ -412,6 +522,50 @@ mod tests {
                 read::PAGE
             )
         );
+    }
+
+    /// A tool of a program's that says what is known of a key.
+    fn lookup() -> Custom {
+        Custom::new("lookup", "Look a key up.", |arguments| {
+            match string(arguments, "key") {
+                Some("answer") => Ok("42".to_string()),
+                Some(key) => Err(format!("nothing is known of {key}")),
+                None => Err("lookup needs a 'key' string".to_string()),
+            }
+        })
+        .parameter(Parameter::string("key", "The key."))
+    }
+
+    #[test]
+    fn runs_a_tool_the_program_gave() {
+        let mut tools = Tools::new(Path::new("."));
+        tools.add(vec![lookup()]);
+        let mut lookup = |arguments: &str| {
+            tools.run(&call(&format!(
+                r#"{{"name": "lookup", "arguments": {arguments}}}"#
+            )))
+        };
+        assert_eq!(lookup(r#"{"key": "answer"}"#), "42");
+        assert_eq!(
+            lookup(r#"{"key": "question"}"#),
+            "error: nothing is known of question"
+        );
+        // The model is told of it after the agent's own tools.
+        let signatures = signatures(&[self::lookup()]);
+        let last: Value = serde_json::from_str(signatures.lines().last().unwrap()).unwrap();
+        assert_eq!(last["function"]["name"], "lookup");
+        assert_eq!(last["function"]["parameters"]["required"][0], "key");
+        assert_eq!(signatures.lines().count(), TOOLS.len() + 1);
+    }
+
+    #[test]
+    fn takes_only_tools_that_can_be_told_apart() {
+        let named = |name: &str| Custom::new(name, "", |_| Ok(String::new()));
+        assert!(distinct(&[named("lookup"), named("look-up_2")]).is_ok());
+        assert!(distinct(&[named("bash")]).is_err());
+        assert!(distinct(&[named("lookup"), named("lookup")]).is_err());
+        assert!(distinct(&[named("look up")]).is_err());
+        assert!(distinct(&[named("")]).is_err());
     }
 
     #[test]

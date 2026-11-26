@@ -151,6 +151,7 @@ impl Opts {
             temperature: self.temperature,
             speculate: self.speculate,
             shell: self.shell.clone(),
+            tools: Vec::new(),
         })
     }
 

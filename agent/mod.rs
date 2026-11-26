@@ -55,6 +55,7 @@ use crate::{
         openrouter, vercel,
     },
     sys::memory,
+    tools::{self, Custom},
 };
 
 pub use crate::{
@@ -90,6 +91,8 @@ pub struct Settings {
     pub speculate: usize,
     /// The program the model's shell commands run through, or `sh`.
     pub shell: Option<PathBuf>,
+    /// The tools the program gives the agent beside the agent's own.
+    pub tools: Vec<Custom>,
 }
 
 /// Where a model that runs on this machine is loaded.
@@ -127,6 +130,7 @@ impl Settings {
             temperature: None,
             speculate: DRAFTS,
             shell: None,
+            tools: Vec::new(),
         }
     }
 
@@ -369,6 +373,7 @@ pub fn harness(
     if let Some(shell) = settings.shell.clone() {
         harness.set_shell(shell);
     }
+    harness.add_tools(settings.tools.clone());
     harness.keep_log(
         log,
         settings.model.name(),
@@ -418,14 +423,17 @@ fn device(session: &mut Session) -> String {
 }
 
 /// Opens a session where the model runs, with the system prompt for the
-/// working directory, which it returns with the session: on the server,
-/// reached, or started if none is running, with `on_status` told what the
-/// server is doing meanwhile, and after, when the session waits for
+/// directory the agent works in, which it returns with the session: on
+/// the server, reached, or started if none is running, or on the engine
+/// in this program, as the settings have it, with `on_status` told what
+/// that is doing meanwhile, and after, when the session waits for
 /// another's request; or at a host, where there is nothing to wait for.
+/// Settings with tools that cannot be told apart are refused.
 pub fn open(
     settings: &Settings,
     mut on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<(Session, String), Box<dyn Error>> {
+    tools::distinct(&settings.tools)?;
     let Some(kind) = provider(settings.provider, settings.model, &settings.disabled)? else {
         let vercel = format!(", or at Vercel by setting {}", vercel::KEY);
         return Err(format!(
@@ -447,6 +455,7 @@ pub fn open(
         &settings.dir,
         settings.model,
         (kind == Kind::Local).then_some(effort),
+        &settings.tools,
     );
     let (model, context, temperature) = (settings.model, settings.context, settings.temperature);
     let hosted = match kind {
