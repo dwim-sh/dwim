@@ -10,7 +10,7 @@
 //! reply that runs out of room is stopped short and goes on after a
 //! compaction.
 
-use std::{error::Error, fmt::Write};
+use std::{error::Error, fmt::Write, path::Path};
 
 use crate::{
     harness::{Entry, Event, Harness, OnEvent},
@@ -139,6 +139,7 @@ pub fn compact<S: Session>(
         &note,
         &harness.tools.plan().brief(),
         &messages,
+        harness.transcript.path(),
         start < harness.conversation.len(),
     );
     restart(harness, briefing, start, before, on_event)?;
@@ -166,6 +167,7 @@ pub fn start_over<S: Session>(
         &harness.preamble(),
         &harness.tools.plan().brief(),
         &messages,
+        harness.transcript.path(),
     );
     restart(harness, briefing, start, before, on_event)
 }
@@ -285,13 +287,15 @@ fn user_message(entry: &Entry) -> Option<(&str, usize)> {
 
 /// The briefing, the turn compaction puts in place of the turns it
 /// removes: where the agent is, the note, the `plan` as it stands if there
-/// is one, the user's most recent messages, and whether the most recent
-/// exchanges follow.
+/// is one, the user's most recent messages, where the session's
+/// `transcript` is if there is one, and whether the most recent exchanges
+/// follow.
 fn briefing(
     environment: &str,
     note: &str,
     plan: &str,
     messages: &[&str],
+    transcript: Option<&Path>,
     exchanges: bool,
 ) -> String {
     let note = note.trim();
@@ -307,6 +311,7 @@ fn briefing(
         .expect("a String takes any write");
     }
     add_messages(&mut text, messages);
+    add_transcript(&mut text, transcript);
     if exchanges {
         text.push_str("\n\nThe most recent exchanges follow as they were.");
     }
@@ -314,10 +319,17 @@ fn briefing(
 }
 
 /// The briefing a conversation cleared at the end of a step starts over
-/// from: where the agent is, the `plan`, and the user's messages.
-fn step_briefing(environment: &str, plan: &str, messages: &[&str]) -> String {
+/// from: where the agent is, the `plan`, the user's messages, and where
+/// the session's `transcript` is if there is one.
+fn step_briefing(
+    environment: &str,
+    plan: &str,
+    messages: &[&str],
+    transcript: Option<&Path>,
+) -> String {
     let mut text = format!("{environment}\n\n{STEP_INTRO}\n\n<plan>\n{plan}\n</plan>");
     add_messages(&mut text, messages);
+    add_transcript(&mut text, transcript);
     text.push_str("\n\nYour last calls follow, and their results after them, which name the step now under way. Read again whatever you need for it.");
     text
 }
@@ -329,6 +341,20 @@ fn add_messages(text: &mut String, messages: &[&str]) {
         for message in messages {
             write!(text, "\n\n<message>\n{message}\n</message>").expect("a String takes any write");
         }
+    }
+}
+
+/// Adds where the session's `transcript` is to `text`, if there is one: it
+/// holds every turn the briefing stands in for, word for word, so whatever
+/// the briefing leaves out can be read there.
+fn add_transcript(text: &mut String, transcript: Option<&Path>) {
+    if let Some(path) = transcript {
+        write!(
+            text,
+            "\n\nEverything before this is in the session's transcript, word for word: {}, a JSON Lines file with a record for each message, reply, tool call and result. Read it for whatever this leaves out.",
+            path.display()
+        )
+        .expect("a String takes any write");
     }
 }
 
@@ -544,11 +570,32 @@ mod tests {
     }
 
     #[test]
+    fn briefings_say_where_the_transcript_is() {
+        // Whatever compaction removes is in the transcript, so a briefing
+        // says where it is; with no transcript, it says nothing of one.
+        let path = Path::new("/home/user/.local/state/dwim/projects/p/t.jsonl");
+        let named = format!("transcript, word for word: {}", path.display());
+        for (kept, none) in [
+            (
+                briefing("env", "Task: go on.", "", &[], Some(path), true),
+                briefing("env", "Task: go on.", "", &[], None, true),
+            ),
+            (
+                step_briefing("env", "1. [under way] fix it", &[], Some(path)),
+                step_briefing("env", "1. [under way] fix it", &[], None),
+            ),
+        ] {
+            assert!(kept.contains(&named), "{kept}");
+            assert!(!none.contains("transcript"), "{none}");
+        }
+    }
+
+    #[test]
     fn a_note_of_headings_alone_reads_as_none() {
         // The headings are written for the model: a note with nothing
         // under any of them says nothing, like a blank one.
         for note in ["", "Task:\n\nFindings:\n\nDone:\n\nNext:"] {
-            let briefing = briefing("env", note, "", &[], false);
+            let briefing = briefing("env", note, "", &[], None, false);
             assert!(briefing.contains("<note>\n(none)\n</note>"), "{briefing}");
         }
         for note in [
@@ -556,7 +603,7 @@ mod tests {
             "Task:\n\nFindings:\n\nDone:\n\nNext: go on.",
             "Go on.",
         ] {
-            let briefing = briefing("env", note, "", &[], false);
+            let briefing = briefing("env", note, "", &[], None, false);
             assert!(
                 briefing.contains(&format!("<note>\n{note}\n</note>")),
                 "{briefing}"
