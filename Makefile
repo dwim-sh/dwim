@@ -40,6 +40,8 @@ help:
 	@echo '  install   - Install the binary and the man page under PREFIX'
 	@echo '  uninstall - Remove what `make install` installed'
 	@echo '  test      - Run the test suite'
+	@echo '  check     - Check the format, lints, tests and Lean specs'
+	@echo '  specs     - Check the Lean specs: examples and proofs'
 	@echo '  clean     - Remove build artifacts'
 
 $(BINARY): $(SOURCES)
@@ -65,8 +67,19 @@ test:
 	$(call msg,TEST,dwim)
 	$(Q)cargo test
 
+check:
+	$(call msg,FMT,dwim)
+	$(Q)cargo fmt --check
+	$(call msg,CLIPPY,dwim)
+	$(Q)cargo clippy --all-targets -- -D warnings
+	$(Q)$(MAKE) --no-print-directory test specs
+
+specs:
+	$(call msg,LAKE,specs)
+	$(Q)cd specs && lake build
+
 clean:
 	$(call msg,CLEAN,target)
 	$(Q)cargo clean
 
-.PHONY: help all install uninstall test clean
+.PHONY: help all install uninstall test check specs clean

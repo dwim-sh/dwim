@@ -11,9 +11,5 @@ examples checked when the spec is built; and proves theorems that make
 each intent precise. A spec is written from what the part should do, not
 from what the code does: where the two differ, the code is wrong.
 
-To check every definition, example and proof:
-
-```
-cd specs && lake build
-```
+To check every definition, example and proof: `make check`.
 -/

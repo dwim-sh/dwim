@@ -9,8 +9,9 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **Test**: `cargo test`
 - **Lint**: `cargo clippy --all-targets -- -D warnings`
 - **Format**: `cargo fmt --check`
-- **Specs**: `cd specs && lake build` checks the Lean specs: their
+- **Specs**: `make specs` checks the Lean specs: their
   examples and their proofs. It needs `lake` from a Lean toolchain.
+- **All of the above**: `make check`
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
   `cargo run --bin difftest`
