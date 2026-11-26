@@ -1,7 +1,8 @@
 This is `dwim`, a coding agent harness in Rust: the agent, the model
 (`inkling2-mini`, a 17.6 GB Q4_K_XL GGUF), and the engine that runs it,
-in one program. One package: `lib.rs` is the library, `cli/` and
-`testing/difftest/` are the binaries.
+in one program. One package: `lib.rs` is the library, which a program
+of one's own can have the agent from, and `cli/` and `testing/difftest/`
+are the binaries.
 
 ## Building and Verifying
 
@@ -25,6 +26,10 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - `cli/` - the `dwim` command: options, `config` (what is kept in
   `config.json`), and `cmd/`, what it does, a module each: the shell,
   `once`, `serve`, `bench`, `download`
+- `agent/` - an agent put together, for the command and for a program
+  that has the library in it: `Settings`, where the model runs, `Agent`,
+  which is opened and sent messages, and `engine`, the model loaded in
+  the program in place of a server of its own
 - `harness/` - the agent: system prompt (includes this file), tool loop,
   the plan of the work, compaction, thinking budget, transcript
 - `providers/` - where a session's model runs: `Provider` is a model
@@ -35,9 +40,10 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   host over its chat completions API, and `openrouter`, `vercel`
   (Vercel's AI Gateway) and `cerebras` the hosts: where each is asked,
   what it is asked in its own way, and the key to it
-- `server/` - the process that has the model, and the `protocol` it is
-  asked in: a request carries the whole conversation, and the server
-  reads only what it has not read of it
+- `server/` - what has the model, a process of its own or a thread of
+  the program the agent is in, and the `protocol` it is asked in: a
+  request carries the whole conversation, and the server reads only what
+  it has not read of it
 - `inference/` - running the model on this machine: `gguf`, `quants`,
   `arch` (which architecture a file is of), `qwen35` (the transformer,
   documented there) and `inkling2` (Inkling 2 Mini's, likewise), `loaded`
@@ -51,7 +57,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   2 Mini, which `--model inkling2-mini` runs, on Metal, CUDA and
   Vulkan). It takes nothing from the directories above, and `providers/`
   take nothing from `inference/`
-- `tools/` - the tools, one file each; `call` parses a call
+- `tools/` - the tools, one file each; `call` parses a call; a `Custom`
+  tool is one a program gives the agent beside these
 - `gpu/` - the `Device` trait; `cpu` is the reference, `cuda` (CUDA C
   kernels, compiled by NVRTC when the device opens), `vulkan` (WGSL
   kernels, compiled by `build.rs`), `metal` (MSL kernels), `platform`
@@ -63,6 +70,7 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   `run.py`: `swebench` (Lite, Verified, Verified Mini); `results/` is
   the report of each run over a whole dataset, and `runs/` what the runs
   leave, which is not kept in git
+- `examples/` - `embed`, the agent in a program of one's own
 - `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built

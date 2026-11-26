@@ -139,6 +139,54 @@ Then, in the agent, ask for the change "with dwim":
 The main agent spends its tokens on the decisions and the review, and
 dwim, on your own GPU, on the code.
 
+## Using dwim as a library
+
+The agent is a Rust library too, with the model and the engine in it, so
+a program of your own can have a coding agent without `dwim` installed
+beside it:
+
+```toml
+[dependencies]
+dwim = { git = "https://github.com/dwim-sh/dwim", default-features = false }
+
+# The forward pass is unusably slow unoptimized on the CPU.
+[profile.dev.package.dwim]
+opt-level = 3
+```
+
+```rust
+use std::{ops::ControlFlow, path::Path};
+
+use dwim::{
+    agent::{Agent, Settings},
+    harness::{Event, Log},
+    model::Model,
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let settings = Settings::new(Path::new("."), Model::InklingMini);
+    let mut agent = Agent::open(settings, Log::none(), |_status| {})?;
+    agent.send("What does this project do?", |event| {
+        if let Event::Text(text) = event {
+            print!("{text}");
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(())
+}
+```
+
+The model runs where `dwim` would run it. On your machine, it is loaded in
+your program, the first time an agent is opened, and stays loaded while the
+program holds the settings or an agent opened with them. The settings also
+take tools of your program's own, which the agent calls beside `bash`,
+`read` and the rest, and instructions for it.
+[`examples/embed.rs`](examples/embed.rs) is a program to start from:
+
+```console
+cargo run --release --example embed -- "what does this project do?"
+```
+
 ## License
 
 [MIT](LICENSE.md).
