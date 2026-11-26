@@ -26,7 +26,7 @@ ifeq ($(V),1)
   msg =
 else
   Q = @
-  msg = @printf '  %-7s %s\n' '$(1)' '$(2)'
+  msg = @printf '  %-8s %s\n' '$(1)' '$(2)'
 endif
 ifneq ($(findstring s,$(firstword -$(MAKEFLAGS))),)
   msg =
@@ -40,6 +40,10 @@ help:
 	@echo '  install   - Install the binary and the man page under PREFIX'
 	@echo '  uninstall - Remove what `make install` installed'
 	@echo '  test      - Run the test suite'
+	@echo '  check     - Check the format, lints, tests, Lean specs, and the code'
+	@echo '              against the specs with difftest'
+	@echo '  specs     - Check the Lean specs: examples and proofs'
+	@echo '  site      - Build the Lean specs as a web site'
 	@echo '  clean     - Remove build artifacts'
 
 $(BINARY): $(SOURCES)
@@ -65,8 +69,30 @@ test:
 	$(call msg,TEST,dwim)
 	$(Q)cargo test
 
+check:
+	$(call msg,FMT,dwim)
+	$(Q)cargo fmt --check
+	$(call msg,CLIPPY,dwim)
+	$(Q)cargo clippy --all-targets -- -D warnings
+	$(Q)$(MAKE) --no-print-directory test specs difftest-compaction
+
+specs:
+	$(call msg,LAKE,specs)
+	$(Q)cd specs && lake build
+
+# `make difftest-SUBJECT` checks one subject against its reference, as
+# `difftest SUBJECT` does: `make difftest-compaction` checks the code of
+# compaction against its Lean spec.
+difftest-%:
+	$(call msg,DIFFTEST,$*)
+	$(Q)cargo run --quiet --bin difftest $*
+
+site:
+	$(call msg,LAKE,specs/site)
+	$(Q)cd specs/site && lake query :literateHtml
+
 clean:
 	$(call msg,CLEAN,target)
 	$(Q)cargo clean
 
-.PHONY: help all install uninstall test clean
+.PHONY: help all install uninstall test check specs site clean

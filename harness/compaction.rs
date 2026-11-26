@@ -19,19 +19,19 @@ use crate::{
 
 /// The high-water mark of a context of `capacity` tokens, past which the
 /// conversation is compacted before more goes into it: four fifths.
-fn high_water(capacity: usize) -> usize {
+pub fn high_water(capacity: usize) -> usize {
     capacity * 4 / 5
 }
 
 /// Most tokens the most recent exchanges may take when they are read back
 /// after a compaction: an eighth of the context.
-fn tail_budget(capacity: usize) -> usize {
+pub fn tail_budget(capacity: usize) -> usize {
     capacity / 8
 }
 
 /// Most tokens the user's messages may take in the briefing: a sixteenth
 /// of the context.
-fn message_budget(capacity: usize) -> usize {
+pub fn message_budget(capacity: usize) -> usize {
     capacity / 16
 }
 
@@ -40,7 +40,7 @@ fn message_budget(capacity: usize) -> usize {
 /// more than 2,048. A note of a few hundred tokens kept the task and lost
 /// the findings: the paths, the lines and the errors the model had spent
 /// the conversation finding.
-fn note_budget(capacity: usize) -> usize {
+pub fn note_budget(capacity: usize) -> usize {
     (capacity / 32).clamp(256, 2048)
 }
 
@@ -215,7 +215,11 @@ fn restart<S: Session>(
 /// What a compaction keeps of `conversation` in a context of `capacity`
 /// tokens, when the user has said `said`: where the exchanges read back
 /// start, and the user's messages the briefing carries.
-fn select<'a>(said: &'a [Entry], conversation: &[Entry], capacity: usize) -> (usize, Vec<&'a str>) {
+pub fn select<'a>(
+    said: &'a [Entry],
+    conversation: &[Entry],
+    capacity: usize,
+) -> (usize, Vec<&'a str>) {
     let start = tail(conversation, tail_budget(capacity));
     (
         start,
@@ -290,7 +294,7 @@ fn user_message(entry: &Entry) -> Option<(&str, usize)> {
 /// is one, the user's most recent messages, where the session's
 /// `transcript` is if there is one, and whether the most recent exchanges
 /// follow.
-fn briefing(
+pub fn briefing(
     environment: &str,
     note: &str,
     plan: &str,

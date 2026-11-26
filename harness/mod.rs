@@ -36,7 +36,7 @@
 //! thoughts and compactions included, for finding out afterwards where a
 //! session's tokens went.
 
-mod compaction;
+pub mod compaction;
 mod snapshot;
 mod transcript;
 
@@ -519,10 +519,10 @@ enum Outcome {
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
 #[derive(Clone)]
-struct Entry {
-    turn: Turn,
-    tokens: usize,
-    prompt: bool,
+pub struct Entry {
+    pub turn: Turn,
+    pub tokens: usize,
+    pub prompt: bool,
 }
 
 /// The loop around a [`Session`] that runs the tools the model calls

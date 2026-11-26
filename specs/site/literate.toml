@@ -1,0 +1,7 @@
+# How the site presents the specs. Every sentence on it comes from the
+# Lean files: docstrings render as text between the code, and the
+# commands that only set up names are left out.
+
+docstrings_as_text = true
+hide_commands = ["import", "open", "set_option", "namespace", "end", "section", "variable"]
+landing_page = "Dwim.Harness.Compaction"
