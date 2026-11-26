@@ -55,6 +55,15 @@ impl Config {
         self.disabled_providers.contains(&name)
     }
 
+    /// The providers that are disabled: those of the names the file has
+    /// that are a provider's.
+    pub fn disabled_providers(&self) -> Vec<Kind> {
+        self.disabled_providers
+            .iter()
+            .filter_map(|name| name.parse().ok())
+            .collect()
+    }
+
     /// Disables `provider`, or enables it again.
     pub fn set_disabled(&mut self, provider: Kind, disabled: bool) {
         let name = provider.to_string();

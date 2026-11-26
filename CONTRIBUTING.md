@@ -65,8 +65,11 @@ dwim has two sides that meet in `model`. The agent side is `harness`, the
 `server`, `inference`, and `gpu`. Neither side imports the other: a provider
 reaches the dwim server over a Unix socket, so the agent builds and runs
 without the transformer or a GPU. `model` is what both sides know of the
-model (the chat format, the tokenizer, its size), `sys` is what is asked of
-the operating system, and `cli` puts it all together.
+model (the chat format, the tokenizer, its size), and `sys` is what is asked
+of the operating system. `agent` puts it all together: the settings, where
+the model runs, and the harness around a session there. `cli`, the command,
+is on top of it, and so is a program that has the library in it, where the
+server that has the model is a thread of the program in place of a process.
 
 Every arrow points down, and a new import should too. A module does not
 import one above it or beside it, and `model` imports nothing but `sys`.

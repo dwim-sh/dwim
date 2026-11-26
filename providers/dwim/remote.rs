@@ -28,9 +28,17 @@ pub struct Connection {
 impl Connection {
     /// Connects to the server listening at `path`.
     pub fn connect(path: &Path) -> io::Result<Self> {
-        let writer = Stream::connect(path)?;
-        let reader = BufReader::new(writer.try_clone()?);
-        Ok(Self { reader, writer })
+        Self::over(Stream::connect(path)?)
+    }
+
+    /// A connection to the server at the other end of `stream`: one in
+    /// this program, which has no socket to connect to.
+    pub fn over(stream: Stream) -> io::Result<Self> {
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            reader,
+            writer: stream,
+        })
     }
 
     /// Asks the server who it is.

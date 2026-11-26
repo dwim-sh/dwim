@@ -1,6 +1,6 @@
 mod help;
 
-use std::{env, path::PathBuf};
+use std::{env, io, path::PathBuf};
 
 use argh::{EarlyExit, FromArgs};
 use dwim::{
@@ -8,7 +8,7 @@ use dwim::{
     providers::Kind,
 };
 
-use crate::session::Settings;
+use crate::session::{Engine, Settings};
 
 /// A coding agent at the command line
 #[derive(FromArgs)]
@@ -129,11 +129,18 @@ impl Opts {
         }
     }
 
-    /// How the model runs, as the options set it.
-    pub fn settings(&self) -> Settings {
-        Settings {
+    /// How the agent runs, as the options set it, in the working
+    /// directory, with a model that runs on this machine in the server
+    /// this program is.
+    pub fn settings(&self) -> io::Result<Settings> {
+        Ok(Settings {
+            dir: env::current_dir()?,
             model: self.model,
             provider: self.provider,
+            disabled: Vec::new(),
+            engine: Engine::Server {
+                program: env::current_exe()?,
+            },
             device: self.device,
             context: self.context,
             sessions: self.sessions,
@@ -144,7 +151,9 @@ impl Opts {
             temperature: self.temperature,
             speculate: self.speculate,
             shell: self.shell.clone(),
-        }
+            tools: Vec::new(),
+            instructions: None,
+        })
     }
 
     /// What the options ask dwim to do. A switch that does something

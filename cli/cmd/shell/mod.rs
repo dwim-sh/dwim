@@ -9,7 +9,6 @@ mod view;
 mod worker;
 
 use std::{
-    env,
     error::Error,
     path::{Path, PathBuf},
     sync::{
@@ -26,7 +25,7 @@ use crossterm::{
     style::Stylize,
 };
 use dwim::{
-    harness::{self, Event, Log},
+    harness::{self, Event},
     model::{Device, Model, Size},
     providers::{
         Kind,
@@ -61,13 +60,14 @@ pub fn run(
     verbose: bool,
     transcript: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
-    let log = Log::open(transcript)?;
+    let log = session::transcript(transcript, &settings.dir)?;
     let transcript = log.path().map(Path::to_path_buf);
     let model = settings.model;
     let provider = session::provider(settings.provider, model)?;
     let context = settings.context.unwrap_or(hosted::CONTEXT);
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
+    let cwd = settings.dir.clone();
     let worker = Worker::spawn(settings, log);
 
     let mut app = App {
@@ -79,7 +79,7 @@ pub fn run(
         device_name: None,
         size: None,
         transcript,
-        cwd: env::current_dir().unwrap_or_default(),
+        cwd,
         input: Input::default(),
         picker: None,
         providers: None,
@@ -1223,7 +1223,7 @@ impl App {
             Event::Output(output)
                 if (self.call == "plan" || self.call == "done")
                     && !output.starts_with("error:") => {}
-            Event::Call { name, detail } => {
+            Event::Call { name, detail, .. } => {
                 self.finish();
                 let detail: Vec<&str> = detail.split_whitespace().collect();
                 let detail = detail.join(" ");

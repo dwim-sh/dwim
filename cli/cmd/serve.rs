@@ -10,14 +10,12 @@
 use std::error::Error;
 
 use dwim::{
+    agent,
     inference::Loaded,
     server::{self, Hello, Server},
 };
 
-use crate::{
-    session::{self, Settings},
-    stderr::Stderr,
-};
+use crate::{session::Settings, stderr::Stderr};
 
 /// Runs the server with the model as `settings` have it, until it exits.
 pub fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
@@ -35,21 +33,5 @@ pub fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let server = Server::bind(&path, hello)?;
     eprintln!("listening on {}", path.display());
     let mut stderr = Stderr::new();
-    let model = match session::load_model(settings, sessions, |status| {
-        stderr.report(&status);
-        server.status(&status);
-    }) {
-        Ok(model) => model,
-        Err(e) => {
-            server.fail(&e.to_string());
-            return Err(e);
-        }
-    };
-    let format = model.format().clone();
-    let (device, size) = (model.device().to_string(), model.size());
-    let temperature = settings.temperature;
-    let sampler = model.sampler();
-    server.run(Box::new(model), format, device, size, move |asked| {
-        sampler(asked.or(temperature))
-    })
+    agent::serve(server, settings, sessions, |status| stderr.report(status))
 }

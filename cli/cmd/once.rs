@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 
-use dwim::harness::{Event, Log};
+use dwim::harness::Event;
 
 use crate::{
     session::{self, Settings},
@@ -31,24 +31,24 @@ pub fn run(
     transcript: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let log = Log::open(transcript)?;
+    let log = session::transcript(transcript, &settings.dir)?;
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
-    let mut loaded = session::load(settings, log, move |status| stderr.report(&status))?;
+    let mut agent = session::load(settings, log, move |status| stderr.report(&status))?;
     if let Some(path) = transcript {
         eprintln!("transcript in {}", path.display());
     }
     // No one is here to answer the model, so it goes on by itself.
-    loaded.harness.set_auto(true);
+    agent.harness().set_auto(true);
     let mut printer = Printer::default();
-    loaded.harness.send(prompt, |event| {
+    agent.send(prompt, |event| {
         printer.print(event);
         ControlFlow::Continue(())
     })?;
     drop(printer);
     if stats {
-        let stats = loaded.harness.stats();
-        for line in session::accounting(&stats, loaded.loading, started.elapsed()) {
+        let stats = agent.stats();
+        for line in session::accounting(&stats, agent.loading(), started.elapsed()) {
             eprintln!("{line}");
         }
     }
@@ -102,7 +102,7 @@ impl Printer {
                     self.replied = true;
                 }
             }
-            Event::Call { name, detail } => {
+            Event::Call { name, detail, .. } => {
                 self.end_thought();
                 eprintln!("{name}({detail})");
             }

@@ -50,10 +50,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::Value;
+
 use crate::{
     harness::snapshot::Snapshot,
     model::{Chunk, Effort, Model, Session, Turn},
-    tools::{ToolCall, Tools, bash, plan::Plan, read},
+    tools::{Custom, ToolCall, Tools, bash, plan::Plan, read},
 };
 
 pub use crate::harness::log::Log;
@@ -316,19 +318,31 @@ Reminder:
 
 /// The system prompt for an agent on `model` working in `dir`: the
 /// template's line for `effort`, if the prompt is to carry one and the
-/// effort has one, the tools, then how to behave as the model is told
-/// it, and the project's own instructions
-/// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
-/// instead, so that the prompt is the same from one run to the next.
-pub fn system_prompt(dir: &Path, model: Model, effort: Option<Effort>) -> String {
+/// effort has one, the tools, with the `custom` ones of the program the
+/// agent is in, then how to behave as the model is told it, what the
+/// `program` tells it beside, if anything, and the project's own
+/// instructions from its `AGENTS.md` if it has one. Where the agent is
+/// goes in [`environment`] instead, so that the prompt is the same from
+/// one run to the next.
+pub fn system_prompt(
+    dir: &Path,
+    model: Model,
+    effort: Option<Effort>,
+    custom: &[Custom],
+    program: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     if let Some(line) = effort.and_then(Effort::instruction) {
         prompt.push_str(line);
         prompt.push_str("\n\n");
     }
-    prompt.push_str(&tools());
+    prompt.push_str(&tools(custom));
     prompt.push_str("\n\n");
     prompt.push_str(&instructions(model));
+    if let Some(program) = program.map(str::trim).filter(|program| !program.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(program);
+    }
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
@@ -337,12 +351,13 @@ pub fn system_prompt(dir: &Path, model: Model, effort: Option<Effort>) -> String
     prompt
 }
 
-/// The tools, declared as the model's chat template puts them: the start of
-/// the system prompt, before what the user's system prompt says.
-fn tools() -> String {
+/// The tools, the agent's own and the `custom` ones a program gives it,
+/// declared as the model's chat template puts them: the start of the
+/// system prompt, before what the user's system prompt says.
+fn tools(custom: &[Custom]) -> String {
     format!(
         "# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}\n</tools>\n\n{CALLING}",
-        crate::tools::signatures()
+        crate::tools::signatures(custom)
     )
 }
 
@@ -475,10 +490,13 @@ pub enum Event {
     /// A token sampled, as it may be hidden (a tool-call tag or body, a
     /// thought that closes) rather than shown as a thought or text piece.
     Token,
-    /// A tool is about to run: its name and how it was called.
+    /// A tool is about to run: its name, how the call reads on screen,
+    /// and the arguments the model gave it, a JSON object, for a program
+    /// that shows the calls of its own tools its own way.
     Call {
         name: String,
         detail: String,
+        arguments: Value,
     },
     /// What the tool returned, as the model sees it.
     Output(String),
@@ -504,8 +522,9 @@ pub enum Event {
 type OnEvent<'a> = &'a mut dyn FnMut(Event) -> ControlFlow<()>;
 
 /// What opens the conversation over with the system prompt, once the session
-/// is cleared: from a saved state, or by reading the prompt again.
-type Restart<S> = Box<dyn FnMut(&mut S) -> Result<(), Box<dyn Error>>>;
+/// is cleared: from a saved state, or by reading the prompt again. It goes
+/// to another thread when the harness does.
+type Restart<S> = Box<dyn FnMut(&mut S) -> Result<(), Box<dyn Error>> + Send>;
 
 /// How a turn ended: with a reply of text alone, or interrupted; or with
 /// the reply stopped short for room.
@@ -600,7 +619,7 @@ impl<S: Session> Harness<S> {
     pub fn new(
         mut session: S,
         dir: &Path,
-        restart: impl FnMut(&mut S) -> Result<(), Box<dyn Error>> + 'static,
+        restart: impl FnMut(&mut S) -> Result<(), Box<dyn Error>> + Send + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let note_tokens = compaction::reserve(&mut session)?;
         let mut harness = Self {
@@ -653,6 +672,13 @@ impl<S: Session> Harness<S> {
         };
         self.thinking_budget = tokens;
         self.session.limit_thoughts(tokens, closing);
+    }
+
+    /// Gives the model the `custom` tools of the program the agent is in,
+    /// beside the agent's own: the ones the system prompt the session was
+    /// opened with declares, with [`system_prompt`].
+    pub fn add_tools(&mut self, custom: Vec<Custom>) {
+        self.tools.add(custom);
     }
 
     /// Runs the model's shell commands through `shell`, as `shell -c
@@ -1120,6 +1146,7 @@ impl<S: Session> Harness<S> {
                             || on_event(Event::Call {
                                 name: call.name.clone(),
                                 detail: detail.clone(),
+                                arguments: call.arguments.clone(),
                             })
                             .is_break();
                         let this = Some((call.name.clone(), call.arguments.to_string()));
@@ -1884,6 +1911,54 @@ mod tests {
     }
 
     #[test]
+    fn runs_a_tool_the_program_gave_and_feeds_the_result_back() {
+        let dir = scratch();
+        let path = dir.join("log.jsonl");
+        let scripts = [
+            calling("lookup", &[("key", "answer")]),
+            calling("lookup", &[("key", "question")]),
+            reply(10, false),
+        ];
+        let mut harness = harness_in(&dir, &scripts, &path);
+        harness.add_tools(vec![
+            Custom::new(
+                "lookup",
+                "Look a key up.",
+                |arguments| match arguments["key"].as_str() {
+                    Some("answer") => Ok("42".to_string()),
+                    _ => Err("nothing is known of it".to_string()),
+                },
+            )
+            .parameter(crate::tools::Parameter::string("key", "The key.")),
+        ]);
+        // The program is told of each call with the arguments it was
+        // given, to show it its own way.
+        let mut keys = Vec::new();
+        harness
+            .send("go", |event| {
+                if let Event::Call {
+                    name, arguments, ..
+                } = event
+                {
+                    keys.push((name, arguments["key"].as_str().map(str::to_string)));
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let key = |key: &str| ("lookup".to_string(), Some(key.to_string()));
+        assert_eq!(keys, [key("answer"), key("question")]);
+        let results: Vec<&String> = harness
+            .transcript()
+            .filter_map(|turn| match turn {
+                Turn::Results(outputs) => outputs.last(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, ["42", "error: nothing is known of it"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reminds_the_model_to_change_a_file_after_many_calls_without() {
         // Under a nudge of three: the results of the third call without a
         // change carry the reminder, and the count starts over after it;
@@ -2522,15 +2597,18 @@ mod tests {
         // As the model's template does: a line for xhigh and for low, and
         // one for high, ahead of the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(system_prompt(dir, Model::Qwen27b, Some(Effort::Medium)).starts_with("# Tools\n"));
+        assert!(
+            system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[], None)
+                .starts_with("# Tools\n")
+        );
         // A host writes the line itself, so its prompt is given none.
-        assert!(system_prompt(dir, Model::Qwen27b, None).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, None, &[], None).starts_with("# Tools\n"));
         for (effort, word) in [
             (Effort::Xhigh, "xhigh"),
             (Effort::High, "high"),
             (Effort::Low, "low"),
         ] {
-            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort));
+            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort), &[], None);
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2543,7 +2621,7 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium));
+        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[], None);
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
@@ -2556,6 +2634,19 @@ mod tests {
         assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
         let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(prompt.contains(&format!("From AGENTS.md:\n\n{}", agents.trim())));
+        // What the program the agent is in tells it comes after how the
+        // agent behaves, and ahead of the project's instructions.
+        let told = system_prompt(
+            dir,
+            Model::Qwen27b,
+            Some(Effort::Medium),
+            &[],
+            Some("Answer in Finnish.\n"),
+        );
+        let behaves = instructions(Model::Qwen27b);
+        assert!(told.contains(&format!(
+            "{behaves}\n\nAnswer in Finnish.\n\n# Project instructions"
+        )));
         // What changes between runs is not in the prompt, so that the state
         // saved after it is good for the next run.
         assert!(!prompt.contains("# Environment"));

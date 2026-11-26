@@ -2,7 +2,6 @@
 //! when none is, replacing one that is not as asked for, and stopping it.
 
 use std::{
-    env,
     fs::OpenOptions,
     path::PathBuf,
     process::{Command, Stdio},
@@ -20,8 +19,12 @@ use crate::{
     sys,
 };
 
-/// The server a session asks for: the model it has, and how it runs it.
+/// The server a session asks for: the program that is one, the model it
+/// has, and how it runs it.
 pub struct Options {
+    /// The program that is started, with `--serve`, when no server is
+    /// listening: `dwim`, or one that serves as it does.
+    pub program: PathBuf,
     /// The model's name.
     pub model: String,
     pub device: Device,
@@ -131,7 +134,7 @@ pub fn connect(options: &Options, on_status: &mut impl FnMut(Status)) -> Result<
 
 /// How the server differs from what `options` ask for, if it does.
 fn difference(welcome: &Welcome, options: &Options) -> Option<String> {
-    if welcome.build != server::build() {
+    if welcome.build != server::build_of(&options.program) {
         return Some("is from another build of dwim".to_string());
     }
     if welcome.model != options.model {
@@ -180,12 +183,11 @@ fn wait_for_exit(pid: u32) {
     }
 }
 
-/// Starts the server as `options` have it, detached: in its own process
+/// Starts the program `options` name as the server they ask for, detached: in its own process
 /// group, with no terminal, and with its standard error appended to its
 /// log. The shell puts it in the background, so that it is not this
 /// process's child to wait for.
 fn spawn(options: &Options) -> Result<()> {
-    let exe = env::current_exe()?;
     let mut args = vec![
         "--serve".to_string(),
         "--model".to_string(),
@@ -218,7 +220,7 @@ fn spawn(options: &Options) -> Result<()> {
     command
         .arg("-c")
         .arg(r#"exec "$0" "$@" &"#)
-        .arg(exe)
+        .arg(&options.program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
