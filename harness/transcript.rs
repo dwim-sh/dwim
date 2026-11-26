@@ -293,13 +293,14 @@ impl Transcript {
     }
 
     /// Records that the conversation was compacted: how many tokens it took
-    /// before, and how many it takes now; the message it starts over from,
-    /// with where the agent is, the note, and the user's earlier messages;
-    /// and how many of the most recent turns were read back after it.
-    pub fn compacted(&mut self, before: usize, after: usize, head: &str, turns: usize) {
+    /// before, and how many it takes now; the briefing it starts over
+    /// from, with where the agent is, the note, and the user's most recent
+    /// messages; and how many of the most recent turns were read back
+    /// after it.
+    pub fn compacted(&mut self, before: usize, after: usize, briefing: &str, turns: usize) {
         self.write(
             "compacted",
-            json!({ "before": before, "after": after, "head": head, "turns": turns }),
+            json!({ "before": before, "after": after, "briefing": briefing, "turns": turns }),
         );
     }
 

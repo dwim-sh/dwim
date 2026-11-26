@@ -4,9 +4,11 @@
 //! the next message or tool result would take the context past a
 //! high-water mark, it compacts the conversation: it has the model write a
 //! note to continue from, starts over from the system prompt, and reads
-//! back where the agent is, the note, the user's earlier messages, and the
-//! most recent exchanges, with the thoughts left out. A reply that runs out
-//! of room is stopped short and goes on after a compaction.
+//! back a briefing, in place of the turns it removes, and the most recent
+//! exchanges, with the thoughts left out. The briefing holds where the
+//! agent is, the note, the plan, and the user's most recent messages. A
+//! reply that runs out of room is stopped short and goes on after a
+//! compaction.
 
 use std::{error::Error, fmt::Write};
 
@@ -23,8 +25,8 @@ const HIGH_WATER: (usize, usize) = (4, 5);
 /// they are read back after a compaction: an eighth.
 const TAIL: usize = 8;
 
-/// The share of the context that the user's earlier messages may take in
-/// the note turn after a compaction: a sixteenth.
+/// The share of the context that the user's messages may take in the
+/// briefing: a sixteenth.
 const MESSAGES: usize = 16;
 
 /// Most tokens of the note the model writes to continue from, headings
@@ -45,23 +47,23 @@ const NOTE_PROMPT: &str = "The conversation so far is about to be cleared to mak
 /// Each heading has its section's share of the note's tokens, in eighths.
 /// Findings has half: it is what the conversation was spent on, and what
 /// is not in it is read all over again. Next has a quarter. Task and Done
-/// have an eighth each: the note turn carries the user's messages as they
+/// have an eighth each: the briefing carries the user's messages as they
 /// were, and the working tree has what was changed. A small model fills
 /// whatever share a section has, so with a quarter each the findings were
 /// cut off after the facts of the task, before anything it had concluded.
-const NOTE_HEADS: [(&str, usize); 4] = [
+const NOTE_HEADINGS: [(&str, usize); 4] = [
     ("Task:", 1),
     ("\n\nFindings:", 4),
     ("\n\nDone:", 1),
     ("\n\nNext:", 2),
 ];
 
-/// How the note turn opens after a compaction.
-const NOTE_HEAD: &str = "The conversation so far was compacted to make room in the context window. This is the note you wrote before it was cleared, to go on from:";
+/// How the briefing introduces the note.
+const NOTE_INTRO: &str = "The conversation so far was compacted to make room in the context window. This is the note you wrote before it was cleared, to go on from:";
 
-/// How the turn opens that a conversation cleared at the end of a step of
-/// the plan starts over from.
-const STEP_HEAD: &str = "The conversation so far was cleared at the end of a step of the plan, to make room in the context window. What you found and did is kept in the plan, which says what each finished step came to:";
+/// How the briefing that a conversation cleared at the end of a step of
+/// the plan starts over from introduces the plan.
+const STEP_INTRO: &str = "The conversation so far was cleared at the end of a step of the plan, to make room in the context window. What you found and did is kept in the plan, which says what each finished step came to:";
 
 /// What the model is told after a reply of its was stopped short and the
 /// conversation compacted, so that it goes on.
@@ -112,7 +114,7 @@ pub fn compact<S: Session>(
     let mut interrupted = false;
     let note = harness
         .session
-        .answer(NOTE_PROMPT, &NOTE_HEADS, harness.note_tokens, |text| {
+        .answer(NOTE_PROMPT, &NOTE_HEADINGS, harness.note_tokens, |text| {
             harness.transcript.stream("note", text);
             let flow = on_event(Event::Note(text.to_string()));
             interrupted |= flow.is_break();
@@ -125,23 +127,23 @@ pub fn compact<S: Session>(
 
     let capacity = harness.session.capacity();
     let (start, messages) = select(&harness.said, &harness.conversation, capacity);
-    let head = note_turn(
+    let briefing = briefing(
         &harness.preamble(),
         &note,
         &harness.tools.plan().brief(),
         &messages,
         start < harness.conversation.len(),
     );
-    restart(harness, head, start, before, on_event)?;
+    restart(harness, briefing, start, before, on_event)?;
     Ok(true)
 }
 
 /// Starts the conversation over at the end of a step of the plan, cleared
-/// down to the plan: from the system prompt, it reads back where the agent
-/// is, the plan with what each finished step came to, the user's messages,
-/// and the last reply, whose calls finished the step and whose results are
-/// yet to be fed. The model writes no note: what it said each step came
-/// to is the note.
+/// down to the plan: from the system prompt, it reads back a briefing,
+/// with where the agent is, the plan with what each finished step came
+/// to, and the user's messages, and the last reply, whose calls finished
+/// the step and whose results are yet to be fed. The model writes no note:
+/// what it said each step came to is the note.
 pub fn start_over<S: Session>(
     harness: &mut Harness<S>,
     on_event: OnEvent,
@@ -153,25 +155,25 @@ pub fn start_over<S: Session>(
         &harness.conversation[start..],
         harness.session.capacity() / MESSAGES,
     );
-    let head = step_turn(
+    let briefing = step_briefing(
         &harness.preamble(),
         &harness.tools.plan().brief(),
         &messages,
     );
-    restart(harness, head, start, before, on_event)
+    restart(harness, briefing, start, before, on_event)
 }
 
-/// Starts the conversation over from the system prompt with `head`, and
-/// the conversation from `start` read back after it; it took `before`
+/// Starts the conversation over from the system prompt with `briefing`,
+/// and the conversation from `start` read back after it; it took `before`
 /// tokens.
 fn restart<S: Session>(
     harness: &mut Harness<S>,
-    head: String,
+    briefing: String,
     start: usize,
     before: usize,
     on_event: OnEvent,
 ) -> Result<(), Box<dyn Error>> {
-    let mut kept = vec![(Turn::User(head.clone()), true)];
+    let mut kept = vec![(Turn::User(briefing.clone()), true)];
     kept.extend(
         harness.conversation[start..]
             .iter()
@@ -183,7 +185,7 @@ fn restart<S: Session>(
     (harness.restart)(&mut harness.session)?;
     harness.session.replay(&turns)?;
     // The turns read back are not said again: the user's among them are in
-    // `said` already, and the head is the harness's own.
+    // `said` already, and the briefing is the harness's own.
     harness.conversation.clear();
     for (turn, prompt) in kept {
         let tokens = harness.session.measure(&turn)?;
@@ -196,14 +198,14 @@ fn restart<S: Session>(
     let after = harness.session.tokens();
     harness
         .transcript
-        .compacted(before, after, &head, harness.conversation.len() - 1);
+        .compacted(before, after, &briefing, harness.conversation.len() - 1);
     let _ = on_event(Event::Compacted { before, after });
     Ok(())
 }
 
 /// What a compaction keeps of `conversation` in a context of `capacity`
 /// tokens, when the user has said `said`: where the exchanges read back
-/// start, and the user's messages the note turn carries.
+/// start, and the user's messages the briefing carries.
 fn select<'a>(said: &'a [Entry], conversation: &[Entry], capacity: usize) -> (usize, Vec<&'a str>) {
     let start = tail(conversation, capacity / TAIL);
     (
@@ -240,12 +242,12 @@ fn tail(conversation: &[Entry], budget: usize) -> usize {
     start
 }
 
-/// The user's messages the note turn carries, oldest first: of all the
+/// The user's messages the briefing carries, oldest first: of all the
 /// user has sent, `said`, but for the last ones, which are in `tail`, the
 /// most recent that fit in `budget` tokens, stopping at the first that
 /// does not; and, when `tail` holds none of the user's, at least the
 /// latest the user sent, whatever it takes. Never the harness's prompts,
-/// such as the notes of earlier compactions.
+/// such as earlier briefings.
 fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
     let in_tail = tail.iter().filter_map(own).count();
     let mut candidates: Vec<(&str, usize)> = said.iter().filter_map(own).collect();
@@ -274,10 +276,11 @@ fn own(entry: &Entry) -> Option<(&str, usize)> {
     }
 }
 
-/// The turn that opens a compacted conversation: where the agent is, the
-/// note, the `plan` as it stands if there is one, the user's earlier
-/// messages, and whether the most recent exchanges follow.
-fn note_turn(
+/// The briefing, the turn compaction puts in place of the turns it
+/// removes: where the agent is, the note, the `plan` as it stands if there
+/// is one, the user's most recent messages, and whether the most recent
+/// exchanges follow.
+fn briefing(
     environment: &str,
     note: &str,
     plan: &str,
@@ -286,7 +289,7 @@ fn note_turn(
 ) -> String {
     let note = note.trim();
     let mut text = format!(
-        "{environment}\n\n{NOTE_HEAD}\n\n<note>\n{}\n</note>",
+        "{environment}\n\n{NOTE_INTRO}\n\n<note>\n{}\n</note>",
         if note_empty(note) { "(none)" } else { note }
     );
     if !plan.is_empty() {
@@ -303,10 +306,10 @@ fn note_turn(
     text
 }
 
-/// The turn that opens a conversation cleared at the end of a step: where
-/// the agent is, the `plan`, and the user's messages.
-fn step_turn(environment: &str, plan: &str, messages: &[&str]) -> String {
-    let mut text = format!("{environment}\n\n{STEP_HEAD}\n\n<plan>\n{plan}\n</plan>");
+/// The briefing a conversation cleared at the end of a step starts over
+/// from: where the agent is, the `plan`, and the user's messages.
+fn step_briefing(environment: &str, plan: &str, messages: &[&str]) -> String {
+    let mut text = format!("{environment}\n\n{STEP_INTRO}\n\n<plan>\n{plan}\n</plan>");
     said(&mut text, messages);
     text.push_str("\n\nYour last calls follow, and their results after them, which name the step now under way. Read again whatever you need for it.");
     text
@@ -325,9 +328,11 @@ fn said(text: &mut String, messages: &[&str]) {
 /// Whether the model wrote nothing in `note`: it is blank, or it is the
 /// headings written for the model with nothing under any of them.
 fn note_empty(note: &str) -> bool {
-    let under = NOTE_HEADS.iter().try_fold(note.trim(), |rest, (head, _)| {
-        rest.strip_prefix(head.trim_start()).map(str::trim_start)
-    });
+    let under = NOTE_HEADINGS
+        .iter()
+        .try_fold(note.trim(), |rest, (heading, _)| {
+            rest.strip_prefix(heading.trim_start()).map(str::trim_start)
+        });
     under.unwrap_or(note.trim()).is_empty()
 }
 
@@ -399,32 +404,35 @@ mod tests {
         // then the most recent exchanges from a reply, then the rest of
         // the turn.
         let turns: Vec<&Turn> = harness.conversation().collect();
-        let Turn::User(head) = turns[0] else {
+        let Turn::User(briefing) = turns[0] else {
             panic!("{:?}", turns[0])
         };
-        assert!(head.starts_with("# Environment\n"), "{head}");
+        assert!(briefing.starts_with("# Environment\n"), "{briefing}");
         assert!(
-            head.contains(&format!("\n\n{NOTE_HEAD}\n\n<note>")),
-            "{head}"
+            briefing.contains(&format!("\n\n{NOTE_INTRO}\n\n<note>")),
+            "{briefing}"
         );
         assert!(
-            head.contains("<note>\nTask: keep going.\n\nFindings: none.\n\nDone: nothing.\n\nNext: more of the same.\n</note>"),
-            "{head}"
+            briefing.contains("<note>\nTask: keep going.\n\nFindings: none.\n\nDone: nothing.\n\nNext: more of the same.\n</note>"),
+            "{briefing}"
         );
-        assert!(head.contains("<message>\nmessage 1\n</message>"), "{head}");
+        assert!(
+            briefing.contains("<message>\nmessage 1\n</message>"),
+            "{briefing}"
+        );
         // A message the conversation holds is not carried too, the
         // message the compaction made room for among them.
         for turn in &turns[1..] {
             if let Turn::User(message) = turn {
                 assert!(
-                    !head.contains(&format!("<message>\n{message}\n</message>")),
-                    "{message} is carried and kept: {head}"
+                    !briefing.contains(&format!("<message>\n{message}\n</message>")),
+                    "{message} is carried and kept: {briefing}"
                 );
             }
         }
         assert!(
-            head.ends_with("The most recent exchanges follow as they were."),
-            "{head}"
+            briefing.ends_with("The most recent exchanges follow as they were."),
+            "{briefing}"
         );
         assert!(
             matches!(turns[1], Turn::Reply { .. }),
@@ -438,7 +446,7 @@ mod tests {
             turns.last()
         );
         let fed = &harness.session.model().fed;
-        let expected = Tokenizer::tiny().encode_with_special(&format!("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{head}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")).unwrap();
+        let expected = Tokenizer::tiny().encode_with_special(&format!("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n{briefing}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")).unwrap();
         assert_eq!(&fed[..expected.len()], expected);
         assert!(harness.session.tokens() < max_len / 2);
         assert_eq!(harness.session.tokens(), fed.len());
@@ -455,16 +463,19 @@ mod tests {
             let (events, _) = send(&mut harness, &format!("later {i}"));
             if events.contains(&"compacted") {
                 compactions += 1;
-                let Some(Turn::User(head)) = harness.conversation().next() else {
+                let Some(Turn::User(briefing)) = harness.conversation().next() else {
                     panic!()
                 };
-                assert!(!head.contains(&format!("<message>\n{NOTE_HEAD}")), "{head}");
-                assert!(!head.contains("<message>\n# Environment"), "{head}");
-                let carried = head.contains("<message>\none more\n</message>");
+                assert!(
+                    !briefing.contains(&format!("<message>\n{NOTE_INTRO}")),
+                    "{briefing}"
+                );
+                assert!(!briefing.contains("<message>\n# Environment"), "{briefing}");
+                let carried = briefing.contains("<message>\none more\n</message>");
                 let kept = harness
                     .conversation()
                     .any(|turn| matches!(turn, Turn::User(message) if message == "one more"));
-                assert!(carried || kept, "{head}");
+                assert!(carried || kept, "{briefing}");
                 break;
             }
         }
@@ -509,9 +520,14 @@ mod tests {
         assert!(matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim() == "Ok."));
         assert!(matches!(&turns[turns.len() - 2], Turn::User(message) if message == CONTINUE));
         // Without their thoughts, the exchanges all fit in the tail but
-        // the first, whose message the note turn carries.
-        let Turn::User(head) = turns[0] else { panic!() };
-        assert!(head.contains("<message>\nmessage 0\n</message>"), "{head}");
+        // the first, whose message the briefing carries.
+        let Turn::User(briefing) = turns[0] else {
+            panic!()
+        };
+        assert!(
+            briefing.contains("<message>\nmessage 0\n</message>"),
+            "{briefing}"
+        );
         assert!(
             turns
                 .iter()
@@ -525,16 +541,19 @@ mod tests {
         // The headings are written for the model: a note with nothing
         // under any of them says nothing, like a blank one.
         for note in ["", "Task:\n\nFindings:\n\nDone:\n\nNext:"] {
-            let head = note_turn("env", note, "", &[], false);
-            assert!(head.contains("<note>\n(none)\n</note>"), "{head}");
+            let briefing = briefing("env", note, "", &[], false);
+            assert!(briefing.contains("<note>\n(none)\n</note>"), "{briefing}");
         }
         for note in [
             "Task: go on.\n\nFindings:\n\nDone:\n\nNext:",
             "Task:\n\nFindings:\n\nDone:\n\nNext: go on.",
             "Go on.",
         ] {
-            let head = note_turn("env", note, "", &[], false);
-            assert!(head.contains(&format!("<note>\n{note}\n</note>")), "{head}");
+            let briefing = briefing("env", note, "", &[], false);
+            assert!(
+                briefing.contains(&format!("<note>\n{note}\n</note>")),
+                "{briefing}"
+            );
         }
     }
 
@@ -562,12 +581,12 @@ mod tests {
             written,
             "Task: keep going.\n\nFindings: lib.rs. Out of time.\n\nDone:\n\nNext:"
         );
-        let Some(Turn::User(head)) = harness.conversation().next() else {
+        let Some(Turn::User(briefing)) = harness.conversation().next() else {
             panic!()
         };
         assert!(
-            head.contains(&format!("<note>\n{written}\n</note>")),
-            "{head}"
+            briefing.contains(&format!("<note>\n{written}\n</note>")),
+            "{briefing}"
         );
     }
 
@@ -613,11 +632,11 @@ mod tests {
                 sent.push(message);
             }
             assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
-            let Some(Turn::User(head)) = harness.conversation().next() else {
+            let Some(Turn::User(briefing)) = harness.conversation().next() else {
                 panic!()
             };
             for message in &sent {
-                let carried = head
+                let carried = briefing
                     .matches(&format!("<message>\n{message}\n</message>"))
                     .count();
                 let kept = harness
@@ -628,7 +647,7 @@ mod tests {
                 assert_eq!(
                     carried + kept,
                     1,
-                    "{message} after compaction {round}: {head}"
+                    "{message} after compaction {round}: {briefing}"
                 );
             }
         }
@@ -681,7 +700,7 @@ mod tests {
         assert_eq!(
             tail(&conversation, 1000),
             1,
-            "the first message is carried by the note turn"
+            "the first message is carried by the briefing"
         );
         // The last reply is kept whatever the budget, and there is nothing
         // to keep before the first reply.
@@ -694,7 +713,7 @@ mod tests {
             reply(50),
             prompt(CONTINUE),
             reply(10),
-            prompt(&format!("# Environment\n\n{NOTE_HEAD} x")),
+            prompt(&format!("# Environment\n\n{NOTE_INTRO} x")),
             user(2),
             prompt(STEPS_PROMPT),
             reply(10),

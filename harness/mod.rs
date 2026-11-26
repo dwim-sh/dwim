@@ -23,7 +23,7 @@
 //! keeps the conversation since the system prompt, and when the next
 //! message or tool result would take the context past a high-water mark,
 //! `compaction` has the model write a note and starts the conversation
-//! over from it.
+//! over from a briefing that holds it.
 //!
 //! The model lays out the work as a plan, with the `plan` tool, and the
 //! tools keep it from then on: the harness reports it as it changes, for
@@ -2238,18 +2238,18 @@ mod tests {
             harness.session.tokens()
         );
         let turns: Vec<&Turn> = harness.conversation().collect();
-        let Turn::User(head) = turns[0] else {
+        let Turn::User(briefing) = turns[0] else {
             panic!("{:?}", turns[0])
         };
-        assert!(head.starts_with("# Environment\n"), "{head}");
+        assert!(briefing.starts_with("# Environment\n"), "{briefing}");
         assert!(
-            head.contains("<plan>\n1. [done] find it: it is in send(), stream.rs:120\n2. [under way] fix it\n3. [to come] check it\n</plan>"),
-            "{head}"
+            briefing.contains("<plan>\n1. [done] find it: it is in send(), stream.rs:120\n2. [under way] fix it\n3. [to come] check it\n</plan>"),
+            "{briefing}"
         );
-        assert!(!head.contains(&filler(100)), "{head}");
+        assert!(!briefing.contains(&filler(100)), "{briefing}");
         assert!(
-            head.contains("<message>\nfix the retries\n</message>"),
-            "{head}"
+            briefing.contains("<message>\nfix the retries\n</message>"),
+            "{briefing}"
         );
         assert!(
             matches!(turns[1], Turn::Reply { calls, .. } if calls.len() == 1),
@@ -2494,10 +2494,10 @@ mod tests {
             "Task: go on.\n\nFindings:\n\nDone:\n\nNext:"
         );
         assert!(records[cut + 3]["after"].as_u64() < records[cut + 3]["before"].as_u64());
-        let head = records[cut + 3]["head"].as_str().unwrap();
-        assert!(head.starts_with("# Environment"), "{head}");
-        assert!(head.contains("Task: go on."), "{head}");
-        assert!(head.contains("message 0"), "{head}");
+        let briefing = records[cut + 3]["briefing"].as_str().unwrap();
+        assert!(briefing.starts_with("# Environment"), "{briefing}");
+        assert!(briefing.contains("Task: go on."), "{briefing}");
+        assert!(briefing.contains("message 0"), "{briefing}");
         assert!(records[cut + 3]["turns"].as_u64().unwrap() > 0);
         assert_eq!(records[cut + 4]["text"], compaction::CONTINUE);
         let times: Vec<f64> = records
