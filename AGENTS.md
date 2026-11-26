@@ -11,6 +11,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **Format**: `cargo fmt --check`
 - **Specs**: `make specs` checks the Lean specs: their
   examples and their proofs. It needs `lake` from a Lean toolchain.
+- **Spec site**: `make site` renders the Lean specs as a web site and
+  prints where it is.
 - **All of the above**: `make check`
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
@@ -69,7 +71,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - `specs/` - Lean specs of the code, a file for each Rust one they
   specify: the intents, what the part is for, in plain sentences; the
   design as Lean definitions, with examples checked when built; and
-  proofs that the design meets the intents
+  proofs that the design meets the intents; `site/` renders them as a web
+  site
 - `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built

@@ -1,0 +1,20 @@
+# The specs as a web site: Verso's literate renderer over the Lean files
+# in `..`. A package of its own, so `lake build` in `specs/` needs nothing
+# but Lean, and the site renders the same files rather than a copy.
+#
+#   lake query :literateHtml     build the site, then print its directory
+#
+# Verso's tags follow Lean's releases, so `rev` names the tag of the
+# release in `lean-toolchain`.
+
+name = "site"
+defaultTargets = ["Dwim"]
+
+[[require]]
+name = "verso"
+git = "https://github.com/leanprover/verso"
+rev = "v4.36.0"
+
+[[lean_lib]]
+name = "Dwim"
+srcDir = ".."

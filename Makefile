@@ -42,6 +42,7 @@ help:
 	@echo '  test      - Run the test suite'
 	@echo '  check     - Check the format, lints, tests and Lean specs'
 	@echo '  specs     - Check the Lean specs: examples and proofs'
+	@echo '  site      - Build the Lean specs as a web site'
 	@echo '  clean     - Remove build artifacts'
 
 $(BINARY): $(SOURCES)
@@ -78,8 +79,12 @@ specs:
 	$(call msg,LAKE,specs)
 	$(Q)cd specs && lake build
 
+site:
+	$(call msg,LAKE,specs/site)
+	$(Q)cd specs/site && lake query :literateHtml
+
 clean:
 	$(call msg,CLEAN,target)
 	$(Q)cargo clean
 
-.PHONY: help all install uninstall test check specs clean
+.PHONY: help all install uninstall test check specs site clean
