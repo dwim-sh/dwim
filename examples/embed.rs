@@ -1,5 +1,6 @@
 //! The agent in a program of one's own: answers the prompt on the command
-//! line, working in the directory it is run in, and prints the reply.
+//! line, working in the directory it is run in, and prints the reply. It
+//! has a tool of the program's beside its own, which says where it runs.
 //!
 //! ```text
 //! cargo run --release --example embed -- "what does this project do?"
@@ -21,6 +22,7 @@ use dwim::{
     agent::{Agent, Settings, Status},
     harness::{Event, Log},
     model::Model,
+    tools::Custom,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -28,7 +30,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     if prompt.trim().is_empty() {
         return Err("usage: embed <prompt>".into());
     }
-    let settings = Settings::new(&env::current_dir()?, Model::default());
+    let mut settings = Settings::new(&env::current_dir()?, Model::default());
+    // A tool of this program's own, beside the agent's, and word of it.
+    settings.tools.push(Custom::new(
+        "host",
+        "Say which program the agent is running in, and its version.",
+        |_| {
+            Ok(format!(
+                "embed, an example of dwim {}",
+                env!("CARGO_PKG_VERSION")
+            ))
+        },
+    ));
+    settings.instructions =
+        Some("You run inside another program. The host tool says which.".to_string());
     let mut agent = Agent::open(settings, Log::none(), |status| match status {
         Status::Device(name) => eprintln!("running on {name}"),
         Status::Weights { done, total } if done == total => eprintln!("loaded the model"),

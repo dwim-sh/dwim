@@ -317,15 +317,17 @@ Reminder:
 /// The system prompt for an agent on `model` working in `dir`: the
 /// template's line for `effort`, if the prompt is to carry one and the
 /// effort has one, the tools, with the `custom` ones of the program the
-/// agent is in, then how to behave as the model is told
-/// it, and the project's own instructions
-/// from its `AGENTS.md` if it has one. Where the agent is goes in [`environment`]
-/// instead, so that the prompt is the same from one run to the next.
+/// agent is in, then how to behave as the model is told it, what the
+/// `program` tells it beside, if anything, and the project's own
+/// instructions from its `AGENTS.md` if it has one. Where the agent is
+/// goes in [`environment`] instead, so that the prompt is the same from
+/// one run to the next.
 pub fn system_prompt(
     dir: &Path,
     model: Model,
     effort: Option<Effort>,
     custom: &[Custom],
+    program: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     if let Some(line) = effort.and_then(Effort::instruction) {
@@ -335,6 +337,10 @@ pub fn system_prompt(
     prompt.push_str(&tools(custom));
     prompt.push_str("\n\n");
     prompt.push_str(&instructions(model));
+    if let Some(program) = program.map(str::trim).filter(|program| !program.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(program);
+    }
     if let Ok(instructions) = fs::read_to_string(dir.join("AGENTS.md")) {
         let instructions = truncate(instructions.trim(), MAX_INSTRUCTIONS);
         prompt.push_str("\n\n# Project instructions\n\nFrom AGENTS.md:\n\n");
@@ -2570,16 +2576,17 @@ mod tests {
         // one for high, ahead of the tools, and none for medium.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
-            system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[]).starts_with("# Tools\n")
+            system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[], None)
+                .starts_with("# Tools\n")
         );
         // A host writes the line itself, so its prompt is given none.
-        assert!(system_prompt(dir, Model::Qwen27b, None, &[]).starts_with("# Tools\n"));
+        assert!(system_prompt(dir, Model::Qwen27b, None, &[], None).starts_with("# Tools\n"));
         for (effort, word) in [
             (Effort::Xhigh, "xhigh"),
             (Effort::High, "high"),
             (Effort::Low, "low"),
         ] {
-            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort), &[]);
+            let prompt = system_prompt(dir, Model::Qwen27b, Some(effort), &[], None);
             let line = format!("Reasoning effort is set to {word}.");
             assert!(prompt.starts_with(&line), "{prompt}");
             assert!(prompt.contains(".\n\n# Tools\n"));
@@ -2592,7 +2599,7 @@ mod tests {
     #[test]
     fn describes_the_project() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[]);
+        let prompt = system_prompt(dir, Model::Qwen27b, Some(Effort::Medium), &[], None);
         assert!(prompt.starts_with("# Tools\n"));
         assert!(
             prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\"")
@@ -2605,6 +2612,19 @@ mod tests {
         assert!(prompt.contains(&format!("killed after {} seconds", bash::TIMEOUT)));
         let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(prompt.contains(&format!("From AGENTS.md:\n\n{}", agents.trim())));
+        // What the program the agent is in tells it comes after how the
+        // agent behaves, and ahead of the project's instructions.
+        let told = system_prompt(
+            dir,
+            Model::Qwen27b,
+            Some(Effort::Medium),
+            &[],
+            Some("Answer in Finnish.\n"),
+        );
+        let behaves = instructions(Model::Qwen27b);
+        assert!(told.contains(&format!(
+            "{behaves}\n\nAnswer in Finnish.\n\n# Project instructions"
+        )));
         // What changes between runs is not in the prompt, so that the state
         // saved after it is good for the next run.
         assert!(!prompt.contains("# Environment"));

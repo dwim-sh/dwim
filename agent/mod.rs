@@ -93,6 +93,10 @@ pub struct Settings {
     pub shell: Option<PathBuf>,
     /// The tools the program gives the agent beside the agent's own.
     pub tools: Vec<Custom>,
+    /// What the program tells the agent beside how the agent is told to
+    /// behave, such as what its tools are for: it goes into the system
+    /// prompt after that, ahead of the project's own instructions.
+    pub instructions: Option<String>,
 }
 
 /// Where a model that runs on this machine is loaded.
@@ -131,6 +135,7 @@ impl Settings {
             speculate: DRAFTS,
             shell: None,
             tools: Vec::new(),
+            instructions: None,
         }
     }
 
@@ -456,6 +461,7 @@ pub fn open(
         settings.model,
         (kind == Kind::Local).then_some(effort),
         &settings.tools,
+        settings.instructions.as_deref(),
     );
     let (model, context, temperature) = (settings.model, settings.context, settings.temperature);
     let hosted = match kind {

@@ -152,6 +152,7 @@ impl Opts {
             speculate: self.speculate,
             shell: self.shell.clone(),
             tools: Vec::new(),
+            instructions: None,
         })
     }
 
