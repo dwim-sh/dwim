@@ -69,8 +69,10 @@ impl Transcript {
     /// options name one, or in a new file in the working directory's folder
     /// of the user's state directory (`~/.local/state`, or on macOS, where
     /// there is none, `~/Library/Application Support`), out of the agent's
-    /// sight. Where that cannot be written, the session goes on without one,
-    /// with a warning.
+    /// sight; and where that cannot be written, in the same folder of the
+    /// temporary directory, with a warning. A compaction removes turns on
+    /// the grounds that the transcript keeps them, so the session goes on
+    /// without one only if neither can be written.
     pub fn open(path: Option<&Path>) -> io::Result<Self> {
         if let Some(path) = path {
             return Self::create(path).map_err(|e| {
@@ -80,21 +82,26 @@ impl Transcript {
                 ))
             });
         }
-        let Some(dir) = sys::dirs::state() else {
-            return Ok(Self::none());
-        };
-        let path = dir
-            .join("dwim")
+        let file = Path::new("dwim")
             .join("projects")
             .join(project(&env::current_dir()?))
             .join(Self::name());
-        Ok(Self::create(&path).unwrap_or_else(|e| {
-            eprintln!(
-                "warning: keeping no transcript: cannot write {}: {e}",
-                path.display()
-            );
-            Self::none()
-        }))
+        let dirs = sys::dirs::state().into_iter().chain([env::temp_dir()]);
+        Ok(Self::create_first(dirs.map(|dir| dir.join(&file))))
+    }
+
+    /// A transcript written to the first of `paths` that can be, with a
+    /// warning for each before it; one that goes nowhere, with a warning,
+    /// if none can be.
+    fn create_first(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        for path in paths {
+            match Self::create(&path) {
+                Ok(transcript) => return transcript,
+                Err(e) => eprintln!("warning: cannot write {}: {e}", path.display()),
+            }
+        }
+        eprintln!("warning: keeping no transcript");
+        Self::none()
     }
 
     /// A transcript written to `path`, with the directories it goes in made
@@ -441,6 +448,23 @@ mod tests {
                 (field("type"), field("text") + &field("detail"))
             })
             .collect()
+    }
+
+    #[test]
+    fn writes_where_it_can() {
+        // A folder that cannot be made, under a file, is passed over for
+        // the next; with none left, the transcript goes nowhere.
+        let dir = env::temp_dir().join(format!("dwim-transcript-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        fs::write(&file, "").unwrap();
+        let blocked = file.join("t.jsonl");
+        let open = dir.join("t.jsonl");
+        let transcript = Transcript::create_first([blocked.clone(), open.clone()]);
+        assert_eq!(transcript.path(), Some(open.as_path()));
+        assert!(open.is_file());
+        assert_eq!(Transcript::create_first([blocked]).path(), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
