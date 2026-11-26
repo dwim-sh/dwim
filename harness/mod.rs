@@ -517,8 +517,9 @@ pub enum Event {
 type OnEvent<'a> = &'a mut dyn FnMut(Event) -> ControlFlow<()>;
 
 /// What opens the conversation over with the system prompt, once the session
-/// is cleared: from a saved state, or by reading the prompt again.
-type Restart<S> = Box<dyn FnMut(&mut S) -> Result<(), Box<dyn Error>>>;
+/// is cleared: from a saved state, or by reading the prompt again. It goes
+/// to another thread when the harness does.
+type Restart<S> = Box<dyn FnMut(&mut S) -> Result<(), Box<dyn Error>> + Send>;
 
 /// How a turn ended: with a reply of text alone, or interrupted; or with
 /// the reply stopped short for room.
@@ -613,7 +614,7 @@ impl<S: Session> Harness<S> {
     pub fn new(
         mut session: S,
         dir: &Path,
-        restart: impl FnMut(&mut S) -> Result<(), Box<dyn Error>> + 'static,
+        restart: impl FnMut(&mut S) -> Result<(), Box<dyn Error>> + Send + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let note_tokens = compaction::reserve(&mut session)?;
         let mut harness = Self {

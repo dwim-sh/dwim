@@ -329,6 +329,14 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_opened_on_one_thread_answers_on_another() {
+        let (embedded, _, _) = engine(&["</think>\n\nOne."]);
+        let mut harness = harness(&embedded, &settings(&embedded));
+        let answer = thread::spawn(move || ask(&mut harness, "first"));
+        assert_eq!(answer.join().unwrap(), "One.");
+    }
+
+    #[test]
     fn the_model_goes_when_the_engine_and_its_sessions_are_let_go_of() {
         let (embedded, _, ended) = engine(&["</think>\n\nOne."]);
         let settings = settings(&embedded);
