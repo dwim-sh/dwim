@@ -44,7 +44,7 @@ struct Record<'a> {
 }
 
 /// The transcript of a session, written to a file as it goes; or nowhere.
-pub struct Log {
+pub struct Transcript {
     file: Option<File>,
     path: Option<PathBuf>,
     start: Instant,
@@ -63,7 +63,7 @@ struct Pending {
     written: Instant,
 }
 
-impl Log {
+impl Transcript {
     /// The session's transcript, opened before anything else so that a file
     /// it cannot be written to is found out at once: in `path`, if the
     /// options name one, or in a new file in the working directory's folder
@@ -384,7 +384,7 @@ impl Log {
     }
 }
 
-impl Drop for Log {
+impl Drop for Transcript {
     /// Writes the streamed text gathered last.
     fn drop(&mut self) {
         self.flush();
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn keeps_streamed_text_of_a_killed_session() {
         let path = env::temp_dir().join(format!("dwim-log-test-{}.jsonl", process::id()));
-        let mut log = Log::create(&path).unwrap();
+        let mut log = Transcript::create(&path).unwrap();
         log.stream("thought", "Let me ");
         assert_eq!(records(&path), [("thought".into(), "Let me ".into())]);
         log.stream("thought", "look.");

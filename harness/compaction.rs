@@ -104,7 +104,7 @@ pub fn compact<S: Session>(
     if harness.conversation.is_empty() {
         return Ok(false);
     }
-    harness.log.compacting();
+    harness.transcript.compacting();
     if on_event(Event::Compacting).is_break() {
         return Ok(false);
     }
@@ -113,7 +113,7 @@ pub fn compact<S: Session>(
     let note = harness
         .session
         .answer(NOTE_PROMPT, &NOTE_HEADS, harness.note_tokens, |text| {
-            harness.log.stream("note", text);
+            harness.transcript.stream("note", text);
             let flow = on_event(Event::Note(text.to_string()));
             interrupted |= flow.is_break();
             flow
@@ -195,7 +195,7 @@ fn restart<S: Session>(
     }
     let after = harness.session.tokens();
     harness
-        .log
+        .transcript
         .compacted(before, after, &head, harness.conversation.len() - 1);
     let _ = on_event(Event::Compacted { before, after });
     Ok(())
