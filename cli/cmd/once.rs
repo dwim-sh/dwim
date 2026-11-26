@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 
-use dwim::harness::{Event, Log};
+use dwim::harness::Event;
 
 use crate::{
     session::{self, Settings},
@@ -31,7 +31,7 @@ pub fn run(
     transcript: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let log = Log::open(transcript)?;
+    let log = session::transcript(transcript, &settings.dir)?;
     let transcript = log.path().map(Path::to_path_buf);
     let mut stderr = Stderr::new();
     let mut loaded = session::load(settings, log, move |status| stderr.report(&status))?;

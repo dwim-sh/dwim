@@ -2,7 +2,7 @@
 //! the agent's settings with the user's configuration in them, and where a
 //! session's time has gone.
 
-use std::{error::Error, time::Duration};
+use std::{error::Error, io, path::Path, time::Duration};
 
 use dwim::{
     agent,
@@ -69,6 +69,26 @@ pub fn switch(
     on_status: impl FnMut(Status) + Send + 'static,
 ) -> Result<Kind, Box<dyn Error>> {
     agent::switch(&configured(settings)?, harness, on_status)
+}
+
+/// The session's transcript, opened before anything else so that a file
+/// it cannot be written to is found out at once: in `path`, if the
+/// options name one, or in a new file in the folder for `dir`, the working
+/// directory, of the user's state directory. Where that cannot be written,
+/// the session goes on without one, with a warning.
+pub fn transcript(path: Option<&Path>, dir: &Path) -> io::Result<Log> {
+    match path {
+        Some(path) => Log::create(path).map_err(|e| {
+            io::Error::other(format!(
+                "cannot write the transcript to {}: {e}",
+                path.display()
+            ))
+        }),
+        None => Ok(Log::in_state(dir).unwrap_or_else(|e| {
+            eprintln!("warning: keeping no transcript: {e}");
+            Log::none()
+        })),
+    }
 }
 
 /// `settings` with the providers the configuration disables as it is now:

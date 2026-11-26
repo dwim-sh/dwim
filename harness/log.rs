@@ -12,7 +12,6 @@
 //! unrecorded rather than stopping the agent.
 
 use std::{
-    env,
     fmt::Display,
     fs::File,
     io::{self, Seek, SeekFrom, Write},
@@ -64,37 +63,22 @@ struct Pending {
 }
 
 impl Log {
-    /// The session's transcript, opened before anything else so that a file
-    /// it cannot be written to is found out at once: in `path`, if the
-    /// options name one, or in a new file in the working directory's folder
-    /// of the user's state directory (`~/.local/state`, or on macOS, where
-    /// there is none, `~/Library/Application Support`), out of the agent's
-    /// sight. Where that cannot be written, the session goes on without one,
-    /// with a warning.
-    pub fn open(path: Option<&Path>) -> io::Result<Self> {
-        if let Some(path) = path {
-            return Self::create(path).map_err(|e| {
-                io::Error::other(format!(
-                    "cannot write the transcript to {}: {e}",
-                    path.display()
-                ))
-            });
-        }
-        let Some(dir) = sys::dirs::state() else {
+    /// A transcript in a new file in the folder for `dir`, the directory
+    /// the agent works in, of the user's state directory (`~/.local/state`,
+    /// or on macOS, where there is none, `~/Library/Application Support`),
+    /// out of the agent's sight. It goes nowhere where the user has no
+    /// state directory, and fails where the file cannot be written.
+    pub fn in_state(dir: &Path) -> io::Result<Self> {
+        let Some(state) = sys::dirs::state() else {
             return Ok(Self::none());
         };
-        let path = dir
+        let path = state
             .join("dwim")
             .join("projects")
-            .join(project(&env::current_dir()?))
+            .join(project(dir))
             .join(Self::name());
-        Ok(Self::create(&path).unwrap_or_else(|e| {
-            eprintln!(
-                "warning: keeping no transcript: cannot write {}: {e}",
-                path.display()
-            );
-            Self::none()
-        }))
+        Self::create(&path)
+            .map_err(|e| io::Error::other(format!("cannot write {}: {e}", path.display())))
     }
 
     /// A transcript written to `path`, with the directories it goes in made
