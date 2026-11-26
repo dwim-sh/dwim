@@ -9,19 +9,27 @@ path = "lib.rs"
 [[bin]]
 name = "dwim"
 path = "cli/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "difftest"
 path = "testing/difftest/main.rs"
 
+# What the `dwim` command needs beside the library: its options and its
+# terminal. A program that has the library in it builds without them, with
+# `default-features = false`.
+[features]
+default = ["cli"]
+cli = ["dep:argh", "dep:crossterm", "dep:unicode-width"]
+
 [build-dependencies]
 naga = { version = "30.0.1", features = ["wgsl-in", "spv-out"] }
 
 [dependencies]
-argh = "0.1.19"
+argh = { version = "0.1.19", optional = true }
 ash = "0.38.0"
 base64 = "0.23.1"
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", optional = true }
 dirs = "7.0.0"
 fancy-regex = "0.19.1"
 libc = "0.2.189"
@@ -29,7 +37,7 @@ rayon = "1.12.0"
 ring = "0.17.14"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-unicode-width = "0.2.2"
+unicode-width = { version = "0.2.2", optional = true }
 ureq = "3.4.1"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
