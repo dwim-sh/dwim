@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
-            Event::Call { name, detail } => eprintln!("{name}({detail})"),
+            Event::Call { name, detail, .. } => eprintln!("{name}({detail})"),
             _ => {}
         }
         ControlFlow::Continue(())

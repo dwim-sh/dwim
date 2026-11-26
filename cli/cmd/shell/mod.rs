@@ -1223,7 +1223,7 @@ impl App {
             Event::Output(output)
                 if (self.call == "plan" || self.call == "done")
                     && !output.starts_with("error:") => {}
-            Event::Call { name, detail } => {
+            Event::Call { name, detail, .. } => {
                 self.finish();
                 let detail: Vec<&str> = detail.split_whitespace().collect();
                 let detail = detail.join(" ");

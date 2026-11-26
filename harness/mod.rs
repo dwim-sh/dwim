@@ -50,6 +50,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::Value;
+
 use crate::{
     harness::snapshot::Snapshot,
     model::{Chunk, Effort, Model, Session, Turn},
@@ -488,10 +490,13 @@ pub enum Event {
     /// A token sampled, as it may be hidden (a tool-call tag or body, a
     /// thought that closes) rather than shown as a thought or text piece.
     Token,
-    /// A tool is about to run: its name and how it was called.
+    /// A tool is about to run: its name, how the call reads on screen,
+    /// and the arguments the model gave it, a JSON object, for a program
+    /// that shows the calls of its own tools its own way.
     Call {
         name: String,
         detail: String,
+        arguments: Value,
     },
     /// What the tool returned, as the model sees it.
     Output(String),
@@ -1141,6 +1146,7 @@ impl<S: Session> Harness<S> {
                             || on_event(Event::Call {
                                 name: call.name.clone(),
                                 detail: detail.clone(),
+                                arguments: call.arguments.clone(),
                             })
                             .is_break();
                         let this = Some((call.name.clone(), call.arguments.to_string()));
@@ -1925,7 +1931,22 @@ mod tests {
             )
             .parameter(crate::tools::Parameter::string("key", "The key.")),
         ]);
-        send(&mut harness, "go");
+        // The program is told of each call with the arguments it was
+        // given, to show it its own way.
+        let mut keys = Vec::new();
+        harness
+            .send("go", |event| {
+                if let Event::Call {
+                    name, arguments, ..
+                } = event
+                {
+                    keys.push((name, arguments["key"].as_str().map(str::to_string)));
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let key = |key: &str| ("lookup".to_string(), Some(key.to_string()));
+        assert_eq!(keys, [key("answer"), key("question")]);
         let results: Vec<&String> = harness
             .transcript()
             .filter_map(|turn| match turn {

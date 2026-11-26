@@ -102,7 +102,7 @@ impl Printer {
                     self.replied = true;
                 }
             }
-            Event::Call { name, detail } => {
+            Event::Call { name, detail, .. } => {
                 self.end_thought();
                 eprintln!("{name}({detail})");
             }
