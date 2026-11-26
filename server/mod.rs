@@ -72,12 +72,22 @@ pub fn socket_path() -> PathBuf {
     dir.join(format!("dwim-{}.sock", sys::user::id()))
 }
 
-/// Which build of dwim this is: its version, and the size and the
-/// modification time of its executable, so that a client and a server of
-/// the same version but different builds tell each other apart.
+/// Which build of dwim this program is: what [`build_of`] says of its
+/// executable.
 pub fn build() -> String {
+    match env::current_exe() {
+        Ok(program) => build_of(&program),
+        Err(_) => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Which build of dwim `program` is, as far as one built with this
+/// library can tell: the library's version, and the size and the
+/// modification time of the executable, so that a client and a server of
+/// the same version but different builds tell each other apart.
+pub fn build_of(program: &Path) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    match env::current_exe().and_then(fs::metadata) {
+    match fs::metadata(program) {
         Ok(metadata) => {
             let modified = metadata
                 .modified()

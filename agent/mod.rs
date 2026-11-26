@@ -5,7 +5,7 @@
 
 use std::{
     error::Error,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -34,6 +34,8 @@ pub struct Settings {
     pub provider: Option<Kind>,
     /// The providers a model is not run at unless `provider` names one.
     pub disabled: Vec<Kind>,
+    /// Where the model is loaded, when it runs on this machine.
+    pub engine: Engine,
     pub device: Device,
     /// Tokens of conversation to make room for in each session, or as
     /// many as fit.
@@ -51,10 +53,20 @@ pub struct Settings {
     pub shell: Option<PathBuf>,
 }
 
+/// Where a model that runs on this machine is loaded.
+#[derive(Clone)]
+pub enum Engine {
+    /// In a dwim server, a process of its own, which the sessions on this
+    /// machine share: `program` is started with `--serve` when none is
+    /// listening, and is `dwim`, or a program that serves as it does.
+    Server { program: PathBuf },
+}
+
 impl Settings {
-    /// The server the settings ask for.
-    fn server(&self) -> server::Options {
+    /// The server the settings ask for, started as `program`.
+    fn server(&self, program: &Path) -> server::Options {
         server::Options {
+            program: program.to_path_buf(),
             model: self.model.name().to_string(),
             device: self.device,
             context: self.context,
@@ -349,7 +361,8 @@ pub fn open(
         session.start(&system, |_, _| {})?;
         return Ok((session, system));
     }
-    let connection = server::connect(&settings.server(), &mut on_status)?;
+    let Engine::Server { program } = &settings.engine;
+    let connection = server::connect(&settings.server(program), &mut on_status)?;
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
     // through, is told of the device and the size afterwards instead.

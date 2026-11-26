@@ -14,7 +14,7 @@ use dwim::{
 use crate::config::Config;
 
 pub use dwim::agent::{
-    Ready, Session, Settings, Status, fetch_model, harness, load_model, ready, runs,
+    Engine, Ready, Session, Settings, Status, fetch_model, harness, load_model, ready, runs,
 };
 
 /// Where `model` runs, as [`agent::provider`] finds, leaving out the
