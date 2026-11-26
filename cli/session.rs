@@ -14,7 +14,7 @@ use dwim::{
 use crate::config::Config;
 
 pub use dwim::agent::{
-    Engine, Ready, Session, Settings, Status, fetch_model, harness, load_model, ready, runs,
+    Agent, Engine, Session, Settings, Status, fetch_model, harness, load_model, ready, runs,
 };
 
 /// Where `model` runs, as [`agent::provider`] finds, leaving out the
@@ -31,14 +31,14 @@ pub fn nowhere(model: Model, config: &Config) -> String {
     agent::nowhere(model, &config.disabled_providers())
 }
 
-/// Opens a session and builds the harness around it, as [`agent::load`]
-/// does, with the providers the configuration disables left out.
+/// Opens an agent, as [`Agent::open`] does, with the providers the
+/// configuration disables left out.
 pub fn load(
     settings: &Settings,
     log: Log,
     on_status: impl FnMut(Status) + Send + 'static,
-) -> Result<Ready, Box<dyn Error>> {
-    agent::load(&configured(settings)?, log, on_status)
+) -> Result<Agent, Box<dyn Error>> {
+    Agent::open(configured(settings)?, log, on_status)
 }
 
 /// Opens a session where the model runs, as [`agent::open`] does, with

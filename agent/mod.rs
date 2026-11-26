@@ -2,18 +2,52 @@
 //! runs, the session opened there with the system prompt, and the harness
 //! around it. What the `dwim` command and a program that has the agent in
 //! it both start from.
+//!
+//! An [`Agent`] is opened with [`Settings`] and sent messages, and
+//! reports what it does in a turn as the harness's events:
+//!
+//! ```no_run
+//! use std::{ops::ControlFlow, path::Path};
+//!
+//! use dwim::{
+//!     agent::{Agent, Settings},
+//!     harness::{Event, Log},
+//!     model::Model,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let settings = Settings::new(Path::new("."), Model::InklingMini);
+//! let mut agent = Agent::open(settings, Log::none(), |_status| {})?;
+//! agent.send("What does this project do?", |event| {
+//!     if let Event::Text(text) = event {
+//!         print!("{text}");
+//!     }
+//!     ControlFlow::Continue(())
+//! })?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The model runs where the settings say: at a host there is a key to,
+//! or on this machine, where [`Engine`] says what loads it. The settings
+//! [`Settings::new`] makes load it in the program itself, as an
+//! [`Embedded`] engine; `dwim` has it in a server of its own, which its
+//! sessions share. The pieces an agent is opened from are here too, for a
+//! program that opens the session on a thread of its own, as the shell
+//! does: [`open`], [`harness()`], [`reopen`] and [`switch`].
 
 mod engine;
 
 use std::{
     error::Error,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use crate::{
-    harness::{self, Harness, Log},
-    inference::{self, Loaded, Progress},
+    harness::{self, Event, Harness, Log},
+    inference::{self, DRAFTS, Loaded, Progress},
     model::{Device, Effort, Model},
     providers::{
         Any, Conversation, Kind, cerebras,
@@ -72,6 +106,30 @@ pub enum Engine {
 }
 
 impl Settings {
+    /// The settings of an agent that works in `dir` on `model`, as `dwim`
+    /// runs it unless told, but for where a model that runs on this
+    /// machine is loaded, which is in this program: it runs where
+    /// [`provider`] finds, on the GPU, with the context that fits, the
+    /// thinking budget the harness has, and the effort the model reasons
+    /// at by default.
+    pub fn new(dir: &Path, model: Model) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            model,
+            provider: None,
+            disabled: Vec::new(),
+            engine: Engine::Embedded(Embedded::default()),
+            device: Device::Gpu(None),
+            context: None,
+            sessions: None,
+            thinking_budget: harness::THINKING_BUDGET,
+            effort: model.default_effort(),
+            temperature: None,
+            speculate: DRAFTS,
+            shell: None,
+        }
+    }
+
     /// The server the settings ask for, started as `program`.
     fn server(&self, program: &Path) -> server::Options {
         server::Options {
@@ -88,12 +146,63 @@ impl Settings {
 /// the model runs at.
 pub type Session = Conversation<Any>;
 
-/// The harness around the model, ready for a message.
-pub struct Ready {
-    pub harness: Harness<Session>,
-    /// How long getting the model ready took: reaching the server, the
-    /// loading if it was loading, and the system prompt.
-    pub loading: Duration,
+/// An agent, ready for a message: the harness around a session with the
+/// model, opened where the model runs.
+pub struct Agent {
+    harness: Harness<Session>,
+    loading: Duration,
+}
+
+impl Agent {
+    /// Opens a session where the model `settings` name runs, with the
+    /// system prompt for the directory the agent works in, and builds the
+    /// harness around it, keeping a transcript in `log`. A model that
+    /// runs on this machine is loaded first if it is not, and fetched if
+    /// its files are not there. `on_status` is told how that goes, and
+    /// after, when the session waits for another's request.
+    pub fn open(
+        settings: Settings,
+        log: Log,
+        on_status: impl FnMut(Status) + Send + 'static,
+    ) -> Result<Self, Box<dyn Error>> {
+        let loading = Instant::now();
+        let (session, system) = open(&settings, on_status)?;
+        let harness = harness(&settings, session, system, log)?;
+        Ok(Self {
+            harness,
+            loading: loading.elapsed(),
+        })
+    }
+
+    /// Sends a message from the user and runs the turn it starts, to the
+    /// reply that calls no tool, reporting what happens to `on_event`,
+    /// which ends the turn early by breaking: what [`Harness::send`]
+    /// does.
+    pub fn send(
+        &mut self,
+        message: &str,
+        on_event: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.harness.send(message, on_event)
+    }
+
+    /// The harness, for what else is asked of it: to compact the
+    /// conversation, to go on with no one to answer, to set the plan
+    /// aside.
+    pub fn harness(&mut self) -> &mut Harness<Session> {
+        &mut self.harness
+    }
+
+    /// Where the conversation's time has gone so far.
+    pub fn stats(&self) -> harness::Stats {
+        self.harness.stats()
+    }
+
+    /// How long getting the model ready took: reaching it, the loading
+    /// if it was loading, and the system prompt.
+    pub fn loading(&self) -> Duration {
+        self.loading
+    }
 }
 
 /// Where `model` runs: at `provider` if one is named, and otherwise on
@@ -242,25 +351,6 @@ pub fn load_model(
     )
 }
 
-/// Reaches the server, starting one if none is running, opens a session
-/// with the system prompt for the working directory, and builds the
-/// harness around it with `settings`, keeping a transcript in `log`.
-/// `on_status` is told what the server is doing meanwhile, and after, when
-/// the session waits for another's request.
-pub fn load(
-    settings: &Settings,
-    log: Log,
-    on_status: impl FnMut(Status) + Send + 'static,
-) -> Result<Ready, Box<dyn Error>> {
-    let loading = Instant::now();
-    let (session, system) = open(settings, on_status)?;
-    let harness = harness(settings, session, system, log)?;
-    Ok(Ready {
-        harness,
-        loading: loading.elapsed(),
-    })
-}
-
 /// Builds the harness around `session`, opened with the system prompt
 /// `system`, with `settings`, keeping a transcript in `log`.
 pub fn harness(
@@ -292,7 +382,7 @@ pub fn harness(
 /// Opens the session over on a server, starting one if none is running,
 /// after the one it was on stopped, and reads the conversation so far
 /// back into it. `on_status` is told what the server is doing, as with
-/// [`load`].
+/// [`Agent::open`].
 pub fn reopen(
     settings: &Settings,
     harness: &mut Harness<Session>,
@@ -306,7 +396,7 @@ pub fn reopen(
 /// that one runs, in place of the model it was on: opens a session there,
 /// reads the conversation so far back into it, and notes the change in
 /// the transcript. Returns where the model runs. `on_status` is told what
-/// the server is doing, as with [`load`].
+/// the server is doing, as with [`Agent::open`].
 pub fn switch(
     settings: &Settings,
     harness: &mut Harness<Session>,
