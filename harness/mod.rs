@@ -20,10 +20,10 @@
 //! directories.
 //!
 //! The harness also keeps the conversation within the context window: it
-//! keeps a transcript of the turns since the system prompt, and when the
-//! next message or tool result would take the context past a high-water
-//! mark, `compaction` has the model write a note and starts the
-//! conversation over from it.
+//! keeps the conversation since the system prompt, and when the next
+//! message or tool result would take the context past a high-water mark,
+//! `compaction` has the model write a note and starts the conversation
+//! over from it.
 //!
 //! The model lays out the work as a plan, with the `plan` tool, and the
 //! tools keep it from then on: the harness reports it as it changes, for
@@ -515,7 +515,7 @@ enum Outcome {
     Cut,
 }
 
-/// A turn as the transcript keeps it: the turn, the tokens it takes read
+/// A turn as the conversation keeps it: the turn, the tokens it takes read
 /// back, and whether a user turn is the harness's own prompt to the model
 /// rather than the user's message.
 #[derive(Clone)]
@@ -541,7 +541,7 @@ pub struct Harness<S: Session> {
     tool_seconds: f64,
     /// The conversation since the system prompt, or since it was last
     /// compacted.
-    transcript: Vec<Entry>,
+    conversation: Vec<Entry>,
     /// Opens the conversation over with the system prompt, once the session
     /// is cleared.
     restart: Restart<S>,
@@ -576,7 +576,7 @@ pub struct Harness<S: Session> {
     /// this turn, and whether it has been asked after the steps left.
     planned: bool,
     asked: bool,
-    /// The user's messages of the session, as the transcript has recorded
+    /// The user's messages of the session, as the conversation has recorded
     /// them, which a compacted conversation reads back.
     said: Vec<Entry>,
     /// The transcript of the whole session.
@@ -611,7 +611,7 @@ impl<S: Session> Harness<S> {
             model: None,
             calls: 0,
             tool_seconds: 0.0,
-            transcript: Vec::new(),
+            conversation: Vec::new(),
             restart: Box::new(restart),
             note_tokens,
             thinking_budget: None,
@@ -801,13 +801,13 @@ impl<S: Session> Harness<S> {
         self.session = session;
         self.note_tokens = compaction::reserve(&mut self.session)?;
         let mut turns: Vec<Turn> = self
-            .transcript
+            .conversation
             .iter()
             .map(|entry| entry.turn.clone())
             .collect();
         if self.environment.is_none()
             && let (Some(Turn::User(message)), Some(first)) =
-                (turns.first_mut(), self.transcript.first())
+                (turns.first_mut(), self.conversation.first())
             && !first.prompt
         {
             *message = format!("{}\n\n{message}", self.preamble());
@@ -828,8 +828,8 @@ impl<S: Session> Harness<S> {
     /// The turns since the system prompt, or since the conversation was
     /// last compacted.
     #[cfg(test)]
-    fn transcript(&self) -> impl Iterator<Item = &Turn> {
-        self.transcript.iter().map(|entry| &entry.turn)
+    fn conversation(&self) -> impl Iterator<Item = &Turn> {
+        self.conversation.iter().map(|entry| &entry.turn)
     }
 
     /// Sends a message from the user, with where the agent is ahead of the
@@ -982,7 +982,7 @@ impl<S: Session> Harness<S> {
             }
             // Where the agent is goes ahead of the first message as fed,
             // and the plan as it stands after one that comes while steps
-            // are left; the transcript keeps the message alone, since a
+            // are left; the conversation keeps the message alone, since a
             // compaction says where the agent is, and the plan, afresh.
             let fed = match (&input, ahead.take(), after.take()) {
                 (Turn::User(message), ahead, after) if ahead.is_some() || after.is_some() => {
@@ -1266,7 +1266,7 @@ impl<S: Session> Harness<S> {
     /// times this turn. Counts it if so.
     fn go_on(&mut self) -> bool {
         let done = matches!(
-            self.transcript.last(),
+            self.conversation.last(),
             Some(Entry { turn: Turn::Reply { text, .. }, .. }) if said_done(text)
         );
         if !self.auto || done || !self.called || self.went_on >= AUTO_ROUNDS {
@@ -1325,7 +1325,7 @@ impl<S: Session> Harness<S> {
             .answer_tokens(STEPS_PROMPT, self.account_limit())
     }
 
-    /// Adds a turn to the transcript, a user turn as the harness's own
+    /// Adds a turn to the conversation, a user turn as the harness's own
     /// `prompt` or the user's message; the user's are kept among what they
     /// said too.
     fn record(&mut self, turn: Turn, prompt: bool) -> Result<(), Box<dyn Error>> {
@@ -1338,7 +1338,7 @@ impl<S: Session> Harness<S> {
         if matches!(entry.turn, Turn::User(_)) && !prompt {
             self.said.push(entry.clone());
         }
-        self.transcript.push(entry);
+        self.conversation.push(entry);
         Ok(())
     }
 }
@@ -1591,7 +1591,7 @@ mod tests {
         assert!(recall < decide, "{thought}");
         assert_eq!(thought.matches(RECALL_CLOSING).count(), 1, "{thought}");
         assert!(thought.len() < 1000, "{}", thought.len());
-        let turns: Vec<&Turn> = limited.transcript().collect();
+        let turns: Vec<&Turn> = limited.conversation().collect();
         assert!(
             matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim().ends_with("Ok.")),
             "{:?}",
@@ -1791,10 +1791,10 @@ mod tests {
             .unwrap();
     }
 
-    /// The transcript's turns as a letter each: a user's, a reply, results.
+    /// The conversation's turns as a letter each: a user's, a reply, results.
     fn shape(harness: &Harness<Local<Scripted>>) -> String {
         harness
-            .transcript()
+            .conversation()
             .map(|turn| match turn {
                 Turn::User(_) => 'u',
                 Turn::Reply { .. } => 'r',
@@ -1815,9 +1815,9 @@ mod tests {
         send(&mut harness, "what happened?");
 
         // The reply's two calls are answered before the next message, and
-        // the model was fed what the transcript has.
+        // the model was fed what the conversation has.
         assert_eq!(shape(&harness), "urtur");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1849,7 +1849,7 @@ mod tests {
         let mut harness = harness(&scripts, 4000, " go on.");
         send(&mut harness, "go");
         assert_eq!(shape(&harness), "urtr");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1873,7 +1873,7 @@ mod tests {
 
         // The call that ran keeps its output, and the other was not run.
         assert_eq!(shape(&harness), "urtur");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::Results(outputs) = turns[2] else {
             panic!("{:?}", turns[2])
         };
@@ -1905,7 +1905,7 @@ mod tests {
         harness.set_nudge_after(3);
         send(&mut harness, "go");
         let results: Vec<&String> = harness
-            .transcript()
+            .conversation()
             .filter_map(|turn| match turn {
                 Turn::Results(outputs) => outputs.last(),
                 _ => None,
@@ -1989,7 +1989,7 @@ mod tests {
         assert_eq!(last.steps()[1].changed, Vec::<String>::new());
         // The model is told the step under way as each is finished.
         let results: Vec<&String> = harness
-            .transcript()
+            .conversation()
             .filter_map(|turn| match turn {
                 Turn::Results(outputs) => outputs.last(),
                 _ => None,
@@ -2017,7 +2017,7 @@ mod tests {
         assert!(plans.last().unwrap().finished());
         let asked = |harness: &Harness<Local<Scripted>>| {
             harness
-                .transcript()
+                .conversation()
                 .filter(|turn| matches!(turn, Turn::User(text) if text == STEPS_LEFT))
                 .count()
         };
@@ -2075,7 +2075,7 @@ mod tests {
             harness.set_model(model);
             send(&mut harness, "go");
             let results = harness
-                .transcript()
+                .conversation()
                 .filter_map(|turn| match turn {
                     Turn::Results(outputs) => outputs.last().cloned(),
                     _ => None,
@@ -2106,7 +2106,7 @@ mod tests {
     #[test]
     fn gives_inkling_the_rules_ahead_of_the_first_message() {
         // With Inkling, the harness says how to work with where the agent
-        // is, once, ahead of the first message, and the transcript keeps
+        // is, once, ahead of the first message, and the conversation keeps
         // the messages alone; with Qwen, it says only where the agent is.
         let scripts = [reply(10, false), reply(10, false)];
         let mut told = harness(&scripts, 100_000, "");
@@ -2118,7 +2118,7 @@ mod tests {
         assert!(read.find("# Environment").unwrap() < read.find(RULES).unwrap());
         assert!(read.find(RULES).unwrap() < read.find("first message").unwrap());
         assert!(
-            matches!(told.transcript().next(), Some(Turn::User(text)) if text == "first message")
+            matches!(told.conversation().next(), Some(Turn::User(text)) if text == "first message")
         );
 
         let mut plain = harness(&scripts, 100_000, "");
@@ -2147,7 +2147,7 @@ mod tests {
         assert!(plans.last().unwrap().finished());
         assert!(
             !harness
-                .transcript()
+                .conversation()
                 .any(|turn| matches!(turn, Turn::User(text) if text == STEPS_PROMPT))
         );
     }
@@ -2235,7 +2235,7 @@ mod tests {
             "{}",
             harness.session.tokens()
         );
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::User(head) = turns[0] else {
             panic!("{:?}", turns[0])
         };
@@ -2281,7 +2281,7 @@ mod tests {
         let mut auto = harness(&scripts, 100_000, "");
         auto.set_auto(true);
         send(&mut auto, "go");
-        let turns: Vec<&Turn> = auto.transcript().collect();
+        let turns: Vec<&Turn> = auto.conversation().collect();
         let told = turns
             .iter()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
@@ -2292,7 +2292,7 @@ mod tests {
 
         let mut plain = harness(&scripts, 100_000, "");
         send(&mut plain, "go");
-        assert_eq!(plain.transcript().count(), 4);
+        assert_eq!(plain.conversation().count(), 4);
         // Only in auto mode is the model told, with the message, how to
         // say it is done.
         assert!(fed(&auto).contains(UNATTENDED));
@@ -2307,7 +2307,7 @@ mod tests {
         endless.set_auto(true);
         send(&mut endless, "go");
         let told = endless
-            .transcript()
+            .conversation()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
             .count();
         assert_eq!(told, AUTO_ROUNDS);
@@ -2328,10 +2328,10 @@ mod tests {
         let mut harness = harness(&scripts, 100_000, "");
         harness.set_auto(true);
         send(&mut harness, "say hello");
-        assert_eq!(harness.transcript().count(), 2);
+        assert_eq!(harness.conversation().count(), 2);
         send(&mut harness, "go");
         let told = harness
-            .transcript()
+            .conversation()
             .filter(|turn| matches!(turn, Turn::User(m) if m == GO_ON))
             .count();
         assert_eq!(told, 1);
@@ -2360,7 +2360,7 @@ mod tests {
         harness.set_call_limit(2);
         harness.set_auto(true);
         send(&mut harness, "go");
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let at = turns
             .iter()
             .position(|turn| matches!(turn, Turn::User(m) if m == STEPS_PROMPT))
@@ -2393,7 +2393,7 @@ mod tests {
             ],
             "{events:?}"
         );
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         assert!(
             matches!(&turns[turns.len() - 2], Turn::User(m) if m == STEPS_PROMPT),
             "{:?}",

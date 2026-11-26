@@ -1,7 +1,7 @@
 //! Keeping the conversation within the context window.
 //!
-//! The harness keeps a transcript of the turns since the system prompt,
-//! and when the next message or tool result would take the context past a
+//! The harness keeps the conversation since the system prompt, and when
+//! the next message or tool result would take the context past a
 //! high-water mark, it compacts the conversation: it has the model write a
 //! note to continue from, starts over from the system prompt, and reads
 //! back where the agent is, the note, the user's earlier messages, and the
@@ -91,7 +91,7 @@ pub fn make_room<S: Session>(
     let capacity = harness.session.capacity();
     Ok(
         harness.session.tokens() + needed <= capacity * HIGH_WATER.0 / HIGH_WATER.1
-            || harness.transcript.is_empty()
+            || harness.conversation.is_empty()
             || compact(harness, on_event)?,
     )
 }
@@ -101,7 +101,7 @@ pub fn compact<S: Session>(
     harness: &mut Harness<S>,
     on_event: OnEvent,
 ) -> Result<bool, Box<dyn Error>> {
-    if harness.transcript.is_empty() {
+    if harness.conversation.is_empty() {
         return Ok(false);
     }
     harness.log.compacting();
@@ -124,13 +124,13 @@ pub fn compact<S: Session>(
     }
 
     let capacity = harness.session.capacity();
-    let (start, messages) = select(&harness.said, &harness.transcript, capacity);
+    let (start, messages) = select(&harness.said, &harness.conversation, capacity);
     let head = note_turn(
         &harness.preamble(),
         &note,
         &harness.tools.plan().brief(),
         &messages,
-        start < harness.transcript.len(),
+        start < harness.conversation.len(),
     );
     restart(harness, head, start, before, on_event)?;
     Ok(true)
@@ -147,10 +147,10 @@ pub fn start_over<S: Session>(
     on_event: OnEvent,
 ) -> Result<(), Box<dyn Error>> {
     let before = harness.session.tokens();
-    let start = tail(&harness.transcript, 0);
+    let start = tail(&harness.conversation, 0);
     let messages = messages(
         &harness.said,
-        &harness.transcript[start..],
+        &harness.conversation[start..],
         harness.session.capacity() / MESSAGES,
     );
     let head = step_turn(
@@ -162,7 +162,8 @@ pub fn start_over<S: Session>(
 }
 
 /// Starts the conversation over from the system prompt with `head`, and
-/// the transcript from `start` read back after it; it took `before` tokens.
+/// the conversation from `start` read back after it; it took `before`
+/// tokens.
 fn restart<S: Session>(
     harness: &mut Harness<S>,
     head: String,
@@ -172,7 +173,7 @@ fn restart<S: Session>(
 ) -> Result<(), Box<dyn Error>> {
     let mut kept = vec![(Turn::User(head.clone()), true)];
     kept.extend(
-        harness.transcript[start..]
+        harness.conversation[start..]
             .iter()
             .map(|entry| (entry.turn.clone(), entry.prompt)),
     );
@@ -183,10 +184,10 @@ fn restart<S: Session>(
     harness.session.replay(&turns)?;
     // The turns read back are not said again: the user's among them are in
     // `said` already, and the head is the harness's own.
-    harness.transcript.clear();
+    harness.conversation.clear();
     for (turn, prompt) in kept {
         let tokens = harness.session.measure(&turn)?;
-        harness.transcript.push(Entry {
+        harness.conversation.push(Entry {
             turn,
             tokens,
             prompt,
@@ -195,38 +196,41 @@ fn restart<S: Session>(
     let after = harness.session.tokens();
     harness
         .log
-        .compacted(before, after, &head, harness.transcript.len() - 1);
+        .compacted(before, after, &head, harness.conversation.len() - 1);
     let _ = on_event(Event::Compacted { before, after });
     Ok(())
 }
 
-/// What a compaction keeps of `transcript` in a context of `capacity`
+/// What a compaction keeps of `conversation` in a context of `capacity`
 /// tokens, when the user has said `said`: where the exchanges read back
 /// start, and the user's messages the note turn carries.
-fn select<'a>(said: &'a [Entry], transcript: &[Entry], capacity: usize) -> (usize, Vec<&'a str>) {
-    let start = tail(transcript, capacity / TAIL);
+fn select<'a>(said: &'a [Entry], conversation: &[Entry], capacity: usize) -> (usize, Vec<&'a str>) {
+    let start = tail(conversation, capacity / TAIL);
     (
         start,
-        messages(said, &transcript[start..], capacity / MESSAGES),
+        messages(said, &conversation[start..], capacity / MESSAGES),
     )
 }
 
-/// Where the exchanges to read back after a compaction start in the
-/// transcript: the most recent whole exchanges that fit in `budget`
+/// Where the exchanges to read back after a compaction start in
+/// `conversation`: the most recent whole exchanges that fit in `budget`
 /// tokens, each starting at a reply, and always the last reply, which any
-/// pending tool results answer. The whole transcript's length if there is
-/// no reply yet.
-fn tail(transcript: &[Entry], budget: usize) -> usize {
-    let replies: Vec<usize> = (0..transcript.len())
-        .filter(|&i| matches!(transcript[i].turn, Turn::Reply { .. }))
+/// pending tool results answer. The whole conversation's length if there
+/// is no reply yet.
+fn tail(conversation: &[Entry], budget: usize) -> usize {
+    let replies: Vec<usize> = (0..conversation.len())
+        .filter(|&i| matches!(conversation[i].turn, Turn::Reply { .. }))
         .collect();
     let Some(&last) = replies.last() else {
-        return transcript.len();
+        return conversation.len();
     };
     let mut start = last;
-    let mut total: usize = transcript[start..].iter().map(|entry| entry.tokens).sum();
+    let mut total: usize = conversation[start..].iter().map(|entry| entry.tokens).sum();
     for &i in replies.iter().rev().skip(1) {
-        let more: usize = transcript[i..start].iter().map(|entry| entry.tokens).sum();
+        let more: usize = conversation[i..start]
+            .iter()
+            .map(|entry| entry.tokens)
+            .sum();
         if total + more > budget {
             break;
         }
@@ -394,7 +398,7 @@ mod tests {
         // turn, which carries the note and the user's earlier messages,
         // then the most recent exchanges from a reply, then the rest of
         // the turn.
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         let Turn::User(head) = turns[0] else {
             panic!("{:?}", turns[0])
         };
@@ -451,14 +455,14 @@ mod tests {
             let (events, _) = send(&mut harness, &format!("later {i}"));
             if events.contains(&"compacted") {
                 compactions += 1;
-                let Some(Turn::User(head)) = harness.transcript().next() else {
+                let Some(Turn::User(head)) = harness.conversation().next() else {
                     panic!()
                 };
                 assert!(!head.contains(&format!("<message>\n{NOTE_HEAD}")), "{head}");
                 assert!(!head.contains("<message>\n# Environment"), "{head}");
                 let carried = head.contains("<message>\none more\n</message>");
                 let kept = harness
-                    .transcript()
+                    .conversation()
                     .any(|turn| matches!(turn, Turn::User(message) if message == "one more"));
                 assert!(carried || kept, "{head}");
                 break;
@@ -501,7 +505,7 @@ mod tests {
                 "text"
             ]
         );
-        let turns: Vec<&Turn> = harness.transcript().collect();
+        let turns: Vec<&Turn> = harness.conversation().collect();
         assert!(matches!(turns.last(), Some(Turn::Reply { text, .. }) if text.trim() == "Ok."));
         assert!(matches!(&turns[turns.len() - 2], Turn::User(message) if message == CONTINUE));
         // Without their thoughts, the exchanges all fit in the tail but
@@ -558,7 +562,7 @@ mod tests {
             written,
             "Task: keep going.\n\nFindings: lib.rs. Out of time.\n\nDone:\n\nNext:"
         );
-        let Some(Turn::User(head)) = harness.transcript().next() else {
+        let Some(Turn::User(head)) = harness.conversation().next() else {
             panic!()
         };
         assert!(
@@ -609,7 +613,7 @@ mod tests {
                 sent.push(message);
             }
             assert!(harness.compact(|_| ControlFlow::Continue(())).unwrap());
-            let Some(Turn::User(head)) = harness.transcript().next() else {
+            let Some(Turn::User(head)) = harness.conversation().next() else {
                 panic!()
             };
             for message in &sent {
@@ -617,7 +621,7 @@ mod tests {
                     .matches(&format!("<message>\n{message}\n</message>"))
                     .count();
                 let kept = harness
-                    .transcript()
+                    .conversation()
                     .skip(1)
                     .filter(|turn| matches!(turn, Turn::User(m) if m == message))
                     .count();
@@ -654,7 +658,7 @@ mod tests {
             )
         };
         let results = |n: usize| entry(Turn::Results(vec!["ok".to_string()]), n);
-        let transcript = vec![
+        let conversation = vec![
             user(1),
             reply(50),
             results(20),
@@ -665,23 +669,23 @@ mod tests {
             reply(30),
         ];
         // Whole exchanges from a reply, newest first, within the budget.
-        assert_eq!(tail(&transcript, 30), 7);
-        assert_eq!(tail(&transcript, 89), 7);
-        assert_eq!(tail(&transcript, 90), 5);
+        assert_eq!(tail(&conversation, 30), 7);
+        assert_eq!(tail(&conversation, 89), 7);
+        assert_eq!(tail(&conversation, 90), 5);
         assert_eq!(
-            tail(&transcript, 129),
+            tail(&conversation, 129),
             5,
             "the message between is not an exchange's start"
         );
-        assert_eq!(tail(&transcript, 130), 3);
+        assert_eq!(tail(&conversation, 130), 3);
         assert_eq!(
-            tail(&transcript, 1000),
+            tail(&conversation, 1000),
             1,
             "the first message is carried by the note turn"
         );
         // The last reply is kept whatever the budget, and there is nothing
         // to keep before the first reply.
-        assert_eq!(tail(&transcript, 0), 7);
+        assert_eq!(tail(&conversation, 0), 7);
         assert_eq!(tail(&[user(1)], 100), 1);
         assert_eq!(tail(&[], 100), 0);
 
