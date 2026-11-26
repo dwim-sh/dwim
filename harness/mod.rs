@@ -2498,6 +2498,10 @@ mod tests {
         assert!(briefing.starts_with("# Environment"), "{briefing}");
         assert!(briefing.contains("Task: go on."), "{briefing}");
         assert!(briefing.contains("message 0"), "{briefing}");
+        assert!(
+            briefing.contains(&format!("transcript, word for word: {}", path.display())),
+            "{briefing}"
+        );
         assert!(records[cut + 3]["turns"].as_u64().unwrap() > 0);
         assert_eq!(records[cut + 4]["text"], compaction::CONTINUE);
         let times: Vec<f64> = records
