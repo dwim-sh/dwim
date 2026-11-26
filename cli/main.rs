@@ -22,18 +22,20 @@ fn main() {
 }
 
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
-    let settings = opts.settings();
     match opts.command() {
         Command::Version => {
             println!("dwim {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Download => download::run(&settings),
-        Command::Bench => bench::run(&settings),
-        Command::Serve => serve::run(&settings),
-        Command::Shell => shell::run(settings, opts.thinking, opts.transcript.as_deref()),
-        Command::Once(prompt) => {
-            once::run(&settings, &prompt, opts.stats, opts.transcript.as_deref())
-        }
+        Command::Download => download::run(&opts.settings()?),
+        Command::Bench => bench::run(&opts.settings()?),
+        Command::Serve => serve::run(&opts.settings()?),
+        Command::Shell => shell::run(opts.settings()?, opts.thinking, opts.transcript.as_deref()),
+        Command::Once(prompt) => once::run(
+            &opts.settings()?,
+            &prompt,
+            opts.stats,
+            opts.transcript.as_deref(),
+        ),
     }
 }
