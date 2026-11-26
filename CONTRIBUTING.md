@@ -87,8 +87,18 @@ picks up here too.
 `make check` runs them all, then checks the Lean specs in `specs/`, their
 examples and their proofs, and runs `difftest compaction`, which checks
 compaction's code against its spec on generated conversations: where
-the tail starts, which of the user's messages the briefing carries, and
-the budgets. It needs `lake` from a Lean toolchain.
+the tail starts, which of the user's messages the briefing carries,
+where the briefing says the transcript is, and the budgets. It needs
+`lake` from a Lean toolchain. `make check` runs the same 10,000 cases
+every time; to look for new ones, run it from a random seed, with as
+many cases as you like:
+
+```
+cargo run --release --bin difftest compaction --random --cases 1000000
+```
+
+A case that disagrees is shrunk to the smallest that still does, and
+reported with its seed and the command that runs it again.
 
 `cargo test gpu::` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the

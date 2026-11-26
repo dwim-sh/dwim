@@ -13,7 +13,7 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   examples and their proofs. It needs `lake` from a Lean toolchain.
 - **Code against the specs**: `make difftest-compaction` runs
   `difftest compaction`, which checks compaction's code against its Lean
-  spec on generated cases.
+  spec on generated cases; `--random --cases N` looks for new ones.
 - **All of the above**: `make check`
 - **Spec site**: `make site` renders the Lean specs as a web site and
   prints where it is.
