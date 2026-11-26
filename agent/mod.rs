@@ -3,6 +3,8 @@
 //! around it. What the `dwim` command and a program that has the agent in
 //! it both start from.
 
+mod engine;
+
 use std::{
     error::Error,
     path::{Path, PathBuf},
@@ -21,7 +23,10 @@ use crate::{
     sys::memory,
 };
 
-pub use crate::server::protocol::Status;
+pub use crate::{
+    agent::engine::{Embedded, serve},
+    server::protocol::Status,
+};
 
 /// How an agent runs: where it works, its model, and how the model runs.
 #[derive(Clone)]
@@ -60,6 +65,10 @@ pub enum Engine {
     /// machine share: `program` is started with `--serve` when none is
     /// listening, and is `dwim`, or a program that serves as it does.
     Server { program: PathBuf },
+    /// In this program, on a thread of it, once a session is opened: the
+    /// sessions opened with clones of the engine share the model, which
+    /// is dropped when the last of them and of the clones is.
+    Embedded(Embedded),
 }
 
 impl Settings {
@@ -361,8 +370,10 @@ pub fn open(
         session.start(&system, |_, _| {})?;
         return Ok((session, system));
     }
-    let Engine::Server { program } = &settings.engine;
-    let connection = server::connect(&settings.server(program), &mut on_status)?;
+    let connection = match &settings.engine {
+        Engine::Server { program } => server::connect(&settings.server(program), &mut on_status)?,
+        Engine::Embedded(embedded) => embedded.connect(settings)?,
+    };
     on_status(Status::Opening);
     // A session that connects once the model is loaded, or part way
     // through, is told of the device and the size afterwards instead.

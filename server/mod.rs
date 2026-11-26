@@ -255,7 +255,7 @@ impl Server {
     /// Has the server read every system prompt, keeping no state of one
     /// from one conversation to the next.
     #[cfg(test)]
-    fn keep_no_states(&mut self) {
+    pub fn keep_no_states(&mut self) {
         self.states = false;
     }
 
@@ -428,6 +428,11 @@ impl Connector {
         let (ours, theirs) = Stream::pair()?;
         self.attach(theirs)?;
         Ok(ours)
+    }
+
+    /// How many connections the server has.
+    pub fn connections(&self) -> usize {
+        self.inner.peers().len()
     }
 
     /// Has the server take `stream` as a connection, and read it on a
