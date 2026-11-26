@@ -115,6 +115,11 @@ pub fn provider_notice(provider: Kind, model: Model) -> String {
             "{} runs on this machine, in the dwim server · /server shows it",
             model.alias().unwrap_or(model.name())
         ),
+        Some(host) if host.kind == Kind::Endpoint => format!(
+            "{} runs at {}",
+            model.alias().unwrap_or(model.name()),
+            host.name
+        ),
         Some(host) => format!(
             "{} runs at {}, as {}",
             model.alias().unwrap_or(model.name()),

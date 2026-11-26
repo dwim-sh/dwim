@@ -7,11 +7,13 @@
 //! one.
 //!
 //! There are two kinds: the dwim server on this machine, and a host of the
-//! model, which is OpenRouter, Vercel's AI Gateway or Cerebras.
+//! model, which is OpenRouter, Vercel's AI Gateway, Cerebras, or a server
+//! of the user's own that answers the chat completions API.
 
 pub mod cerebras;
 mod conversation;
 pub mod dwim;
+pub mod endpoint;
 pub mod hosted;
 pub mod openrouter;
 pub mod vercel;
@@ -88,6 +90,8 @@ pub enum Kind {
     /// Vercel's AI Gateway.
     Vercel,
     Cerebras,
+    /// The user's own server.
+    Endpoint,
 }
 
 impl Kind {
@@ -98,6 +102,7 @@ impl Kind {
             Kind::OpenRouter => Some(&openrouter::HOST),
             Kind::Vercel => Some(&vercel::HOST),
             Kind::Cerebras => Some(&cerebras::HOST),
+            Kind::Endpoint => Some(&endpoint::HOST),
         }
     }
 }
@@ -109,6 +114,7 @@ impl fmt::Display for Kind {
             Kind::OpenRouter => "openrouter",
             Kind::Vercel => "vercel",
             Kind::Cerebras => "cerebras",
+            Kind::Endpoint => "endpoint",
         })
     }
 }
@@ -122,8 +128,9 @@ impl FromStr for Kind {
             "openrouter" => Ok(Kind::OpenRouter),
             "vercel" => Ok(Kind::Vercel),
             "cerebras" => Ok(Kind::Cerebras),
+            "endpoint" => Ok(Kind::Endpoint),
             _ => Err(format!(
-                "unknown provider '{value}' (expected local, openrouter, vercel or cerebras)"
+                "unknown provider '{value}' (expected local, openrouter, vercel, cerebras or endpoint)"
             )),
         }
     }

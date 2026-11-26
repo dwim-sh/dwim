@@ -16,7 +16,7 @@ use dwim::{
     providers::{
         Any, Conversation, Kind, cerebras,
         dwim::{self as server},
-        openrouter, vercel,
+        endpoint, openrouter, vercel,
     },
     sys::memory,
 };
@@ -47,6 +47,8 @@ pub struct Settings {
     pub speculate: usize,
     /// The program the model's shell commands run through, or `sh`.
     pub shell: Option<PathBuf>,
+    /// What the user's own server said it serves when last asked.
+    pub served: Option<endpoint::Served>,
 }
 
 impl Settings {
@@ -74,7 +76,8 @@ pub struct Ready {
 }
 
 /// Where `model` runs: at `provider` if the command line named one, and
-/// otherwise on this machine if it can, or at a host there is a key to:
+/// otherwise at the user's own server if `/login` kept its address, or
+/// else on this machine if it can, or at a host there is a key to:
 /// OpenRouter, or else Vercel's AI Gateway, or else Cerebras, leaving out
 /// the providers the configuration disables. Inkling 2 Mini runs on this
 /// machine, at OpenRouter or at Vercel's AI Gateway, and the large models,
@@ -113,11 +116,18 @@ pub fn provider(provider: Option<Kind>, model: Model) -> Result<Option<Kind>, Bo
 }
 
 /// The providers, in the order a model is run at the first that can run
-/// it, and in which the pickers show them.
-const KINDS: [Kind; 4] = [Kind::Local, Kind::OpenRouter, Kind::Vercel, Kind::Cerebras];
+/// it.
+const KINDS: [Kind; 5] = [
+    Kind::Endpoint,
+    Kind::Local,
+    Kind::OpenRouter,
+    Kind::Vercel,
+    Kind::Cerebras,
+];
 
 /// Whether `model` can run at `kind` as things are: on this machine with
-/// the memory for it, at a host that runs it with a key to the host.
+/// the memory for it, at a host that runs it with a key to the host, at
+/// the user's own server once its address is kept.
 pub fn ready(kind: Kind, model: Model) -> bool {
     runs(kind, model)
         && match kind {
@@ -125,17 +135,17 @@ pub fn ready(kind: Kind, model: Model) -> bool {
             Kind::OpenRouter => openrouter::key().is_some(),
             Kind::Vercel => vercel::key().is_some(),
             Kind::Cerebras => cerebras::key().is_some(),
+            Kind::Endpoint => server_address().is_some(),
         }
 }
 
 /// Whether `kind` is a provider of `model`: on this machine the ones with
-/// weights, at Cerebras the Qwen model, and at OpenRouter and Vercel's AI
-/// Gateway all of them.
+/// weights, at Cerebras the Qwen model, and anywhere else all of them.
 pub fn runs(kind: Kind, model: Model) -> bool {
     match kind {
         Kind::Local => model.weights().is_some(),
         Kind::Cerebras => model == Model::Qwen27b,
-        Kind::OpenRouter | Kind::Vercel => true,
+        Kind::OpenRouter | Kind::Vercel | Kind::Endpoint => true,
     }
 }
 
@@ -298,6 +308,73 @@ pub fn switch(
     Ok(harness.session().provider().kind())
 }
 
+/// Asks the user's own server, if the session runs there, what it serves,
+/// keeps the answer in `settings` and runs that model. Returns what to tell
+/// the user.
+pub fn follow_server(
+    settings: &mut Settings,
+    model_given: bool,
+    effort_given: bool,
+) -> Option<String> {
+    if provider(settings.provider, settings.model).ok()?? != Kind::Endpoint {
+        return None;
+    }
+    let served = endpoint::served(&server_address()?);
+    let note = follow(settings, &served, model_given, effort_given);
+    settings.served = Some(served);
+    Some(note)
+}
+
+pub fn server_address() -> Option<endpoint::Address> {
+    Config::load().ok()?.endpoint()
+}
+
+/// Has `settings` run the model `served` names, unless `model_given`, at
+/// its default effort unless `effort_given`.
+fn follow(
+    settings: &mut Settings,
+    served: &endpoint::Served,
+    model_given: bool,
+    effort_given: bool,
+) -> String {
+    if !served.answered {
+        return format!(
+            "warning: {} does not answer to say what it serves: running {}",
+            served.base, settings.model
+        );
+    }
+    let Some(name) = &served.name else {
+        return format!(
+            "{} names no one model it serves: running {}, or the model \"model\" names \
+             under \"endpoint\" in {}",
+            served.base,
+            settings.model,
+            crate::config::path().map_or("config.json".into(), |path| path.display().to_string())
+        );
+    };
+    let room = served.context.map_or(String::new(), |tokens| {
+        format!(", with room for {tokens} tokens")
+    });
+    match served.model {
+        Some(model) if model != settings.model && model_given => format!(
+            "warning: {} serves {name}, which is {model}, but runs it as {} as --model says",
+            served.base, settings.model
+        ),
+        Some(model) => {
+            settings.model = model;
+            if !effort_given {
+                settings.effort = model.default_effort();
+            }
+            format!("{} serves {name}: running it as {model}{room}", served.base)
+        }
+        None => format!(
+            "{} serves {name}, which is none of dwim's models: running it as {}{room}; \
+             --model names the one it is",
+            served.base, settings.model
+        ),
+    }
+}
+
 /// What a session's model runs on, as the transcript names it.
 fn device(session: &mut Session) -> String {
     match session.provider() {
@@ -343,6 +420,10 @@ pub fn open(
         Kind::OpenRouter => Some(openrouter::open(model, effort, context, temperature)?),
         Kind::Vercel => Some(vercel::open(model, effort, context, temperature)?),
         Kind::Cerebras => Some(cerebras::open(model, effort, context, temperature)?),
+        Kind::Endpoint => {
+            let served = settings.served.as_ref().ok_or_else(endpoint::nowhere)?;
+            Some(endpoint::open(served, model, effort, context, temperature))
+        }
     };
     if let Some(hosted) = hosted {
         let mut session = Conversation::new(Any::Hosted(hosted));
@@ -451,4 +532,46 @@ pub fn accounting(stats: &harness::Stats, loading: Duration, total: Duration) ->
         .into_iter()
         .map(|line| line.trim_end().to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_at_the_users_server_asks_for_the_model_it_runs_as_the_server_named_it() {
+        let served = endpoint::Served {
+            base: "http://localhost:8000/v1".to_string(),
+            answered: true,
+            name: Some("Qwen/Qwen3.8-27B".to_string()),
+            model: Some(Model::Qwen27b),
+            context: Some(32_768),
+        };
+        let mut settings = Settings {
+            model: Model::InklingMini,
+            provider: Some(Kind::Endpoint),
+            device: Device::Cpu,
+            context: None,
+            sessions: None,
+            thinking_budget: None,
+            effort: Model::InklingMini.default_effort(),
+            temperature: None,
+            speculate: 0,
+            shell: None,
+            served: None,
+        };
+        follow(&mut settings, &served, false, false);
+        let hosted = endpoint::open(
+            &served,
+            settings.model,
+            settings.effort,
+            settings.context,
+            settings.temperature,
+        );
+
+        assert_eq!(settings.model, Model::Qwen27b);
+        assert_eq!(settings.effort, Model::Qwen27b.default_effort());
+        assert_eq!(hosted.model(), "Qwen/Qwen3.8-27B");
+        assert_eq!(dwim::providers::Provider::capacity(&hosted), 32_768);
+    }
 }

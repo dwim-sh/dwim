@@ -29,7 +29,7 @@ use dwim::{
     harness::{self, Event, Transcript},
     model::{Device, Model, Size},
     providers::{
-        Kind,
+        Kind, endpoint,
         hosted::{self, Host},
         openrouter::{self, login::Login},
     },
@@ -38,7 +38,7 @@ use dwim::{
 };
 
 use crate::{
-    config::Config,
+    config::{self, Config},
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
 };
@@ -68,12 +68,14 @@ pub fn run(
     let context = settings.context.unwrap_or(hosted::CONTEXT);
     let device = settings.device;
     let thinking_budget = settings.thinking_budget;
+    let served = settings.served.as_ref().and_then(|served| served.model);
     let worker = Worker::spawn(settings, log);
 
     let mut app = App {
         screen: Screen::new()?,
         model,
         provider,
+        served,
         context,
         device,
         device_name: None,
@@ -142,13 +144,15 @@ pub fn run(
     result
 }
 
-/// A key to a host that makes its keys in a console of its own, being
-/// typed or pasted in.
+/// A key to a host, or the address of the user's own server, being typed
+/// or pasted in.
 struct KeyEntry {
     host: &'static Host,
+    /// The key, or the address, so far.
     key: String,
     /// What was wrong with the last thing pasted, if it was not taken.
     refused: Option<String>,
+    address: bool,
 }
 
 impl KeyEntry {
@@ -160,7 +164,8 @@ impl KeyEntry {
         let text = text.trim();
         if text.contains(char::is_whitespace) {
             self.refused = Some(format!(
-                "That was not a key: the {} characters pasted have spaces in them",
+                "That was not {}: the {} characters pasted have spaces in them",
+                if self.address { "an address" } else { "a key" },
                 text.chars().count()
             ));
         } else {
@@ -175,10 +180,27 @@ impl KeyEntry {
     /// the last thing pasted if it was not taken.
     fn rows(&self) -> (Vec<Line>, usize) {
         const SHOWN: usize = 4;
+        if self.address {
+            let mut rows = vec![
+                vec![span("  Your server").bold()],
+                Line::new(),
+                vec![
+                    span("  Where it answers the chat completions API, as http://localhost:8080")
+                        .dark_grey(),
+                ],
+                Line::new(),
+                vec![span(format!("  › {}", self.key))],
+            ];
+            if let Some(refused) = &self.refused {
+                rows.push(Line::new());
+                rows.push(vec![span(format!("  {refused}")).dark_yellow()]);
+            }
+            return (rows, 4);
+        }
         let where_made = match self.host.kind {
             Kind::Vercel => "the Vercel dashboard, under AI Gateway",
             Kind::Cerebras => "the Cerebras cloud console",
-            Kind::OpenRouter | Kind::Local => "its settings",
+            Kind::OpenRouter | Kind::Local | Kind::Endpoint => "its settings",
         };
         // A key long enough to hide most of shows how it starts as well,
         // which is where a host's keys are alike.
@@ -191,10 +213,16 @@ impl KeyEntry {
         if length > 0 {
             key.push(span(format!("  {length} characters")).dark_grey());
         }
+        let hint = match self.host.kind {
+            Kind::Endpoint => {
+                "  Paste the key the server takes, or enter to go on without one".to_string()
+            }
+            _ => format!("  Paste a key made in {where_made}"),
+        };
         let mut rows = vec![
             vec![span(format!("  Key to {}", self.host.name)).bold()],
             Line::new(),
-            vec![span(format!("  Paste a key made in {where_made}")).dark_grey()],
+            vec![span(hint).dark_grey()],
             Line::new(),
             key,
         ];
@@ -312,6 +340,7 @@ struct App {
     /// of conversation a session at a provider has room for.
     model: Model,
     provider: Option<Kind>,
+    served: Option<Model>,
     context: usize,
     /// The kind of device the model runs on, and its name once it is open.
     device: Device,
@@ -680,19 +709,34 @@ impl App {
             KeyCode::Char('d') => {
                 let (host, kept) = (logins.account().host, logins.account().kept);
                 self.logins = None;
-                self.sign_out(host, kept);
+                if host.kind == Kind::Endpoint {
+                    self.forget_server(kept);
+                } else {
+                    self.sign_out(host, kept);
+                }
             }
             KeyCode::Enter => {
                 let host = logins.account().host;
                 self.logins = None;
-                if host.kind == Kind::OpenRouter {
-                    self.sign_in();
-                } else {
-                    self.key_entry = Some(KeyEntry {
-                        host,
-                        key: String::new(),
-                        refused: None,
-                    });
+                match host.kind {
+                    Kind::OpenRouter => self.sign_in(),
+                    Kind::Endpoint => {
+                        let kept = self.config().and_then(|config| config.endpoint());
+                        self.key_entry = Some(KeyEntry {
+                            host,
+                            key: kept.map(|address| address.url).unwrap_or_default(),
+                            refused: None,
+                            address: true,
+                        });
+                    }
+                    _ => {
+                        self.key_entry = Some(KeyEntry {
+                            host,
+                            key: String::new(),
+                            refused: None,
+                            address: false,
+                        })
+                    }
                 }
             }
             _ => {}
@@ -727,6 +771,23 @@ impl App {
         }
     }
 
+    fn forget_server(&mut self, kept: bool) {
+        if !kept {
+            self.say(&view::notice("No server is kept"));
+            return;
+        }
+        let forgotten = Config::load()
+            .and_then(|mut config| {
+                config.set_endpoint(None);
+                config.save()
+            })
+            .and_then(|()| hosted::key::forget(&endpoint::HOST));
+        match forgotten {
+            Ok(_) => self.say(&view::notice("Forgot your server, and the key to it")),
+            Err(e) => self.say(&view::notice(format!("Cannot forget your server: {e}"))),
+        }
+    }
+
     /// Handles a key press while a key is being entered: enter keeps it,
     /// esc calls it off.
     fn enter_key(&mut self, key: KeyEvent) {
@@ -742,6 +803,31 @@ impl App {
             KeyCode::Backspace => {
                 entry.key.pop();
             }
+            KeyCode::Enter if entry.address && !entry.key.is_empty() => {
+                let (host, url) = (entry.host, std::mem::take(&mut entry.key));
+                self.key_entry = None;
+                if self.keep_server(url) {
+                    self.key_entry = Some(KeyEntry {
+                        host,
+                        key: String::new(),
+                        refused: None,
+                        address: false,
+                    });
+                }
+            }
+            // The user's server may take no key.
+            KeyCode::Enter if entry.host.kind == Kind::Endpoint && !entry.address => {
+                let key = std::mem::take(&mut entry.key);
+                self.key_entry = None;
+                if key.is_empty() {
+                    self.server_given(None);
+                } else {
+                    match hosted::key::keep(&endpoint::HOST, &key) {
+                        Ok(path) => self.server_given(Some(&path)),
+                        Err(e) => self.say(&view::notice(format!("Cannot keep the key: {e}"))),
+                    }
+                }
+            }
             KeyCode::Enter if !entry.key.is_empty() => {
                 let (host, key) = (entry.host, std::mem::take(&mut entry.key));
                 self.key_entry = None;
@@ -752,6 +838,45 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Keeps `url` as the server's address, returning whether it was kept.
+    fn keep_server(&mut self, url: String) -> bool {
+        let Some(mut config) = self.config() else {
+            return false;
+        };
+        let model = config
+            .endpoint()
+            .filter(|address| address.url == url)
+            .and_then(|address| address.model);
+        config.set_endpoint(Some(endpoint::Address { url, model }));
+        match config.save() {
+            Ok(()) => true,
+            Err(e) => {
+                self.say(&view::notice(format!("Cannot keep the address: {e}")));
+                false
+            }
+        }
+    }
+
+    fn server_given(&mut self, key: Option<&Path>) {
+        let host = &endpoint::HOST;
+        let url = self
+            .config()
+            .and_then(|config| config.endpoint())
+            .map(|address| address.url)
+            .unwrap_or_default();
+        let kept = config::path().map_or(String::new(), |path| {
+            format!(" · kept in {}", view::tilde(&path))
+        });
+        self.say(&view::notice(format!("Your server is at {url}{kept}")));
+        if let Some(path) = key {
+            self.say(&view::notice(format!(
+                "Key to it kept in {}",
+                view::tilde(path)
+            )));
+        }
+        self.go_on_at(host);
     }
 
     /// Goes on from signing in to `host`, with the key kept at `path`:
@@ -770,6 +895,13 @@ impl App {
                 host.key
             )));
         }
+        self.go_on_at(host);
+    }
+
+    /// Opens the session at `host` if it has no model yet or is already
+    /// there; a session elsewhere stays, for `/model` to move.
+    fn go_on_at(&mut self, host: &'static Host) {
+        let name = host.name;
         if self.provider.is_some_and(|provider| provider != host.kind) {
             self.say(&view::notice(format!(
                 "/model moves the conversation to {name}"
@@ -939,7 +1071,7 @@ impl App {
                 let Some(config) = self.config() else {
                     return;
                 };
-                let (groups, more) = providers::providers(&config, self.provider);
+                let (groups, more) = providers::providers(&config, self.provider, self.served);
                 if groups.is_empty() {
                     self.say(&view::notice(
                         "No provider a model can run at · /login signs in to one, /provider enables one",
@@ -1064,13 +1196,18 @@ impl App {
                     span(format!("● {}", view::auto_notice(auto))).dark_grey(),
                 ]);
             }
-            Reply::Model { model, provider } => {
+            Reply::Model {
+                model,
+                provider,
+                served,
+            } => {
                 let notice = match self.provider {
                     Some(_) => view::switched(model, provider),
                     None => view::provider_notice(provider, model),
                 };
                 self.model = model;
                 self.provider = Some(provider);
+                self.served = served;
                 // Picked while the model was loading: the pick loads now.
                 if !self.ready {
                     self.status = Status::Switching(Instant::now());
@@ -1484,7 +1621,12 @@ impl App {
                 "  ↑↓ provider · enter to sign in · d to sign out · esc to cancel",
             ))
         } else if let Some(entry) = &self.key_entry {
-            Some((entry.rows(), "  enter to keep the key · esc to cancel"))
+            let keys = if entry.address {
+                "  enter to keep the address · esc to cancel"
+            } else {
+                "  enter to keep the key · esc to cancel"
+            };
+            Some((entry.rows(), keys))
         } else {
             self.signin
                 .as_ref()
@@ -1563,7 +1705,7 @@ impl App {
                     span(format!("● Local model is {doing}")),
                     span(" · /model picks another model or provider").dark_grey(),
                 ]),
-                Some(Kind::OpenRouter | Kind::Vercel | Kind::Cerebras) => None,
+                Some(Kind::OpenRouter | Kind::Vercel | Kind::Cerebras | Kind::Endpoint) => None,
             };
         }
         let (frame, verb, details) = self.doing()?;
@@ -1692,6 +1834,7 @@ mod tests {
             host: &openrouter::HOST,
             key: String::new(),
             refused: None,
+            address: false,
         };
         entry.paste("Model picker: runs at the gateway, not a key\n");
         assert!(entry.key.is_empty());

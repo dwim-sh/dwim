@@ -22,8 +22,18 @@ fn main() {
 }
 
 fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
-    let settings = opts.settings();
-    match opts.command() {
+    let mut settings = opts.settings();
+    let command = opts.command();
+    if matches!(command, Command::Shell | Command::Once(_))
+        && let Some(note) = session::follow_server(
+            &mut settings,
+            opts.model.is_some(),
+            opts.reasoning_effort.is_some(),
+        )
+    {
+        eprintln!("{note}");
+    }
+    match command {
         Command::Version => {
             println!("dwim {}", env!("CARGO_PKG_VERSION"));
             Ok(())

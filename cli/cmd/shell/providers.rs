@@ -5,7 +5,7 @@
 use dwim::{
     model::Model,
     providers::{
-        Kind, cerebras,
+        Kind, cerebras, endpoint,
         hosted::{self, Host},
         openrouter, vercel,
     },
@@ -15,7 +15,7 @@ use dwim::{
 use crate::{
     cmd::shell::picker::{Account, Choice, Group},
     config::Config,
-    session::{ready, runs},
+    session::{self, ready, runs},
 };
 
 /// The providers a model can run at, each with the models it runs, for
@@ -23,8 +23,13 @@ use crate::{
 /// is disabled in `config`, this machine without the memory for a model,
 /// a host without a key to it. They are this machine first, then the
 /// hosts by name. Where the session's model runs, `current`, is among
-/// them whatever is said of it, since the model does run there.
-pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
+/// them whatever is said of it, since the model does run there. The
+/// user's own server lists only what it `served`, if known.
+pub fn providers(
+    config: &Config,
+    current: Option<Kind>,
+    served: Option<Model>,
+) -> (Vec<Group>, bool) {
     let usable = |&kind: &Kind| {
         Some(kind) == current
             || (!config.disabled(kind) && Model::SHOWN.iter().any(|&model| ready(kind, model)))
@@ -35,10 +40,13 @@ pub fn providers(config: &Config, current: Option<Kind>) -> (Vec<Group>, bool) {
         .map(|kind| Group {
             provider: kind,
             name: label(kind),
-            models: Model::SHOWN
-                .into_iter()
-                .filter(|&model| runs(kind, model))
-                .collect(),
+            models: match (kind, served) {
+                (Kind::Endpoint, Some(model)) => vec![model],
+                _ => Model::SHOWN
+                    .into_iter()
+                    .filter(|&model| runs(kind, model))
+                    .collect(),
+            },
         })
         .collect();
     let more = groups.len() < SHOWN.len();
@@ -55,9 +63,12 @@ pub fn provider_choices(config: &Config) -> Vec<Choice> {
         .map(|kind| Choice {
             provider: kind,
             name: label(kind),
-            problem: match kind.host() {
-                None => memory::check().err().map(|e| e.to_string()),
-                Some(host) => hosted::key::find(host)
+            problem: match (kind, kind.host()) {
+                (Kind::Endpoint, _) => session::server_address()
+                    .is_none()
+                    .then(|| "no server · /login takes its address".to_string()),
+                (_, None) => memory::check().err().map(|e| e.to_string()),
+                (_, Some(host)) => hosted::key::find(host)
                     .is_none()
                     .then(|| "no key · /login signs in".to_string()),
             },
@@ -67,8 +78,14 @@ pub fn provider_choices(config: &Config) -> Vec<Choice> {
 }
 
 /// The providers in the order the pickers show them: this machine, then
-/// the hosts by name.
-const SHOWN: [Kind; 4] = [Kind::Local, Kind::Cerebras, Kind::OpenRouter, Kind::Vercel];
+/// the hosts by name, then the user's own server.
+const SHOWN: [Kind; 5] = [
+    Kind::Local,
+    Kind::Cerebras,
+    Kind::OpenRouter,
+    Kind::Vercel,
+    Kind::Endpoint,
+];
 
 /// What `kind` is called in a picker: this machine with a house by it.
 fn label(kind: Kind) -> &'static str {
@@ -77,10 +94,11 @@ fn label(kind: Kind) -> &'static str {
 
 /// The hosts, each with what there is of a key to it, for the sign-in
 /// picker: the environment's, which is used ahead of one kept and is not
-/// the shell's to change, or one kept from signing in, or none.
+/// the shell's to change, or one kept from signing in, or none; then the
+/// user's own server.
 pub fn accounts() -> Vec<Account> {
     let hosts: [&'static Host; 3] = [&cerebras::HOST, &openrouter::HOST, &vercel::HOST];
-    hosts
+    let mut accounts: Vec<Account> = hosts
         .into_iter()
         .map(|host| {
             let kept = hosted::key::kept(host).is_some();
@@ -98,5 +116,35 @@ pub fn accounts() -> Vec<Account> {
             };
             Account { host, note, kept }
         })
-        .collect()
+        .collect();
+    accounts.push(server_account());
+    accounts
+}
+
+fn server_account() -> Account {
+    let host = &endpoint::HOST;
+    let configured = Config::load().ok().and_then(|config| config.endpoint());
+    let kept = configured.is_some() || hosted::key::kept(host).is_some();
+    let note = match configured {
+        Some(address) => format!("{} · enter changes it", address.url),
+        None => "give the server's address".to_string(),
+    };
+    Account { host, note, kept }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::shell::picker::Picker;
+
+    #[test]
+    fn the_users_own_server_offers_the_model_it_serves_alone() {
+        let current = Some(Kind::Endpoint);
+        let (groups, more) = providers(&Config::default(), current, Some(Model::Qwen27b));
+        let endpoint = groups.iter().find(|group| group.provider == Kind::Endpoint);
+        assert_eq!(endpoint.unwrap().models, [Model::Qwen27b]);
+
+        let picker = Picker::new(groups, more, current, Model::Qwen27b);
+        assert_eq!(picker.picked(), Some((Kind::Endpoint, Model::Qwen27b)));
+    }
 }

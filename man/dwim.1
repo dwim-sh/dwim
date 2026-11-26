@@ -102,14 +102,19 @@ at OpenRouter, with the key in
 .BR vercel ,
 at Vercel's AI Gateway, with the key in
 .BR AI_GATEWAY_API_KEY ,
-or
 .BR cerebras ,
 at Cerebras, with the key in
-.BR CEREBRAS_API_KEY ;
+.BR CEREBRAS_API_KEY ,
 where the variable is not set, the key is the one kept from signing in
 with
+.BR /login ,
+or
+.BR endpoint ,
+at your own chat completions server, such as llama.cpp's or vLLM's, at
+the address given to
 .BR /login .
-Without the option, the model runs on this machine where it can, and
+Without the option, the model runs there where the server's address is
+given, else on this machine where it can, and
 where it cannot, at OpenRouter if there is a key to it, or else at
 Vercel's AI Gateway if there is a key to that, passing over a provider
 that is disabled in
@@ -119,7 +124,12 @@ of the hosts
 loads no model, has room for 131072 tokens of conversation unless
 .B \-\-context
 says, and sends the conversation there: what the agent reads of the
-project leaves the machine, and each request is charged for.
+project leaves the machine, and each request is charged for. Your own
+server is asked which model it serves, which runs unless
+.B \-\-model
+names another, and how much room it has, which
+.B \-\-context
+cannot exceed.
 .TP
 .BI \-\-sessions " n"
 Most sessions the server has room for at once (default: 2). The weights
@@ -298,9 +308,9 @@ A session that is on it when it is disabled stays on it, and a session
 with no model yet opens at a provider enabled that is ready.
 .TP
 .B /login
-Open a picker of the providers to sign in to, Cerebras, OpenRouter and
-Vercel's AI Gateway: up and down move over them, enter signs in, d signs
-out, esc cancels.
+Open a picker of the providers to sign in to, Cerebras, OpenRouter,
+Vercel's AI Gateway and your own server: up and down move over them,
+enter signs in, d signs out, esc cancels.
 Signing in to OpenRouter opens the browser at OpenRouter, which asks
 whether to make a key for
 .BR dwim ;
@@ -308,6 +318,10 @@ where the browser does not open, the address to go to is shown.
 Vercel's AI Gateway and Cerebras make their keys in a console of their
 own, and signing in to either is pasting a key made there.
 The key is kept for the sessions to come.
+Your own server is asked for its address, kept in
+.IR config.json ,
+and then for a key to it, which enter without one goes on without;
+signing out of it forgets both.
 A session with no model yet opens at the provider signed in to, and one
 that is there already opens again with the new key; one elsewhere stays
 where it is, for
@@ -424,13 +438,19 @@ The configuration, which lists the providers disabled with
 by the names
 .B \-\-provider
 takes, as in
-.BR "{ \(dqdisabled_providers\(dq: [\(dqlocal\(dq] }" .
+.BR "{ \(dqdisabled_providers\(dq: [\(dqlocal\(dq] }" ,
+and where your own server is, kept by
+.BR /login ,
+as in
+.BR "{ \(dqendpoint\(dq: { \(dqurl\(dq: \(dqhttp://localhost:8080\(dq, \(dqmodel\(dq: \(dqQwen/Qwen3.8-27B\(dq } }" ,
+the model being the name of the one to run at a server that serves
+several.
 A disabled provider is not where the model runs unless
 .B \-\-provider
 names it, and cannot be picked in the shell. On macOS the file is in
 .IR "~/Library/Application Support/dwim/" .
 .TP
-.IR ~/.config/dwim/openrouter.key ", " vercel.key ", " cerebras.key
+.IR ~/.config/dwim/openrouter.key ", " vercel.key ", " cerebras.key ", " endpoint.key
 The key to each provider kept from signing in with
 .BR /login ,
 readable by the user alone, and removed by signing out there. On macOS

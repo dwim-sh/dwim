@@ -113,6 +113,15 @@ impl Model {
         }
     }
 
+    /// Whether the model's chat template opens its thought in the prompt, so
+    /// a reply sent as text starts inside it.
+    pub const fn opens_thought(self) -> bool {
+        match self {
+            Model::InklingMini | Model::InklingSmall => false,
+            Model::Qwen27b | Model::QwenMax => true,
+        }
+    }
+
     /// Whether the model has to be steered as it works to keep to the
     /// rules of its system prompt: told them in the user's message, and
     /// reminded of one where it has just gone another way. Inkling 2

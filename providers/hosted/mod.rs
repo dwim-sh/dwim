@@ -1,7 +1,6 @@
 //! A model at a host, asked over its chat completions API: OpenRouter,
-//! Vercel's AI Gateway, or Cerebras. The first two pass the request on to
-//! a provider of the model, and Cerebras runs it itself. What is asked of
-//! each in its own way is its [`Host`]'s.
+//! Vercel's AI Gateway, Cerebras, or the user's own server. What is asked
+//! of each in its own way is its [`Host`]'s.
 //!
 //! The conversation goes as messages, and the provider writes the prompt
 //! the model reads from them. The harness declares the tools in the
@@ -50,7 +49,7 @@ use crate::{
     tools::{ToolCall, declared},
 };
 
-use stream::{Failure, Outcome, Usage};
+use stream::{Failure, Outcome, Thinking, Usage};
 
 /// Who a model is hosted by: where it is asked, and what is asked there
 /// in the host's own way.
@@ -59,7 +58,7 @@ pub struct Host {
     pub kind: Kind,
     /// The host as it is named to the user.
     pub name: &'static str,
-    /// Where a chat is completed.
+    /// Where a chat is completed, if the host has a fixed address.
     pub url: &'static str,
     /// A model as the host names it.
     pub model: fn(Model) -> &'static str,
@@ -112,10 +111,15 @@ const RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 pub struct Hosted {
     host: &'static Host,
     agent: Agent,
-    /// Where a chat is completed: the host's address.
     url: String,
+    /// Empty for a server that takes no key.
     key: String,
     model: Model,
+    /// The model as its host names it.
+    name: String,
+    /// Whether a thought may come in the text, until the host sends one
+    /// apart from it.
+    tagged: bool,
     /// How much the model reasons before it replies.
     effort: Effort,
     capacity: usize,
@@ -149,6 +153,8 @@ impl Hosted {
             url: host.url.to_string(),
             key,
             model,
+            name: (host.model)(model).to_string(),
+            tagged: false,
             effort,
             capacity: context.unwrap_or(CONTEXT),
             sampling: Sampling {
@@ -165,9 +171,22 @@ impl Hosted {
         self.host
     }
 
+    /// The model asked at `url`, named `name` there.
+    pub fn at(self, url: String, name: String) -> Self {
+        Self { url, name, ..self }
+    }
+
+    /// The model at a server that may send a thought in the text.
+    pub fn tagged(self) -> Self {
+        Self {
+            tagged: true,
+            ..self
+        }
+    }
+
     /// The model as its host names it.
-    pub fn model(&self) -> &'static str {
-        (self.host.model)(self.model)
+    pub fn model(&self) -> &str {
+        &self.name
     }
 
     /// Tokens in `chat`: what the provider counted of it, and an estimate
@@ -228,7 +247,8 @@ impl Hosted {
             // A reply has to come of the thought, so the one after the
             // last ending is let run.
             let most = most.filter(|_| endings < ENDINGS);
-            let (outcome, over) = self.ask_within(&body, most, &mut on_chunk)?;
+            let thinking = self.thinking(endings == 0);
+            let (outcome, over) = self.ask_within(&body, thinking, most, &mut on_chunk)?;
             if endings > 0 && !outcome.thought.trim().is_empty() {
                 thought.push_str("\n\n");
             }
@@ -265,6 +285,15 @@ impl Hosted {
         }
     }
 
+    /// Where the thought of a reply comes, `asked` for one or not.
+    fn thinking(&self, asked: bool) -> Thinking {
+        match (self.tagged, asked && self.model.opens_thought()) {
+            (false, _) => Thinking::Apart,
+            (true, true) => Thinking::Opened,
+            (true, false) => Thinking::Tagged,
+        }
+    }
+
     /// Asks for a reply as [`Hosted::ask`] does, and drops it where its
     /// thought runs to `most` bytes, if they are limited: what there was
     /// of the reply, and whether it was dropped there. A reply whose
@@ -274,6 +303,7 @@ impl Hosted {
     fn ask_within(
         &mut self,
         body: &Value,
+        thinking: Thinking,
         most: Option<usize>,
         on_chunk: &mut impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> Result<(Outcome, bool)> {
@@ -283,7 +313,7 @@ impl Hosted {
             let mut bytes = 0;
             let mut over = false;
             let mut shown = false;
-            let asked = self.ask(body, |chunk| {
+            let asked = self.ask(body, thinking, |chunk| {
                 let thinking = matches!(chunk, Chunk::Thought(_));
                 if let Chunk::Thought(piece) = &chunk {
                     bytes += piece.len();
@@ -319,6 +349,7 @@ impl Hosted {
     fn ask(
         &mut self,
         body: &Value,
+        thinking: Thinking,
         on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
     ) -> std::result::Result<Outcome, Failure> {
         let started = Instant::now();
@@ -329,7 +360,8 @@ impl Hosted {
             again: false,
         })?;
         let waited = started.elapsed().as_secs_f64();
-        let outcome = stream::read(BufReader::new(response), self.host.name, on_chunk)?;
+        let outcome = stream::read(BufReader::new(response), self.host.name, thinking, on_chunk)?;
+        self.tagged &= !outcome.apart;
         if let Some(usage) = outcome.usage {
             let generating = started.elapsed().as_secs_f64() - waited;
             let share = usage.reasoning as f64 / usage.completion.max(1) as f64;
@@ -353,10 +385,11 @@ impl Hosted {
         let name = self.host.name;
         let mut retries = RETRIES.iter();
         loop {
-            let sent = self
-                .agent
-                .post(&self.url)
-                .header("Authorization", &format!("Bearer {}", self.key))
+            let mut request = self.agent.post(&self.url);
+            if !self.key.is_empty() {
+                request = request.header("Authorization", &format!("Bearer {}", self.key));
+            }
+            let sent = request
                 .header("Content-Type", "application/json")
                 .header("X-Title", "dwim")
                 .send(body);
@@ -683,6 +716,10 @@ mod tests {
     /// gets with `replies` in turn, and the thread that hands back what
     /// it was asked.
     fn provider(replies: Vec<String>) -> (Hosted, thread::JoinHandle<Vec<Value>>) {
+        provider_at(Model::QwenMax, replies)
+    }
+
+    fn provider_at(model: Model, replies: Vec<String>) -> (Hosted, thread::JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let serving = thread::spawn(move || {
@@ -716,7 +753,7 @@ mod tests {
         let mut provider = Hosted::new(
             &openrouter::HOST,
             "key".to_string(),
-            Model::QwenMax,
+            model,
             Effort::Xhigh,
             None,
             None,
@@ -794,6 +831,75 @@ mod tests {
             "{error}"
         );
         assert_eq!(serving.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_thought_the_prompt_opened_at_the_users_server_is_held_to_its_limit_and_not_shown() {
+        // As vLLM without a reasoning parser sends Qwen's thought.
+        let thinking: Vec<Value> = (0..50)
+            .map(|_| json!({ "content": "Let me reconsider. " }))
+            .collect();
+        let (provider, serving) = provider_at(
+            Model::Qwen27b,
+            vec![events(&thinking), events(&[json!({ "content": "Done." })])],
+        );
+        let mut provider = provider.tagged();
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        let generation = Generation {
+            reserve: 0,
+            thought_limit: Some(2),
+            closing: Some("I will decide now.".to_string()),
+        };
+        let mut shown = String::new();
+        let completion = provider
+            .reply(&chat, &generation, |chunk| {
+                if let Chunk::Text(piece) = chunk {
+                    shown.push_str(piece);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        serving.join().unwrap();
+
+        assert_eq!(shown, "Done.");
+        assert!(completion.reply.thought_ended);
+        assert!(completion.thought.starts_with("Let me reconsider."));
+    }
+
+    #[test]
+    fn a_server_seen_to_send_the_thought_apart_has_the_text_of_its_replies_shown_as_text() {
+        let (provider, serving) = provider_at(
+            Model::Qwen27b,
+            vec![
+                events(&[
+                    json!({ "reasoning_content": "Hm." }),
+                    json!({ "content": "One." }),
+                ]),
+                events(&[json!({ "content": "Two." })]),
+            ],
+        );
+        let mut provider = provider.tagged();
+        let chat = Chat {
+            system: "Be brief.".to_string(),
+            turns: vec![Turn::User("Fix it.".to_string())],
+        };
+        for answer in ["One.", "Two."] {
+            let mut thought = String::new();
+            let completion = provider
+                .reply(&chat, &Generation::default(), |chunk| {
+                    if let Chunk::Thought(piece) = chunk {
+                        thought.push_str(piece);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .unwrap();
+            assert_eq!(completion.text, answer);
+            assert!(answer == "One." || thought.is_empty(), "{thought:?}");
+        }
+        serving.join().unwrap();
     }
 
     #[test]
