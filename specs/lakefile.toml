@@ -3,3 +3,7 @@ defaultTargets = ["Dwim"]
 
 [[lean_lib]]
 name = "Dwim"
+
+[[lean_exe]]
+name = "compaction-oracle"
+root = "CompactionOracle"

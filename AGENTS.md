@@ -11,12 +11,15 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **Format**: `cargo fmt --check`
 - **Specs**: `make specs` checks the Lean specs: their
   examples and their proofs. It needs `lake` from a Lean toolchain.
+- **Code against the specs**: `make difftest-compaction` runs
+  `difftest compaction`, which checks compaction's code against its Lean
+  spec on generated cases.
+- **All of the above**: `make check`
 - **Spec site**: `make site` renders the Lean specs as a web site and
   prints where it is.
-- **All of the above**: `make check`
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
-  `cargo run --bin difftest`
+  `cargo run --bin difftest model`
 - **Fetch the weights** (17.6 GB, into the Hugging Face cache):
   `dwim --download`
 - Before calling a change done, run `./target/debug/dwim` in a terminal

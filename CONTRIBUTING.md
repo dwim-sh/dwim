@@ -84,12 +84,18 @@ cargo fmt --check
 CI runs these with the toolchain `rust-toolchain.toml` pins, which `rustup`
 picks up here too.
 
+`make check` runs them all, then checks the Lean specs in `specs/`, their
+examples and their proofs, and runs `difftest compaction`, which checks
+compaction's code against its spec on generated conversations: where
+the tail starts, which of the user's messages the briefing carries, and
+the budgets. It needs `lake` from a Lean toolchain.
+
 `cargo test gpu::` skips a backend whose GPU is not available, so it
 passes on a machine with no GPU without having checked anything. With the
 model in the cache, `cargo test real_model -- --ignored --nocapture`
 completes a prompt with it and reports the speed, with and without the
 drafter, and
-`cargo run --bin difftest` checks the GPU against the CPU with it, on a
+`cargo run --bin difftest model` checks the GPU against the CPU with it, on a
 few prompts run in pieces of different sizes and on their continuations
 run a token at a time, and on the same prompts run again with a detour
 marked and rewound halfway through, as a session drops a thought. The CPU's
