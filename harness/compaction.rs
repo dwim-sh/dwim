@@ -157,7 +157,7 @@ pub fn start_over<S: Session>(
 ) -> Result<(), Box<dyn Error>> {
     let before = harness.session.tokens();
     let start = tail(&harness.conversation, 0);
-    let messages = messages(
+    let messages = carried(
         &harness.said,
         &harness.conversation[start..],
         message_budget(harness.session.capacity()),
@@ -217,7 +217,7 @@ fn select<'a>(said: &'a [Entry], conversation: &[Entry], capacity: usize) -> (us
     let start = tail(conversation, tail_budget(capacity));
     (
         start,
-        messages(said, &conversation[start..], message_budget(capacity)),
+        carried(said, &conversation[start..], message_budget(capacity)),
     )
 }
 
@@ -255,9 +255,9 @@ fn tail(conversation: &[Entry], budget: usize) -> usize {
 /// does not; and, when `tail` holds none of the user's, at least the
 /// latest the user sent, whatever it takes. Never the harness's prompts,
 /// such as earlier briefings.
-fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
-    let in_tail = tail.iter().filter_map(own).count();
-    let mut candidates: Vec<(&str, usize)> = said.iter().filter_map(own).collect();
+fn carried<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str> {
+    let in_tail = tail.iter().filter_map(user_message).count();
+    let mut candidates: Vec<(&str, usize)> = said.iter().filter_map(user_message).collect();
     candidates.truncate(candidates.len().saturating_sub(in_tail));
     let mut kept = Vec::new();
     let mut total = 0;
@@ -276,7 +276,7 @@ fn messages<'a>(said: &'a [Entry], tail: &[Entry], budget: usize) -> Vec<&'a str
 }
 
 /// The message and the tokens of `entry`, if the user wrote it.
-fn own(entry: &Entry) -> Option<(&str, usize)> {
+fn user_message(entry: &Entry) -> Option<(&str, usize)> {
     match &entry.turn {
         Turn::User(message) if !entry.prompt => Some((message.as_str(), entry.tokens)),
         _ => None,
@@ -306,7 +306,7 @@ fn briefing(
         )
         .expect("a String takes any write");
     }
-    said(&mut text, messages);
+    add_messages(&mut text, messages);
     if exchanges {
         text.push_str("\n\nThe most recent exchanges follow as they were.");
     }
@@ -317,13 +317,13 @@ fn briefing(
 /// from: where the agent is, the `plan`, and the user's messages.
 fn step_briefing(environment: &str, plan: &str, messages: &[&str]) -> String {
     let mut text = format!("{environment}\n\n{STEP_INTRO}\n\n<plan>\n{plan}\n</plan>");
-    said(&mut text, messages);
+    add_messages(&mut text, messages);
     text.push_str("\n\nYour last calls follow, and their results after them, which name the step now under way. Read again whatever you need for it.");
     text
 }
 
 /// Adds the user's `messages` so far to `text`, if there are any.
-fn said(text: &mut String, messages: &[&str]) {
+fn add_messages(text: &mut String, messages: &[&str]) {
     if !messages.is_empty() {
         text.push_str("\n\nThe user's messages so far, oldest first:");
         for message in messages {
@@ -727,26 +727,26 @@ mod tests {
             user(3),
         ];
         assert_eq!(
-            messages(&turns, &[], 100),
+            carried(&turns, &[], 100),
             ["message 1", "message 2", "message 3"]
         );
         assert_eq!(
-            messages(&turns, &[], 20),
+            carried(&turns, &[], 20),
             ["message 2", "message 3"],
             "the newest that fit"
         );
         assert_eq!(
-            messages(&turns, &[], 5),
+            carried(&turns, &[], 5),
             ["message 3"],
             "the latest, whatever it takes"
         );
         assert_eq!(
-            messages(&turns, &turns[8..], 5),
+            carried(&turns, &turns[8..], 5),
             Vec::<&str>::new(),
             "the latest is in the tail"
         );
         assert_eq!(
-            messages(&turns, &turns[8..], 20),
+            carried(&turns, &turns[8..], 20),
             ["message 1", "message 2"],
             "not those in the tail"
         );
