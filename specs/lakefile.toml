@@ -1,0 +1,5 @@
+name = "specs"
+defaultTargets = ["Dwim"]
+
+[[lean_lib]]
+name = "Dwim"

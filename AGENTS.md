@@ -9,6 +9,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **Test**: `cargo test`
 - **Lint**: `cargo clippy --all-targets -- -D warnings`
 - **Format**: `cargo fmt --check`
+- **Specs**: `cd specs && lake build` checks the Lean specs: their
+  examples and their proofs. It needs `lake` from a Lean toolchain.
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
   `cargo run --bin difftest`
@@ -63,6 +65,10 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   `run.py`: `swebench` (Lite, Verified, Verified Mini); `results/` is
   the report of each run over a whole dataset, and `runs/` what the runs
   leave, which is not kept in git
+- `specs/` - Lean specs of the code, a file for each Rust one they
+  specify: the intents, what the part is for, in plain sentences; the
+  design as Lean definitions, with examples checked when built; and
+  proofs that the design meets the intents
 - `scripts/` - `release`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built
