@@ -17,6 +17,10 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **All of the above**: `make check`
 - **Spec site**: `make site` renders the Lean specs as a web site and
   prints where it is.
+- **Line coverage**: `make coverage-test` and `make coverage-compaction`
+  run the tests or the compaction difftest built with
+  `-Cinstrument-coverage`, and write a report to `.coverage/<subject>/`.
+  It needs `rustup component add llvm-tools-preview`.
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
   `cargo run --bin difftest model`
@@ -79,7 +83,7 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   design as Lean definitions, with examples checked when built; and
   proofs that the design meets the intents; `site/` renders them as a web
   site
-- `scripts/` - `release`
+- `scripts/` - `release`, and `coverage`
 - `man/dwim.1` - the manual page
 - `third_party/` - references to read, not built
 

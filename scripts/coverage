@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+# Line coverage of dwim's tests, run under `make coverage-<SUBJECT>`.
+# Builds with `-Cinstrument-coverage` into `.coverage/<subject>/`, runs the
+# subject, and reports what lines of the code it exercised:
+#
+#   .coverage/<subject>/report.txt
+#   .coverage/<subject>/html/index.html
+#
+# Usage:
+#
+#   scripts/coverage test [ARGS...]        the tests (cargo test)
+#   scripts/coverage compaction [ARGS...]  the compaction difftest against
+#                                          its Lean spec
+#
+# Arguments are passed to the command, e.g.
+# `scripts/coverage compaction --random --cases 100`.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: scripts/coverage <subject> [ARGS...]
+  test        the tests (cargo test)
+  compaction  the compaction difftest against its Lean spec
+EOF
+    exit 2
+}
+
+subject="${1:-}"
+if [ $# -eq 0 ]; then
+    usage
+fi
+shift
+case "$subject" in
+    test|compaction) ;;
+    *) usage ;;
+esac
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+coverage_dir="${repo_root}/.coverage/${subject}"
+profiles_dir="${coverage_dir}/profiles"
+target_dir="${coverage_dir}/target"
+profdata_path="${coverage_dir}/dwim.profdata"
+text_report_path="${coverage_dir}/report.txt"
+html_report_dir="${coverage_dir}/html"
+
+toolchain_bin_dir="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+llvm_profdata="${toolchain_bin_dir}/llvm-profdata"
+llvm_cov="${toolchain_bin_dir}/llvm-cov"
+
+if [ ! -x "${llvm_profdata}" ] || [ ! -x "${llvm_cov}" ]; then
+    echo "llvm coverage tools are missing" >&2
+    echo "install them with: rustup component add llvm-tools-preview" >&2
+    exit 1
+fi
+
+mkdir -p "${profiles_dir}" "${html_report_dir}"
+rm -f "${profiles_dir}"/*.profraw "${profdata_path}" "${text_report_path}"
+
+export CARGO_TARGET_DIR="${target_dir}"
+export RUSTFLAGS="-Cinstrument-coverage"
+# The build scripts are instrumented too, and write a profile when they
+# exit. Theirs go with the rest, not into the repository root; the report
+# leaves them out, since it covers only the executables named.
+export LLVM_PROFILE_FILE="${profiles_dir}/prof-%p-%m.profraw"
+
+subject_code=0
+case "$subject" in
+    test)
+        # The tests are several executables: the library's, and each
+        # binary's. Build them first, for their names.
+        executables=()
+        while IFS= read -r exe; do
+            executables+=("${exe}")
+        done < <(
+            cargo test --no-run --message-format=json "$@" 2>/dev/null |
+                grep -o '"executable":"[^"]*"' | sed 's/^"executable":"//; s/"$//'
+        )
+        cargo test "$@" || subject_code=$?
+        ;;
+    compaction)
+        cargo run --quiet --bin difftest "$subject" "$@" || subject_code=$?
+        executables=("${target_dir}/debug/difftest")
+        ;;
+esac
+
+"${llvm_profdata}" merge -sparse "${profiles_dir}"/*.profraw -o "${profdata_path}"
+
+# llvm-cov reads the first executable given as an argument and ignores any
+# more; each of the rest has to come with `-object`.
+objects=()
+for exe in "${executables[@]}"; do
+    if [ ${#objects[@]} -eq 0 ]; then
+        objects=("${exe}")
+    else
+        objects+=(-object "${exe}")
+    fi
+done
+cov_args=(--instr-profile "${profdata_path}" --ignore-filename-regex='\.cargo|rustc|rustlib|/usr/')
+
+"${llvm_cov}" report "${objects[@]}" "${cov_args[@]}"
+"${llvm_cov}" show "${objects[@]}" "${cov_args[@]}" \
+    --show-line-counts-or-regions > "${text_report_path}"
+rm -rf "${html_report_dir}"
+"${llvm_cov}" show "${objects[@]}" "${cov_args[@]}" \
+    --format html --output-dir "${html_report_dir}"
+
+echo
+echo "text report: ${text_report_path}"
+echo "html report: ${html_report_dir}/index.html"
+
+exit ${subject_code}
