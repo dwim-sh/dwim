@@ -34,13 +34,14 @@ use dwim::{
         openrouter::{self, login::Login},
     },
     sys::browser,
-    tools::plan::Plan,
+    tools::{bash::Progress, plan::Plan},
 };
 
 use crate::{
     config::{self, Config},
     session::{self, Settings},
     tui::{self, Input, Line, Screen, span},
+    units,
 };
 
 use picker::{Logins, Picker, Providers};
@@ -109,6 +110,8 @@ pub fn run(
         auto: false,
         plan: Plan::default(),
         doing: None,
+        running: String::new(),
+        progress: None,
         redirect: None,
         unheeded: false,
         lines: Vec::new(),
@@ -399,6 +402,12 @@ struct App {
     /// way.
     plan: Plan,
     doing: Option<String>,
+    /// What the command a call of `bash` runs has printed so far, while it
+    /// runs.
+    progress: Option<Progress>,
+    /// What the status line says is running: the command, for a call of
+    /// `bash`, or the call.
+    running: String,
     /// What the user wrote while the model worked: the model is stopped
     /// for it, and it is sent once the turn has ended.
     redirect: Option<String>,
@@ -1370,9 +1379,16 @@ impl App {
                     span(format!("({detail})")).dark_grey(),
                 ]);
                 self.doing = Some(format!("{name}({detail})"));
+                self.running = if name == "bash" {
+                    detail
+                } else {
+                    format!("{name}({detail})")
+                };
+                self.progress = None;
                 self.call = name;
                 self.status = Status::Running(Instant::now());
             }
+            Event::Progress(progress) => self.progress = Some(progress),
             Event::Output(output) => {
                 if self.call == "plan" || self.call == "done" {
                     self.finish();
@@ -1590,6 +1606,22 @@ impl App {
             ]);
             live.push(Line::new());
         }
+        // The last line the command running printed, over what the model
+        // is doing, which counts what it has printed; the plan above says
+        // which command it is.
+        if let (Status::Running(_), Some(progress)) = (&self.status, &self.progress)
+            && !progress.line.is_empty()
+        {
+            let line = vec![
+                span("  ⎿ ").dark_grey(),
+                if progress.stderr {
+                    span(&progress.line).dark_yellow()
+                } else {
+                    span(&progress.line).dark_grey()
+                },
+            ];
+            live.push(tui::truncate(&line, columns));
+        }
         if let Some(status) = self.status() {
             live.push(status);
         }
@@ -1755,11 +1787,24 @@ impl App {
         let (verb, since, details) = match self.status {
             Status::Idle => return None,
             Status::Running(since) => {
-                return Some((
-                    frame(since),
-                    format!("Running {}…", self.call),
-                    format!("{} · esc to interrupt", seconds(since)),
-                ));
+                let printed = match &self.progress {
+                    Some(progress) => format!(
+                        " · {} line{} · {}",
+                        progress.lines,
+                        if progress.lines == 1 { "" } else { "s" },
+                        units::bytes(progress.bytes),
+                    ),
+                    None => String::new(),
+                };
+                let details = format!("{}{printed} · esc to interrupt", seconds(since));
+                // As much of what is running as fits beside the details.
+                let (columns, _) = self.screen.size();
+                let room = columns.saturating_sub(tui::width(&vec![span(&details)]) + 13);
+                let mut verb = format!("Running {}", tui::fit(&self.running, room));
+                if !verb.ends_with('…') {
+                    verb.push('…');
+                }
+                return Some((frame(since), verb, details));
             }
             Status::Downloading {
                 since, done, total, ..

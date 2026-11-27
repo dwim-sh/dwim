@@ -106,6 +106,8 @@ impl Printer {
                 self.end_thought();
                 eprintln!("{name}({detail})");
             }
+            // The output follows in full once the command ends.
+            Event::Progress(_) => {}
             Event::Output(output) => eprintln!("{output}"),
             Event::Plan(plan) => {
                 // Not for what is known of a step alone: the calls that

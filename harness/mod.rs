@@ -480,6 +480,9 @@ pub enum Event {
         name: String,
         detail: String,
     },
+    /// What the command a call of `bash` runs has printed so far, while it
+    /// runs: a few times a second while it prints.
+    Progress(bash::Progress),
     /// What the tool returned, as the model sees it.
     Output(String),
     /// The reply was stopped short because the context window was full.
@@ -1136,7 +1139,13 @@ impl<S: Session> Harness<S> {
                             // it is.
                             let before = self.tools.changes(&call).then(|| Snapshot::of(&self.dir));
                             let unplanned = self.tools.plan().is_empty();
-                            let output = self.tools.run(&call);
+                            // What a command prints is shown as it runs.
+                            let output = self.tools.run_with(
+                                &call,
+                                Some(&mut |progress| {
+                                    let _ = on_event(Event::Progress(progress.clone()));
+                                }),
+                            );
                             if let Some(before) = before {
                                 let paths = Snapshot::of(&self.dir).changed(&before);
                                 for path in &paths {
@@ -1525,7 +1534,7 @@ mod tests {
                 let name = match event {
                     Event::Thought(_) => "thought",
                     Event::Text(_) => "text",
-                    Event::Token => return ControlFlow::Continue(()),
+                    Event::Token | Event::Progress(_) => return ControlFlow::Continue(()),
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
                     Event::Cut => "cut",
@@ -1574,7 +1583,7 @@ mod tests {
                     Event::Text(_) => "text",
                     Event::Call { .. } => "call",
                     Event::Output(_) => "output",
-                    Event::Token => return ControlFlow::Continue(()),
+                    Event::Token | Event::Progress(_) => return ControlFlow::Continue(()),
                     _ => "other",
                 };
                 events.push(name);

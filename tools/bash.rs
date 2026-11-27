@@ -47,7 +47,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -57,7 +57,7 @@ use crate::{
     tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string},
 };
 
-const NAME: &str = "bash";
+pub const NAME: &str = "bash";
 
 /// The environment every command runs with, over the user's: no editor,
 /// since there is no one to type into one, so that `git commit --amend`,
@@ -151,6 +151,13 @@ const PREVIEW: usize = 32 << 10;
 /// How much of each end of a stream too long for its preview is shown.
 const HALF: usize = PREVIEW / 2;
 
+/// How often a running command's progress is reported, at most.
+const PROGRESS: Duration = Duration::from_millis(100);
+
+/// The longest line of progress reported, in bytes: its end, which is
+/// where a long line says what it is at.
+const PROGRESS_LINE: usize = 512;
+
 /// Most of one stream that is kept on disk. What a command prints past that
 /// is discarded, and the model is told how much.
 const RETAINED: u64 = 4 << 20;
@@ -180,6 +187,22 @@ pub struct Bash {
 
 /// Tells apart the output directories of the tools of one process.
 static OUTPUT_DIRS: AtomicUsize = AtomicUsize::new(0);
+
+/// What a running command has printed so far, as it runs: the last line
+/// it printed, from either stream, and how many lines and bytes it has
+/// printed in all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Progress {
+    /// The last line printed, without its ending, or what there is of it
+    /// yet; empty while the command has printed nothing.
+    pub line: String,
+    /// Whether that line came from standard error.
+    pub stderr: bool,
+    /// How many lines the command has printed, on both streams.
+    pub lines: u64,
+    /// How many bytes.
+    pub bytes: u64,
+}
 
 impl Default for Bash {
     fn default() -> Self {
@@ -213,6 +236,17 @@ impl Bash {
     /// call names, returning what the model should see; not one that would
     /// discard the model's changes to the project at `dir`.
     fn run(&mut self, dir: &Path, arguments: &Value) -> Result<String, String> {
+        self.run_with(dir, arguments, None)
+    }
+
+    /// The same, telling `on_progress` what the command has printed so
+    /// far, at most every [`PROGRESS`] while it prints.
+    pub fn run_with(
+        &mut self,
+        dir: &Path,
+        arguments: &Value,
+        on_progress: Option<&mut dyn FnMut(&Progress)>,
+    ) -> Result<String, String> {
         let command = required(arguments, NAME, "command")?;
         let timeout = match optional_number(
             arguments,
@@ -258,17 +292,21 @@ impl Bash {
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.shell.display()))?;
         let pid = child.id();
-        let mut stdout = Stream::new("stdout", self);
-        let mut stderr = Stream::new("stderr", self);
         let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let (done, finished) = mpsc::channel::<()>();
         let timed_out = AtomicBool::new(false);
         // Each pipe is read on its own thread, so that neither fills up and
-        // blocks the command while the other is being read; a third kills
-        // the command's process group at the timeout, which closes the
-        // pipes too, unless the command ends first.
-        let waited = thread::scope(|s| {
-            s.spawn(|| stderr.drain(err));
+        // blocks the command while the other is being read, and tells this
+        // one what it has printed so far; a third kills the command's process group
+        // at the timeout, which closes the pipes too, unless the command
+        // ends first.
+        let (read, reads) = mpsc::channel::<Progress>();
+        let (stdout, stderr, waited) = thread::scope(|s| {
+            let stdout = Stream::new("stdout", self);
+            let stderr = Stream::new("stderr", self);
+            let read_err = read.clone();
+            let stdout = s.spawn(move || stdout.drain(out, &read));
+            let stderr = s.spawn(move || stderr.drain(err, &read_err));
             if let Some(timeout) = timeout {
                 let timed_out = &timed_out;
                 s.spawn(move || {
@@ -278,10 +316,10 @@ impl Bash {
                     }
                 });
             }
-            stdout.drain(out);
+            relay(&reads, on_progress);
             let waited = child.wait();
             let _ = done.send(());
-            waited
+            (stdout.join().unwrap(), stderr.join().unwrap(), waited)
         });
         let status = match waited {
             Ok(_) if timed_out.load(Ordering::Relaxed) => format!(
@@ -395,6 +433,98 @@ fn sweep(tmp: &Path) {
     }
 }
 
+/// Passes what the streams of a command tell of as they are read, through
+/// `reads`, to `on_progress`, as both streams together, at most every
+/// [`PROGRESS`], until both are read to their ends.
+fn relay(reads: &mpsc::Receiver<Progress>, mut on_progress: Option<&mut dyn FnMut(&Progress)>) {
+    // Each stream's last word, and when the sink last heard.
+    let mut streams: [Option<Progress>; 2] = [None, None];
+    let mut latest = 0;
+    let mut told = None::<Instant>;
+    let mut news = false;
+    loop {
+        match reads.recv_timeout(PROGRESS) {
+            Ok(progress) => {
+                let at = usize::from(progress.stderr);
+                // A read of nothing but blank lines leaves the line as it
+                // was.
+                if !progress.line.is_empty() {
+                    latest = at;
+                }
+                let line = match (&streams[at], progress.line.is_empty()) {
+                    (Some(before), true) => before.line.clone(),
+                    _ => progress.line.clone(),
+                };
+                streams[at] = Some(Progress { line, ..progress });
+                news = true;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let Some(sink) = on_progress.as_mut() else {
+            continue;
+        };
+        if news && told.is_none_or(|told| told.elapsed() >= PROGRESS) {
+            let line = streams[latest].as_ref().map(|p| p.line.clone());
+            let total = |f: fn(&Progress) -> u64| streams.iter().flatten().map(f).sum();
+            sink(&Progress {
+                line: line.unwrap_or_default(),
+                stderr: latest == 1,
+                lines: total(|p| p.lines),
+                bytes: total(|p| p.bytes),
+            });
+            told = Some(Instant::now());
+            news = false;
+        }
+    }
+}
+
+/// The last line in `tail` with something on it, from the last carriage
+/// return in it on, as a progress bar redraws itself, without colors or
+/// other control characters, and at most [`PROGRESS_LINE`] bytes of its
+/// end.
+fn last_line(tail: &VecDeque<u8>) -> String {
+    let start = tail.len().saturating_sub(PROGRESS_LINE * 4);
+    let bytes: Vec<u8> = tail.range(start..).copied().collect();
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text
+        .split(['\n', '\r'])
+        .map(plain)
+        .rfind(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let line = line.trim();
+    let mut at = line.len().saturating_sub(PROGRESS_LINE);
+    while !line.is_char_boundary(at) {
+        at += 1;
+    }
+    line[at..].to_string()
+}
+
+/// `text` without the escape sequences that color it or move the cursor,
+/// and with tabs made spaces and other control characters dropped.
+fn plain(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // A control sequence ends at its final byte, `@` to `~`.
+            '\x1b' => {
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\t' => plain.push(' '),
+            c if c.is_control() => {}
+            c => plain.push(c),
+        }
+    }
+    plain
+}
+
 /// One stream of a command's output as it is read: its first [`PREVIEW`]
 /// bytes and its last [`HALF`] in memory, all of it in a file once it
 /// outgrows the preview, up to the retention cap, and counts of the rest.
@@ -434,13 +564,23 @@ impl Stream {
         }
     }
 
-    /// Reads `pipe` to its end, or until reading it fails.
-    fn drain(&mut self, mut pipe: impl Read) {
+    /// Reads `pipe` to its end, or until reading it fails, telling `read`
+    /// after each read what the stream has printed so far, and returns the
+    /// stream.
+    fn drain(mut self, mut pipe: impl Read, read: &mpsc::Sender<Progress>) -> Self {
         let mut buf = vec![0; 64 << 10];
         loop {
             match pipe.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => self.push(&buf[..n]),
+                Ok(n) => {
+                    self.push(&buf[..n]);
+                    let _ = read.send(Progress {
+                        line: last_line(&self.tail),
+                        stderr: self.name == "stderr",
+                        lines: self.newlines,
+                        bytes: self.total,
+                    });
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => {
                     self.error = Some(format!("could not read the rest: {e}"));
@@ -448,6 +588,7 @@ impl Stream {
                 }
             }
         }
+        self
     }
 
     /// Takes in the next `bytes` of the stream.
@@ -936,6 +1077,52 @@ mod tests {
             "{output}"
         );
         assert!(output.ends_with("[exit code 0]"));
+    }
+
+    #[test]
+    fn tells_what_a_command_prints_as_it_runs() {
+        // A line on each stream, then a pause long enough to be told of
+        // both before the command ends.
+        let mut bash = Bash::default();
+        let mut told = Vec::new();
+        let output = bash.run_with(
+            &env::temp_dir(),
+            &serde_json::json!({
+                "command": "echo one; sleep 0.3; printf '\\033[32mtwo\\033[0m\\n' >&2; sleep 0.3"
+            }),
+            Some(&mut |progress: &Progress| told.push(progress.clone())),
+        );
+        assert!(output.is_ok());
+        let first = told.iter().find(|p| p.line == "one").expect("told of one");
+        assert_eq!((first.stderr, first.lines, first.bytes), (false, 1, 4));
+        let last = told.last().unwrap();
+        assert_eq!(
+            last,
+            &Progress {
+                line: "two".to_string(),
+                stderr: true,
+                lines: 2,
+                bytes: 4 + 13,
+            }
+        );
+    }
+
+    #[test]
+    fn tells_where_a_progress_bar_is() {
+        let tail: VecDeque<u8> = b"Building [==>  ] 1/3\rBuilding [====>] 2/3\r\n\n"
+            .to_vec()
+            .into();
+        assert_eq!(last_line(&tail), "Building [====>] 2/3");
+    }
+
+    #[test]
+    fn times_out_a_command_that_closes_its_output() {
+        let mut bash = Bash::default();
+        let output = run(
+            &mut bash,
+            &serde_json::json!({ "command": "exec >&- 2>&-; sleep 30", "timeout": 1 }),
+        );
+        assert!(output.contains("[killed after 1 s"), "{output}");
     }
 
     #[test]
