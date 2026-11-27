@@ -218,10 +218,25 @@ impl Tools {
     /// the step of the plan under way the command it ran, if it ran one,
     /// and whether that succeeded.
     pub fn run(&mut self, call: &ToolCall) -> String {
+        self.run_with(call, None)
+    }
+
+    /// The same, telling `on_progress` what the command a call of `bash`
+    /// runs has printed, as it runs; a call of another tool tells it
+    /// nothing.
+    pub fn run_with(
+        &mut self,
+        call: &ToolCall,
+        on_progress: Option<&mut dyn FnMut(&bash::Progress)>,
+    ) -> String {
         let Some(tool) = tool(&call.name) else {
             return shown(Err(format!("unknown tool '{}'", call.name)));
         };
-        let result = (tool.run)(self, &call.arguments);
+        let result = if tool.name == bash::NAME {
+            self.bash.run_with(&self.dir, &call.arguments, on_progress)
+        } else {
+            (tool.run)(self, &call.arguments)
+        };
         if let Ok(text) = &result
             && let Some(command) = bash::command(tool, &call.arguments)
         {
