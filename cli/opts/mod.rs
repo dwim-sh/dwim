@@ -15,15 +15,18 @@ use crate::session::Settings;
 pub struct Opts {
     /// model to run: inkling2-mini (default), which medium also names, on
     /// this machine, at OpenRouter or at Vercel, or inkling2-small, which
-    /// large also names, at OpenRouter or Vercel
-    #[argh(option, default = "Model::default()")]
-    pub model: Model,
+    /// large also names, at OpenRouter or Vercel (default at your own
+    /// server: the one it serves)
+    #[argh(option)]
+    pub model: Option<Model>,
 
     /// where the model runs: local, on this machine, openrouter, with the
     /// key in OPENROUTER_API_KEY, vercel, Vercel's AI Gateway, with the
-    /// key in AI_GATEWAY_API_KEY, or cerebras, with the key in
-    /// CEREBRAS_API_KEY (default: local where the model runs here, and a
-    /// host there is a key to where it does not)
+    /// key in AI_GATEWAY_API_KEY, cerebras, with the key in
+    /// CEREBRAS_API_KEY, or endpoint, your own server, whose address
+    /// /login takes (default: endpoint where its address is kept, else
+    /// local where the model runs here, and a host there is a key to where
+    /// it does not)
     #[argh(option)]
     pub provider: Option<Kind>,
 
@@ -131,8 +134,9 @@ impl Opts {
 
     /// How the model runs, as the options set it.
     pub fn settings(&self) -> Settings {
+        let model = self.model.unwrap_or_default();
         Settings {
-            model: self.model,
+            model,
             provider: self.provider,
             device: self.device,
             context: self.context,
@@ -140,10 +144,11 @@ impl Opts {
             thinking_budget: budget(self.thinking_budget),
             effort: self
                 .reasoning_effort
-                .unwrap_or_else(|| self.model.default_effort()),
+                .unwrap_or_else(|| model.default_effort()),
             temperature: self.temperature,
             speculate: self.speculate,
             shell: self.shell.clone(),
+            served: None,
         }
     }
 

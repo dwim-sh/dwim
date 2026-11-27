@@ -36,6 +36,20 @@ pub struct Outcome {
     pub provider: Option<String>,
     /// What the requests for the reply that were made again failed with.
     pub retried: Vec<String>,
+    /// Whether the server sent the thought apart from the text.
+    pub apart: bool,
+}
+
+/// Where a reply's thought comes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Thinking {
+    /// Only in its own field.
+    Apart,
+    /// In its own field, or in the text between `<think>` and `</think>`.
+    Tagged,
+    /// In its own field, or in the text up to `</think>`: the chat
+    /// template opened it in the prompt.
+    Opened,
 }
 
 /// Why a reply did not come: what went wrong, and whether the request
@@ -79,14 +93,16 @@ pub struct Usage {
     pub cost: f64,
 }
 
-/// Reads a reply from the events in `body`, which `host` sends, streaming
-/// it to `on_chunk`, which ends it early by breaking.
+/// Reads a reply from the events in `body`, streaming it to `on_chunk`, which ends it
+/// early by breaking.
 pub fn read(
     body: impl BufRead,
     host: &str,
+    thinking: Thinking,
     mut on_chunk: impl FnMut(Chunk) -> ControlFlow<()>,
 ) -> Result<Outcome, Failure> {
     let mut outcome = Outcome::default();
+    let mut tags = Tags::new(thinking);
     let mut text = Splitter::default();
     // Calls sent as fields: the name and the arguments of each, as they
     // come in pieces.
@@ -121,14 +137,26 @@ pub fn read(
         }
         let delta = &choice["delta"];
         let mut flow = ControlFlow::Continue(());
-        if let Some(thought) = delta["reasoning"].as_str().filter(|s| !s.is_empty()) {
-            outcome.thought.push_str(thought);
-            flow = on_chunk(Chunk::Thought(thought));
+        let thought = delta["reasoning"]
+            .as_str()
+            .or_else(|| delta["reasoning_content"].as_str())
+            .filter(|thought| !thought.is_empty());
+        if let Some(thought) = thought {
+            outcome.apart = true;
+            let held = tags.apart();
+            flow = think(thought, &mut outcome, &mut on_chunk);
+            if flow.is_continue() && !held.is_empty() {
+                flow = text.push(&held, &mut outcome, &mut on_chunk);
+            }
         }
         if flow.is_continue()
-            && let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty())
+            && let Some(content) = delta["content"].as_str()
         {
-            flow = text.push(content, &mut outcome, &mut on_chunk);
+            let (thought, content) = tags.split(content);
+            flow = think(&thought, &mut outcome, &mut on_chunk);
+            if flow.is_continue() && !content.is_empty() {
+                flow = text.push(&content, &mut outcome, &mut on_chunk);
+            }
         }
         for call in delta["tool_calls"].as_array().into_iter().flatten() {
             let index = call["index"].as_u64().unwrap_or(0) as usize;
@@ -152,6 +180,17 @@ pub fn read(
         }
     }
     if !outcome.interrupted {
+        let (thought, content) = tags.finish();
+        if tags.unclosed() && !outcome.cut {
+            // Never closed: the server parsed out an empty thought, so
+            // this was the text all along.
+            outcome.apart = true;
+            let content = std::mem::take(&mut outcome.thought) + &thought;
+            let _ = text.push(&content, &mut outcome, &mut on_chunk);
+        } else {
+            let _ = think(&thought, &mut outcome, &mut on_chunk);
+            let _ = text.push(&content, &mut outcome, &mut on_chunk);
+        }
         text.finish(&mut outcome, &mut on_chunk);
         for (name, arguments) in fields {
             // Arguments that are not the JSON they should be go on as the
@@ -168,7 +207,38 @@ pub fn read(
     if outcome.interrupted || outcome.cut {
         outcome.calls.clear();
     }
+    // A thought that was not expected in the text: calls inside it are
+    // not made.
+    if thinking != Thinking::Apart
+        && outcome.thought.is_empty()
+        && let Some(at) = outcome.text.find(THOUGHT)
+    {
+        let inside = text.offsets.iter().filter(|&&offset| offset <= at).count();
+        outcome.calls.drain(..inside.min(outcome.calls.len()));
+        let text = outcome.text.split_off(at + THOUGHT.len());
+        outcome.text.truncate(at);
+        outcome.thought = std::mem::replace(&mut outcome.text, text.trim_start().to_string());
+    }
+    // llama.cpp does not count reasoning tokens.
+    if let Some(usage) = &mut outcome.usage
+        && usage.reasoning == 0
+        && !outcome.thought.is_empty()
+    {
+        usage.reasoning = (outcome.thought.len() / super::THOUGHT_BYTES).min(usage.completion);
+    }
     Ok(outcome)
+}
+
+fn think(
+    thought: &str,
+    outcome: &mut Outcome,
+    on_chunk: &mut impl FnMut(Chunk) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    if thought.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    outcome.thought.push_str(thought);
+    on_chunk(Chunk::Thought(thought))
 }
 
 /// What an error says, as `host` writes one: its message, with the
@@ -216,6 +286,104 @@ impl Usage {
     }
 }
 
+const THINK: &str = "<think>";
+const THOUGHT: &str = "</think>";
+
+/// Splits a thought written in the text from the text, as it streams.
+struct Tags {
+    /// Text that may be the start of a tag.
+    held: String,
+    at: Part,
+    /// Whether the reply starts inside a thought the prompt opened.
+    opened: bool,
+}
+
+#[derive(PartialEq)]
+enum Part {
+    Start,
+    Thought,
+    /// After the thought, skipping blank lines.
+    Between,
+    Text,
+}
+
+impl Tags {
+    fn new(thinking: Thinking) -> Self {
+        Self {
+            held: String::new(),
+            at: match thinking {
+                Thinking::Apart => Part::Text,
+                Thinking::Tagged | Thinking::Opened => Part::Start,
+            },
+            opened: thinking == Thinking::Opened,
+        }
+    }
+
+    /// The server sends the thought apart: what was held is text.
+    fn apart(&mut self) -> String {
+        if self.at != Part::Start {
+            return String::new();
+        }
+        self.at = Part::Text;
+        std::mem::take(&mut self.held)
+    }
+
+    fn unclosed(&self) -> bool {
+        self.opened && self.at == Part::Thought
+    }
+
+    /// The next piece of the text, as thought and text.
+    fn split(&mut self, piece: &str) -> (String, String) {
+        match self.at {
+            Part::Text => return (String::new(), piece.to_string()),
+            Part::Between => {
+                let text = piece.trim_start();
+                if !text.is_empty() {
+                    self.at = Part::Text;
+                }
+                return (String::new(), text.to_string());
+            }
+            Part::Start | Part::Thought => self.held.push_str(piece),
+        }
+        if self.at == Part::Start {
+            let start = self.held.trim_start();
+            if let Some(thought) = start.strip_prefix(THINK) {
+                self.held = thought.to_string();
+                self.at = Part::Thought;
+                self.opened = false;
+            } else if THINK.starts_with(start) {
+                return (String::new(), String::new());
+            } else if self.opened {
+                self.at = Part::Thought;
+            } else {
+                self.at = Part::Text;
+                return (String::new(), std::mem::take(&mut self.held));
+            }
+        }
+        if let Some(at) = self.held.find(THOUGHT) {
+            let thought = self.held[..at].to_string();
+            let rest = self.held[at + THOUGHT.len()..].to_string();
+            self.held.clear();
+            self.at = Part::Between;
+            return (thought, self.split(&rest).1);
+        }
+        let keep = (1..THOUGHT.len())
+            .rev()
+            .find(|&n| self.held.ends_with(&THOUGHT[..n]))
+            .unwrap_or(0);
+        let thought = self.held.drain(..self.held.len() - keep).collect();
+        (thought, String::new())
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        let held = std::mem::take(&mut self.held);
+        match self.at {
+            Part::Thought => (held, String::new()),
+            _ => (String::new(), held),
+        }
+    }
+}
+
 /// The tags a call is written between. The model now and then writes the
 /// opening in the plural, with the block otherwise as it should be.
 const OPENINGS: [&str; 2] = ["<tool_call>", "<tool_calls>"];
@@ -229,6 +397,8 @@ struct Splitter {
     /// of a call so far.
     held: String,
     in_call: bool,
+    /// The length of the text shown when each call was written.
+    offsets: Vec<usize>,
 }
 
 impl Splitter {
@@ -246,6 +416,7 @@ impl Splitter {
                     return ControlFlow::Continue(());
                 };
                 outcome.calls.push(self.held[..at].to_string());
+                self.offsets.push(outcome.text.len());
                 self.held.drain(..at + tag.len());
                 self.in_call = false;
             } else if let Some((at, tag)) = find(&self.held, &OPENINGS) {
@@ -279,6 +450,7 @@ impl Splitter {
         let held = std::mem::take(&mut self.held);
         if self.in_call {
             outcome.calls.push(held);
+            self.offsets.push(outcome.text.len());
         } else {
             let _ = show(&held, outcome, on_chunk);
         }
@@ -322,11 +494,14 @@ mod tests {
         Cursor::new(body)
     }
 
-    /// The reply read from `deltas`, and its thought and its text as they
-    /// were streamed.
     fn reply(deltas: &[Value]) -> (Outcome, String, String) {
+        reply_as(Thinking::Tagged, deltas)
+    }
+
+    /// The reply read from `deltas`, and its thought and text as streamed.
+    fn reply_as(thinking: Thinking, deltas: &[Value]) -> (Outcome, String, String) {
         let (mut thought, mut text) = (String::new(), String::new());
-        let outcome = read(events(deltas), "OpenRouter", |chunk| {
+        let outcome = read(events(deltas), "Endpoint", thinking, |chunk| {
             match chunk {
                 Chunk::Thought(piece) => thought.push_str(piece),
                 Chunk::Text(piece) => text.push_str(piece),
@@ -355,6 +530,143 @@ mod tests {
             outcome.calls,
             ["\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"]
         );
+    }
+
+    #[test]
+    fn a_thought_written_in_the_text_is_the_thought_however_it_is_cut_up() {
+        let pieces = ["\n<thi", "nk>\nI will ", "look.</th", "ink>\n", "\nDone."];
+        let deltas: Vec<Value> = pieces.iter().map(|p| json!({ "content": p })).collect();
+        let (outcome, thought, text) = reply(&deltas);
+
+        assert_eq!(outcome.thought.trim(), "I will look.");
+        assert_eq!(thought, outcome.thought);
+        assert_eq!((outcome.text.as_str(), text.as_str()), ("Done.", "Done."));
+    }
+
+    #[test]
+    fn a_reply_that_does_not_open_with_a_thought_is_all_text() {
+        for content in ["Use <think> tags.", "<thinking> is a word.", "  "] {
+            let (outcome, thought, _) = reply(&[json!({ "content": content })]);
+            assert_eq!((outcome.text.as_str(), thought.as_str()), (content, ""));
+        }
+    }
+
+    #[test]
+    fn a_thought_the_prompt_opened_is_the_thought_once_the_reply_is_read() {
+        let (outcome, _, _) = reply(&[
+            json!({ "content": "I will count.\n</th" }),
+            json!({ "content": "ink>\n\nIt has 48 lines." }),
+        ]);
+        assert_eq!(outcome.thought, "I will count.\n");
+        assert_eq!(outcome.text, "It has 48 lines.");
+    }
+
+    const REMOVE: &str = "<tool_call>\n<function=bash>\n<parameter=command>\nrm x\n</parameter>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_thought_the_prompt_opened_is_streamed_as_the_thought_and_its_calls_are_not_made() {
+        let (outcome, thought, text) = reply_as(
+            Thinking::Opened,
+            &[
+                json!({ "content": format!("I could run {REMOVE}, but no.\n</th") }),
+                json!({ "content": "ink>\n\nDone." }),
+            ],
+        );
+        assert_eq!(thought, outcome.thought);
+        assert!(outcome.thought.starts_with("I could run <tool_call>"));
+        assert_eq!((outcome.text.as_str(), text.as_str()), ("Done.", "Done."));
+        assert!(outcome.calls.is_empty(), "{:?}", outcome.calls);
+    }
+
+    #[test]
+    fn a_thought_sent_apart_leaves_the_text_as_text_whatever_the_prompt_opened() {
+        let (outcome, thought, text) = reply_as(
+            Thinking::Opened,
+            &[
+                json!({ "reasoning_content": "I will look." }),
+                json!({ "content": "Looking." }),
+                json!({ "content": REMOVE }),
+            ],
+        );
+        assert_eq!(
+            (thought.as_str(), text.as_str()),
+            ("I will look.", "Looking.")
+        );
+        assert_eq!(outcome.calls.len(), 1);
+        assert!(outcome.apart);
+    }
+
+    #[test]
+    fn a_reply_the_prompt_opened_a_thought_for_that_never_closes_it_is_the_text() {
+        let (outcome, _, text) = reply_as(
+            Thinking::Opened,
+            &[
+                json!({ "content": "Looking." }),
+                json!({ "content": REMOVE }),
+            ],
+        );
+        assert_eq!(
+            (outcome.thought.as_str(), outcome.text.as_str()),
+            ("", "Looking.")
+        );
+        assert_eq!(text, "Looking.");
+        assert_eq!(outcome.calls.len(), 1);
+        assert!(outcome.apart);
+    }
+
+    #[test]
+    fn a_thought_the_prompt_opened_that_is_cut_off_is_the_thought() {
+        let body = events(&[json!({ "content": "Let me think about" })])
+            .into_inner()
+            .replace("data: [DONE]", "");
+        let cut =
+            json!({ "choices": [{ "delta": { "content": " it." }, "finish_reason": "length" }] });
+        let body = format!("{body}data: {cut}\n\ndata: [DONE]\n\n");
+        let outcome = read(Cursor::new(body), "Endpoint", Thinking::Opened, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            (outcome.thought.as_str(), outcome.text.as_str()),
+            ("Let me think about it.", "")
+        );
+        assert!(outcome.cut);
+    }
+
+    #[test]
+    fn a_closing_tag_a_host_sends_in_the_text_is_text() {
+        let content = "Qwen ends its thought with </think>, then answers.";
+        let (outcome, thought, text) = reply_as(Thinking::Apart, &[json!({ "content": content })]);
+        assert_eq!((outcome.text.as_str(), text.as_str()), (content, content));
+        assert_eq!((outcome.thought.as_str(), thought.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn a_call_written_before_a_closing_not_known_to_be_opened_is_not_made() {
+        let (outcome, _, _) = reply(&[
+            json!({ "content": format!("I could run {REMOVE}.\n</think>\n\n") }),
+            json!({ "content": format!("Listing. {}", REMOVE.replace("rm x", "ls")) }),
+        ]);
+        assert_eq!(outcome.text, "Listing. ");
+        assert_eq!(outcome.calls.len(), 1);
+        assert!(outcome.calls[0].contains("ls"), "{:?}", outcome.calls);
+    }
+
+    #[test]
+    fn a_thought_the_server_does_not_count_is_estimated() {
+        let mut body = events(&[json!({ "reasoning_content": "Let me look at it first." })])
+            .into_inner()
+            .replace("data: [DONE]", "");
+        let usage =
+            json!({ "choices": [], "usage": { "prompt_tokens": 10, "completion_tokens": 20 } });
+        body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+        let outcome = read(Cursor::new(body), "Endpoint", Thinking::Tagged, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+
+        let usage = outcome.usage.unwrap();
+        assert!((1..20).contains(&usage.reasoning), "{usage:?}");
     }
 
     #[test]
@@ -387,6 +699,7 @@ mod tests {
                 json!({ "content": "<tool_call>\n<function=bash>\n</function>\n</tool_call>" }),
             ]),
             "OpenRouter",
+            Thinking::Apart,
             |chunk| match chunk {
                 Chunk::Text(_) => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
@@ -403,14 +716,20 @@ mod tests {
         let body = Cursor::new(
             "data: {\"error\":{\"message\":\"Provider returned error\",\"metadata\":{\"raw\":\"overloaded\"}}}\n\n",
         );
-        let error = read(body, "OpenRouter", |_| ControlFlow::Continue(())).unwrap_err();
+        let error = read(body, "OpenRouter", Thinking::Apart, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("overloaded"), "{error}");
         assert!(error.again);
         // A request refused for what it asks is not worth making again.
         let body = Cursor::new(
             "data: {\"error\":{\"code\":400,\"message\":\"the prompt is too long\"}}\n\n",
         );
-        let error = read(body, "OpenRouter", |_| ControlFlow::Continue(())).unwrap_err();
+        let error = read(body, "OpenRouter", Thinking::Apart, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
         assert!(!error.again, "{error}");
     }
 }

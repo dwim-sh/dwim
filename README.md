@@ -56,6 +56,8 @@ ahead of time.
 - **Or in the cloud.** Any model can run at a host instead, such as
   OpenRouter or Vercel's AI Gateway, and a session moves between your
   machine and the cloud without losing the conversation.
+- **Or on your own server.** Give `/login` the address of a llama.cpp or
+  vLLM server running Inkling 2 or Qwen3.8, and the session runs there.
 - **Doesn't ask before running commands.** Run it in a sandbox, such as a
   container or a virtual machine.
 

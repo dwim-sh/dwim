@@ -20,6 +20,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
 - **Real model**, if the weights are in the cache:
   `cargo test real_model -- --ignored --nocapture` and
   `cargo run --bin difftest model`
+- **Your own server**, if one is running:
+  `DWIM_TEST_ENDPOINT=http://host:8080 cargo test real_endpoint -- --ignored`
 - **Fetch the weights** (17.6 GB, into the Hugging Face cache):
   `dwim --download`
 - Before calling a change done, run `./target/debug/dwim` in a terminal
@@ -42,7 +44,8 @@ in one program. One package: `lib.rs` is the library, `cli/` and
   reaching or starting that server (`launch`); `hosted` is a model at a
   host over its chat completions API, and `openrouter`, `vercel`
   (Vercel's AI Gateway) and `cerebras` the hosts: where each is asked,
-  what it is asked in its own way, and the key to it
+  what it is asked in its own way, and the key to it; `endpoint` the
+  user's own server
 - `server/` - the process that has the model, and the `protocol` it is
   asked in: a request carries the whole conversation, and the server
   reads only what it has not read of it

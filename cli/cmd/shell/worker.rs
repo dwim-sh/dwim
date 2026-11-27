@@ -143,8 +143,13 @@ pub enum Reply {
     ThinkingBudget(Option<usize>),
     /// Auto mode, as now set.
     Auto(bool),
-    /// The model the conversation is now on, and where it runs.
-    Model { model: Model, provider: Kind },
+    /// The model the conversation is now on, where it runs, and what the
+    /// user's own server serves, if known.
+    Model {
+        model: Model,
+        provider: Kind,
+        served: Option<Model>,
+    },
     /// The reply is over, and where the conversation's time has gone.
     Done(harness::Stats),
     /// The turn failed, though the model is still there for the next one.
@@ -228,11 +233,11 @@ fn work(
             }
             Request::Model(provider, model) => {
                 let before = (settings.provider, settings.model);
-                (settings.provider, settings.model) = (Some(provider), model);
+                pick(&mut settings, provider, model, replies);
                 match session::switch(&settings, &mut harness, on_status()) {
                     Ok(provider) => {
                         stopped = false;
-                        let _ = replies.send(Reply::Model { model, provider });
+                        let _ = replies.send(picked(&settings, provider));
                         Ok(())
                     }
                     // The session may be neither model's by now: the next
@@ -285,8 +290,8 @@ fn open(
                 if let Some(open) = &opening {
                     open.left.store(true, Ordering::Relaxed);
                 }
-                (settings.provider, settings.model) = (Some(provider), model);
-                let _ = replies.send(Reply::Model { model, provider });
+                pick(settings, provider, model, replies);
+                let _ = replies.send(picked(settings, provider));
                 opening = Some(Opening::start(settings, replies));
             }
             Ok(_) => {
@@ -416,4 +421,21 @@ fn remote(harness: &mut Harness<session::Session>) -> &mut Remote {
         .provider()
         .dwim()
         .expect("the session is on the dwim server")
+}
+
+/// Has `settings` run `model` at `provider`, or the model the user's own
+/// server serves, if `provider` is it.
+fn pick(settings: &mut Settings, provider: Kind, model: Model, replies: &Sender<Reply>) {
+    (settings.provider, settings.model) = (Some(provider), model);
+    if let Some(note) = session::follow_server(settings, false, true) {
+        let _ = replies.send(Reply::Notice(note));
+    }
+}
+
+fn picked(settings: &Settings, provider: Kind) -> Reply {
+    Reply::Model {
+        model: settings.model,
+        provider,
+        served: settings.served.as_ref().and_then(|served| served.model),
+    }
 }
