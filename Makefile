@@ -43,6 +43,7 @@ help:
 	@echo '  check     - Check the format, lints, tests, Lean specs, and the code'
 	@echo '              against the specs with difftest'
 	@echo '  specs     - Check the Lean specs: examples and proofs'
+	@echo '  coverage-<subject> - Line coverage of a test (test, compaction)'
 	@echo '  site      - Build the Lean specs as a web site'
 	@echo '  clean     - Remove build artifacts'
 
@@ -86,6 +87,14 @@ specs:
 difftest-%:
 	$(call msg,DIFFTEST,$*)
 	$(Q)cargo run --quiet --bin difftest $*
+
+# `make coverage-SUBJECT` runs a test under line coverage, as `scripts/coverage`
+# does: `make coverage-test` runs the tests, `make coverage-compaction` the
+# compaction difftest. Arguments are passed to the command, e.g.
+# `make coverage-compaction COVERAGE_ARGS="--random"`.
+coverage-%:
+	$(call msg,COVERAGE,$*)
+	$(Q)scripts/coverage $* $(COVERAGE_ARGS)
 
 site:
 	$(call msg,LAKE,specs/site)
