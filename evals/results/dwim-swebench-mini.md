@@ -4,7 +4,7 @@
 |---|---|
 | Dataset | verified-mini, 50 instances |
 | Agent | dwim 0.3.0, commit a8aa882b1a49 |
-| Model | medium, served as Vercel · alibaba/qwen3.8-27b with a context of 131072 tokens |
+| Model | qwen3.8-27b, asked for as `medium`, served as Vercel · alibaba/qwen3.8-27b with a context of 131072 tokens |
 | Reasoning effort | low |
 | Thinking budget | 2048 tokens a thought |
 | Sampling | temperature 0.6, top-p 0.95 |

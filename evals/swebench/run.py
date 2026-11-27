@@ -298,9 +298,9 @@ def directory(args, agent):
     now = manifest(args, agent)
     name = "gold"
     if agent and args.agent == "dwim":
-        name = f"dwim-{now['agent']['commit'][:12]}{'-dirty' if now['agent']['dirty'] else ''}"
+        name = f"{named(now['agent'])}-{now['agent']['commit'][:12]}{'-dirty' if now['agent']['dirty'] else ''}"
     elif agent:
-        name = f"{args.agent}-{now['agent']['version']}"
+        name = f"{named(now['agent'])}-{now['agent']['version']}"
     run = pathlib.Path(args.runs).resolve() / (args.run_id or f"{args.dataset}-{name}")
     run.mkdir(parents=True, exist_ok=True)
     path = run / "manifest.json"
@@ -312,6 +312,14 @@ def directory(args, agent):
     else:
         write(path, json.dumps(now, indent=2) + "\n")
     return run
+
+
+def named(agent):
+    """The agent as a run and its report are named for it: by its name,
+    and by its model where that is not the one it runs unasked, so that a
+    run on another model is kept beside the run on that one."""
+    name = agent.get("name", "dwim")
+    return name if agent["model"] == MODELS[name] else f"{name}-{agent['model'].replace('/', '-')}"
 
 
 def manifest(args, agent):
@@ -690,7 +698,8 @@ def report(run, rows, keep):
     came of it, and each instance. A run of a whole dataset is one to
     `keep`, and its report goes to evals/results/ as well, which git has,
     where the runs themselves are too large for it. The report kept is
-    named for the agent and the dataset, as dwim-swebench-mini.md is, so
+    named for the agent, its model if that is not its usual one, and the
+    dataset, as dwim-swebench-mini.md is, so
     that a later run's takes the place of an earlier one's: which `dwim`
     it was is the commit the report names."""
     said = json.loads((run / "manifest.json").read_text())
@@ -698,8 +707,14 @@ def report(run, rows, keep):
     results = [result(run, row["instance_id"]) or {"agent": "error", "patch_bytes": 0} for row in rows]
     known = [facts(agent, run / row["instance_id"] / "transcript.jsonl") for row in rows]
     served = sorted({fact["served"] for fact in known if fact.get("served")})
+    # The model as `dwim` names the one it ran, which says more than the
+    # word it was asked for by, such as `medium`.
+    models = sorted({fact["model"] for fact in known if fact.get("model")})
+    model = ", ".join(models) or agent.get("model", "")
+    if models and models != [agent["model"]]:
+        model += f", asked for as `{agent['model']}`"
     resolved = sum(1 for r in results if r.get("verdict") == "resolved")
-    name = f"{'gold' if agent == 'gold' else agent.get('name', 'dwim')}-{KEPT[said['dataset']]}"
+    name = f"{'gold' if agent == 'gold' else named(agent)}-{KEPT[said['dataset']]}"
     lines = [f"# {name}", "", "| | |", "|---|---|", f"| Dataset | {said['dataset']}, {len(rows)} instances |"]
     if agent == "gold":
         lines += ["| Agent | none: the dataset's own fixes |"]
@@ -707,7 +722,7 @@ def report(run, rows, keep):
         built = f", commit {agent['commit'][:12]}{', with changes not committed' if agent['dirty'] else ''}" if "commit" in agent else ""
         lines += [
             f"| Agent | {agent.get('name', 'dwim')} {agent['version'].removeprefix('dwim ')}{built} |",
-            f"| Model | {agent['model']}{', served as ' + '; '.join(served) if served else ''} |",
+            f"| Model | {model}{', served as ' + '; '.join(served) if served else ''} |",
             *settings(known),
             f"| Arguments | {' '.join(agent['arguments']) or 'none'} |",
             f"| Time limit | {agent['timeout']} seconds an instance |",
@@ -749,8 +764,20 @@ def settings(known):
         ("Reasoning effort", values("effort")),
         ("Thinking budget", values("budget", lambda tokens: f"{tokens} tokens a thought" if tokens else "none")),
         ("Sampling", values("sampling")),
+        ("Providers", providers(known)),
     ]
     return [f"| {name} | {value} |" for name, value in rows if value]
+
+
+def providers(known):
+    """Who ran the model's replies, where the host passes a request on to
+    one of several providers and the transcripts say which: each with the
+    replies it made, the most first."""
+    replies = {}
+    for fact in known:
+        for provider, count in fact.get("providers", {}).items():
+            replies[provider] = replies.get(provider, 0) + count
+    return ", ".join(f"{provider} ({count} replies)" for provider, count in sorted(replies.items(), key=lambda item: -item[1]))
 
 
 def thinking(known):
@@ -784,8 +811,8 @@ def middle_of(ordered):
 
 def facts(agent, transcript):
     """What an instance's transcript tells that its result does not: how
-    many tool calls the agent made, and for `dwim`, where the model was
-    served and with how much context, which `dwim` chooses for itself
+    many tool calls the agent made, and for `dwim`, the model it ran, where
+    it was served, by which providers and with how much context, which `dwim` chooses for itself
     when it is not told, the reasoning effort, the thinking budget and the
     sampling it was started with, and how much it thought: the tokens of
     its thoughts, about, how many replies had one, the longest, and how
@@ -800,6 +827,7 @@ def facts(agent, transcript):
     if rows and rows[0].get("type") == "start":
         start = rows[0]
         known["served"] = f"{start.get('device')} with a context of {start.get('context')} tokens"
+        known["model"] = start.get("model")
         known["effort"] = start.get("reasoning_effort")
         if "thinking_budget" in start:
             known["budget"] = start["thinking_budget"] or 0
@@ -813,6 +841,10 @@ def facts(agent, transcript):
     known["longest"] = max(thoughts, default=0)
     known["ended"] = sum(1 for row in rows if row.get("type") == "reply" and row.get("thought_ended"))
     known["counted"] = sum(row.get("thought_tokens", 0) for row in rows if row.get("type") == "reply")
+    known["providers"] = {}
+    for row in rows:
+        if row.get("type") == "reply" and row.get("provider"):
+            known["providers"][row["provider"]] = known["providers"].get(row["provider"], 0) + 1
     return known
 
 
