@@ -5,7 +5,7 @@
 //! files whose paths match one, and `plan` and `done`, which lay out the
 //! plan of the work and finish a step of it. Each is a [`Tool`]: the signature the
 //! system prompt declares it with, whether it can change files, how a call
-//! reads on screen, and what it does. The tools work in the directory the
+//! reads on screen, before it runs and once it has, and what it does. The tools work in the directory the
 //! agent does: a path a call gives is taken from there.
 
 pub mod bash;
@@ -16,6 +16,7 @@ mod glob;
 mod grep;
 pub mod plan;
 pub mod read;
+mod summary;
 mod write;
 
 use std::{
@@ -25,8 +26,11 @@ use std::{
 
 use serde_json::Value;
 
-pub use crate::tools::call::ToolCall;
 use crate::tools::{bash::Bash, plan::Plan};
+pub use crate::tools::{
+    call::ToolCall,
+    summary::{Summary, Verb, summary},
+};
 
 /// A tool: what the model is told of it, and what it does.
 pub struct Tool {
@@ -35,6 +39,9 @@ pub struct Tool {
     signature: fn() -> Signature,
     /// Whether a call can change files.
     changes: bool,
+    /// What a call is said to have done once it has run, for a tool
+    /// that does something to files or runs a command.
+    verb: Option<Verb>,
     /// How a call reads on screen, if its arguments make sense.
     describe: fn(&Value) -> Option<String>,
     /// Runs a call, returning what the model should see, or what it is
@@ -332,7 +339,7 @@ fn within(tool: &str, dir: &Path, path: &str) -> Result<(), String> {
 /// How a search reads on screen: the pattern, and where it is looked for.
 fn search(arguments: &Value) -> Option<String> {
     let pattern = string(arguments, "pattern")?;
-    Some(match directory(arguments) {
+    Some(match directory(arguments).filter(|&path| path != ".") {
         Some(path) => format!("{pattern} in {path}"),
         None => pattern.to_string(),
     })

@@ -53,7 +53,7 @@ use std::{
 use crate::{
     harness::snapshot::Snapshot,
     model::{Chunk, Effort, Model, Session, Turn},
-    tools::{ToolCall, Tools, bash, plan::Plan, read},
+    tools::{Summary, ToolCall, Tools, bash, plan::Plan, read},
 };
 
 pub use crate::harness::transcript::Transcript;
@@ -483,8 +483,13 @@ pub enum Event {
     /// What the command a call of `bash` runs has printed so far, while it
     /// runs: a few times a second while it prints.
     Progress(bash::Progress),
-    /// What the tool returned, as the model sees it.
-    Output(String),
+    /// What the tool returned, as the model sees it, and what the call
+    /// did, said for a person, for a call that ran a tool that has it
+    /// said.
+    Output {
+        text: String,
+        summary: Option<Summary>,
+    },
     /// The reply was stopped short because the context window was full.
     Cut,
     /// The conversation is being compacted: the model is writing the note
@@ -1116,6 +1121,7 @@ impl<S: Session> Harness<S> {
                 let mut reminder = None;
                 self.steps += 1;
                 self.called = true;
+                let mut summary = None;
                 let output = match ToolCall::parse(call) {
                     Ok(call) => {
                         let detail = crate::tools::describe(&call);
@@ -1160,7 +1166,7 @@ impl<S: Session> Harness<S> {
                             let elapsed = start.elapsed().as_secs_f64();
                             self.tool_seconds += elapsed;
                             seconds = Some(elapsed);
-                            self.planned |= self.show_plan(on_event);
+                            summary = crate::tools::summary(&call, &output);
                             output
                         }
                     }
@@ -1168,7 +1174,16 @@ impl<S: Session> Harness<S> {
                     Err(e) => format!("error: malformed tool call: {e}"),
                 };
                 self.transcript.output(&output, seconds);
-                interrupted = interrupted || on_event(Event::Output(output.clone())).is_break();
+                interrupted = interrupted
+                    || on_event(Event::Output {
+                        text: output.clone(),
+                        summary,
+                    })
+                    .is_break();
+                // The plan, as the call left it, follows what it did.
+                if seconds.is_some() {
+                    self.planned |= self.show_plan(on_event);
+                }
                 let mut output = output;
                 if let Some(reminder) = reminder {
                     output.push_str("\n\n");
@@ -1536,7 +1551,7 @@ mod tests {
                     Event::Text(_) => "text",
                     Event::Token | Event::Progress(_) => return ControlFlow::Continue(()),
                     Event::Call { .. } => "call",
-                    Event::Output(_) => "output",
+                    Event::Output { .. } => "output",
                     Event::Cut => "cut",
                     Event::Compacting => "compacting",
                     Event::Note(text) => {
@@ -1582,7 +1597,7 @@ mod tests {
                     }
                     Event::Text(_) => "text",
                     Event::Call { .. } => "call",
-                    Event::Output(_) => "output",
+                    Event::Output { .. } => "output",
                     Event::Token | Event::Progress(_) => return ControlFlow::Continue(()),
                     _ => "other",
                 };
@@ -1877,7 +1892,7 @@ mod tests {
         let scripts = [reply_making_two(&dir), reply(10, false)];
         let mut harness = harness(&scripts, 100_000, "");
         send_until(&mut harness, "go", |event| {
-            matches!(event, Event::Output(_))
+            matches!(event, Event::Output { .. })
         });
         assert!(dir.join("a").exists() && !dir.join("b").exists());
         send(&mut harness, "what happened?");
@@ -2182,7 +2197,7 @@ mod tests {
         let mut calls = 0;
         harness
             .send("go", |event| {
-                calls += usize::from(matches!(event, Event::Output(_)));
+                calls += usize::from(matches!(event, Event::Output { .. }));
                 if calls == 2 {
                     ControlFlow::Break(())
                 } else {

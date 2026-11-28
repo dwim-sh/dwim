@@ -68,8 +68,8 @@ pub struct Opts {
     #[argh(switch)]
     pub serve: bool,
 
-    /// show the model's thinking and the files it reads in the shell,
-    /// which ctrl+o toggles
+    /// show the model's thinking, and each tool call with all it returned,
+    /// in the shell, which ctrl+o toggles
     #[argh(switch)]
     pub thinking: bool,
 

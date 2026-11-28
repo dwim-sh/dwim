@@ -16,7 +16,7 @@ use std::{
 use serde_json::Value;
 
 use crate::tools::{
-    Parameter, Signature, Tool, cut, directory, plural, required, search, string, within,
+    Parameter, Signature, Tool, Verb, cut, directory, plural, required, search, string, within,
     without_ending,
 };
 
@@ -26,6 +26,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: false,
+    verb: Some(Verb::Searched),
     describe: search,
     run: |tools, arguments| run(&tools.dir, arguments),
 };

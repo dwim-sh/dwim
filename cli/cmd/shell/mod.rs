@@ -34,7 +34,7 @@ use dwim::{
         openrouter::{self, login::Login},
     },
     sys::browser,
-    tools::{bash::Progress, plan::Plan},
+    tools::{Summary, bash::Progress, plan::Plan},
 };
 
 use crate::{
@@ -54,7 +54,8 @@ use worker::{Reply, Request, Worker};
 const TICK: Duration = Duration::from_millis(80);
 
 /// Runs the shell until the user quits, showing the model's thinking and
-/// what it reads if `verbose` is set, or once ctrl+o is pressed, and
+/// each call with its output if `verbose` is set, or once ctrl+o is
+/// pressed, and
 /// keeping a transcript of the session in `transcript`, or a new file in
 /// the user's state directory.
 pub fn run(
@@ -105,6 +106,8 @@ pub fn run(
         committed: 0,
         interrupted: false,
         call: String::new(),
+        detail: String::new(),
+        calls: Vec::new(),
         verbose,
         thinking_budget,
         auto: false,
@@ -385,12 +388,18 @@ struct App {
     reply_width: usize,
     committed: usize,
     interrupted: bool,
-    /// The name of the tool last called, whose output comes next.
+    /// The name of the tool last called, whose output comes next, and how
+    /// it was called.
     call: String,
-    /// Whether the model's thinking and the files it reads are shown.
-    /// While the thought is hidden, it is kept but none of it is printed,
-    /// so showing it prints all of it so far; a read hidden shows only
-    /// its last line, which says what was read.
+    detail: String,
+    /// What the calls the model has made since it last wrote did, shown
+    /// over the input box as they go, and as one entry once it writes
+    /// again or the turn ends.
+    calls: Vec<Summary>,
+    /// Whether the model's thinking and each call with its output are
+    /// shown. While the thought is hidden, it is kept but none of it is
+    /// printed, so showing it prints all of it so far; while calls are
+    /// hidden, what each did is said in a line, with the calls around it.
     verbose: bool,
     /// Most tokens of a thought, if they are limited, as the harness last
     /// said.
@@ -1170,6 +1179,7 @@ impl App {
                 self.stats = stats;
                 self.reply.truncate(self.reply.trim_end().len());
                 self.commit(true);
+                self.end_calls();
                 self.doing = None;
                 self.unheeded = false;
                 self.status = Status::Idle;
@@ -1310,9 +1320,9 @@ impl App {
     fn event(&mut self, event: Event) {
         // The model has answered the message once a call of plan goes
         // through, even with the steps unchanged, which reports no plan.
-        if let Event::Output(output) = &event
+        if let Event::Output { text, .. } = &event
             && self.call == "plan"
-            && !output.starts_with("error:")
+            && !text.starts_with("error:")
         {
             self.unheeded = false;
         }
@@ -1349,10 +1359,15 @@ impl App {
                 };
             }
             Event::Plan(plan) => {
-                self.finish();
+                self.end_reply();
                 let (columns, _) = self.screen.size();
-                self.lines
-                    .extend(view::plan_news(&self.plan, &plan, columns));
+                let news = view::plan_news(&self.plan, &plan, columns);
+                // A plan that says nothing new, as one that only notes a
+                // command run, leaves the calls going.
+                if !news.is_empty() {
+                    self.end_calls();
+                }
+                self.lines.extend(news);
                 // What the model was at was the step before's.
                 if plan.done() != self.plan.done() {
                     self.doing = None;
@@ -1366,18 +1381,19 @@ impl App {
                 self.call = name;
                 self.status = Status::Reading(Instant::now());
             }
-            Event::Output(output)
-                if (self.call == "plan" || self.call == "done")
-                    && !output.starts_with("error:") => {}
+            Event::Output { text, .. }
+                if (self.call == "plan" || self.call == "done") && !text.starts_with("error:") => {}
             Event::Call { name, detail } => {
-                self.finish();
+                self.end_reply();
                 let detail: Vec<&str> = detail.split_whitespace().collect();
                 let detail = detail.join(" ");
-                self.lines.push(vec![
-                    span("● "),
-                    span(&name).bold(),
-                    span(format!("({detail})")).dark_grey(),
-                ]);
+                // Shown with its output, unless what it did is said in
+                // its place.
+                if self.verbose {
+                    self.end_calls();
+                    self.lines.push(view::call(&name, &detail));
+                }
+                self.detail = detail.clone();
                 self.doing = Some(format!("{name}({detail})"));
                 self.running = if name == "bash" {
                     detail
@@ -1389,11 +1405,26 @@ impl App {
                 self.status = Status::Running(Instant::now());
             }
             Event::Progress(progress) => self.progress = Some(progress),
-            Event::Output(output) => {
+            // What a call did, with the calls before it, unless its output
+            // is asked for.
+            Event::Output {
+                summary: Some(summary),
+                ..
+            } if !self.verbose => {
+                self.calls.push(summary);
+                self.status = Status::Reading(Instant::now());
+            }
+            Event::Output { text: output, .. } => {
                 if self.call == "plan" || self.call == "done" {
                     self.finish();
                     self.lines
                         .push(vec![span("● "), span(self.call.clone()).bold()]);
+                } else if !self.verbose {
+                    // A call whose result says nothing of what it did, as
+                    // one not run is, is shown as it was made.
+                    self.end_calls();
+                    let call = view::call(&self.call, &self.detail);
+                    self.lines.push(call);
                 }
                 let (columns, _) = self.screen.size();
                 let output = tui::sanitize(&output);
@@ -1446,9 +1477,28 @@ impl App {
         self.commit(false);
     }
 
+    /// Prints the calls going, then the rest of the part of the reply
+    /// being generated: before something else is printed.
+    fn finish(&mut self) {
+        self.end_calls();
+        self.end_reply();
+    }
+
+    /// Prints what the calls the model has made in a row did, as one
+    /// entry, with a blank line after it, if it has made any.
+    fn end_calls(&mut self) {
+        if self.calls.is_empty() {
+            return;
+        }
+        let (columns, _) = self.screen.size();
+        let calls = std::mem::take(&mut self.calls);
+        self.lines.extend(view::calls(&calls, columns));
+        self.lines.push(Line::new());
+    }
+
     /// Prints the rest of the part of the reply being generated, with a
     /// blank line after it if there was anything to print, and starts over.
-    fn finish(&mut self) {
+    fn end_reply(&mut self) {
         self.reply.truncate(self.reply.trim_end().len());
         self.commit(true);
         if self.committed > 0 {
@@ -1473,15 +1523,16 @@ impl App {
             .map_or(0, |i| i + 1);
         if end > self.committed {
             let segment = self.segment;
-            let committed = self.committed;
-            self.lines.extend(
-                lines
-                    .into_iter()
-                    .enumerate()
-                    .take(end)
-                    .skip(committed)
-                    .map(|line| view::reply_line(segment, line)),
-            );
+            let printed: Vec<Line> = lines
+                .into_iter()
+                .enumerate()
+                .take(end)
+                .skip(self.committed)
+                .map(|line| view::reply_line(segment, line))
+                .collect();
+            // The model writes once its calls are over.
+            self.end_calls();
+            self.lines.extend(printed);
             self.committed = end;
         }
     }
@@ -1550,6 +1601,11 @@ impl App {
         let (columns, rows) = self.screen.size();
         let mut live = Vec::new();
 
+        // What the calls going have done so far, which comes before what
+        // the model writes after them.
+        if !self.calls.is_empty() {
+            live.extend(view::calls(&self.calls, columns));
+        }
         // The line of the reply still being generated. An empty reply has no
         // line yet: after its thought, the model writes blank lines, or a
         // tool call, which is shown only once it is complete, and a bullet
@@ -1560,6 +1616,9 @@ impl App {
         {
             let lines = tui::wrap(&self.reply, self.reply_width);
             let segment = self.segment;
+            if !live.is_empty() {
+                live.push(Line::new());
+            }
             live.extend(
                 lines
                     .into_iter()

@@ -21,7 +21,9 @@ use std::{
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, cut, optional_number, plural, required, string};
+use crate::tools::{
+    Parameter, Signature, Tool, Verb, cut, optional_number, plural, required, string,
+};
 
 const NAME: &str = "read";
 
@@ -29,6 +31,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: false,
+    verb: Some(Verb::Read),
     describe,
     run: |tools, arguments| run(&tools.dir, arguments),
 };

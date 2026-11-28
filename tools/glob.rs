@@ -15,7 +15,7 @@ use std::{fs, path::Path, process::Command};
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, directory, plural, required, search, within};
+use crate::tools::{Parameter, Signature, Tool, Verb, directory, plural, required, search, within};
 
 const NAME: &str = "glob";
 
@@ -23,6 +23,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: false,
+    verb: Some(Verb::Listed),
     describe: search,
     run: |tools, arguments| run(&tools.dir, arguments),
 };
