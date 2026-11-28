@@ -694,6 +694,46 @@ pub trait Device {
         );
     }
 
+    /// [`Self::expert_ffn`] followed by [`Self::weighted_sum`] with `shares`:
+    /// `out` gets each token's weighted sum of its experts' outputs, and
+    /// `down_scratch`, `scratch`, and `act` are left undefined.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_ffn_sum(
+        &self,
+        out: &mut Self::Buffer,
+        gate_up: &Self::Weight,
+        gate_up_scale: &Self::Buffer,
+        down: &Self::Weight,
+        down_scale: &Self::Buffer,
+        x: &Self::Buffer,
+        ids: &Self::Buffer,
+        shares: &Self::Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Self::Buffer,
+        act: &mut Self::Buffer,
+        down_scratch: &mut Self::Buffer,
+    ) {
+        self.expert_ffn(
+            down_scratch,
+            gate_up,
+            gate_up_scale,
+            down,
+            down_scale,
+            x,
+            ids,
+            k,
+            width,
+            beta,
+            linear_beta,
+            scratch,
+            act,
+        );
+        self.weighted_sum(out, down_scratch, shares);
+    }
+
     /// `x += ` the convolution of `input` that [`Self::short_conv`] gives
     /// without taps of the heads' own: a convolution whose output joins
     /// the residual stream. `scratch` is as long as `x`, and is left

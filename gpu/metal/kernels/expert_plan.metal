@@ -1,9 +1,10 @@
 // Lays out a batch's (token, expert) pairs on the GPU, avoiding a host
 // readback and pipeline stall on every MoE layer: sorts pair indices by
-// expert into `order`, emits wide (up to 32 pairs) and narrow (up to 16
-// pairs) tiles into `wide_tiles` and `narrow_tiles`, and writes two pairs
-// of MTLDispatchThreadgroupsIndirectArguments into `indirect` (for two
-// row tile counts, e.g. gate_up and down). One threadgroup of 256 threads.
+// expert into `order` (and writes the inverse map `inv_order[pair] = slot`),
+// emits wide (up to 32 pairs) and narrow (up to 16 pairs) tiles into
+// `wide_tiles` and `narrow_tiles`, and writes two pairs of
+// MTLDispatchThreadgroupsIndirectArguments into `indirect` (for two row
+// tile counts, e.g. gate_up and down). One threadgroup of 256 threads.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -22,11 +23,12 @@ struct Params {
 
 kernel void expert_plan(
     device uint* order [[buffer(0)]],
-    device uint* wide_tiles [[buffer(1)]],
-    device uint* narrow_tiles [[buffer(2)]],
-    device uint* indirect [[buffer(3)]],
-    const device float* ids [[buffer(4)]],
-    constant Params& p [[buffer(5)]],
+    device uint* inv_order [[buffer(1)]],
+    device uint* wide_tiles [[buffer(2)]],
+    device uint* narrow_tiles [[buffer(3)]],
+    device uint* indirect [[buffer(4)]],
+    const device float* ids [[buffer(5)]],
+    constant Params& p [[buffer(6)]],
     uint lid [[thread_index_in_threadgroup]])
 {
     threadgroup atomic_uint counts[MAX_EXPERTS];
@@ -79,6 +81,7 @@ kernel void expert_plan(
         uint e = uint(ids[i]);
         uint slot = atomic_fetch_add_explicit(&next[e], 1u, memory_order_relaxed);
         order[slot] = i;
+        inv_order[i] = slot;
     }
 
     if (lid < p.experts) {

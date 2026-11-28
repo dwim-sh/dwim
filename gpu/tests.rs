@@ -1263,14 +1263,22 @@ pub fn expert_ffn_matches_cpu<D: Device>(gpu: &D) {
                 let mut out = gpu.alloc(n * k * rows);
                 let (mut scratch, mut act) =
                     (gpu.alloc(n * k * 2 * width), gpu.alloc(n * k * width));
+                let (gate_up_gpu, scale_gpu, down_gpu, down_scale_gpu, x_gpu, ids_gpu) = (
+                    gpu.upload(clone(&gate_up)),
+                    buffer(gpu, &scale),
+                    gpu.upload(clone(&down)),
+                    buffer(gpu, &down_scale),
+                    buffer(gpu, &x),
+                    buffer(gpu, &ids),
+                );
                 gpu.expert_ffn(
                     &mut out,
-                    &gpu.upload(gate_up),
-                    &buffer(gpu, &scale),
-                    &gpu.upload(down),
-                    &buffer(gpu, &down_scale),
-                    &buffer(gpu, &x),
-                    &buffer(gpu, &ids),
+                    &gate_up_gpu,
+                    &scale_gpu,
+                    &down_gpu,
+                    &down_scale_gpu,
+                    &x_gpu,
+                    &ids_gpu,
                     k,
                     width,
                     2.0,
@@ -1280,6 +1288,29 @@ pub fn expert_ffn_matches_cpu<D: Device>(gpu: &D) {
                 );
                 let what = format!("{width} {rows}x{cols} n={n} nvfp4={nvfp4}");
                 close_batch(&gpu.read(&out), &want, &what);
+
+                let shares = rng.floats(n * k);
+                let mut want_sum = vec![0.0; n * rows];
+                Cpu.weighted_sum(&mut want_sum, &want, &shares);
+                let mut got_sum = gpu.alloc(n * rows);
+                gpu.expert_ffn_sum(
+                    &mut got_sum,
+                    &gate_up_gpu,
+                    &scale_gpu,
+                    &down_gpu,
+                    &down_scale_gpu,
+                    &x_gpu,
+                    &ids_gpu,
+                    &buffer(gpu, &shares),
+                    k,
+                    width,
+                    2.0,
+                    3.0,
+                    &mut scratch,
+                    &mut act,
+                    &mut out,
+                );
+                close_batch(&gpu.read(&got_sum), &want_sum, &format!("{what} sum"));
             }
         }
     }

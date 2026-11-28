@@ -763,6 +763,46 @@ impl Device for Gpu {
         )
     }
 
+    fn expert_ffn_sum(
+        &self,
+        out: &mut Buffer,
+        gate_up: &Weight,
+        gate_up_scale: &Buffer,
+        down: &Weight,
+        down_scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        shares: &Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Buffer,
+        act: &mut Buffer,
+        down_scratch: &mut Buffer,
+    ) {
+        dispatch!(
+            self,
+            expert_ffn_sum(
+                [out],
+                { gate_up },
+                [gate_up_scale],
+                { down },
+                [down_scale],
+                [x],
+                [ids],
+                [shares],
+                k,
+                width,
+                beta,
+                linear_beta,
+                [scratch],
+                [act],
+                [down_scratch]
+            )
+        )
+    }
+
     fn situ(&self, out: &mut Buffer, gate_up: &Buffer, width: usize, beta: f32, linear_beta: f32) {
         dispatch!(self, situ([out], [gate_up], width, beta, linear_beta))
     }

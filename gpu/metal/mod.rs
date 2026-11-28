@@ -239,10 +239,13 @@ struct Kernels {
     /// result scattering.
     expert_matmul: [Object<dyn MTLComputePipelineState>; 2],
     expert_matmul_mma: Option<[[Object<dyn MTLComputePipelineState>; 2]; 2]>,
+    expert_gate_up_situ: [Object<dyn MTLComputePipelineState>; 2],
+    expert_down_sum: [Object<dyn MTLComputePipelineState>; 2],
     expert_plan: Object<dyn MTLComputePipelineState>,
     expert_pack: Object<dyn MTLComputePipelineState>,
     expert_situ_pack: Object<dyn MTLComputePipelineState>,
     expert_scatter: Object<dyn MTLComputePipelineState>,
+    expert_gather_sum: Object<dyn MTLComputePipelineState>,
     /// Depth mixes for 1, up to 3, and up to 4 queries at once, with optional
     /// fused RMS normalization.
     mix: [Object<dyn MTLComputePipelineState>; 3],
@@ -373,6 +376,7 @@ pub struct Metal {
 #[derive(Default)]
 struct Experts {
     order: Scratch,
+    inv_order: Scratch,
     wide_tiles: Scratch,
     narrow_tiles: Scratch,
     indirect: Scratch,
@@ -630,10 +634,19 @@ impl Metal {
                 msl!("expert_matmul", THREADS, "BITS" = 8),
             ],
             expert_matmul_mma,
+            expert_gate_up_situ: [
+                msl!("expert_gate_up_situ", THREADS, "BITS" = 4),
+                msl!("expert_gate_up_situ", THREADS, "BITS" = 8),
+            ],
+            expert_down_sum: [
+                msl!("expert_down_sum", THREADS, "BITS" = 4),
+                msl!("expert_down_sum", THREADS, "BITS" = 8),
+            ],
             expert_plan: msl!("expert_plan", THREADS),
             expert_pack: msl!("expert_pack", THREADS),
             expert_situ_pack: msl!("expert_situ_pack", THREADS),
             expert_scatter: msl!("expert_scatter", THREADS),
+            expert_gather_sum: msl!("expert_gather_sum", THREADS),
             mix: [
                 msl!("mix", THREADS, "M" = 1),
                 msl!("mix", THREADS, "M" = 3),
@@ -895,6 +908,7 @@ impl Metal {
         }
         let pairs = ids.len;
         let order = self.scratch(&mut scratch.order, pairs * 4);
+        let inv_order = self.scratch(&mut scratch.inv_order, pairs * 4);
         let wide_tiles = self.scratch(&mut scratch.wide_tiles, (pairs / EXPERT_TILE + 1) * 12);
         let narrow_tiles = self.scratch(&mut scratch.narrow_tiles, experts * 12);
         let indirect = self.scratch(&mut scratch.indirect, 12 * 4);
@@ -906,8 +920,8 @@ impl Metal {
         };
         self.dispatch_writes(
             &self.kernels.expert_plan,
-            &[order, wide_tiles, narrow_tiles, indirect, &ids.buf],
-            0b1111,
+            &[order, inv_order, wide_tiles, narrow_tiles, indirect, &ids.buf],
+            0b1_1111,
             &params,
             1,
             THREADS,
@@ -1422,6 +1436,32 @@ struct ExpertTileParams {
 struct ExpertScatterParams {
     pairs: u32,
     rows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertGatherSumParams {
+    n: u32,
+    rows: u32,
+    k: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertGateUpSituParams {
+    width: u32,
+    cols: u32,
+    k: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertDownSumParams {
+    rows: u32,
+    cols: u32,
+    k: u32,
 }
 
 #[repr(C)]
@@ -2526,6 +2566,217 @@ impl Device for Metal {
         );
     }
 
+    fn expert_ffn_sum(
+        &self,
+        out: &mut Buffer,
+        gate_up: &Weight,
+        gate_up_scale: &Buffer,
+        down: &Weight,
+        down_scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        shares: &Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Buffer,
+        act: &mut Buffer,
+        down_scratch: &mut Buffer,
+    ) {
+        let experts = gate_up_scale.len;
+        let rows = down.shape[0] / experts;
+        let cols = gate_up.shape[1];
+        let pairs = ids.len;
+        let n = pairs / k;
+        let which = |w: &Weight| match w.format {
+            Format::Nvfp4 => Some(0usize),
+            Format::Q8_0 => Some(1usize),
+            Format::Bf16 | Format::Q4_0 => None,
+        };
+        let (Some(w_gu), Some(w_down)) = (which(gate_up), which(down)) else {
+            self.expert_ffn(
+                down_scratch,
+                gate_up,
+                gate_up_scale,
+                down,
+                down_scale,
+                x,
+                ids,
+                k,
+                width,
+                beta,
+                linear_beta,
+                scratch,
+                act,
+            );
+            return self.weighted_sum(out, down_scratch, shares);
+        };
+        assert!(gate_up.shape[0] == experts * 2 * width && down_scale.len == experts);
+        assert_eq!(down.shape[1], width);
+        assert!(x.len == n * cols && act.len == pairs * width && shares.len == pairs);
+        assert_eq!(out.len, n * rows);
+
+        // On M5 (Apple10 + Metal 4), fuse the batched MMA path end-to-end:
+        // expert_plan -> expert_pack -> gate_up MMA -> expert_situ_pack ->
+        // down MMA -> expert_gather_sum (no intermediate scatter or weighted_sum).
+        if let Some(tiled) = &self.kernels.expert_matmul_mma
+            && pairs >= EXPERT_TOKENS * k
+            && experts <= EXPERT_MAX
+            && cols.is_multiple_of(128)
+            && width.is_multiple_of(128)
+            && rows.is_multiple_of(4)
+        {
+            let grid_x_gu = (2 * width).div_ceil(TILE_ROWS);
+            let grid_x_down = rows.div_ceil(TILE_ROWS);
+            let mut exp = self.experts.borrow_mut();
+            self.plan_experts(&mut exp, ids, experts, grid_x_gu, grid_x_down);
+            let padded = pairs + EXPERT_TILE_WIDE;
+            let Experts {
+                order,
+                inv_order,
+                wide_tiles,
+                narrow_tiles,
+                indirect,
+                packed,
+                sorted,
+                ..
+            } = &mut *exp;
+            let order = &order.0.as_ref().expect("planned above").0;
+            let inv_order = &inv_order.0.as_ref().expect("planned above").0;
+            let wide_tiles = &wide_tiles.0.as_ref().expect("planned above").0;
+            let narrow_tiles = &narrow_tiles.0.as_ref().expect("planned above").0;
+            let indirect = &indirect.0.as_ref().expect("planned above").0;
+            let packed = self.scratch(packed, padded * cols.max(width) * 2);
+            let sorted = self.scratch(sorted, pairs * rows.max(2 * width) * 4);
+            out.touch();
+
+            let pack = ExpertPackParams {
+                pairs: pairs as u32,
+                cols: cols as u32,
+                padded: padded as u32,
+                share: k as u32,
+            };
+            self.dispatch(
+                &self.kernels.expert_pack,
+                &[packed, &x.buf, order],
+                &pack,
+                (padded * cols / 4).div_ceil(THREADS),
+                THREADS,
+            );
+            self.dispatch_expert_mma(
+                &tiled[w_gu],
+                sorted,
+                gate_up,
+                gate_up_scale,
+                packed,
+                wide_tiles,
+                narrow_tiles,
+                indirect,
+                0,
+                2 * width,
+                cols,
+                padded,
+            );
+            let situ_pack = ExpertSituPackParams {
+                pairs: pairs as u32,
+                width: width as u32,
+                padded: padded as u32,
+                beta,
+                linear_beta,
+            };
+            self.dispatch(
+                &self.kernels.expert_situ_pack,
+                &[packed, sorted],
+                &situ_pack,
+                (padded * width / 4).div_ceil(THREADS),
+                THREADS,
+            );
+            self.dispatch_expert_mma(
+                &tiled[w_down],
+                sorted,
+                down,
+                down_scale,
+                packed,
+                wide_tiles,
+                narrow_tiles,
+                indirect,
+                24,
+                rows,
+                width,
+                padded,
+            );
+            let gather = ExpertGatherSumParams {
+                n: n as u32,
+                rows: rows as u32,
+                k: k as u32,
+            };
+            self.dispatch(
+                &self.kernels.expert_gather_sum,
+                &[&out.buf, sorted, inv_order, &shares.buf],
+                &gather,
+                (n * rows / 4).div_ceil(THREADS),
+                THREADS,
+            );
+            return;
+        }
+
+        // Decode / small-batch fused path: two dispatches total
+        // (expert_gate_up_situ -> expert_down_sum), eliminating both the
+        // [pairs, 2*width] and [pairs, rows] intermediate buffers.
+        act.touch();
+        out.touch();
+        let gu_scales = gate_up
+            .scales
+            .as_ref()
+            .expect("quantized weights have scales");
+        let gu_params = ExpertGateUpSituParams {
+            width: width as u32,
+            cols: cols as u32,
+            k: k as u32,
+            beta,
+            linear_beta,
+        };
+        let gu_per_simd = if w_gu == 0 { 4 } else { 1 };
+        self.dispatch_grid(
+            &self.kernels.expert_gate_up_situ[w_gu],
+            &[
+                &act.buf,
+                &gate_up.buf,
+                gu_scales,
+                &x.buf,
+                &ids.buf,
+                &gate_up_scale.buf,
+            ],
+            &gu_params,
+            (width.div_ceil(self.matmul_rows * gu_per_simd), pairs),
+            THREADS,
+        );
+
+        let dn_scales = down.scales.as_ref().expect("quantized weights have scales");
+        let dn_params = ExpertDownSumParams {
+            rows: rows as u32,
+            cols: width as u32,
+            k: k as u32,
+        };
+        let dn_per_simd = if w_down == 0 { 4 } else { 1 };
+        self.dispatch_grid(
+            &self.kernels.expert_down_sum[w_down],
+            &[
+                &out.buf,
+                &down.buf,
+                dn_scales,
+                &act.buf,
+                &ids.buf,
+                &down_scale.buf,
+                &shares.buf,
+            ],
+            &dn_params,
+            (rows.div_ceil(self.matmul_rows * dn_per_simd), n),
+            THREADS,
+        );
+    }
+
     fn copy_cache(&self, dst: &mut Cache, src: &Cache, len: usize) {
         assert!(len <= dst.len && len <= src.len && len.is_multiple_of(CACHE_BLOCK));
         for (kernel, dst, src, words) in [
@@ -3456,13 +3707,16 @@ mod tests {
         // e=6(48->w+n), e=7(49->2w), e=8(64->2w), e=9(65->2w+n) => 10 wide, 5 narrow.
         assert_eq!(indirect, [36, 10, 1, 36, 5, 1, 18, 10, 1, 18, 5, 1]);
         let order = read_u32(&scratch.order, pairs);
+        let inv_order = read_u32(&scratch.inv_order, pairs);
         let wide = read_u32(&scratch.wide_tiles, wide_count * 3);
         let narrow = read_u32(&scratch.narrow_tiles, narrow_count * 3);
-        // Every pair appears once, and every tile covers only pairs of its expert.
+        // Every pair appears once, inv_order is the exact inverse of order,
+        // and every tile covers only pairs of its expert.
         let mut seen = vec![false; pairs];
-        for &p in &order {
+        for (slot, &p) in order.iter().enumerate() {
             assert!(!seen[p as usize]);
             seen[p as usize] = true;
+            assert_eq!(inv_order[p as usize] as usize, slot);
         }
         let mut covered = vec![false; pairs];
         for (tiles, max_of) in [(&wide, 32u32), (&narrow, 16u32)] {
@@ -3513,6 +3767,64 @@ mod tests {
             assert!((g - w).abs() <= 5e-3, "element {i}: {g} vs {w}");
         }
         assert!(got[pairs * width..].iter().all(|&b| b == 0));
+
+        // Check expert_gather_sum gathers via inv_order and matches Cpu::weighted_sum.
+        let (n_tok, k_exp, rows) = (16usize, 4usize, 128usize);
+        let gather_pairs = n_tok * k_exp;
+        let gather_picks: Vec<f32> = (0..gather_pairs).map(|i| ((i * 7) % 13) as f32).collect();
+        let mut g_ids = gpu.alloc(gather_pairs);
+        gpu.write(&mut g_ids, &gather_picks);
+        {
+            let mut scratch = gpu.experts.borrow_mut();
+            gpu.plan_experts(&mut scratch, &g_ids, 16, 2, 2);
+        }
+        gpu.flush();
+        let g_order = {
+            let scratch = gpu.experts.borrow();
+            let buf = &scratch.order.0.as_ref().unwrap().0;
+            unsafe {
+                std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u32>(), gather_pairs)
+                    .to_vec()
+            }
+        };
+        let pair_vals: Vec<f32> = (0..gather_pairs * rows)
+            .map(|i| ((i * 19) % 53) as f32 * 0.05 - 1.2)
+            .collect();
+        let mut sorted_vals = vec![0.0f32; gather_pairs * rows];
+        for (slot, &pair) in g_order.iter().enumerate() {
+            sorted_vals[slot * rows..][..rows]
+                .copy_from_slice(&pair_vals[pair as usize * rows..][..rows]);
+        }
+        let shares_vec: Vec<f32> = (0..gather_pairs)
+            .map(|i| 0.1 + (i % 5) as f32 * 0.2)
+            .collect();
+        let mut want_gather = vec![0.0f32; n_tok * rows];
+        crate::gpu::Cpu.weighted_sum(&mut want_gather, &pair_vals, &shares_vec);
+        let mut sorted_buf = gpu.alloc(sorted_vals.len());
+        gpu.write(&mut sorted_buf, &sorted_vals);
+        let mut shares_buf = gpu.alloc(shares_vec.len());
+        gpu.write(&mut shares_buf, &shares_vec);
+        let gather_out = gpu.alloc(n_tok * rows);
+        {
+            let scratch = gpu.experts.borrow();
+            let inv = &scratch.inv_order.0.as_ref().unwrap().0;
+            let params = super::ExpertGatherSumParams {
+                n: n_tok as u32,
+                rows: rows as u32,
+                k: k_exp as u32,
+            };
+            gpu.dispatch(
+                &gpu.kernels.expert_gather_sum,
+                &[&gather_out.buf, &sorted_buf.buf, inv, &shares_buf.buf],
+                &params,
+                (n_tok * rows / 4).div_ceil(super::THREADS),
+                super::THREADS,
+            );
+        }
+        let got_gather = gpu.read(&gather_out);
+        for (i, (&g, &w)) in got_gather.iter().zip(&want_gather).enumerate() {
+            assert!((g - w).abs() <= 1e-4, "gather {i}: {g} vs {w}");
+        }
     }
 
     /// Times the cost of a dispatch; run with `--ignored --nocapture`.
