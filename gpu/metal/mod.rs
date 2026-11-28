@@ -193,6 +193,8 @@ struct Kernels {
     /// tokens; and their tile kernels on the SIMD groups' matrices for the
     /// same tiles.
     matmul_quant: [Object<dyn MTLComputePipelineState>; 2],
+    /// Single-token Q8_0 matmul without multi-token register arrays.
+    matmul_q8_0_vec: Object<dyn MTLComputePipelineState>,
     matmul_quant_mma: Option<[[Object<dyn MTLComputePipelineState>; 3]; 2]>,
     matmul_quant_tile: [[Object<dyn MTLComputePipelineState>; 3]; 2],
     add: Object<dyn MTLComputePipelineState>,
@@ -452,6 +454,7 @@ impl Metal {
             matmul_bf16: msl!("matmul_bf16", THREADS),
             attention_mma,
             matmul_quant: [msl!("matmul_q4_0", THREADS), msl!("matmul_q8_0", THREADS)],
+            matmul_q8_0_vec: msl!("matmul_q8_0", THREADS, "VEC" = 1),
             matmul_quant_mma,
             matmul_quant_tile: [
                 [
@@ -1360,6 +1363,18 @@ impl Device for Metal {
             );
             return;
         }
+        // A single token through Q8_0 weights takes the low-register single-token
+        // kernel rather than holding eight token accumulators per lane.
+        if n == 1 && w.format == Format::Q8_0 {
+            self.dispatch(
+                &self.kernels.matmul_q8_0_vec,
+                &[&out.buf, &w.buf, scales, &x.buf],
+                &params,
+                rows.div_ceil(self.matmul_rows),
+                THREADS,
+            );
+            return;
+        }
         // Each SIMD group takes one row of block-quantized weights, the
         // tokens eight at a time.
         self.dispatch(
@@ -1762,11 +1777,13 @@ impl Device for Metal {
             k: k as u32,
             shared: shared as u32,
         };
+        // NVFP4 takes four rows per SIMD group (8 lanes/row); Q8_0 takes one.
+        let per_simd = if which == 0 { 4 } else { 1 };
         self.dispatch_grid(
             kernel,
             &[&out.buf, &w.buf, scales, &x.buf, &ids.buf, &scale.buf],
             &params,
-            (rows.div_ceil(self.matmul_rows), pairs),
+            (rows.div_ceil(self.matmul_rows * per_simd), pairs),
             THREADS,
         );
     }

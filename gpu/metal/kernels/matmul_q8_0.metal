@@ -1,10 +1,10 @@
 // out[t][r] = w[r] · x[t] for Q8_0 weights: each SIMD group takes one row,
 // its lanes a block of 32 weights each in turn, so that the lanes read
-// adjacent blocks. A lane reads its block's quants as two 16-byte words
-// and its scale as a half, and multiplies them into the block's
-// activations of up to eight tokens at once, so that a block is read and
-// unpacked once per eight tokens rather than once per token. The quants
-// and the scales are laid out as `quant.rs` says.
+// adjacent blocks. For a single token (VEC != 0), each lane dots its block
+// straight into one accumulator without holding a multi-token array in
+// registers; for a batch of up to eight tokens, each unpacked block is
+// reused across all tokens. The quants and the scales are laid out as
+// `quant.rs` says.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -15,13 +15,56 @@ struct Params {
     uint n;
 };
 
-// Tokens taken at once.
-constant uint TOKENS = 8;
+#ifndef VEC
+#define VEC 0
+#endif
 
 // The four signed bytes of a word, in memory order.
 static float4 unpack(uint word) {
     return float4(as_type<char4>(word));
 }
+
+#if VEC
+
+kernel void matmul_q8_0(
+    device float* out [[buffer(0)]],
+    const device uint4* w [[buffer(1)]],
+    const device half* scales [[buffer(2)]],
+    const device float4* x [[buffer(3)]],
+    constant Params& p [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sid [[simdgroup_index_in_threadgroup]],
+    uint nsg [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]])
+{
+    uint r = group * nsg + sid;
+    if (r >= p.rows) {
+        return;
+    }
+    uint blocks = p.cols / 32;
+    float acc = 0.0f;
+    for (uint b = lane; b < blocks; b += width) {
+        uint4 lo = w[(r * blocks + b) * 2];
+        uint4 hi = w[(r * blocks + b) * 2 + 1];
+        float d = float(scales[r * blocks + b]);
+        const device float4* xb = x + b * 8;
+        float sum = dot(unpack(lo.x), xb[0]) + dot(unpack(lo.y), xb[1])
+            + dot(unpack(lo.z), xb[2]) + dot(unpack(lo.w), xb[3])
+            + dot(unpack(hi.x), xb[4]) + dot(unpack(hi.y), xb[5])
+            + dot(unpack(hi.z), xb[6]) + dot(unpack(hi.w), xb[7]);
+        acc += d * sum;
+    }
+    float total = simd_sum(acc);
+    if (lane == 0) {
+        out[r] = total;
+    }
+}
+
+#else
+
+// Tokens taken at once.
+constant uint TOKENS = 8;
 
 kernel void matmul_q8_0(
     device float* out [[buffer(0)]],
@@ -70,3 +113,5 @@ kernel void matmul_q8_0(
         }
     }
 }
+
+#endif
