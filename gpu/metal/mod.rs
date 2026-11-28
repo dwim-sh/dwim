@@ -101,9 +101,12 @@ const QUANT_COLS: usize = 128;
 
 /// Fewest tokens of a batch whose experts are multiplied in tiles on the
 /// matrix accelerators, an expert at a time, and the pairs of a token and
-/// an expert a tile takes: below it, a pair at a time reads fewer of the
-/// experts' weights than unpacking each expert's matrix for a tile.
-const EXPERT_TOKENS: usize = 4;
+/// an expert a tile takes. Below it a pair at a time is faster: it reads
+/// fewer of the experts' weights than unpacking each expert's matrix for
+/// a tile, and does not wait for the router's picks, which the tiles are
+/// laid out from on the host each time a layer is run. Most batches being
+/// verified, a token and the drafts after it, are below it.
+const EXPERT_TOKENS: usize = 7;
 const EXPERT_TILE: usize = 16;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
