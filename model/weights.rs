@@ -20,10 +20,11 @@ pub struct Weights {
     /// The file holding the model: a GGUF file, which carries the
     /// tokenizer and the sampling settings too.
     pub file: &'static str,
-    /// The file holding the model's drafter, where that is a file of its
-    /// own: a small network that drafts the tokens ahead, for the model
-    /// to verify several of at once.
-    pub drafter: Option<&'static str>,
+    /// The model's drafter, where it has one that is a file of its own: a
+    /// small network that drafts the tokens ahead, for the model to
+    /// verify several of at once. Weights of their own, which may come
+    /// from another repository than the model's.
+    pub drafter: Option<&'static Weights>,
     /// The files fetched.
     pub files: &'static [File],
 }
@@ -58,22 +59,35 @@ impl Weights {
         dir.join(self.file)
     }
 
-    /// The file in `dir` that holds the model's drafter, if it has one of
-    /// its own.
-    pub fn drafter_path(&self, dir: &Path) -> Option<PathBuf> {
-        self.drafter.map(|file| dir.join(file))
+    /// The file that holds the model's drafter, where its files are
+    /// kept, if the model has one of its own.
+    pub fn drafter_path(&self) -> Option<PathBuf> {
+        let drafter = self.drafter?;
+        Some(drafter.path(&drafter.dir()?))
     }
 
-    /// How much of the model is in `dir`.
+    /// How much of the model is in `dir`, and of its drafter where the
+    /// drafter's files are kept.
     pub fn on_disk(&self, dir: &Path) -> OnDisk {
         let found = self
             .files
             .iter()
             .filter_map(|file| fs::metadata(dir.join(file.name)).ok());
-        OnDisk {
+        let mut on_disk = OnDisk {
             files: found.clone().count(),
             of: self.files.len(),
             bytes: found.map(|metadata| metadata.len()).sum(),
+        };
+        if let Some(drafter) = self.drafter {
+            let dir = drafter.dir();
+            let found = drafter
+                .files
+                .iter()
+                .filter_map(|file| fs::metadata(dir.as_ref()?.join(file.name)).ok());
+            on_disk.files += found.clone().count();
+            on_disk.of += drafter.files.len();
+            on_disk.bytes += found.map(|metadata| metadata.len()).sum::<u64>();
         }
+        on_disk
     }
 }

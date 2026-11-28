@@ -3111,6 +3111,7 @@ mod tests {
         attention_rel_matches_cpu,
         route_matches_cpu,
         rows_and_gates_match_cpu,
+        block_conv_matches_cpu,
         read_capped_matches_cpu,
         gate_matches_cpu,
         copy_cache_copies_a_prefix,

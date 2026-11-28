@@ -33,7 +33,9 @@
 //! way into a few of the layers and the model's output, of every token
 //! run, and a batch the model verifies keeps what it takes to drop the
 //! tokens that turn out wrong: each convolution's state from before the
-//! batch, and the batch's input to it.
+//! batch, and the batch's input to it. The model asks for the drafts the
+//! drafter is sure enough of, and for no more than it has lately kept
+//! and as many again.
 
 mod drafter;
 
@@ -70,6 +72,13 @@ const FFN: usize = 3;
 /// over the keys, the values, attention's output and the feed-forward
 /// network's.
 const CONVS: usize = 4;
+
+/// How sure the drafter must be of a draft and of all those before it
+/// for the model to verify it: the probability that they are all kept, as
+/// its selector reckons it. A draft verified costs the weights of its
+/// token's experts, a quarter or so of a pass, and one kept saves a pass
+/// its share of the tokens a pass writes.
+const SURE: f32 = 0.35;
 
 /// The architecture, read from the GGUF metadata.
 #[derive(Debug)]
@@ -380,6 +389,21 @@ fn is_matrix(name: &str) -> bool {
     name.ends_with("ffn_gate_inp.weight") || name.contains(".loop_") && name.contains("_ctrl_")
 }
 
+/// The embedding of `token`, looked up in the file and normalized on the
+/// host as the model's input is on the device: a row the drafter starts a
+/// block from.
+fn embedding(gguf: &Gguf, c: &Config, norm: &[f32], token: usize) -> Vec<f32> {
+    let mut row = vec![0.0; c.hidden];
+    gguf.row("token_embd.weight", token, &mut row)
+        .expect("checked at load");
+    let mean_square = row.iter().map(|v| v * v).sum::<f32>() / c.hidden as f32;
+    let scale = 1.0 / (mean_square + c.eps).sqrt();
+    for (v, w) in row.iter_mut().zip(norm) {
+        *v *= scale * w;
+    }
+    row
+}
+
 /// The model, with its weights on a device, and the state of a sequence.
 pub struct Model<D: Device> {
     config: Config,
@@ -390,8 +414,10 @@ pub struct Model<D: Device> {
     embed_norm: D::Buffer,
     /// The same on the host, for the row the drafter starts a block from.
     embed_norm_host: Vec<f32>,
-    /// The drafter, where its file is there.
+    /// The drafter, where its file is there, and how sure it must be of
+    /// a draft and of all those before it for the model to verify it.
     drafter: Option<Drafter<D>>,
+    sure: f32,
     layers: Vec<Layer<D>>,
     /// What the core's layers read the pass before with, a layer each.
     loops: Vec<Loop<D>>,
@@ -529,9 +555,17 @@ impl<D: Device> Model<D> {
         };
         let (ones_head, ones_kv) = (ones(c.head_dim), ones(c.kv_dim()));
         let most = device.batch() * BATCHES;
+        let embed_norm_host = gguf.f32s("token_embd_norm.weight")?;
         let drafter = match drafter {
             Some(file) => {
-                let drafter = Drafter::load(file, &device, most)?;
+                // The rows of a block not yet drafted hold the drafter's
+                // mask token, embedded as the model's tokens are.
+                let mask = drafter::Config::load(&file)?.mask as usize;
+                if mask >= c.vocab {
+                    return Err("the drafter is of another model".into());
+                }
+                let mask = embedding(&gguf, c, &embed_norm_host, mask);
+                let drafter = Drafter::load(file, &device, most, mask)?;
                 let d = &drafter.config;
                 // The drafter reads the model's layers by number, and
                 // writes through its output projection.
@@ -546,7 +580,6 @@ impl<D: Device> Model<D> {
             None => None,
         };
         let state = State::new(c, &device, max_len, drafter.as_ref());
-        let embed_norm_host = gguf.f32s("token_embd_norm.weight")?;
         Ok(Self {
             config,
             device,
@@ -554,6 +587,7 @@ impl<D: Device> Model<D> {
             embed_norm,
             embed_norm_host,
             drafter,
+            sure: SURE,
             layers,
             loops,
             out_query,
@@ -1230,7 +1264,7 @@ fn load_loop<D: Device, F: FnMut(usize, usize)>(
 
 /// The first bytes of a saved state, and its layout's version.
 const STATE_MAGIC: &[u8; 8] = b"dwimink2";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 impl<D: Device> LanguageModel for Model<D> {
     /// The state after `len` positions: a header of the layout's version
@@ -1347,7 +1381,8 @@ impl<D: Device> LanguageModel for Model<D> {
     }
 
     /// Drafts with the model's drafter, if its file is there and the
-    /// sequence has context for every position before the token.
+    /// sequence has context for every position before the token: the
+    /// drafts the drafter is sure enough of, all told.
     fn draft(&mut self, token: u32, pos: usize, k: usize) -> Vec<u32> {
         let (c, d, s) = (&self.config, &self.device, &mut self.state);
         let (Some(drafter), Some(context)) = (&mut self.drafter, &mut s.seq.context) else {
@@ -1356,20 +1391,11 @@ impl<D: Device> LanguageModel for Model<D> {
         if k == 0 || s.verified.is_some() || !drafter.ready(context, pos, s.seq.max_len) {
             return Vec::new();
         }
-        // No more than the model has lately been keeping, and one.
+        // No more than the model has lately been keeping, and as many
+        // again.
         let k = k.min(s.seq.drafts);
-        // The token's embedding, normalized as the model's input is.
-        let mut anchor = vec![0.0; c.hidden];
-        self.gguf
-            .row("token_embd.weight", token as usize, &mut anchor)
-            .expect("checked at load");
-        let mean_square = anchor.iter().map(|v| v * v).sum::<f32>() / c.hidden as f32;
-        let scale = 1.0 / (mean_square + c.eps).sqrt();
-        for (v, w) in anchor.iter_mut().zip(&self.embed_norm_host) {
-            *v *= scale * w;
-        }
-        d.resize(&mut s.logits, c.vocab_padded);
-        drafter
+        let anchor = embedding(&self.gguf, c, &self.embed_norm_host, token as usize);
+        let drafts = drafter
             .draft(
                 d,
                 context,
@@ -1378,9 +1404,20 @@ impl<D: Device> LanguageModel for Model<D> {
                 pos,
                 k,
                 &self.head,
+                c.vocab_padded,
                 &mut s.logits,
             )
-            .expect("the drafter's table was checked at load")
+            .expect("the selector's vectors were checked at load");
+        d.resize(&mut s.logits, c.vocab_padded);
+        let mut sure = 1.0;
+        drafts
+            .iter()
+            .take_while(|draft| {
+                sure *= draft.sure;
+                sure >= self.sure
+            })
+            .map(|draft| draft.token)
+            .collect()
     }
 
     fn verify(&mut self, tokens: &[u32], pos: usize) -> Vec<f32> {
@@ -1434,16 +1471,17 @@ impl<D: Device> LanguageModel for Model<D> {
                 }
             }
         }
-        // A draft costs a pass over the output projection, and a token
-        // verified its experts' weights: one more is drafted after a
-        // batch kept whole, and after another no more than were kept.
+        // A block costs the same however many of its drafts are asked
+        // for, and a token verified its experts' weights: twice as many
+        // are asked for after a batch kept whole, and after another one
+        // more than were kept.
         let block = self
             .drafter
             .as_ref()
             .map_or(1, |drafter| drafter.config.block);
         s.seq.drafts = match keep == n {
-            true => (s.seq.drafts + 1).min(block - 1),
-            false => (keep - 1).max(1),
+            true => (2 * s.seq.drafts).min(block - 1),
+            false => keep,
         };
         if let (Some(drafter), Some(context)) = (&mut self.drafter, &mut s.seq.context) {
             for feature in &mut s.features {
@@ -2115,40 +2153,40 @@ mod tests {
 
     /// Writes a tiny random drafter for the tiny model, in the file format
     /// its drafter's is: two layers, the first over a window of four, a
-    /// block of four rows, and a head of rank eight, reading the model's
-    /// stream on the way into its second and sixth layers as it runs
-    /// them, and its output.
+    /// block of four rows, convolutions over two rows with a tap of a
+    /// row's own for every sixteen channels, and a selector of rank eight
+    /// over four candidates, reading the model's stream on the way into
+    /// its second and sixth layers as it runs them, and its output.
     fn synthetic_drafter(path: &Path) {
         let (hidden, layers, heads, kv_heads, head_dim) = (64, 2, 4, 2, 32);
         let (ff, block, rank, window) = (128, 4, 8, 4);
-        let (vocab, padded) = (40, 48);
+        let (kernel, group, candidates) = (2, 16, 4);
+        let vocab = 40;
         let targets = [1, 5, 10];
         let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+        let taps = 2 * kernel * (hidden / group);
         let mut rng = Rng(3);
         let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
         let mut add = |name: String, dims: &[usize], dtype: u32, data: Vec<u8>| {
             tensors.push((name, dims.to_vec(), dtype, data));
         };
         let small = |cols: usize| 1.0 / (cols as f32).sqrt();
-        let floats: &[(&str, &[usize], f32, f32)] = &[
-            ("dspark_fuse.weight", &[targets.len(), layers + 1], 1.0, 0.0),
-            ("dspark_hidden_out.bias", &[hidden], 0.1, 0.0),
-            ("dspark_norm.weight", &[hidden], 0.1, 1.0),
-            ("joint_proj.bias", &[3 * rank], 0.1, 0.0),
-            ("mask_embd.weight", &[hidden], 1.0, 0.0),
-            ("output_norm.weight", &[hidden], 0.1, 1.0),
-        ];
-        for &(name, dims, scale, offset) in floats {
-            let data = rng.floats(dims.iter().product(), scale, offset);
-            add(name.into(), dims, gguf::F32, data);
+        for name in ["enc.output_norm.weight", "output_norm.weight"] {
+            let data = rng.floats(hidden, 0.1, 1.0);
+            add(name.into(), &[hidden], gguf::F32, data);
         }
         for (name, rows, cols) in [
-            ("dspark_hidden_out", hidden, rank),
-            ("joint_proj", 3 * rank, 2 * rank + 2 * hidden),
-            ("markov_w1", padded, rank),
+            ("fc", hidden, targets.len() * hidden),
+            ("selector_hidden", rank, hidden),
         ] {
-            let data = rng.bf16(rows * cols, small(cols));
-            add(format!("{name}.weight"), &[cols, rows], gguf::BF16, data);
+            let data = rng.q8_0(rows, cols, small(cols));
+            add(format!("{name}.weight"), &[cols, rows], gguf::Q8_0, data);
+        }
+        // The selector's vectors are large enough to change which
+        // candidate a row's pick is.
+        for name in ["selector_predecessor", "selector_successor"] {
+            let data = rng.bf16(vocab * rank, 4.0);
+            add(format!("{name}.weight"), &[rank, vocab], gguf::BF16, data);
         }
         for i in 0..layers {
             let p = format!("blk.{i}");
@@ -2156,9 +2194,9 @@ mod tests {
                 ("attn_q", q_dim, hidden),
                 ("attn_k", kv_dim, hidden),
                 ("attn_v", kv_dim, hidden),
-                ("attn_k_ctx", kv_dim, hidden),
-                ("attn_v_ctx", kv_dim, hidden),
                 ("attn_output", hidden, q_dim),
+                ("attn_conv_proj", taps, hidden),
+                ("ffn_conv_proj", taps, hidden),
                 ("ffn_gate", ff, hidden),
                 ("ffn_up", ff, hidden),
                 ("ffn_down", hidden, ff),
@@ -2171,16 +2209,22 @@ mod tests {
                     data,
                 );
             }
-            for (name, len) in [
-                ("attn_q_norm", head_dim),
-                ("attn_k_norm", head_dim),
-                ("attn_k_ctx_norm", head_dim),
-                ("attn_norm", hidden),
-                ("ffn_norm", hidden),
-                ("dflare_norm", hidden),
+            // Queries and keys long enough that a row attends to a few
+            // positions rather than to all of them alike.
+            for (name, len, scale) in [
+                ("attn_q_norm", head_dim, 3.0),
+                ("attn_k_norm", head_dim, 3.0),
+                ("attn_norm", hidden, 1.0),
+                ("ffn_norm", hidden, 1.0),
             ] {
-                let data = rng.floats(len, 0.1, 1.0);
+                let data = rng.floats(len, 0.1, scale);
                 add(format!("{p}.{name}.weight"), &[len], gguf::F32, data);
+            }
+            // A row's own channels count for about one, and the row
+            // before's for less.
+            for name in ["attn_conv_base", "ffn_conv_base"] {
+                let data = rng.floats(2 * kernel * hidden, 0.5, 0.5);
+                add(format!("{p}.{name}"), &[hidden, kernel, 2], gguf::F32, data);
             }
         }
         let n = |v: usize| Value::U32(v as u32);
@@ -2192,7 +2236,6 @@ mod tests {
             ("dflash.attention.head_count", n(heads)),
             ("dflash.attention.head_count_kv", n(kv_heads)),
             ("dflash.attention.key_length", n(head_dim)),
-            ("dflash.rope.dimension_count", n(head_dim)),
             ("dflash.rope.freq_base", Value::F32(10000.0)),
             ("dflash.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
             ("dflash.attention.sliding_window", n(window)),
@@ -2205,9 +2248,16 @@ mod tests {
                 Value::Array(targets.iter().map(|&t| Value::I32(t)).collect()),
             ),
             ("dflash.block_size", n(block)),
-            ("dflash.dspark.markov_rank", n(rank)),
-            ("dflash.vocab_size", n(padded)),
-            ("dflash.vocab_size_unpadded", n(vocab)),
+            ("dflash.conv_kernel_size", n(kernel)),
+            ("dflash.conv_group_size", n(group)),
+            ("dflash.selector_rank", n(rank)),
+            ("dflash.selector_top_k", n(candidates)),
+            (
+                "dflash.selector_softcap_after_correction",
+                Value::Bool(true),
+            ),
+            ("dflash.final_logit_softcapping", Value::F32(30.0)),
+            ("tokenizer.ggml.mask_token_id", n(vocab - 1)),
         ];
         gguf::write(path, &meta, &tensors).unwrap();
     }
@@ -2235,7 +2285,9 @@ mod tests {
             Model::load(gguf, None, device, max_len, |_, _| {}).unwrap()
         }
 
-        /// The model with a drafter, whose file is written beside it.
+        /// The model with a drafter, whose file is written beside it, and
+        /// which is sure enough of every draft: a random drafter is sure
+        /// of none.
         fn load_drafting<D: Device>(&self, device: D, max_len: usize) -> Model<D> {
             let path = self.0.join("drafter.gguf");
             if !path.exists() {
@@ -2243,7 +2295,9 @@ mod tests {
             }
             let gguf = Arc::new(Gguf::open(&self.0.join("model.gguf")).unwrap());
             let drafter = Arc::new(Gguf::open(&path).unwrap());
-            Model::load(gguf, Some(drafter), device, max_len, |_, _| {}).unwrap()
+            let mut model = Model::load(gguf, Some(drafter), device, max_len, |_, _| {}).unwrap();
+            model.sure = 0.0;
+            model
         }
     }
 
@@ -2390,7 +2444,7 @@ mod tests {
         let tokens = sequence(330);
         let mut model = file.load_drafting(Cpu, 400);
         // Nothing is drafted before any token is run; then one token at
-        // a time, and one more after each batch that is kept whole.
+        // a time, and twice as many after each batch that is kept whole.
         assert_eq!(model.draft(1, 0, 3), Vec::<u32>::new());
         model.forward(&tokens[..296], 0);
         assert_eq!(model.draft(tokens[296], 296, 3).len(), 1);
@@ -2410,6 +2464,19 @@ mod tests {
         changed[290] = (changed[290] + 1) % 40;
         other.forward(&changed[..300], 0);
         assert_ne!(other.draft(tokens[300], 300, 3), drafts);
+        // A model that asks the drafter to be surer verifies the first of
+        // the same drafts, and one that asks for certainty none.
+        let mut surer = file.load_drafting(Cpu, 400);
+        surer.forward(&tokens[..296], 0);
+        for at in [296, 298] {
+            surer.verify(&tokens[at..at + 2], at);
+            surer.rewind(2);
+        }
+        surer.sure = 0.3;
+        let fewer = surer.draft(tokens[300], 300, 3);
+        assert_eq!(fewer, drafts[..fewer.len()]);
+        surer.sure = 1.5;
+        assert_eq!(surer.draft(tokens[300], 300, 3), Vec::<u32>::new());
 
         // A model that takes up a saved state drafts as the one that
         // saved it, a token at a time again, and so does one put back at
@@ -2545,7 +2612,7 @@ mod tests {
     fn real_model_drafts() {
         let weights = crate::model::Model::InklingMini.weights().unwrap();
         let dir = weights.dir().unwrap();
-        let (path, drafter) = (weights.path(&dir), weights.drafter_path(&dir).unwrap());
+        let (path, drafter) = (weights.path(&dir), weights.drafter_path().unwrap());
         if !path.exists() || !drafter.exists() {
             eprintln!("skipping: no model and drafter at {}", dir.display());
             return;
@@ -2578,12 +2645,15 @@ mod tests {
             model.reset();
             let mut logits = model.forward(&prompt, 0);
             let (mut written, mut drafted, mut kept, mut passes) = (Vec::new(), 0, 0, 0);
+            let mut drafting = std::time::Duration::ZERO;
             let start = std::time::Instant::now();
             while written.len() < total {
                 let pos = prompt.len() + written.len();
                 let token = top(&logits);
                 written.push(token);
+                let before = std::time::Instant::now();
                 let drafts = model.draft(token, pos, 7);
+                drafting += before.elapsed();
                 passes += 1;
                 if drafts.is_empty() {
                     logits = model.forward(&[token], pos);
@@ -2610,9 +2680,10 @@ mod tests {
                 .count();
             eprintln!(
                 "{alone:.1} tok/s a token at a time, {speed:.1} drafted: {} tokens in {passes} \
-                 passes, {kept} of {drafted} drafts kept; the same as a token at a time for \
-                 {same} tokens",
-                written.len()
+                 passes, {kept} of {drafted} drafts kept, {:.1} ms a pass drafting; the same as \
+                 a token at a time for {same} tokens",
+                written.len(),
+                drafting.as_secs_f64() * 1e3 / passes as f64
             );
         }
     }

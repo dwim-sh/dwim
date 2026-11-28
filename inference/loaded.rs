@@ -45,7 +45,7 @@ impl Loaded {
             return None;
         }
         let gguf = Gguf::open(&path).ok()?;
-        let drafter = drafter(weights, &weights.dir()?).ok()?;
+        let drafter = drafter(weights).ok()?;
         let device = Opened::open(device).ok()?;
         size(&gguf, drafter.as_deref(), &device, None, Self::SESSIONS).ok()
     }
@@ -70,7 +70,7 @@ impl Loaded {
         let name = device.name();
         on_progress(Progress::Device(name.clone()));
         let format = model.format(&gguf)?;
-        let drafter = drafter(weights, dir)?;
+        let drafter = drafter(weights)?;
         let size = size(&gguf, drafter.as_deref(), &device, context, sessions)?;
         on_progress(Progress::Sized(size));
         let model = device.load(gguf.clone(), drafter, size.context, |done, total| {
@@ -263,11 +263,11 @@ fn size(
     })
 }
 
-/// The file of the drafter of the model whose files are in `dir`, where
-/// the model has one of its own and it is there: a model without it runs
-/// as it does, a token at a time.
-fn drafter(weights: &Weights, dir: &Path) -> Result<Option<Arc<Gguf>>> {
-    match weights.drafter_path(dir).filter(|path| path.exists()) {
+/// The file of the model's drafter, where the model has one of its own
+/// and it is there: a model without it runs as it does, a token at a
+/// time.
+fn drafter(weights: &Weights) -> Result<Option<Arc<Gguf>>> {
+    match weights.drafter_path().filter(|path| path.exists()) {
         Some(path) => Ok(Some(Arc::new(Gguf::open(&path)?))),
         None => Ok(None),
     }
