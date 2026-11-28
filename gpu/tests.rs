@@ -1638,6 +1638,64 @@ pub fn attention_rel_matches_cpu<D: Device>(gpu: &D) {
             close(&gpu.read(&out), &want, 1e-4);
         }
     }
+
+    // Bidirectional block attention (as the drafter runs it): every row of the
+    // block attends to the same window ending at pos, with no bias or sink.
+    for (n_heads, head_dim, n_kv_heads, block, pos, window, rows) in [
+        (24, 128, 8, 8, 300, usize::MAX, 301),
+        (24, 128, 8, 8, 2500, 1032, 1096),
+        (24, 128, 8, 8, 12, 16, 24),
+    ] {
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        let q = rng.floats(block * q_dim);
+        let held = (pos + 1).min(rows);
+        let (k_cache, v_cache) = (rng.floats(held * kv_dim), rng.floats(held * kv_dim));
+        let rel = vec![0.0; n_heads * 16];
+        let bias = vec![0.0; 16];
+        let sinks = vec![-1e9; n_heads];
+        let mut want = vec![0.0; block * q_dim];
+        let (mut q_row_cpu, mut att_row_cpu) = (vec![0.0; q_dim], vec![0.0; q_dim]);
+        Cpu.attention_block(
+            &mut want,
+            &q,
+            &cache(&Cpu, &k_cache, 0),
+            &cache(&Cpu, &v_cache, 0),
+            pos,
+            block,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+            &mut q_row_cpu,
+            &mut att_row_cpu,
+            &rel,
+            &bias,
+            &sinks,
+        );
+        let mut out = gpu.alloc(want.len());
+        let (mut q_row, mut att_row) = (gpu.alloc(q_dim), gpu.alloc(q_dim));
+        gpu.attention_block(
+            &mut out,
+            &buffer(gpu, &q),
+            &cache(gpu, &k_cache, 0),
+            &cache(gpu, &v_cache, 0),
+            pos,
+            block,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+            &mut q_row,
+            &mut att_row,
+            &buffer(gpu, &rel),
+            &buffer(gpu, &bias),
+            &buffer(gpu, &sinks),
+        );
+        close_batch(&gpu.read(&out), &want, &format!("block {block} at {pos}"));
+    }
 }
 
 /// The router: the experts picked are the same, and what each counts for.

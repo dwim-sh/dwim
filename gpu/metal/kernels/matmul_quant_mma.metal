@@ -24,7 +24,7 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
-    uint splits;
+    uint add;
 };
 
 #ifndef BITS
@@ -162,6 +162,20 @@ kernel void matmul_quant_mma(
         auto xb = xs.slice<COLS, TOKENS>(s * COLS, t0);
         op.run(xb, ws, acc);
     }
-    auto tile = results.slice(r0, t0);
-    acc.store(tile);
+    if (p.add != 0) {
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+            if (acc.is_valid_element(i)) {
+                auto ids = acc.get_multidimensional_index(i);
+                uint rr = r0 + ids[0];
+                uint tt = t0 + ids[1];
+                if (rr < p.rows && tt < p.n) {
+                    out[tt * p.rows + rr] += acc[i];
+                }
+            }
+        }
+    } else {
+        auto tile = results.slice(r0, t0);
+        acc.store(tile);
+    }
 }

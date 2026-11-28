@@ -1056,6 +1056,259 @@ impl Metal {
         );
     }
 
+    /// Runs a matrix multiplication, writing into or adding to `out`.
+    fn run_matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer, add: bool) {
+        let (rows, cols) = (w.shape[0], w.shape[1]);
+        let n = x.len / cols;
+        assert_eq!(x.len, n * cols);
+        assert_eq!(out.len, n * rows);
+        assert!(cols % 8 == 0);
+        out.touch();
+        let params = MatmulParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            n: n as u32,
+            add: add as u32,
+        };
+        // Each SIMD group takes one row of bf16 weights for eight tokens.
+        if w.format == Format::Bf16 {
+            self.dispatch_grid(
+                &self.kernels.matmul_bf16,
+                &[&out.buf, &w.buf, &x.buf],
+                &params,
+                (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
+                THREADS,
+            );
+            return;
+        }
+        // The block-quantized kernels bind the scales after the quants.
+        let which = quant_index(w.format);
+        let scales = w
+            .scales
+            .as_ref()
+            .expect("block-quantized weights have scales");
+        // A batch through block-quantized weights is a tiled matrix product
+        // too, on the accelerators or the SIMD groups' matrix units, over
+        // the activations packed as half floats, where the matrix is a whole
+        // number of the steps the tile kernels take.
+        if n > QUANT_TOKENS && cols.is_multiple_of(QUANT_COLS) {
+            let size = TILE_TOKENS
+                .iter()
+                .position(|&tokens| n <= tokens)
+                .unwrap_or(TILE_TOKENS.len() - 1);
+            let tile_tokens = TILE_TOKENS[size];
+            let padded = n.next_multiple_of(tile_tokens);
+            self.pack(x, n, cols, padded);
+            let kernel = match &self.kernels.matmul_quant_mma {
+                Some(mma) => &mma[which][size],
+                None => &self.kernels.matmul_quant_tile[which][size],
+            };
+            self.dispatch_grid(
+                kernel,
+                &[&out.buf, &w.buf, scales, &self.packed],
+                &params,
+                (rows.div_ceil(TILE_ROWS), padded / tile_tokens),
+                MATRIX_THREADS,
+            );
+            return;
+        }
+        // A single token through Q8_0 weights takes the low-register single-token
+        // kernel rather than holding eight token accumulators per lane.
+        if n == 1 && w.format == Format::Q8_0 {
+            self.dispatch(
+                &self.kernels.matmul_q8_0_vec,
+                &[&out.buf, &w.buf, scales, &x.buf],
+                &params,
+                rows.div_ceil(self.matmul_rows),
+                THREADS,
+            );
+            return;
+        }
+        // Each SIMD group takes one row of block-quantized weights, the
+        // tokens eight at a time.
+        self.dispatch(
+            &self.kernels.matmul_quant[which],
+            &[&out.buf, &w.buf, scales, &x.buf],
+            &params,
+            rows.div_ceil(self.matmul_rows),
+            THREADS,
+        );
+    }
+
+    /// Runs relative-position attention (causal when `!bidir`, or bidirectional
+    /// block attention over `[pos+1-window, pos]` with no bias or sink when `bidir`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_rel(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+        bidir: bool,
+    ) {
+        let n = q.len / (n_heads * head_dim);
+        assert_eq!(q.len, n * n_heads * head_dim);
+        assert_eq!(out.len, q.len);
+        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= ATTENTION_THREADS);
+        assert!(
+            n_heads / n_kv_heads <= 8,
+            "the kernel holds up to eight query heads per key/value head"
+        );
+        let (n_rel, extent) = if bidir {
+            (0, 0)
+        } else {
+            assert!(sinks.len == n * n_heads && rel.len.is_multiple_of(n * n_heads));
+            let n_rel = rel.len / (n * n_heads);
+            assert!(bias.len.is_multiple_of(n_rel));
+            (n_rel, bias.len / n_rel)
+        };
+        out.touch();
+        let group = n_heads / n_kv_heads;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 10] = [
+            &out.buf,
+            &q.buf,
+            &k_cache.quants,
+            &k_cache.scales,
+            &v_cache.quants,
+            &v_cache.scales,
+            &self.partials,
+            &rel.buf,
+            &bias.buf,
+            &sinks.buf,
+        ];
+        let params = |first: usize, tokens: usize, chunks: usize, chunk: usize| AttentionRelParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            n_kv_heads: n_kv_heads as u32,
+            pos: pos as u32,
+            first: first as u32,
+            chunks: chunks as u32,
+            chunk: chunk as u32,
+            tokens: tokens as u32,
+            padded: 0,
+            window: window.min(u32::MAX as usize) as u32,
+            ring: rows as u32,
+            n_rel: n_rel as u32,
+            extent: extent as u32,
+            base: 0,
+            batched: 0,
+            bidir: bidir as u32,
+        };
+        let decode = n == 1 && (pos + 1).min(window) >= DECODE_DEPTH;
+        if let Some(kernels) = &self.kernels.attention_rel_mma
+            && (n >= FLASH_TOKENS || decode)
+            && head_dim == 128
+            && n_rel.is_multiple_of(4)
+            && n_rel <= 16
+        {
+            let (kernel, tile_rows, threads) = match decode {
+                false => (&kernels[0], MMA_ROWS, MMA_THREADS),
+                true => (&kernels[1], DECODE_ROWS, DECODE_THREADS),
+            };
+            let packed_rows = PACKED / (n_kv_heads * head_dim) / tile_rows * tile_rows;
+            let per_dispatch = (PARTIALS / (n_heads * MMA_CHUNKS * (head_dim + 2)))
+                .min(packed_rows / group)
+                .max(1);
+            for first in (0..n).step_by(per_dispatch) {
+                let tokens = per_dispatch.min(n - first);
+                let (base, span) = if bidir {
+                    let base = (pos + 1).saturating_sub(window);
+                    (base, pos + 1 - base)
+                } else {
+                    let base = (pos + first + 1).saturating_sub(window);
+                    (base, pos + first + tokens - base)
+                };
+                let chunk = span.div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK);
+                let chunks = span.div_ceil(chunk);
+                let padded = (tokens * group).next_multiple_of(tile_rows);
+                self.packed_for.set(None);
+                let pack = PackQueriesParams {
+                    n_heads: n_heads as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    dim: head_dim as u32,
+                    first: first as u32,
+                    n: tokens as u32,
+                    padded: padded as u32,
+                };
+                self.dispatch(
+                    &self.kernels.pack_queries,
+                    &[&self.packed, &q.buf],
+                    &pack,
+                    (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
+                    THREADS,
+                );
+                let params = AttentionRelParams {
+                    padded: padded as u32,
+                    base: base as u32,
+                    batched: 1,
+                    ..params(first, tokens, chunks, chunk)
+                };
+                let mut packed = buffers;
+                packed[1] = &self.packed;
+                let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
+                self.dispatch_grid_writes(
+                    kernel,
+                    &packed,
+                    writes,
+                    &params,
+                    ((tokens * group).div_ceil(tile_rows), n_kv_heads * chunks),
+                    threads,
+                );
+                if chunks > 1 {
+                    self.dispatch(
+                        &self.kernels.attention_rel_combine,
+                        &[&out.buf, &self.partials, &sinks.buf],
+                        &params,
+                        tokens * n_heads,
+                        head_dim.next_multiple_of(SIMD_THREADS),
+                    );
+                }
+            }
+            return;
+        }
+        let max_len = if bidir { pos + 1 } else { pos + n };
+        let chunks = max_len.min(window).div_ceil(CHUNK);
+        let per_token = n_heads * chunks * (head_dim + 2);
+        assert!(
+            per_token <= PARTIALS,
+            "attention over {max_len} positions needs more partials than {PARTIALS}"
+        );
+        let per_dispatch = PARTIALS / per_token;
+        let attention_rel = &self.kernels.attention_rel[usize::from(head_dim > 128)];
+        let combine_threads = head_dim.next_multiple_of(SIMD_THREADS);
+        let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
+        for first in (0..n).step_by(per_dispatch) {
+            let tokens = per_dispatch.min(n - first);
+            let params = params(first, tokens, chunks, CHUNK);
+            self.dispatch_writes(
+                attention_rel,
+                &buffers,
+                writes,
+                &params,
+                tokens * n_kv_heads * chunks,
+                ATTENTION_THREADS,
+            );
+            if chunks > 1 {
+                self.dispatch(
+                    &self.kernels.attention_rel_combine,
+                    &[&out.buf, &self.partials, &sinks.buf],
+                    &params,
+                    tokens * n_heads,
+                    combine_threads,
+                );
+            }
+        }
+    }
+
     /// Runs `short_conv`, writing into or adding to `out`, and moves the
     /// convolution state on past a batch.
     fn run_short_conv(
@@ -1160,8 +1413,8 @@ struct MatmulParams {
     rows: u32,
     cols: u32,
     n: u32,
-    /// Splits of the columns, for the kernels that take them.
-    splits: u32,
+    /// When nonzero, add the product into `out` in place.
+    add: u32,
 }
 
 #[repr(C)]
@@ -1304,6 +1557,9 @@ struct AttentionRelParams {
     /// token's: the first position the dispatch attends over.
     base: u32,
     batched: u32,
+    /// When nonzero, every token attends bidirectionally up to `pos` with no
+    /// relative-position bias and no sink.
+    bidir: u32,
 }
 
 #[repr(C)]
@@ -1731,81 +1987,23 @@ impl Device for Metal {
     }
 
     fn matmul(&self, out: &mut Buffer, w: &Weight, x: &Buffer) {
-        let (rows, cols) = (w.shape[0], w.shape[1]);
-        let n = x.len / cols;
-        assert_eq!(x.len, n * cols);
-        assert_eq!(out.len, n * rows);
-        assert!(cols % 8 == 0);
-        out.touch();
-        let params = MatmulParams {
-            rows: rows as u32,
-            cols: cols as u32,
-            n: n as u32,
-            splits: 1,
-        };
-        // Each SIMD group takes one row of bf16 weights for eight tokens.
-        if w.format == Format::Bf16 {
-            self.dispatch_grid(
-                &self.kernels.matmul_bf16,
-                &[&out.buf, &w.buf, &x.buf],
-                &params,
-                (rows.div_ceil(self.matmul_rows), n.div_ceil(BF16_TOKENS)),
-                THREADS,
-            );
-            return;
-        }
-        // The block-quantized kernels bind the scales after the quants.
-        let which = quant_index(w.format);
-        let scales = w
-            .scales
-            .as_ref()
-            .expect("block-quantized weights have scales");
-        // A batch through block-quantized weights is a tiled matrix product
-        // too, on the accelerators or the SIMD groups' matrix units, over
-        // the activations packed as half floats, where the matrix is a whole
-        // number of the steps the tile kernels take.
-        if n > QUANT_TOKENS && cols.is_multiple_of(QUANT_COLS) {
-            let size = TILE_TOKENS
-                .iter()
-                .position(|&tokens| n <= tokens)
-                .unwrap_or(TILE_TOKENS.len() - 1);
-            let tile_tokens = TILE_TOKENS[size];
-            let padded = n.next_multiple_of(tile_tokens);
-            self.pack(x, n, cols, padded);
-            let kernel = match &self.kernels.matmul_quant_mma {
-                Some(mma) => &mma[which][size],
-                None => &self.kernels.matmul_quant_tile[which][size],
-            };
-            self.dispatch_grid(
-                kernel,
-                &[&out.buf, &w.buf, scales, &self.packed],
-                &params,
-                (rows.div_ceil(TILE_ROWS), padded / tile_tokens),
-                MATRIX_THREADS,
-            );
-            return;
-        }
-        // A single token through Q8_0 weights takes the low-register single-token
-        // kernel rather than holding eight token accumulators per lane.
-        if n == 1 && w.format == Format::Q8_0 {
-            self.dispatch(
-                &self.kernels.matmul_q8_0_vec,
-                &[&out.buf, &w.buf, scales, &x.buf],
-                &params,
-                rows.div_ceil(self.matmul_rows),
-                THREADS,
-            );
-            return;
-        }
-        // Each SIMD group takes one row of block-quantized weights, the
-        // tokens eight at a time.
-        self.dispatch(
-            &self.kernels.matmul_quant[which],
-            &[&out.buf, &w.buf, scales, &x.buf],
-            &params,
-            rows.div_ceil(self.matmul_rows),
-            THREADS,
-        );
+        self.run_matmul(out, w, x, false);
+    }
+
+    fn matmul_add(&self, x: &mut Buffer, w: &Weight, input: &Buffer, _scratch: &mut Buffer) {
+        self.run_matmul(x, w, input, true);
+    }
+
+    fn swiglu(
+        &self,
+        out: &mut Buffer,
+        gate: &Weight,
+        up: &Weight,
+        x: &Buffer,
+        scratch: &mut Buffer,
+    ) {
+        self.matmuls(&mut [(out, gate, x), (scratch, up, x)]);
+        self.silu_mul(out, scratch);
     }
 
     fn matmuls(&self, jobs: &mut [(&mut Buffer, &Weight, &Buffer)]) {
@@ -3232,157 +3430,36 @@ impl Device for Metal {
         window: usize,
         rows: usize,
     ) {
-        let n = q.len / (n_heads * head_dim);
-        assert_eq!(q.len, n * n_heads * head_dim);
-        assert_eq!(out.len, q.len);
-        assert!(head_dim.is_multiple_of(CACHE_BLOCK) && head_dim <= ATTENTION_THREADS);
-        assert!(
-            n_heads / n_kv_heads <= 8,
-            "the kernel holds up to eight query heads per key/value head"
+        self.run_attention_rel(
+            out, q, k_cache, v_cache, rel, bias, sinks, pos, n_heads, head_dim, n_kv_heads, window,
+            rows, false,
         );
-        assert!(sinks.len == n * n_heads && rel.len.is_multiple_of(n * n_heads));
-        let n_rel = rel.len / (n * n_heads);
-        assert!(bias.len.is_multiple_of(n_rel));
-        out.touch();
-        let group = n_heads / n_kv_heads;
-        let extent = bias.len / n_rel;
-        let buffers: [&ProtocolObject<dyn MTLBuffer>; 10] = [
-            &out.buf,
-            &q.buf,
-            &k_cache.quants,
-            &k_cache.scales,
-            &v_cache.quants,
-            &v_cache.scales,
-            &self.partials,
-            &rel.buf,
-            &bias.buf,
-            &sinks.buf,
-        ];
-        let params = |first: usize, tokens: usize, chunks: usize, chunk: usize| AttentionRelParams {
-            n_heads: n_heads as u32,
-            head_dim: head_dim as u32,
-            n_kv_heads: n_kv_heads as u32,
-            pos: pos as u32,
-            first: first as u32,
-            chunks: chunks as u32,
-            chunk: chunk as u32,
-            tokens: tokens as u32,
-            padded: 0,
-            window: window.min(u32::MAX as usize) as u32,
-            ring: rows as u32,
-            n_rel: n_rel as u32,
-            extent: extent as u32,
-            base: 0,
-            batched: 0,
-        };
-        // A batch of tokens of heads of 128 goes through the kernel on the
-        // matrix accelerators, where the GPU has them, and so does a token
-        // that attends over enough positions that reading the caches is
-        // the work, in tiles of its own size. The queries are packed for
-        // it: as many tokens to a dispatch as the partials and the packed
-        // queries fit at the most chunks a dispatch has, over chunks that
-        // start where the dispatch's first token attends from.
-        let decode = n == 1 && (pos + 1).min(window) >= DECODE_DEPTH;
-        if let Some(kernels) = &self.kernels.attention_rel_mma
-            && (n >= FLASH_TOKENS || decode)
-            && head_dim == 128
-            && n_rel.is_multiple_of(4)
-            && n_rel <= 16
-        {
-            let (kernel, tile_rows, threads) = match decode {
-                false => (&kernels[0], MMA_ROWS, MMA_THREADS),
-                true => (&kernels[1], DECODE_ROWS, DECODE_THREADS),
-            };
-            let packed_rows = PACKED / (n_kv_heads * head_dim) / tile_rows * tile_rows;
-            let per_dispatch = (PARTIALS / (n_heads * MMA_CHUNKS * (head_dim + 2)))
-                .min(packed_rows / group)
-                .max(1);
-            for first in (0..n).step_by(per_dispatch) {
-                let tokens = per_dispatch.min(n - first);
-                let base = (pos + first + 1).saturating_sub(window);
-                let span = pos + first + tokens - base;
-                let chunk = span.div_ceil(MMA_CHUNKS).next_multiple_of(FLASH_CHUNK);
-                let chunks = span.div_ceil(chunk);
-                let padded = (tokens * group).next_multiple_of(tile_rows);
-                self.packed_for.set(None);
-                let pack = PackQueriesParams {
-                    n_heads: n_heads as u32,
-                    n_kv_heads: n_kv_heads as u32,
-                    dim: head_dim as u32,
-                    first: first as u32,
-                    n: tokens as u32,
-                    padded: padded as u32,
-                };
-                self.dispatch(
-                    &self.kernels.pack_queries,
-                    &[&self.packed, &q.buf],
-                    &pack,
-                    (n_kv_heads * padded * head_dim / 4).div_ceil(THREADS),
-                    THREADS,
-                );
-                let params = AttentionRelParams {
-                    padded: padded as u32,
-                    base: base as u32,
-                    batched: 1,
-                    ..params(first, tokens, chunks, chunk)
-                };
-                let mut packed = buffers;
-                packed[1] = &self.packed;
-                let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
-                self.dispatch_grid_writes(
-                    kernel,
-                    &packed,
-                    writes,
-                    &params,
-                    ((tokens * group).div_ceil(tile_rows), n_kv_heads * chunks),
-                    threads,
-                );
-                if chunks > 1 {
-                    self.dispatch(
-                        &self.kernels.attention_rel_combine,
-                        &[&out.buf, &self.partials, &sinks.buf],
-                        &params,
-                        tokens * n_heads,
-                        head_dim.next_multiple_of(SIMD_THREADS),
-                    );
-                }
-            }
-            return;
-        }
-        // Every token's heads get as many chunks as the last token attends
-        // over, as many tokens to a dispatch as the partials fit.
-        let chunks = (pos + n).min(window).div_ceil(CHUNK);
-        let per_token = n_heads * chunks * (head_dim + 2);
-        assert!(
-            per_token <= PARTIALS,
-            "attention over {} positions needs more partials than {PARTIALS}",
-            pos + n
+    }
+
+    fn attention_block(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        pos: usize,
+        block: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+        _q_row: &mut Buffer,
+        _att_row: &mut Buffer,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+    ) {
+        assert_eq!(q.len, block * n_heads * head_dim);
+        self.run_attention_rel(
+            out, q, k_cache, v_cache, rel, bias, sinks, pos, n_heads, head_dim, n_kv_heads, window,
+            rows, true,
         );
-        let per_dispatch = PARTIALS / per_token;
-        let attention_rel = &self.kernels.attention_rel[usize::from(head_dim > 128)];
-        let combine_threads = head_dim.next_multiple_of(SIMD_THREADS);
-        let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
-        for first in (0..n).step_by(per_dispatch) {
-            let tokens = per_dispatch.min(n - first);
-            let params = params(first, tokens, chunks, CHUNK);
-            self.dispatch_writes(
-                attention_rel,
-                &buffers,
-                writes,
-                &params,
-                tokens * n_kv_heads * chunks,
-                ATTENTION_THREADS,
-            );
-            if chunks > 1 {
-                self.dispatch(
-                    &self.kernels.attention_rel_combine,
-                    &[&out.buf, &self.partials, &sinks.buf],
-                    &params,
-                    tokens * n_heads,
-                    combine_threads,
-                );
-            }
-        }
     }
 
     fn route(

@@ -30,6 +30,7 @@ struct Params {
     uint extent;
     uint base;
     uint batched;
+    uint bidir;
 };
 
 #ifndef CHUNK
@@ -68,9 +69,9 @@ kernel void attention_rel(
     uint tk = wg / p.chunks;
     uint t = p.first + tk / p.n_kv_heads;
     uint kvh = tk % p.n_kv_heads;
-    // The token's own position, the first it attends over, and how many
-    // it does.
-    uint at = p.pos + t;
+    // The token's own position (or shared block end when bidirectional), the
+    // first it attends over, and how many it does.
+    uint at = p.bidir != 0 ? p.pos : p.pos + t;
     uint lo = at + 1 > p.window ? at + 1 - p.window : 0;
     uint len = at + 1 - lo;
     if (c * CHUNK >= len) {
@@ -104,7 +105,7 @@ kernel void attention_rel(
     uint rel_quads = p.n_rel / 4;
     float4 rel_v[4] = {};
     const device float* rel_head = rel + (t * p.n_heads + kvh * group + head) * p.n_rel;
-    if ((lane & 3) == 0 && head < group && vec_rel) {
+    if (p.extent != 0 && (lane & 3) == 0 && head < group && vec_rel) {
         const device float4* r4 = (const device float4*)rel_head;
         for (uint j = 0; j < rel_quads; j++) {
             rel_v[j] = r4[j];
@@ -242,11 +243,15 @@ kernel void attention_rel(
     for (uint g = 0; g < group; g++) {
         uint h = kvh * group + g;
         if (p.chunks == 1) {
-            float sink = sinks[t * p.n_heads + h];
-            float most = max(m[g], sink);
-            float keys = exp(m[g] - most);
             device float4* dst = (device float4*)(out + (t * p.n_heads + h) * p.head_dim);
-            dst[d] = acc[g] * keys / (total[g] * keys + exp(sink - most));
+            if (p.bidir != 0) {
+                dst[d] = acc[g] / total[g];
+            } else {
+                float sink = sinks[t * p.n_heads + h];
+                float most = max(m[g], sink);
+                float keys = exp(m[g] - most);
+                dst[d] = acc[g] * keys / (total[g] * keys + exp(sink - most));
+            }
         } else {
             uint base = (((t - p.first) * p.n_heads + h) * p.chunks + c) * (p.head_dim + 2);
             if (d == 0) {

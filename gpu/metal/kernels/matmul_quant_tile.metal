@@ -20,7 +20,7 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
-    uint splits;
+    uint add;
 };
 
 #ifndef BITS
@@ -171,7 +171,7 @@ kernel void matmul_quant_tile(
     // A whole tile goes straight to the output; one at the edge of the
     // matrix or the batch through threadgroup memory, a lane taking two of
     // each 8x8.
-    bool whole = r0 + ROWS <= p.rows && t0 + TOKENS <= p.n;
+    bool whole = p.add == 0 && r0 + ROWS <= p.rows && t0 + TOKENS <= p.n;
     for (uint i = 0; i < TI; i++) {
         for (uint j = 0; j < RJ; j++) {
             uint t = t0 + st + 8 * i;
@@ -186,7 +186,8 @@ kernel void matmul_quant_tile(
                 uint tt = t + e / 8;
                 uint rr = r + e % 8;
                 if (tt < p.n && rr < p.rows) {
-                    out[tt * p.rows + rr] = edge[sg][e];
+                    uint at = tt * p.rows + rr;
+                    out[at] = p.add != 0 ? out[at] + edge[sg][e] : edge[sg][e];
                 }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);

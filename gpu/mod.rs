@@ -861,6 +861,43 @@ pub trait Device {
         self.write(out, &host);
     }
 
+    /// Bidirectional block attention over an 8-bit ring cache, as a block
+    /// drafter runs it: every row of `q` attends over the latest `window`
+    /// positions up to and including `pos` (no bias by distance, no sink),
+    /// stored in `k_cache` and `v_cache` at `p % rows`. Defaults to running
+    /// [`Self::attention_rel`] one row at a time using `q_row`, `att_row`,
+    /// `rel`, `bias`, and `sinks`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block(
+        &self,
+        out: &mut Self::Buffer,
+        q: &Self::Buffer,
+        k_cache: &Self::Cache,
+        v_cache: &Self::Cache,
+        pos: usize,
+        block: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+        q_row: &mut Self::Buffer,
+        att_row: &mut Self::Buffer,
+        rel: &Self::Buffer,
+        bias: &Self::Buffer,
+        sinks: &Self::Buffer,
+    ) {
+        let q_dim = n_heads * head_dim;
+        for row in 0..block {
+            self.copy(q_row, 0, q, row * q_dim, q_dim);
+            self.attention_rel(
+                att_row, q_row, k_cache, v_cache, rel, bias, sinks, pos, n_heads, head_dim,
+                n_kv_heads, window, rows,
+            );
+            self.copy(out, row * q_dim, att_row, 0, q_dim);
+        }
+    }
+
     /// Picks each token's experts: the `k` of them whose score is highest,
     /// the score of each being the sigmoid of its logit, of which `logits`
     /// holds a row per token, plus its `bias`. `ids` gets the experts'

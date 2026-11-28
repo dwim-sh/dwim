@@ -13,6 +13,7 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
+    uint add;
 };
 
 #ifndef VEC
@@ -57,7 +58,7 @@ kernel void matmul_q8_0(
     }
     float total = simd_sum(acc);
     if (lane == 0) {
-        out[r] = total;
+        out[r] = p.add != 0 ? out[r] + total : total;
     }
 }
 
@@ -108,7 +109,8 @@ kernel void matmul_q8_0(
         for (uint k = 0; k < TOKENS; k++) {
             float total = simd_sum(acc[k]);
             if (lane == 0 && t0 + k < p.n) {
-                out[(t0 + k) * p.rows + r] = total;
+                uint at = (t0 + k) * p.rows + r;
+                out[at] = p.add != 0 ? out[at] + total : total;
             }
         }
     }

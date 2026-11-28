@@ -45,6 +45,7 @@ struct Params {
     uint extent;
     uint base;
     uint batched;
+    uint bidir;
 };
 
 #ifndef DIM
@@ -162,9 +163,9 @@ kernel void attention_rel_mma(
     uint r0 = wg.x * ROWS;
     // The positions any row of the threadgroup attends to in the chunk.
     uint last_row = min(r0 + ROWS, rows) - 1;
-    uint tg_len = p.pos + p.first + last_row / group + 1;
+    uint tg_len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + last_row / group + 1;
     // The first position its first row does.
-    uint first_len = p.pos + p.first + r0 / group + 1;
+    uint first_len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + r0 / group + 1;
     uint tg_lo = first_len > p.window ? first_len - p.window : 0;
     uint start = p.base + c * p.chunk;
     if (start >= tg_len || start + p.chunk <= tg_lo) {
@@ -177,14 +178,14 @@ kernel void attention_rel_mma(
     uint my = lid / PER_ROW;
     uint c0 = (lid % PER_ROW) * (ROUND / PER_ROW);
     uint mine_row = min(r0 + my, rows - 1);
-    uint len = p.pos + p.first + mine_row / group + 1;
+    uint len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + mine_row / group + 1;
     uint lo = len > p.window ? len - p.window : 0;
     // The row's projection for the bias, up to sixteen wide.
     uint quads = p.n_rel / 4;
     uint head = (p.first + mine_row / group) * p.n_heads + kvh * group + mine_row % group;
     float4 projected[4];
     for (uint j = 0; j < 4; j++) {
-        projected[j] = j < quads ? rel[head * quads + j] : float4(0.0f);
+        projected[j] = p.extent != 0 && j < quads ? rel[head * quads + j] : float4(0.0f);
     }
     float m = -1e30f;
     float l = 0.0f;
@@ -310,12 +311,16 @@ kernel void attention_rel_mma(
     if (lid % PER_ROW == 0) {
         row_l[my] = l;
         row_f[my] = m;
-        // The sink is one more to the softmax: the sums are rescaled to
-        // whichever is greater, the keys' maximum or the sink.
-        float sink = sinks[head];
-        float most = max(m, sink);
-        float keys_scale = exp(m - most);
-        row_o[my] = keys_scale / (l * keys_scale + exp(sink - most));
+        if (p.bidir != 0) {
+            row_o[my] = 1.0f / l;
+        } else {
+            // The sink is one more to the softmax: the sums are rescaled to
+            // whichever is greater, the keys' maximum or the sink.
+            float sink = sinks[head];
+            float most = max(m, sink);
+            float keys_scale = exp(m - most);
+            row_o[my] = keys_scale / (l * keys_scale + exp(sink - most));
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
