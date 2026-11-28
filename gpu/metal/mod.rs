@@ -101,9 +101,12 @@ const QUANT_COLS: usize = 128;
 
 /// Fewest tokens of a batch whose experts are multiplied in tiles on the
 /// matrix accelerators, an expert at a time, and the pairs of a token and
-/// an expert a tile takes: below it, a pair at a time reads fewer of the
-/// experts' weights than unpacking each expert's matrix for a tile.
-const EXPERT_TOKENS: usize = 4;
+/// an expert a tile takes. Below it a pair at a time is faster: it reads
+/// fewer of the experts' weights than unpacking each expert's matrix for
+/// a tile, and does not wait for the router's picks, which the tiles are
+/// laid out from on the host each time a layer is run. Most batches being
+/// verified, a token and the drafts after it, are below it.
+const EXPERT_TOKENS: usize = 7;
 const EXPERT_TILE: usize = 16;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
@@ -223,6 +226,7 @@ struct Kernels {
     short_conv_state: Object<dyn MTLComputePipelineState>,
     clip: Object<dyn MTLComputePipelineState>,
     scale_rows: Object<dyn MTLComputePipelineState>,
+    block_conv: Object<dyn MTLComputePipelineState>,
     /// Attention with a bias by distance and a sink: a token at a time,
     /// the merging of its chunks, and for heads of 128 the kernel on the
     /// matrix accelerators, where the GPU has them, in tiles of
@@ -530,6 +534,7 @@ impl Metal {
             short_conv_state: msl!("short_conv_state", THREADS),
             clip: msl!("clip", THREADS),
             scale_rows: msl!("scale_rows", THREADS),
+            block_conv: msl!("block_conv", THREADS),
             attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
             attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
             attention_rel_mma,
@@ -1023,6 +1028,20 @@ struct RowsParams {
     len: u32,
     width: u32,
     k: u32,
+}
+
+/// What `block_conv.metal` is told: the rows and their channels, the
+/// distances a row is convolved over, the channels to a group, and how
+/// long a row of taps is and where the taps to take start in it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlockConvParams {
+    n: u32,
+    channels: u32,
+    kernel: u32,
+    group: u32,
+    width: u32,
+    from: u32,
 }
 
 #[repr(C)]
@@ -1961,6 +1980,40 @@ impl Device for Metal {
         self.dispatch(
             &self.kernels.scale_rows,
             &[&x.buf, &factors.buf],
+            &params,
+            x.len.div_ceil(THREADS),
+            THREADS,
+        );
+    }
+
+    fn block_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        taps: &Buffer,
+        from: usize,
+        base: &Buffer,
+        kernel: usize,
+        group: usize,
+    ) {
+        let channels = base.len / kernel;
+        let n = x.len / channels;
+        assert!(x.len == n * channels && out.len == x.len);
+        assert!(base.len == kernel * channels && channels.is_multiple_of(group));
+        let width = taps.len / n;
+        assert!(taps.len == n * width && from + kernel * (channels / group) <= width);
+        out.touch();
+        let params = BlockConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            kernel: kernel as u32,
+            group: group as u32,
+            width: width as u32,
+            from: from as u32,
+        };
+        self.dispatch(
+            &self.kernels.block_conv,
+            &[&out.buf, &x.buf, &taps.buf, &base.buf],
             &params,
             x.len.div_ceil(THREADS),
             THREADS,

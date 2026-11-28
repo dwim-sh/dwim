@@ -493,6 +493,36 @@ impl Device for Cpu {
         }
     }
 
+    fn block_conv(
+        &self,
+        out: &mut Vec<f32>,
+        x: &Vec<f32>,
+        taps: &Vec<f32>,
+        from: usize,
+        base: &Vec<f32>,
+        kernel: usize,
+        group: usize,
+    ) {
+        let channels = base.len() / kernel;
+        let groups = channels / group;
+        let n = x.len() / channels;
+        assert!(x.len() == n * channels && out.len() == x.len());
+        assert!(base.len() == kernel * channels && channels == groups * group);
+        let width = taps.len() / n;
+        assert!(taps.len() == n * width && from + kernel * groups <= width);
+        for t in 0..n {
+            let own = &taps[t * width + from..][..kernel * groups];
+            for c in 0..channels {
+                let mut acc = 0.0;
+                for back in 0..kernel.min(t + 1) {
+                    let tap = base[back * channels + c] + own[back * groups + c / group];
+                    acc += tap * x[(t - back) * channels + c];
+                }
+                out[t * channels + c] = acc;
+            }
+        }
+    }
+
     fn attention_rel(
         &self,
         out: &mut Vec<f32>,

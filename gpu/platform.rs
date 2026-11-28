@@ -667,6 +667,22 @@ impl Device for Gpu {
         dispatch!(self, scale_rows([x], [factors]))
     }
 
+    fn block_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        taps: &Buffer,
+        from: usize,
+        base: &Buffer,
+        kernel: usize,
+        group: usize,
+    ) {
+        dispatch!(
+            self,
+            block_conv([out], [x], [taps], from, [base], kernel, group)
+        )
+    }
+
     fn attention_rel(
         &self,
         out: &mut Buffer,

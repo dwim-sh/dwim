@@ -15,9 +15,24 @@ pub use tokenizer::tokenizer;
 /// The file holding Inkling 2 Mini.
 const FILE: &str = "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file";
 
-/// The file holding its drafter: the three-layer block drafter the model
-/// ships, `dflash` to llama.cpp, with its projections as Q8_0.
-const DRAFTER: &str = "dspark-Inkling-2-Mini-Q8_0.gguf";
+/// The file holding its drafter.
+const DRAFTER_FILE: &str = "Inkling-2-Mini-DFlash2-Q8_0.gguf";
+
+/// Where Inkling 2 Mini's drafter comes from: Inco AI's DFlash 2 for the
+/// model, `incoai/Inkling-2-Mini-DFlash2`, a block drafter of five layers,
+/// as llama.cpp's converter writes it, `dflash` to llama.cpp, with its
+/// matrices as Q8_0. The file carries the norm of the model's embeddings
+/// and the model's vocabulary, and nothing else of the model's.
+const DRAFTER: Weights = Weights {
+    repo: "na0x2c6/Inkling-2-Mini-DFlash2-GGUF",
+    revision: "e12c9c89cf07a2e063a7a95cc753165c662976d1",
+    file: DRAFTER_FILE,
+    drafter: None,
+    files: &[File {
+        name: DRAFTER_FILE,
+        digest: "c2179daa877bbdca5d8ca87c8562296578e72840aa3b5eba60ac2fb54aef2d42",
+    }],
+};
 
 /// Where Inkling 2 Mini comes from: Unsloth's conversion of
 /// `thinkingmachines/Inkling-2-Mini`, in the layout mainline llama.cpp
@@ -33,17 +48,11 @@ pub const INKLING_MINI: Weights = Weights {
     repo: "unsloth/Inkling-2-Mini-GGUF",
     revision: "ea0c79b2ecd73669e774c8519b79bfabfddbc027",
     file: FILE,
-    drafter: Some(DRAFTER),
-    files: &[
-        File {
-            name: FILE,
-            digest: "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
-        },
-        File {
-            name: DRAFTER,
-            digest: "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773",
-        },
-    ],
+    drafter: Some(&DRAFTER),
+    files: &[File {
+        name: FILE,
+        digest: "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
+    }],
 };
 
 /// How Inkling's tokens are sampled where no file of it says, at a host:

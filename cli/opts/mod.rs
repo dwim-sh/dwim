@@ -93,10 +93,11 @@ pub struct Opts {
     #[argh(option, arg_name = "t", from_str_fn(temperature))]
     pub temperature: Option<f32>,
 
-    /// tokens the model drafts ahead and verifies in one pass, or 0 to
-    /// decode a token at a time (default: 4)
-    #[argh(option, arg_name = "n", default = "dwim::inference::DRAFTS")]
-    pub speculate: usize,
+    /// most tokens the model drafts ahead and verifies in one pass, or 0
+    /// to decode a token at a time (default: 7 for inkling2-mini, 4 for
+    /// the others)
+    #[argh(option, arg_name = "n")]
+    pub speculate: Option<usize>,
 
     /// program to run the model's shell commands through, as `shell -c
     /// command` (default: sh)
@@ -146,7 +147,7 @@ impl Opts {
                 .reasoning_effort
                 .unwrap_or_else(|| model.default_effort()),
             temperature: self.temperature,
-            speculate: self.speculate,
+            speculate: self.speculate.unwrap_or_else(|| model.default_drafts()),
             shell: self.shell.clone(),
             served: None,
         }

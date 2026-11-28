@@ -104,6 +104,17 @@ impl Model {
         }
     }
 
+    /// Tokens the model is asked to draft after each token picked when
+    /// no number is given: for Inkling 2 Mini as many as its drafter
+    /// drafts in a block, of which the model verifies the ones the
+    /// drafter is sure of, and four for the rest.
+    pub const fn default_drafts(self) -> usize {
+        match self {
+            Model::InklingMini => 7,
+            _ => 4,
+        }
+    }
+
     /// How the model's tokens are sampled where no file of it says how:
     /// at a host.
     pub const fn sampling(self) -> Sampling {

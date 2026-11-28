@@ -167,8 +167,11 @@ thinks about as long as
 .BR xhigh .
 .TP
 .BI \-\-speculate " n"
-Tokens the model drafts ahead and verifies in one pass; 0 decodes a token
-at a time (default: 4).
+Most tokens the model drafts ahead and verifies in one pass; 0 decodes a
+token at a time (default: 7 for
+.BR inkling2\-mini ,
+of which it verifies the ones its drafter is sure of, and 4 for the
+others).
 .TP
 .BI \-\-temperature " t"
 Sample at temperature

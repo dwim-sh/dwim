@@ -765,6 +765,38 @@ pub trait Device {
         self.write(x, &host);
     }
 
+    /// A convolution over the rows of `x`, a block of them, with taps of
+    /// each row's own: a channel of a row is the sum, over the row and the
+    /// `kernel - 1` before it, of the channel that far back times a tap,
+    /// which is the one `base` has for the channel and the distance, a row
+    /// of channels per distance, plus the one the row has in `taps` for
+    /// the distance and the channel's group, of `group` channels. A row of
+    /// `taps` holds its own from `from` on, a group's for each distance, a
+    /// distance after another. The rows before the block count as zeros.
+    #[allow(clippy::too_many_arguments)]
+    fn block_conv(
+        &self,
+        out: &mut Self::Buffer,
+        x: &Self::Buffer,
+        taps: &Self::Buffer,
+        from: usize,
+        base: &Self::Buffer,
+        kernel: usize,
+        group: usize,
+    ) {
+        let mut host = self.read(out);
+        Cpu.block_conv(
+            &mut host,
+            &self.read(x),
+            &self.read(taps),
+            from,
+            &self.read(base),
+            kernel,
+            group,
+        );
+        self.write(out, &host);
+    }
+
     /// Causal self-attention as [`attention`](Self::attention) is, over
     /// the keys no more than `window - 1` positions back, with a bias by
     /// distance and a sink. The caches hold `rows` positions, position `p`

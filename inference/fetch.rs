@@ -32,12 +32,23 @@ pub struct Download {
 }
 
 /// Downloads the files of `weights` into `dir`, their snapshot in the
-/// cache, skipping any that are already there, and reporting progress on
-/// each one as it comes in. A file's content goes in the repository's blobs,
-/// named by its digest, and the file in the snapshot is a link to it, as
-/// the cache's other users lay them out; a blob one of them downloaded is
-/// linked to without downloading it again.
+/// cache, and those of the model's drafter into its own, skipping any that
+/// are already there, and reporting progress on each one as it comes in.
 pub fn fetch(weights: &Weights, dir: &Path, mut progress: impl FnMut(Download)) -> Result<()> {
+    fetch_files(weights, dir, &mut progress)?;
+    if let Some(drafter) = weights.drafter {
+        let dir = drafter.dir().ok_or("cannot determine the home directory")?;
+        fetch_files(drafter, &dir, &mut progress)?;
+    }
+    Ok(())
+}
+
+/// Downloads the files of one repository, those of `weights`, into `dir`.
+/// A file's content goes in the repository's blobs, named by its digest,
+/// and the file in the snapshot is a link to it, as the cache's other
+/// users lay them out; a blob one of them downloaded is linked to without
+/// downloading it again.
+fn fetch_files(weights: &Weights, dir: &Path, progress: &mut impl FnMut(Download)) -> Result<()> {
     let blobs = hub::blobs_dir(weights.repo).ok_or("cannot determine the home directory")?;
     for file in weights.files {
         let path = dir.join(file.name);
@@ -52,7 +63,7 @@ pub fn fetch(weights: &Weights, dir: &Path, mut progress: impl FnMut(Download)) 
                     .into());
             }
             fs::create_dir_all(&blobs)?;
-            download(weights, file, &blob, &mut progress)?;
+            download(weights, file, &blob, progress)?;
         }
         fs::create_dir_all(path.parent().unwrap_or(dir))?;
         // A link left pointing at a blob that was removed is replaced.

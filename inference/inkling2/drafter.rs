@@ -1,41 +1,43 @@
-//! Inkling 2 Mini's drafter: a network of three layers that drafts the
+//! Inkling 2 Mini's drafter: a network of five layers that drafts the
 //! tokens after the last one picked, a block of them in one pass, for the
-//! model to verify as a batch. It is a file of its own, of the `dflash`
-//! architecture as llama.cpp names it, and borrows the model's embeddings
-//! and its output projection. What it computes is what llama.cpp's graph
-//! for it does (ggml-org/llama.cpp#32218).
+//! model to verify as a batch. It is a file of its own, DFlash 2 of Inco
+//! AI's, of the `dflash` architecture as llama.cpp names it, and borrows
+//! the model's embeddings and its output projection. What it computes is
+//! what llama.cpp's graph for it does (ggml-org/llama.cpp#33073).
 //!
 //! The drafter reads the model, not the text: as the model runs a token,
 //! its residual stream on the way into a few of its layers and its
-//! normalized output are kept, the token's *features*. Each of the
-//! drafter's layers mixes them in its own proportions and projects the mix
-//! to a key and a value, which join the layer's caches at the token's
-//! position: the *context*. One more mix of them, of the last token run,
-//! is carried over for the head.
+//! normalized output are kept, the token's *features*. One projection
+//! fuses them, and each of the drafter's layers projects the fusion to a
+//! key and a value with the matrices it has for its own, which join the
+//! layer's caches at the token's position: the *context*.
 //!
 //! To draft after a token, the drafter runs a block of eight rows at the
-//! positions from the token's on: the token's embedding, and seven of a
-//! mask's. Each layer is attention and a SwiGLU feed-forward network, both
-//! on a normalized input. The rows attend to each other in both
-//! directions, and to the context before them: over everything in one
-//! layer, and over a window of the latest positions in the others. Queries
-//! and keys are normalized a head at a time and rotated by their position.
+//! positions from the token's on: the token's embedding, and seven of the
+//! mask token's. Each layer is attention and a SwiGLU feed-forward
+//! network, both on a normalized input. The rows attend to each other in
+//! both directions, and to the context before them, over a window of the
+//! latest positions. Queries and keys are normalized a head at a time and
+//! rotated by their position. The rows are drafted at once, so nothing
+//! of a row's token reaches the next but through a convolution: the input
+//! and the output of attention and of the network each go through one
+//! over the row and the row before, whose taps the row's own input sets.
 //!
-//! A row's output is not yet its token's logits. A small recurrent head
-//! goes down the block: from its state, the token before, the row's output
-//! and the mix carried over, it makes a correction to the row's output,
-//! and the model's output projection of the two is the row's logits, whose
-//! likeliest token is the draft and the token before of the next row.
+//! A row's output through the model's output projection is its logits,
+//! and its sixteen likeliest tokens its candidates. A selector then goes
+//! down the rows and picks one of each row's: a candidate's score is its
+//! logit and a correction for the token picked before it, the dot product
+//! of a vector of the candidate's with one of that token's, weighed by a
+//! projection of the row's output. The scores, capped softly as the
+//! model's logits are, are the selector's logits for the row, and their
+//! softmax says how sure it is of its pick.
 //!
-//! A draft costs a pass over the output projection, half a gigabyte, and
-//! a token verified costs the weights of its own experts, so drafting
-//! pays where the model keeps most of what is drafted: the model asks for
-//! one token more after a batch it kept whole, and for no more than it
-//! kept after another.
+//! A block costs a pass over the drafter and one over the output
+//! projection, a gigabyte in all, however many of its rows are used, and
+//! a token verified costs the weights of its own experts: the model asks
+//! for the drafts the selector is sure enough of.
 
 use std::sync::Arc;
-
-use rayon::prelude::*;
 
 use crate::{
     gpu::{CACHE_BLOCK, Device, cache_bytes},
@@ -45,15 +47,13 @@ use crate::{
 /// What a drafter's file names its architecture.
 pub const ARCHITECTURE: &str = "dflash";
 
-/// The tensors of the head, which runs on the host.
-const HOST: [&str; 7] = [
-    "markov_w1.weight",
-    "joint_proj.weight",
-    "joint_proj.bias",
-    "dspark_hidden_out.weight",
-    "dspark_hidden_out.bias",
-    "mask_embd.weight",
-    "dspark_fuse.weight",
+/// The tensors that stay in the file on the host: the selector's vectors
+/// of each token, a row of which is looked up as it is needed, and the
+/// norm of the model's embeddings, which the model has.
+const HOST: [&str; 3] = [
+    "selector_predecessor.weight",
+    "selector_successor.weight",
+    "token_embd_norm.weight",
 ];
 
 /// Width of the bias by distance the attention is given, which the
@@ -75,10 +75,18 @@ pub struct Config {
     pub ff: usize,
     /// Rows of a block: the token drafted after, and the drafts.
     pub block: usize,
-    /// Width of the head's state.
+    /// The convolutions: how many rows one reaches over, and how many
+    /// channels share a tap of a row's own.
+    pub kernel: usize,
+    pub group: usize,
+    /// The selector: how wide its vectors are, and how many candidates a
+    /// row has.
     pub rank: usize,
+    pub candidates: usize,
+    /// What the selector's scores are capped to, softly.
+    pub softcap: f32,
     /// Which layers attend over a window of the latest positions, and how
-    /// far back of the block's first it reaches.
+    /// far back it reaches.
     pub local: Vec<bool>,
     pub window: usize,
     /// The layers of the model whose input is a feature, counted as the
@@ -86,6 +94,8 @@ pub struct Config {
     pub targets: Vec<usize>,
     pub eps: f32,
     pub rope_base: f32,
+    /// The token a row not yet drafted holds.
+    pub mask: u32,
     /// Tokens of the vocabulary.
     pub vocab: usize,
 }
@@ -111,6 +121,11 @@ impl Config {
                     .ok_or("a target layer is not a number")
             })
             .collect::<std::result::Result<Vec<usize>, _>>()?;
+        // The selector has a vector for each token of the vocabulary.
+        let vocab = match gguf.info("selector_successor.weight") {
+            Ok(info) if info.dims.len() == 2 => info.dims[1],
+            _ => return Err("the drafter has no selector: not one dwim runs".into()),
+        };
         let config = Self {
             hidden: key("embedding_length")?,
             layers: key("block_count")?,
@@ -119,23 +134,42 @@ impl Config {
             head_dim: key("attention.key_length")?,
             ff: key("feed_forward_length")?,
             block: key("block_size")?,
-            rank: key("dspark.markov_rank")?,
+            kernel: key("conv_kernel_size")?,
+            group: key("conv_group_size")?,
+            rank: key("selector_rank")?,
+            candidates: key("selector_top_k")?,
+            softcap: gguf.f32(&format!("{arch}.final_logit_softcapping"))?,
             local,
             window: key("attention.sliding_window")?,
             targets,
             eps: gguf.f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))?,
             rope_base: gguf.f32(&format!("{arch}.rope.freq_base"))?,
-            vocab: key("vocab_size_unpadded")?,
+            mask: gguf.u32("tokenizer.ggml.mask_token_id")?,
+            vocab,
         };
         let c = &config;
+        // The scores are capped once the correction is added, as Inkling's
+        // drafter was trained: one that caps the logits before it is of
+        // another model.
+        let capped_after = gguf
+            .get(&format!("{arch}.selector_softcap_after_correction"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
         if c.local.len() != c.layers
             || c.targets.len() < 2
             || !c.targets.is_sorted()
             || c.block < 2
+            || c.kernel == 0
+            || c.group == 0
+            || !c.hidden.is_multiple_of(c.group)
+            || c.candidates == 0
+            || c.candidates > c.vocab
+            || c.mask as usize >= c.vocab
+            || c.softcap <= 0.0
+            || !capped_after
             || c.kv_heads == 0
             || !c.heads.is_multiple_of(c.kv_heads)
             || !c.head_dim.is_multiple_of(CACHE_BLOCK)
-            || key("rope.dimension_count")? != c.head_dim
         {
             return Err("the drafter's dimensions are not ones dwim runs".into());
         }
@@ -150,13 +184,18 @@ impl Config {
         self.kv_heads * self.head_dim
     }
 
+    /// Taps a row has of its own for a convolution's input, and as many
+    /// again for its output.
+    fn taps(&self) -> usize {
+        self.kernel * (self.hidden / self.group)
+    }
+
     /// The device memory the drafter in `gguf`, configured as this, takes
     /// beside the model, for batches of `most` tokens: `per_sequence` for
     /// the windowed layers' keys and values, and `per_token` for those of
     /// the layers that attend over everything.
     pub fn memory(&self, gguf: &Gguf, most: usize) -> Result<Memory> {
         let c = self;
-        // The head's tensors stay on the host.
         let mut weights = 0;
         for name in gguf.tensors().filter(|name| !HOST.contains(name)) {
             weights += gguf.info(name)?.size()?;
@@ -165,7 +204,8 @@ impl Config {
         let local = c.local.iter().filter(|&&local| local).count();
         let rings = local * c.ring(most, usize::MAX) * kv;
         let batch = most * (3 * c.hidden + 3 * c.kv_dim() + c.head_dim);
-        let block = c.block * (3 * c.hidden + 2 * c.q_dim() + 2 * c.ff) + 2 * c.q_dim();
+        let block = c.block * (6 * c.hidden + 2 * c.taps() + 2 * c.q_dim() + 2 * c.ff + c.rank)
+            + 2 * c.q_dim();
         Ok(Memory {
             // And the copy a mark keeps of a sequence's rings.
             fixed: (weights + 4 * (batch + block) + rings) as u64,
@@ -185,36 +225,26 @@ impl Config {
 /// The drafter on a device, with the buffers it computes in.
 pub struct Drafter<D: Device> {
     pub config: Config,
-    /// The file, kept mapped for the head's table of tokens, which is
-    /// looked up on the CPU as the model's embeddings are.
+    /// The file, kept mapped for the selector's vectors of each token,
+    /// which are looked up on the CPU as the model's embeddings are.
     gguf: Arc<Gguf>,
+    /// The fusion of the features: its columns for each feature, a matrix
+    /// of their own, and the norm of what they add up to.
+    fuse: Vec<D::Weight>,
+    fuse_norm: D::Buffer,
     layers: Vec<Layer<D>>,
-    /// Each layer's shares of the features, and then the head's: one
-    /// number to a buffer, for scaling a whole buffer by.
-    shares: Vec<Vec<D::Buffer>>,
-    /// The norm of the mix carried over for the head, and of the output.
-    rnn_norm: D::Buffer,
     out_norm: D::Buffer,
-    /// The embedding of a row not yet drafted.
+    /// The selector's projection of a row's output.
+    selector: D::Weight,
+    /// The embedding of the mask token, normalized as the model's input
+    /// is.
     mask: Vec<f32>,
-    /// The head, which runs on the host: the projection of its inputs to
-    /// its gate, its candidate state and its latent, and of the latent to
-    /// a correction, a row of each matrix after another.
-    joint: Vec<f32>,
-    joint_bias: Vec<f32>,
-    hidden_out: Vec<f32>,
-    hidden_out_bias: Vec<f32>,
     s: Scratch<D>,
 }
 
 struct Layer<D: Device> {
-    /// The context: the norm of the layer's mix of the features, its
-    /// projections to keys and values, and the norm of a key's head.
-    ctx_norm: D::Buffer,
-    k_ctx: D::Weight,
-    v_ctx: D::Weight,
-    k_ctx_norm: D::Buffer,
     attn_norm: D::Buffer,
+    attn_conv: Conv<D>,
     q: D::Weight,
     k: D::Weight,
     v: D::Weight,
@@ -222,9 +252,20 @@ struct Layer<D: Device> {
     q_norm: D::Buffer,
     k_norm: D::Buffer,
     ffn_norm: D::Buffer,
+    ffn_conv: Conv<D>,
     gate: D::Weight,
     up: D::Weight,
     down: D::Weight,
+}
+
+/// The convolutions around attention or a feed-forward network: the
+/// projection of the normalized input to the taps a row has of its own,
+/// for the input and then for the output, and the taps every row has, a
+/// row of channels for each row a convolution reaches back.
+struct Conv<D: Device> {
+    taps: D::Weight,
+    before: D::Buffer,
+    after: D::Buffer,
 }
 
 /// What the drafter computes in: for a batch of the model's tokens whose
@@ -232,7 +273,7 @@ struct Layer<D: Device> {
 struct Scratch<D: Device> {
     /// Most tokens of context stored at once.
     most: usize,
-    mixed: D::Buffer,
+    fused: D::Buffer,
     part: D::Buffer,
     normed: D::Buffer,
     k: D::Buffer,
@@ -240,12 +281,12 @@ struct Scratch<D: Device> {
     wrapped: D::Buffer,
     /// The cosines and sines that rotate the positions being run.
     table: D::Buffer,
-    /// A row of the block's output with the head's correction to it.
-    row: D::Buffer,
-    /// The block: its stream, the same normalized, a layer's output, and
-    /// the output normalized.
+    /// The block: its stream, the same normalized, a row's own taps, what
+    /// a convolution gives, and a layer's output.
     x: D::Buffer,
     xn: D::Buffer,
+    taps: D::Buffer,
+    conv: D::Buffer,
     out: D::Buffer,
     q: D::Buffer,
     att: D::Buffer,
@@ -255,6 +296,10 @@ struct Scratch<D: Device> {
     att_row: D::Buffer,
     h: D::Buffer,
     h_scratch: D::Buffer,
+    /// The outputs of the rows drafted, and the selector's projection of
+    /// them.
+    rows: D::Buffer,
+    weighed: D::Buffer,
     /// No bias by distance, and no sink.
     rel: D::Buffer,
     bias: D::Buffer,
@@ -262,13 +307,11 @@ struct Scratch<D: Device> {
 }
 
 /// A sequence's context: each layer's keys and values, a windowed layer's
-/// in a ring, the mix carried over from the last position, and how many
-/// positions there are context for.
+/// in a ring, and how many positions there are context for.
 pub struct Context<D: Device> {
     k: Vec<D::Cache>,
     v: Vec<D::Cache>,
     rows: Vec<usize>,
-    carried: D::Buffer,
     /// Positions there is context for, or [`BROKEN`].
     pub len: usize,
 }
@@ -278,18 +321,26 @@ pub struct Context<D: Device> {
 pub const BROKEN: usize = usize::MAX;
 
 /// What a mark keeps of a context: the windowed layers' rings, which are
-/// written over the positions before the mark as the sequence goes on, the
-/// mix carried over, and how long the context was.
+/// written over the positions before the mark as the sequence goes on, and
+/// how long the context was.
 pub struct Mark<D: Device> {
     rings: Vec<D::Cache>,
-    carried: D::Buffer,
     len: usize,
+}
+
+/// A token drafted, and how sure the selector is of it: the probability
+/// its scores give the token among the row's candidates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Draft {
+    pub token: u32,
+    pub sure: f32,
 }
 
 impl<D: Device> Drafter<D> {
     /// Loads the drafter from its GGUF file onto `device`, with buffers
-    /// for `most` tokens of context at once.
-    pub fn load(gguf: Arc<Gguf>, device: &D, most: usize) -> Result<Self> {
+    /// for `most` tokens of context at once. `mask` is the embedding of
+    /// the file's mask token, normalized as the model's input is.
+    pub fn load(gguf: Arc<Gguf>, device: &D, most: usize, mask: Vec<f32>) -> Result<Self> {
         let config = Config::load(&gguf)?;
         let c = &config;
         let buffer = |values: &[f32]| {
@@ -306,94 +357,100 @@ impl<D: Device> Drafter<D> {
         };
         let vector =
             |name: &str, len: usize| -> Result<D::Buffer> { Ok(buffer(&floats(name, len)?)) };
-        let weight = |name: &str| -> Result<D::Weight> { Ok(device.upload(gguf.matrix(name)?)) };
+        // A matrix of `rows` outputs of `cols` inputs.
+        let weight = |name: &str, rows: usize, cols: usize| -> Result<D::Weight> {
+            let matrix = gguf.matrix(name)?;
+            if matrix.shape() != [rows, cols] {
+                return Err(format!("{name} is not {rows} rows of {cols}").into());
+            }
+            Ok(device.upload(matrix))
+        };
+        // The taps every row has, which the file holds for the input and
+        // then for the output: a row of channels for each row back.
+        let conv = |p: &str, name: &str| -> Result<Conv<D>> {
+            let base = floats(&format!("{p}.{name}_conv_base"), 2 * c.kernel * c.hidden)?;
+            let (before, after) = base.split_at(c.kernel * c.hidden);
+            Ok(Conv {
+                taps: weight(
+                    &format!("{p}.{name}_conv_proj.weight"),
+                    2 * c.taps(),
+                    c.hidden,
+                )?,
+                before: buffer(before),
+                after: buffer(after),
+            })
+        };
+        let (hidden, q_dim, kv_dim) = (c.hidden, c.q_dim(), c.kv_dim());
         let mut layers = Vec::with_capacity(c.layers);
         for i in 0..c.layers {
             let p = format!("blk.{i}");
             layers.push(Layer {
-                ctx_norm: vector(&format!("{p}.dflare_norm.weight"), c.hidden)?,
-                k_ctx: weight(&format!("{p}.attn_k_ctx.weight"))?,
-                v_ctx: weight(&format!("{p}.attn_v_ctx.weight"))?,
-                k_ctx_norm: vector(&format!("{p}.attn_k_ctx_norm.weight"), c.head_dim)?,
-                attn_norm: vector(&format!("{p}.attn_norm.weight"), c.hidden)?,
-                q: weight(&format!("{p}.attn_q.weight"))?,
-                k: weight(&format!("{p}.attn_k.weight"))?,
-                v: weight(&format!("{p}.attn_v.weight"))?,
-                o: weight(&format!("{p}.attn_output.weight"))?,
+                attn_norm: vector(&format!("{p}.attn_norm.weight"), hidden)?,
+                attn_conv: conv(&p, "attn")?,
+                q: weight(&format!("{p}.attn_q.weight"), q_dim, hidden)?,
+                k: weight(&format!("{p}.attn_k.weight"), kv_dim, hidden)?,
+                v: weight(&format!("{p}.attn_v.weight"), kv_dim, hidden)?,
+                o: weight(&format!("{p}.attn_output.weight"), hidden, q_dim)?,
                 q_norm: vector(&format!("{p}.attn_q_norm.weight"), c.head_dim)?,
                 k_norm: vector(&format!("{p}.attn_k_norm.weight"), c.head_dim)?,
-                ffn_norm: vector(&format!("{p}.ffn_norm.weight"), c.hidden)?,
-                gate: weight(&format!("{p}.ffn_gate.weight"))?,
-                up: weight(&format!("{p}.ffn_up.weight"))?,
-                down: weight(&format!("{p}.ffn_down.weight"))?,
+                ffn_norm: vector(&format!("{p}.ffn_norm.weight"), hidden)?,
+                ffn_conv: conv(&p, "ffn")?,
+                gate: weight(&format!("{p}.ffn_gate.weight"), c.ff, hidden)?,
+                up: weight(&format!("{p}.ffn_up.weight"), c.ff, hidden)?,
+                down: weight(&format!("{p}.ffn_down.weight"), hidden, c.ff)?,
             });
         }
-        // A row of the fusion's weights for each layer and one for the
-        // head, each row's softmax its shares of the features.
-        let fuse = gguf.f32s("dspark_fuse.weight")?;
-        let targets = c.targets.len();
-        if fuse.len() != (c.layers + 1) * targets {
-            return Err("the drafter's fusion is not a row for each layer and the head".into());
+        // The fusion takes the features one after another in a row: its
+        // columns for each are a matrix of that feature alone.
+        let fusion = gguf.matrix("fc.weight")?;
+        if fusion.shape() != [hidden, c.targets.len() * hidden] {
+            return Err("the drafter's fusion is not of a feature for each target".into());
         }
-        let shares = fuse
-            .chunks_exact(targets)
-            .map(|row| {
-                let most = row.iter().cloned().fold(f32::MIN, f32::max);
-                let sum: f32 = row.iter().map(|w| (w - most).exp()).sum();
-                row.iter()
-                    .map(|w| buffer(&[(w - most).exp() / sum]))
-                    .collect()
-            })
+        let fuse = (0..c.targets.len())
+            .map(|feature| device.upload(fusion.select_column_groups(hidden, &[feature])))
             .collect();
-        // A matrix as rows on the host, each row an output's weights.
-        let rows = |name: &str, cols: usize, rows: usize| -> Result<Vec<f32>> {
-            let mut out = vec![0.0; rows * cols];
-            for (i, row) in out.chunks_exact_mut(cols).enumerate() {
-                gguf.row(name, i, row)?;
+        for name in ["selector_predecessor.weight", "selector_successor.weight"] {
+            if gguf.info(name)?.dims != [c.rank, c.vocab] {
+                return Err(format!("{name} is not a vector of the selector's a token").into());
             }
-            Ok(out)
-        };
-        let joint = rows("joint_proj.weight", 2 * c.rank + 2 * c.hidden, 3 * c.rank)?;
-        let hidden_out = rows("dspark_hidden_out.weight", c.rank, c.hidden)?;
-        // The head's table of tokens stays in the file: a row a token.
-        let table = gguf.info("markov_w1.weight")?.shape();
-        if table.len() != 2 || table[1] != c.rank || table[0] < c.vocab {
-            return Err("the drafter's table is not a row of its head's for each token".into());
         }
-        let (block, hidden) = (c.block, c.hidden);
+        if mask.len() != hidden {
+            return Err("the mask token's embedding is not as wide as the drafter".into());
+        }
+        let block = c.block;
         let s = Scratch {
             most,
-            mixed: device.alloc(most * hidden),
+            fused: device.alloc(most * hidden),
             part: device.alloc(most * hidden),
             normed: device.alloc(most * hidden),
-            k: device.alloc(most * c.kv_dim()),
-            v: device.alloc(most * c.kv_dim()),
-            wrapped: device.alloc(most * c.kv_dim()),
+            k: device.alloc(most.max(block) * kv_dim),
+            v: device.alloc(most.max(block) * kv_dim),
+            wrapped: device.alloc(most.max(block) * kv_dim),
             table: device.alloc(most.max(block) * c.head_dim),
-            row: device.alloc(hidden),
             x: device.alloc(block * hidden),
             xn: device.alloc(block * hidden),
+            taps: device.alloc(block * 2 * c.taps()),
+            conv: device.alloc(block * hidden),
             out: device.alloc(block * hidden),
-            q: device.alloc(block * c.q_dim()),
-            att: device.alloc(block * c.q_dim()),
-            q_row: device.alloc(c.q_dim()),
-            att_row: device.alloc(c.q_dim()),
+            q: device.alloc(block * q_dim),
+            att: device.alloc(block * q_dim),
+            q_row: device.alloc(q_dim),
+            att_row: device.alloc(q_dim),
             h: device.alloc(block * c.ff),
             h_scratch: device.alloc(block * c.ff),
+            rows: device.alloc(block * hidden),
+            weighed: device.alloc(block * c.rank),
             rel: buffer(&vec![0.0; c.heads * REL]),
             bias: buffer(&[0.0; REL]),
             sinks: buffer(&vec![NO_SINK; c.heads]),
         };
         Ok(Self {
-            rnn_norm: vector("dspark_norm.weight", hidden)?,
+            fuse,
+            fuse_norm: vector("enc.output_norm.weight", hidden)?,
             out_norm: vector("output_norm.weight", hidden)?,
-            mask: floats("mask_embd.weight", hidden)?,
-            joint,
-            joint_bias: floats("joint_proj.bias", 3 * c.rank)?,
-            hidden_out,
-            hidden_out_bias: floats("dspark_hidden_out.bias", hidden)?,
+            selector: weight("selector_hidden.weight", c.rank, hidden)?,
             layers,
-            shares,
+            mask,
             s,
             gguf,
             config,
@@ -419,7 +476,6 @@ impl<D: Device> Drafter<D> {
         Context {
             k: caches(),
             v: caches(),
-            carried: device.alloc(c.hidden),
             rows,
             len: 0,
         }
@@ -438,7 +494,6 @@ impl<D: Device> Drafter<D> {
                 .flat_map(|(rows, _)| [rows, rows])
                 .map(|rows| device.alloc_cache(rows * c.kv_dim()))
                 .collect(),
-            carried: device.alloc(c.hidden),
             len: BROKEN,
         }
     }
@@ -453,7 +508,6 @@ impl<D: Device> Drafter<D> {
                 d.copy_cache(rings.next().expect("a copy for each ring"), cache, len);
             }
         }
-        d.copy(&mut mark.carried, 0, &context.carried, 0, c.hidden);
         mark.len = context.len;
     }
 
@@ -467,14 +521,12 @@ impl<D: Device> Drafter<D> {
                 d.copy_cache(cache, rings.next().expect("a copy for each ring"), len);
             }
         }
-        d.copy(&mut context.carried, 0, &mark.carried, 0, c.hidden);
         context.len = mark.len;
     }
 
     /// Appends the context of the first `len` positions to `out`: whether
     /// it is whole, which it is if the context ends there, then each
-    /// layer's keys and values as the caches hold them, and the mix
-    /// carried over.
+    /// layer's keys and values as the caches hold them.
     pub fn save(&self, d: &D, context: &Context<D>, len: usize, out: &mut Vec<u8>) {
         let c = &self.config;
         out.push((context.len == len) as u8);
@@ -488,11 +540,6 @@ impl<D: Device> Drafter<D> {
                 out.extend(d.read_cache(cache, rows * c.kv_dim()));
             }
         }
-        out.extend(
-            d.read(&context.carried)
-                .iter()
-                .flat_map(|v| v.to_le_bytes()),
-        );
     }
 
     /// Reads the context [`Self::save`] wrote for `len` positions back
@@ -522,11 +569,6 @@ impl<D: Device> Drafter<D> {
                 whole = false;
             }
         }
-        let carried: Vec<f32> = take(c.hidden * 4)?
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        d.write(&mut context.carried, &carried);
         if whole {
             context.len = len;
         }
@@ -555,28 +597,24 @@ impl<D: Device> Drafter<D> {
         let s = &mut self.s;
         assert!(n <= s.most && features.len() == c.targets.len());
         let (hidden, kv_dim) = (c.hidden, c.kv_dim());
-        for buf in [&mut s.mixed, &mut s.part, &mut s.normed] {
+        for buf in [&mut s.fused, &mut s.part, &mut s.normed] {
             d.resize(buf, n * hidden);
         }
         d.resize(&mut s.k, n * kv_dim);
         d.resize(&mut s.v, n * kv_dim);
         write_table(d, &mut s.table, c, pos, n);
+        // The fusion of the features, a feature's part after another.
+        d.matmul(&mut s.fused, &self.fuse[0], &features[0]);
+        for (fuse, feature) in self.fuse.iter().zip(features).skip(1) {
+            d.matmul_add(&mut s.fused, fuse, feature, &mut s.part);
+        }
+        d.normalize(&mut s.normed, &s.fused, &self.fuse_norm, n * hidden, c.eps);
         for (i, layer) in self.layers.iter().enumerate() {
-            mix(
-                d,
-                &mut s.mixed,
-                &mut s.part,
-                features,
-                &self.shares[i],
-                0,
-                n * hidden,
-            );
-            d.normalize(&mut s.normed, &s.mixed, &layer.ctx_norm, n * hidden, c.eps);
             d.matmuls(&mut [
-                (&mut s.k, &layer.k_ctx, &s.normed),
-                (&mut s.v, &layer.v_ctx, &s.normed),
+                (&mut s.k, &layer.k, &s.normed),
+                (&mut s.v, &layer.v, &s.normed),
             ]);
-            d.rmsnorm(&mut s.k, &layer.k_ctx_norm, c.eps);
+            d.rmsnorm(&mut s.k, &layer.k_norm, c.eps);
             d.rope(&mut s.k, &s.table, 0, c.kv_heads, c.head_dim, c.head_dim);
             let rows = context.rows[i];
             store(
@@ -600,27 +638,15 @@ impl<D: Device> Drafter<D> {
                 &mut s.wrapped,
             );
         }
-        // The head's mix, of the last token.
-        d.resize(&mut s.mixed, hidden);
-        d.resize(&mut s.part, hidden);
-        mix(
-            d,
-            &mut s.mixed,
-            &mut s.part,
-            features,
-            &self.shares[c.layers],
-            (n - 1) * hidden,
-            hidden,
-        );
-        d.copy(&mut context.carried, 0, &s.mixed, 0, hidden);
-        d.rmsnorm(&mut context.carried, &self.rnn_norm, c.eps);
         context.len = pos + n;
     }
 
     /// Drafts `k` tokens to follow `token` at `pos`, whose embedding,
     /// normalized as the model's input is, is `anchor`: the block's rows
-    /// through the layers, and then the head down them, each row's logits
-    /// through `head`, the model's output projection, into `logits`.
+    /// through the layers, the logits of the rows drafted through `head`,
+    /// the model's output projection, which has `padded` rows, into
+    /// `logits`, which has room for the logits of a block's drafts, and
+    /// then the selector down the rows.
     #[allow(clippy::too_many_arguments)]
     pub fn draft(
         &mut self,
@@ -631,8 +657,9 @@ impl<D: Device> Drafter<D> {
         pos: usize,
         k: usize,
         head: &D::Weight,
+        padded: usize,
         logits: &mut D::Buffer,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<Draft>> {
         let c = &self.config;
         let s = &mut self.s;
         let (hidden, block, kv_dim, q_dim) = (c.hidden, c.block, c.kv_dim(), c.q_dim());
@@ -646,12 +673,26 @@ impl<D: Device> Drafter<D> {
         d.resize(&mut s.v, block * kv_dim);
         d.write(&mut s.x, &rows);
         write_table(d, &mut s.table, c, pos, block);
+        let taps = c.taps();
         for (i, layer) in self.layers.iter().enumerate() {
+            // Attention, between the convolutions of its input and of its
+            // output.
             d.normalize(&mut s.xn, &s.x, &layer.attn_norm, block * hidden, c.eps);
+            let conv = &layer.attn_conv;
+            d.matmul(&mut s.taps, &conv.taps, &s.xn);
+            d.block_conv(
+                &mut s.conv,
+                &s.xn,
+                &s.taps,
+                0,
+                &conv.before,
+                c.kernel,
+                c.group,
+            );
             d.matmuls(&mut [
-                (&mut s.q, &layer.q, &s.xn),
-                (&mut s.k, &layer.k, &s.xn),
-                (&mut s.v, &layer.v, &s.xn),
+                (&mut s.q, &layer.q, &s.conv),
+                (&mut s.k, &layer.k, &s.conv),
+                (&mut s.v, &layer.v, &s.conv),
             ]);
             d.rmsnorm(&mut s.q, &layer.q_norm, c.eps);
             d.rmsnorm(&mut s.k, &layer.k_norm, c.eps);
@@ -678,14 +719,14 @@ impl<D: Device> Drafter<D> {
                 &mut s.v,
                 &mut s.wrapped,
             );
-            // Every row attends as the block's last position does, which
-            // has all the block's keys before it; a windowed layer from
-            // as far back as its window reaches of the block's first.
-            let window = match c.local[i] {
-                true => c.window + block,
-                false => usize::MAX,
-            };
+            // Every row attends from the block's last position, which
+            // has all the block's keys before it; a windowed layer as far
+            // back as the window reaches of the row's own position.
             for row in 0..block {
+                let window = match c.local[i] {
+                    true => c.window + block - 1 - row,
+                    false => usize::MAX,
+                };
                 d.copy(&mut s.q_row, 0, &s.q, row * q_dim, q_dim);
                 d.attention_rel(
                     &mut s.att_row,
@@ -704,73 +745,95 @@ impl<D: Device> Drafter<D> {
                 );
                 d.copy(&mut s.att, row * q_dim, &s.att_row, 0, q_dim);
             }
-            d.matmul_add(&mut s.x, &layer.o, &s.att, &mut s.out);
+            d.matmul(&mut s.out, &layer.o, &s.att);
+            d.block_conv(
+                &mut s.conv,
+                &s.out,
+                &s.taps,
+                taps,
+                &conv.after,
+                c.kernel,
+                c.group,
+            );
+            d.add(&mut s.x, &s.conv);
+            // And the feed-forward network, between its own.
             d.normalize(&mut s.xn, &s.x, &layer.ffn_norm, block * hidden, c.eps);
-            d.swiglu(&mut s.h, &layer.gate, &layer.up, &s.xn, &mut s.h_scratch);
-            d.matmul_add(&mut s.x, &layer.down, &s.h, &mut s.out);
+            let conv = &layer.ffn_conv;
+            d.matmul(&mut s.taps, &conv.taps, &s.xn);
+            d.block_conv(
+                &mut s.conv,
+                &s.xn,
+                &s.taps,
+                0,
+                &conv.before,
+                c.kernel,
+                c.group,
+            );
+            d.swiglu(&mut s.h, &layer.gate, &layer.up, &s.conv, &mut s.h_scratch);
+            d.matmul(&mut s.out, &layer.down, &s.h);
+            d.block_conv(
+                &mut s.conv,
+                &s.out,
+                &s.taps,
+                taps,
+                &conv.after,
+                c.kernel,
+                c.group,
+            );
+            d.add(&mut s.x, &s.conv);
         }
         d.rmsnorm(&mut s.x, &self.out_norm, c.eps);
-        let outputs = d.read(&s.x);
-        let carried = d.read(&context.carried);
 
-        // The head, a row at a time: its state starts at nothing.
+        // The rows drafted: their logits, and the selector's projection.
+        d.resize(&mut s.rows, k * hidden);
+        d.copy(&mut s.rows, 0, &s.x, hidden, k * hidden);
+        d.resize(&mut s.weighed, k * c.rank);
+        d.matmul(&mut s.weighed, &self.selector, &s.rows);
+        d.resize(logits, k * padded);
+        d.matmul(logits, head, &s.rows);
+        let logits = d.read(logits);
+        let weighed = d.read(&s.weighed);
+
+        // The selector, a row at a time: a candidate's score is its logit
+        // and its vector's dot product with the vector of the token
+        // before, weighed by the row's.
         let rank = c.rank;
-        let mut state = vec![0.0f32; rank];
         let mut before = token;
         let mut drafts = Vec::with_capacity(k);
-        let mut joint = vec![0.0f32; 2 * rank + 2 * hidden];
-        let mut projected = vec![0.0f32; 3 * rank];
-        let mut row = vec![0.0f32; hidden];
-        for i in 1..=k {
-            let output = &outputs[i * hidden..][..hidden];
-            joint[..rank].copy_from_slice(&state);
+        let mut condition = vec![0.0f32; rank];
+        let mut vector = vec![0.0f32; rank];
+        for (row, weights) in logits.chunks_exact(padded).zip(weighed.chunks_exact(rank)) {
             self.gguf.row(
-                "markov_w1.weight",
+                "selector_predecessor.weight",
                 before as usize,
-                &mut joint[rank..2 * rank],
+                &mut condition,
             )?;
-            joint[2 * rank..][..hidden].copy_from_slice(output);
-            joint[2 * rank + hidden..].copy_from_slice(&carried);
-            project(&mut projected, &self.joint, &self.joint_bias, &joint);
-            let (gate, rest) = projected.split_at(rank);
-            let (candidate, latent) = rest.split_at(rank);
-            for ((state, gate), candidate) in state.iter_mut().zip(gate).zip(candidate) {
-                let (gate, candidate) = (sigmoid(*gate), candidate.tanh());
-                *state = candidate + gate * (*state - candidate);
+            for (condition, weight) in condition.iter_mut().zip(weights) {
+                *condition *= weight;
             }
-            let latent: Vec<f32> = latent.iter().map(|v| v.tanh()).collect();
-            // The correction is to the row's output: the projection of
-            // the two is the row's logits.
-            project(&mut row, &self.hidden_out, &self.hidden_out_bias, &latent);
-            for (row, output) in row.iter_mut().zip(output) {
-                *row += output;
+            let mut scores = Vec::with_capacity(c.candidates);
+            for (candidate, logit) in likeliest(&row[..c.vocab], c.candidates) {
+                self.gguf
+                    .row("selector_successor.weight", candidate as usize, &mut vector)?;
+                let correction: f32 = vector.iter().zip(&condition).map(|(a, b)| a * b).sum();
+                scores.push((
+                    candidate,
+                    c.softcap * ((logit + correction) / c.softcap).tanh(),
+                ));
             }
-            d.write(&mut s.row, &row);
-            d.matmul(logits, head, &s.row);
-            before = likeliest(&d.read(logits)[..c.vocab]);
-            drafts.push(before);
+            let (token, best) = scores
+                .iter()
+                .copied()
+                .reduce(|best, score| if score.1 > best.1 { score } else { best })
+                .expect("a row has candidates");
+            let total: f32 = scores.iter().map(|(_, score)| (score - best).exp()).sum();
+            drafts.push(Draft {
+                token,
+                sure: 1.0 / total,
+            });
+            before = token;
         }
         Ok(drafts)
-    }
-}
-
-/// `out = Σ shares[j] * features[j][from..][..len]`, with `part` as long
-/// for the terms.
-fn mix<D: Device>(
-    d: &D,
-    out: &mut D::Buffer,
-    part: &mut D::Buffer,
-    features: &[D::Buffer],
-    shares: &[D::Buffer],
-    from: usize,
-    len: usize,
-) {
-    d.copy(out, 0, &features[0], from, len);
-    d.scale_rows(out, &shares[0]);
-    for (feature, share) in features.iter().zip(shares).skip(1) {
-        d.copy(part, 0, feature, from, len);
-        d.scale_rows(part, share);
-        d.add(out, part);
     }
 }
 
@@ -817,27 +880,18 @@ fn store<D: Device>(
     d.resize(src, n * width);
 }
 
-/// `out = matrix · x + bias`, the matrix a row of weights for each output.
-fn project(out: &mut [f32], matrix: &[f32], bias: &[f32], x: &[f32]) {
-    out.par_iter_mut()
-        .zip(matrix.par_chunks_exact(x.len()))
-        .zip(bias)
-        .for_each(|((out, row), bias)| {
-            *out = bias + row.iter().zip(x).map(|(w, x)| w * x).sum::<f32>();
-        });
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// The first of the likeliest tokens.
-fn likeliest(logits: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, &logit) in logits.iter().enumerate() {
-        if logit > logits[best] {
-            best = i;
+/// The `k` likeliest tokens of `logits`, each with its logit, the
+/// likeliest first, and of two as likely the first: in one pass over the
+/// logits, a vocabulary's worth, for a handful.
+fn likeliest(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+    for (token, &logit) in logits.iter().enumerate() {
+        if best.len() == k && logit <= best[k - 1].1 {
+            continue;
         }
+        let at = best.partition_point(|&(_, l)| l >= logit);
+        best.insert(at, (token as u32, logit));
+        best.truncate(k);
     }
-    best as u32
+    best
 }

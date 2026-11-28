@@ -36,6 +36,7 @@ macro_rules! check_against_cpu {
             attention_rel_matches_cpu,
             route_matches_cpu,
             rows_and_gates_match_cpu,
+            block_conv_matches_cpu,
             read_capped_matches_cpu,
             gate_matches_cpu,
             copy_cache_copies_a_prefix,
@@ -1629,6 +1630,48 @@ pub fn route_matches_cpu<D: Device>(gpu: &D) {
         assert_eq!(gpu.read(&ids), want_ids);
         close(&gpu.read(&weights), &want_weights, 1e-5);
     }
+}
+
+/// A block's convolution with taps of each row's own, of either half of a
+/// row of them: a drafter's dimensions, and a kernel longer than the block.
+pub fn block_conv_matches_cpu<D: Device>(gpu: &D) {
+    let mut rng = Rng(65);
+    let mut wide =
+        |n: usize, size: f32| -> Vec<f32> { rng.floats(n).iter().map(|x| x * size).collect() };
+    for (n, channels, kernel, group) in [(8, 2304, 2, 16), (2, 96, 3, 8), (1, 64, 2, 16)] {
+        let groups = channels / group;
+        let x = wide(n * channels, 2.0);
+        let taps = wide(n * 2 * kernel * groups, 1.0);
+        let base = wide(kernel * channels, 1.0);
+        for from in [0, kernel * groups] {
+            let mut want = vec![0.0; n * channels];
+            Cpu.block_conv(&mut want, &x, &taps, from, &base, kernel, group);
+            let mut got = gpu.alloc(n * channels);
+            gpu.block_conv(
+                &mut got,
+                &buffer(gpu, &x),
+                &buffer(gpu, &taps),
+                from,
+                &buffer(gpu, &base),
+                kernel,
+                group,
+            );
+            close(&gpu.read(&got), &want, 1e-5);
+        }
+    }
+    // A row is its own channels times its taps, and the row before's times
+    // the taps a row back: rows before the block add nothing.
+    let mut out = vec![0.0; 4];
+    Cpu.block_conv(
+        &mut out,
+        &vec![1.0, 2.0, 3.0, 4.0],
+        &vec![0.5, 0.0, 0.0, 10.0],
+        0,
+        &vec![1.0, 1.0, 100.0, 100.0],
+        2,
+        2,
+    );
+    assert_eq!(out, [1.5, 3.0, 113.0, 224.0]);
 }
 
 /// The operations a thread an element takes: the gate on a message, the
