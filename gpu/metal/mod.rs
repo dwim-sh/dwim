@@ -74,11 +74,14 @@ const THREADS: usize = 256;
 /// per unit of work.
 const SIMD_THREADS: usize = 32;
 
-/// Most clips or normalizations dispatched in one grid, and most depth mixes
-/// computed in one pass over the states.
+/// Most clips or normalizations dispatched in one grid, most depth mixes
+/// computed in one pass over the states, and tokens and gates a block of
+/// the gate kernels takes at once.
 const CLIP_JOBS: usize = 4;
 const NORM_JOBS: usize = 4;
 const MIXES: usize = 4;
+const GATE_TOKENS: usize = 8;
+const GATES: usize = 4;
 
 /// Threads in a threadgroup of the kernels on the matrix units: the tile
 /// kernels and flash attention, four SIMD groups.
@@ -233,7 +236,11 @@ struct Kernels {
     /// fused RMS normalization.
     mix: [Object<dyn MTLComputePipelineState>; 3],
     gated_update: Object<dyn MTLComputePipelineState>,
-    gate: Object<dyn MTLComputePipelineState>,
+    /// The projections down of up to four gates in one grid: batched eight
+    /// tokens per threadgroup, and a threadgroup per rank row for small batches.
+    gate_down: [Object<dyn MTLComputePipelineState>; 2],
+    /// The projections up and gated update of up to four gates in one grid.
+    gate_up: Object<dyn MTLComputePipelineState>,
     short_conv: Object<dyn MTLComputePipelineState>,
     short_conv_state: Object<dyn MTLComputePipelineState>,
     clip: Object<dyn MTLComputePipelineState>,
@@ -279,6 +286,9 @@ pub struct Metal {
     name: String,
     /// What a batch's experts are multiplied in tiles with.
     experts: RefCell<Experts>,
+    /// Intermediate down-projected vectors and norms between `gate_down` and
+    /// `gate_up`.
+    gate_down: RefCell<Scratch>,
     pending: RefCell<Option<Pending>>,
     /// Command buffers committed and not yet waited for, in order.
     committed: RefCell<Vec<Object<dyn MTLCommandBuffer>>>,
@@ -546,7 +556,11 @@ impl Metal {
                 msl!("mix", THREADS, "M" = 4),
             ],
             gated_update: msl!("gated_update", THREADS),
-            gate: msl!("gate", THREADS),
+            gate_down: [
+                msl!("gate_down", THREADS, "FEW" = 0),
+                msl!("gate_down", THREADS, "FEW" = 1),
+            ],
+            gate_up: msl!("gate_up", THREADS),
             short_conv: msl!("short_conv", THREADS),
             short_conv_state: msl!("short_conv_state", THREADS),
             clip: msl!("clip", SIMD_THREADS),
@@ -580,6 +594,7 @@ impl Metal {
             matmul_rows,
             name,
             experts: RefCell::new(Experts::default()),
+            gate_down: RefCell::new(Scratch::default()),
             pending: RefCell::new(None),
             committed: RefCell::new(Vec::new()),
         })
@@ -998,6 +1013,7 @@ struct MixParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GateParams {
+    n: u32,
     dim: u32,
     rank: u32,
     eps: f32,
@@ -2005,40 +2021,121 @@ impl Device for Metal {
         rank: usize,
         eps: f32,
     ) {
-        assert!(x.len.is_multiple_of(dim) && message.len == x.len);
+        self.gates(
+            &mut [x],
+            &[message],
+            &[[down_input, down_message, gain, forget]],
+            dim,
+            rank,
+            eps,
+        );
+    }
+
+    fn gates(
+        &self,
+        xs: &mut [&mut Buffer],
+        messages: &[&Buffer],
+        weights: &[[&Weight; 4]],
+        dim: usize,
+        rank: usize,
+        eps: f32,
+    ) {
+        if xs.is_empty() {
+            return;
+        }
+        if xs.len() > GATES {
+            let (first, rest) = xs.split_at_mut(GATES);
+            self.gates(first, &messages[..GATES], &weights[..GATES], dim, rank, eps);
+            return self.gates(rest, &messages[GATES..], &weights[GATES..], dim, rank, eps);
+        }
+        assert!(xs.len() == messages.len() && xs.len() == weights.len());
         assert!(
             dim.is_multiple_of(8) && rank.is_multiple_of(8) && rank <= 64,
             "the kernel takes a gate of up to 64 dimensions, in eights"
         );
-        for (w, shape) in [
-            (down_input, [rank, dim]),
-            (down_message, [rank, dim]),
-            (gain, [dim, rank]),
-            (forget, [dim, rank]),
-        ] {
-            assert!(
-                w.format == Format::Bf16 && w.shape == shape,
-                "a gate's weights are bf16"
-            );
+        let len = xs[0].len;
+        assert!(len.is_multiple_of(dim));
+        let n = len / dim;
+        for (j, x) in xs.iter_mut().enumerate() {
+            assert!(x.len == len && messages[j].len == len);
+            for (w, shape) in weights[j]
+                .iter()
+                .zip([[rank, dim], [rank, dim], [dim, rank], [dim, rank]])
+            {
+                assert!(
+                    w.format == Format::Bf16 && w.shape == shape,
+                    "a gate's weights are bf16"
+                );
+            }
+            x.touch();
         }
-        x.touch();
+        let mut scratch = self.gate_down.borrow_mut();
+        let down = self.scratch(&mut scratch, xs.len() * n * (2 * rank + 4) * 4);
         let params = GateParams {
+            n: n as u32,
             dim: dim as u32,
             rank: rank as u32,
             eps,
         };
-        self.dispatch(
-            &self.kernels.gate,
-            &[
-                &x.buf,
-                &message.buf,
-                &down_input.buf,
-                &down_message.buf,
-                &gain.buf,
-                &forget.buf,
-            ],
+        let last = xs.len() - 1;
+        let x = |j: usize| &*xs[j.min(last)].buf;
+        let m = |j: usize| &*messages[j.min(last)].buf;
+        let w = |j: usize, which: usize| &*weights[j.min(last)][which].buf;
+        let groups = n.div_ceil(GATE_TOKENS);
+        let (down_kernel, down_blocks) = match groups {
+            1 => (&self.kernels.gate_down[1], rank),
+            _ => (&self.kernels.gate_down[0], rank / self.matmul_rows),
+        };
+        let down_buffers: [&ProtocolObject<dyn MTLBuffer>; 17] = [
+            down,
+            x(0),
+            x(1),
+            x(2),
+            x(3),
+            m(0),
+            m(1),
+            m(2),
+            m(3),
+            w(0, 0),
+            w(1, 0),
+            w(2, 0),
+            w(3, 0),
+            w(0, 1),
+            w(1, 1),
+            w(2, 1),
+            w(3, 1),
+        ];
+        self.dispatch_grid(
+            down_kernel,
+            &down_buffers,
             &params,
-            x.len / dim,
+            (down_blocks * xs.len(), groups),
+            THREADS,
+        );
+        let up_buffers: [&ProtocolObject<dyn MTLBuffer>; 17] = [
+            down,
+            x(0),
+            x(1),
+            x(2),
+            x(3),
+            m(0),
+            m(1),
+            m(2),
+            m(3),
+            w(0, 2),
+            w(1, 2),
+            w(2, 2),
+            w(3, 2),
+            w(0, 3),
+            w(1, 3),
+            w(2, 3),
+            w(3, 3),
+        ];
+        self.dispatch_grid(
+            &self.kernels.gate_up,
+            &up_buffers,
+            &params,
+            (dim.div_ceil(THREADS) * xs.len(), groups),
             THREADS,
         );
     }
