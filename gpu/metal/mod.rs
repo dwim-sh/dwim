@@ -74,8 +74,11 @@ const THREADS: usize = 256;
 /// per unit of work.
 const SIMD_THREADS: usize = 32;
 
-/// Most clips dispatched in one grid.
+/// Most clips or normalizations dispatched in one grid, and most depth mixes
+/// computed in one pass over the states.
 const CLIP_JOBS: usize = 4;
+const NORM_JOBS: usize = 4;
+const MIXES: usize = 4;
 
 /// Threads in a threadgroup of the kernels on the matrix units: the tile
 /// kernels and flash attention, four SIMD groups.
@@ -199,6 +202,7 @@ struct Kernels {
     matmul_quant_tile: [[Object<dyn MTLComputePipelineState>; 3]; 2],
     add: Object<dyn MTLComputePipelineState>,
     rmsnorm: Object<dyn MTLComputePipelineState>,
+    normalize: Object<dyn MTLComputePipelineState>,
     l2norm: Object<dyn MTLComputePipelineState>,
     rope: Object<dyn MTLComputePipelineState>,
     attention: Object<dyn MTLComputePipelineState>,
@@ -225,7 +229,9 @@ struct Kernels {
     expert_matmul_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
     expert_pack: Object<dyn MTLComputePipelineState>,
     expert_scatter: Object<dyn MTLComputePipelineState>,
-    mix: Object<dyn MTLComputePipelineState>,
+    /// Depth mixes for 1, up to 3, and up to 4 queries at once, with optional
+    /// fused RMS normalization.
+    mix: [Object<dyn MTLComputePipelineState>; 3],
     gated_update: Object<dyn MTLComputePipelineState>,
     gate: Object<dyn MTLComputePipelineState>,
     short_conv: Object<dyn MTLComputePipelineState>,
@@ -502,6 +508,7 @@ impl Metal {
             pack_queries: msl!("pack_queries", THREADS),
             add: msl!("add", THREADS),
             rmsnorm: msl!("rmsnorm", THREADS),
+            normalize: msl!("normalize", THREADS),
             l2norm: msl!("l2norm", THREADS),
             rope: msl!("rope", THREADS),
             attention: msl!("attention", ATTENTION_THREADS, "CHUNK" = CHUNK),
@@ -533,7 +540,11 @@ impl Metal {
             expert_matmul_mma,
             expert_pack: msl!("expert_pack", THREADS),
             expert_scatter: msl!("expert_scatter", THREADS),
-            mix: msl!("mix", THREADS),
+            mix: [
+                msl!("mix", THREADS, "M" = 1),
+                msl!("mix", THREADS, "M" = 3),
+                msl!("mix", THREADS, "M" = 4),
+            ],
             gated_update: msl!("gated_update", THREADS),
             gate: msl!("gate", THREADS),
             short_conv: msl!("short_conv", THREADS),
@@ -977,8 +988,11 @@ struct AttentionRelParams {
 #[derive(Clone, Copy)]
 struct MixParams {
     dim: u32,
-    count: u32,
+    states: u32,
+    mixes: u32,
+    normed: u32,
     eps: f32,
+    norm_eps: f32,
 }
 
 #[repr(C)]
@@ -1399,6 +1413,64 @@ impl Device for Metal {
         );
     }
 
+    fn normalize(&self, out: &mut Buffer, x: &Buffer, weight: &Buffer, len: usize, eps: f32) {
+        self.normalizes(&mut [out], &[x], &[weight], len, eps);
+    }
+
+    fn normalizes(
+        &self,
+        outs: &mut [&mut Buffer],
+        xs: &[&Buffer],
+        weights: &[&Buffer],
+        len: usize,
+        eps: f32,
+    ) {
+        if outs.is_empty() {
+            return;
+        }
+        if outs.len() > NORM_JOBS {
+            let (first, rest) = outs.split_at_mut(NORM_JOBS);
+            self.normalizes(first, &xs[..NORM_JOBS], &weights[..NORM_JOBS], len, eps);
+            return self.normalizes(rest, &xs[NORM_JOBS..], &weights[NORM_JOBS..], len, eps);
+        }
+        assert!(outs.len() == xs.len() && outs.len() == weights.len());
+        let dim = weights[0].len;
+        assert!(len.is_multiple_of(dim));
+        for ((out, x), w) in outs.iter_mut().zip(xs).zip(weights) {
+            assert!(out.len == len && len <= x.len && w.len == dim);
+            out.touch();
+        }
+        let params = RmsnormParams {
+            dim: dim as u32,
+            eps,
+        };
+        let last = outs.len() - 1;
+        let o = |j: usize| &*outs[j.min(last)].buf;
+        let x = |j: usize| &*xs[j.min(last)].buf;
+        let w = |j: usize| &*weights[j.min(last)].buf;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 3 * NORM_JOBS] = [
+            o(0),
+            o(1),
+            o(2),
+            o(3),
+            x(0),
+            x(1),
+            x(2),
+            x(3),
+            w(0),
+            w(1),
+            w(2),
+            w(3),
+        ];
+        self.dispatch_grid(
+            &self.kernels.normalize,
+            &buffers,
+            &params,
+            (len / dim, outs.len()),
+            THREADS,
+        );
+    }
+
     fn rmsnorm(&self, x: &mut Buffer, weight: &Buffer, eps: f32) {
         let dim = weight.len;
         assert_eq!(x.len % dim, 0);
@@ -1811,7 +1883,34 @@ impl Device for Metal {
     }
 
     fn mix(&self, out: &mut Buffer, states: &[&Buffer], query: &Buffer, eps: f32) {
-        let dim = query.len;
+        self.mixes(&mut [out], states, &[query], eps, None);
+    }
+
+    fn mixes(
+        &self,
+        outs: &mut [&mut Buffer],
+        states: &[&Buffer],
+        queries: &[&Buffer],
+        eps: f32,
+        norms: Option<(&[&Buffer], f32)>,
+    ) {
+        if outs.is_empty() {
+            return;
+        }
+        if outs.len() > MIXES {
+            let (first, rest) = outs.split_at_mut(MIXES);
+            let part = |from, to| norms.map(|(norms, eps)| (&norms[from..to], eps));
+            self.mixes(first, states, &queries[..MIXES], eps, part(0, MIXES));
+            return self.mixes(
+                rest,
+                states,
+                &queries[MIXES..],
+                eps,
+                part(MIXES, queries.len()),
+            );
+        }
+        let dim = queries[0].len;
+        let len = outs[0].len;
         assert!(
             !states.is_empty() && states.len() <= 6,
             "the kernel mixes up to six states"
@@ -1820,27 +1919,65 @@ impl Device for Metal {
             dim.is_multiple_of(4) && dim <= 4096,
             "the kernel takes rows of up to 4096 in fours"
         );
-        assert!(states.iter().all(|state| state.len == out.len) && out.len.is_multiple_of(dim));
-        out.touch();
+        assert_eq!(outs.len(), queries.len());
+        assert!(states.iter().all(|state| state.len == len) && len.is_multiple_of(dim));
+        assert!(outs.iter().all(|out| out.len == len));
+        assert!(queries.iter().all(|query| query.len == dim));
+        if let Some((norms, _)) = norms {
+            assert_eq!(norms.len(), outs.len());
+            assert!(norms.iter().all(|n| n.len == dim));
+        }
+        for out in outs.iter_mut() {
+            out.touch();
+        }
         let params = MixParams {
             dim: dim as u32,
-            count: states.len() as u32,
+            states: states.len() as u32,
+            mixes: outs.len() as u32,
+            normed: norms.is_some() as u32,
             eps,
+            norm_eps: norms.map_or(0.0, |(_, eps)| eps),
         };
-        // The kernel binds six states: the ones there are not are the
-        // first again, which it does not read.
-        let state = |i: usize| &*states[i.min(states.len() - 1)].buf;
-        let buffers: [&ProtocolObject<dyn MTLBuffer>; 8] = [
-            &out.buf,
-            &query.buf,
-            state(0),
-            state(1),
-            state(2),
-            state(3),
-            state(4),
-            state(5),
+        let last = outs.len() - 1;
+        let o = |j: usize| &*outs[j.min(last)].buf;
+        let q = |j: usize| &*queries[j.min(last)].buf;
+        let n = |j: usize| match norms {
+            Some((norms, _)) => &*norms[j.min(last)].buf,
+            None => q(j),
+        };
+        let s = |i: usize| &*states[i.min(states.len() - 1)].buf;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 18] = [
+            o(0),
+            o(1),
+            o(2),
+            o(3),
+            q(0),
+            q(1),
+            q(2),
+            q(3),
+            n(0),
+            n(1),
+            n(2),
+            n(3),
+            s(0),
+            s(1),
+            s(2),
+            s(3),
+            s(4),
+            s(5),
         ];
-        self.dispatch(&self.kernels.mix, &buffers, &params, out.len / dim, THREADS);
+        let kernel = match outs.len() {
+            1 => 0,
+            2 | 3 => 1,
+            _ => 2,
+        };
+        self.dispatch(
+            &self.kernels.mix[kernel],
+            &buffers,
+            &params,
+            len / dim,
+            THREADS,
+        );
     }
 
     fn gated_update(&self, x: &mut Buffer, forget: &Buffer, gain: &Buffer, message: &Buffer) {
