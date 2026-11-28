@@ -114,10 +114,14 @@ const QUANT_COLS: usize = 128;
 
 /// Fewest tokens of a batch whose experts are multiplied in tiles on the
 /// matrix accelerators, an expert at a time, and the pairs of a token and
-/// an expert a tile takes: below it, a pair at a time reads fewer of the
-/// experts' weights than unpacking each expert's matrix for a tile.
+/// an expert a narrow or wide tile takes: below it, a pair at a time reads
+/// fewer of the experts' weights than unpacking each expert's matrix for a
+/// tile.
 const EXPERT_TOKENS: usize = 4;
 const EXPERT_TILE: usize = 16;
+const EXPERT_TILE_WIDE: usize = 32;
+/// Most experts supported by the GPU tile planner.
+const EXPERT_MAX: usize = 256;
 
 /// Threads in a threadgroup of the attention kernel: one per element of a
 /// head, for heads up to this long.
@@ -225,12 +229,15 @@ struct Kernels {
     conv: Object<dyn MTLComputePipelineState>,
     delta_net: Object<dyn MTLComputePipelineState>,
     /// The experts' matrix multiplication over NVFP4 and over Q8_0 weights,
-    /// a pair of a token and an expert at a time; and for a batch, in
-    /// tiles on the matrix accelerators, where the GPU has them, with the
-    /// packing of the tiles' inputs and the putting back of their results.
+    /// a pair of a token and an expert at a time; and for a batch, in narrow
+    /// (16) and wide (32) tiles on the matrix accelerators, where the GPU has
+    /// them, with GPU tile planning, input packing, fused SiTU packing, and
+    /// result scattering.
     expert_matmul: [Object<dyn MTLComputePipelineState>; 2],
-    expert_matmul_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
+    expert_matmul_mma: Option<[[Object<dyn MTLComputePipelineState>; 2]; 2]>,
+    expert_plan: Object<dyn MTLComputePipelineState>,
     expert_pack: Object<dyn MTLComputePipelineState>,
+    expert_situ_pack: Object<dyn MTLComputePipelineState>,
     expert_scatter: Object<dyn MTLComputePipelineState>,
     /// Depth mixes for 1, up to 3, and up to 4 queries at once, with optional
     /// fused RMS normalization.
@@ -297,21 +304,20 @@ pub struct Metal {
 }
 
 /// What a batch's experts are multiplied in tiles with: the pairs of a
-/// token and an expert in the order of the tiles, an expert's together;
-/// the tiles, each its expert, its first pair in that order and how many
-/// it has; the inputs packed in that order; and the results in it. The
-/// order and the tiles are laid out on the host from the experts the
-/// router picked, once for both of a layer's multiplications.
+/// token and an expert sorted by expert on the GPU; the wide (32) and
+/// narrow (16) tiles, each its expert, its first pair in that order and
+/// how many it has; the indirect dispatch arguments for both tile sizes;
+/// the inputs packed in that order; and the results in it.
 #[derive(Default)]
 struct Experts {
     order: Scratch,
-    tiles: Scratch,
+    wide_tiles: Scratch,
+    narrow_tiles: Scratch,
+    indirect: Scratch,
     packed: Scratch,
     sorted: Scratch,
-    /// The buffer of picks the order and the tiles are of, as it was, and
-    /// how many tiles there are.
-    planned: Option<(u64, u64)>,
-    count: usize,
+    /// The picks buffer and row tile counts the current GPU plan covers.
+    planned: Option<(u64, u64, usize, usize)>,
 }
 
 /// A buffer that is made, and made again longer, as it is needed.
@@ -412,17 +418,20 @@ impl Metal {
         let expert_matmul_mma = if matmul_quant_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let tiled = |bits| {
+            let tiled = |bits, tokens| {
                 compile(
                     &device,
                     "expert_matmul_mma",
                     MATRIX_THREADS,
-                    &[("BITS", bits), ("TOKENS", EXPERT_TILE)],
+                    &[("BITS", bits), ("TOKENS", tokens)],
                     &[source!("expert_matmul_mma")],
                     Some(&metal4),
                 )
             };
-            Some([tiled(4)?, tiled(8)?])
+            Some([
+                [tiled(4, EXPERT_TILE)?, tiled(4, EXPERT_TILE_WIDE)?],
+                [tiled(8, EXPERT_TILE)?, tiled(8, EXPERT_TILE_WIDE)?],
+            ])
         } else {
             None
         };
@@ -555,7 +564,9 @@ impl Metal {
                 msl!("expert_matmul", THREADS, "BITS" = 8),
             ],
             expert_matmul_mma,
+            expert_plan: msl!("expert_plan", THREADS),
             expert_pack: msl!("expert_pack", THREADS),
+            expert_situ_pack: msl!("expert_situ_pack", THREADS),
             expert_scatter: msl!("expert_scatter", THREADS),
             mix: [
                 msl!("mix", THREADS, "M" = 1),
@@ -683,6 +694,50 @@ impl Metal {
         }
     }
 
+    /// Encodes a kernel whose threadgroup grid comes from `indirect` at byte
+    /// offset `offset`.
+    fn dispatch_indirect<P: Copy>(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        params: &P,
+        indirect: &ProtocolObject<dyn MTLBuffer>,
+        offset: usize,
+        threads: usize,
+    ) {
+        let mut pending = self.pending.borrow_mut();
+        let current = pending.get_or_insert_with(|| self.begin());
+        let encoder = &current.encoder;
+        encoder.setComputePipelineState(kernel);
+        unsafe {
+            for (i, &buf) in buffers.iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(buf), 0, i);
+            }
+            encoder.setBytes_length_atIndex(
+                NonNull::from(params).cast(),
+                size_of::<P>(),
+                buffers.len(),
+            );
+            encoder
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    indirect,
+                    offset,
+                    MTLSize {
+                        width: threads,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+        }
+        current.dispatched += 1;
+        if current.dispatched >= SUBMIT_EVERY {
+            let Pending { cmd, encoder, .. } = pending.take().unwrap();
+            encoder.endEncoding();
+            cmd.commit();
+            self.committed.borrow_mut().push(cmd);
+        }
+    }
+
     /// Packs the `n` tokens of `cols` activations of `x` as half floats, with
     /// zeros for the tokens up to `padded`, for the tile kernels, unless
     /// they are what is packed already.
@@ -724,14 +779,91 @@ impl Metal {
         &scratch.0.as_ref().expect("made above").0
     }
 
-    /// Multiplies a batch's pairs of a token and an expert in tiles of one
-    /// expert's pairs, with `kernel` on the matrix accelerators: what
-    /// [`Device::expert_matmul`] does, reading each expert's matrix once
-    /// for a tile rather than once for each token that goes through it.
+    /// Plans the sorted pair order, wide (32) and narrow (16) tiles, and
+    /// indirect dispatch descriptors for `ids` on the GPU without stalling
+    /// for a host readback.
+    fn plan_experts(
+        &self,
+        scratch: &mut Experts,
+        ids: &Buffer,
+        experts: usize,
+        grid_x_0: usize,
+        grid_x_1: usize,
+    ) {
+        if scratch.planned == Some((ids.id, ids.version, grid_x_0, grid_x_1)) {
+            return;
+        }
+        let pairs = ids.len;
+        let order = self.scratch(&mut scratch.order, pairs * 4);
+        let wide_tiles = self.scratch(&mut scratch.wide_tiles, (pairs / EXPERT_TILE + 1) * 12);
+        let narrow_tiles = self.scratch(&mut scratch.narrow_tiles, experts * 12);
+        let indirect = self.scratch(&mut scratch.indirect, 12 * 4);
+        let params = ExpertPlanParams {
+            pairs: pairs as u32,
+            experts: experts as u32,
+            grid_x_0: grid_x_0 as u32,
+            grid_x_1: grid_x_1 as u32,
+        };
+        self.dispatch(
+            &self.kernels.expert_plan,
+            &[order, wide_tiles, narrow_tiles, indirect, &ids.buf],
+            &params,
+            1,
+            THREADS,
+        );
+        scratch.planned = Some((ids.id, ids.version, grid_x_0, grid_x_1));
+    }
+
+    /// Dispatches the wide (32) and narrow (16) MMA expert kernels using the
+    /// indirect descriptors written by [`Self::plan_experts`] at `slot_offset`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_expert_mma(
+        &self,
+        kernels: &[Object<dyn MTLComputePipelineState>; 2],
+        sorted: &ProtocolObject<dyn MTLBuffer>,
+        w: &Weight,
+        scale: &Buffer,
+        packed: &ProtocolObject<dyn MTLBuffer>,
+        wide_tiles: &ProtocolObject<dyn MTLBuffer>,
+        narrow_tiles: &ProtocolObject<dyn MTLBuffer>,
+        indirect: &ProtocolObject<dyn MTLBuffer>,
+        slot_offset: usize,
+        rows: usize,
+        cols: usize,
+        padded: usize,
+    ) {
+        let params = ExpertTileParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+        };
+        let scales = w.scales.as_ref().expect("quantized weights have scales");
+        self.dispatch_indirect(
+            &kernels[1],
+            &[sorted, &w.buf, scales, packed, wide_tiles, &scale.buf],
+            &params,
+            indirect,
+            slot_offset,
+            MATRIX_THREADS,
+        );
+        self.dispatch_indirect(
+            &kernels[0],
+            &[sorted, &w.buf, scales, packed, narrow_tiles, &scale.buf],
+            &params,
+            indirect,
+            slot_offset + 12,
+            MATRIX_THREADS,
+        );
+    }
+
+    /// Multiplies a batch's pairs of a token and an expert in wide (32) and
+    /// narrow (16) tiles of one expert's pairs on the matrix accelerators:
+    /// what [`Device::expert_matmul`] does, reading each expert's matrix once
+    /// per tile without stalling the GPU for host planning.
     #[allow(clippy::too_many_arguments)]
     fn expert_tiles(
         &self,
-        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        kernels: &[Object<dyn MTLComputePipelineState>; 2],
         out: &mut Buffer,
         w: &Weight,
         scale: &Buffer,
@@ -742,58 +874,24 @@ impl Metal {
     ) {
         let (pairs, experts) = (ids.len, scale.len);
         let (rows, cols) = (w.shape[0] / experts, w.shape[1]);
+        let grid_x = rows.div_ceil(TILE_ROWS);
         let mut scratch = self.experts.borrow_mut();
+        self.plan_experts(&mut scratch, ids, experts, grid_x, grid_x);
+        // The last wide tile reaches a whole wide tile past its first pair.
+        let padded = pairs + EXPERT_TILE_WIDE;
         let Experts {
             order,
-            tiles,
+            wide_tiles,
+            narrow_tiles,
+            indirect,
             packed,
             sorted,
-            planned,
-            count,
+            ..
         } = &mut *scratch;
-        // The pairs in the order of their experts, and each expert's in
-        // tiles: laid out once for the picks, which both of a layer's
-        // multiplications are of. Reading the picks waits for the router.
-        if *planned != Some((ids.id, ids.version)) {
-            let picks: Vec<usize> = self.read(ids).iter().map(|&e| e as usize).collect();
-            let mut counts = vec![0u32; experts];
-            for &expert in &picks {
-                counts[expert] += 1;
-            }
-            let mut first = vec![0u32; experts];
-            for expert in 1..experts {
-                first[expert] = first[expert - 1] + counts[expert - 1];
-            }
-            let mut sorted_pairs = vec![0u32; pairs];
-            let mut next = first.clone();
-            for (pair, &expert) in picks.iter().enumerate() {
-                sorted_pairs[next[expert] as usize] = pair as u32;
-                next[expert] += 1;
-            }
-            let mut laid = Vec::new();
-            for expert in 0..experts {
-                for at in (0..counts[expert]).step_by(EXPERT_TILE) {
-                    let of = (counts[expert] - at).min(EXPERT_TILE as u32);
-                    laid.extend([expert as u32, first[expert] + at, of]);
-                }
-            }
-            for (scratch, words) in [(&mut *order, &sorted_pairs), (&mut *tiles, &laid)] {
-                let buf = self.scratch(scratch, words.len() * 4);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        words.as_ptr(),
-                        buf.contents().as_ptr().cast(),
-                        words.len(),
-                    )
-                };
-            }
-            *planned = Some((ids.id, ids.version));
-            *count = laid.len() / 3;
-        }
-        // The last tile reaches a whole tile past its first pair.
-        let padded = pairs + EXPERT_TILE;
-        let order = &order.0.as_ref().expect("laid out above").0;
-        let tiles = &tiles.0.as_ref().expect("laid out above").0;
+        let order = &order.0.as_ref().expect("planned above").0;
+        let wide_tiles = &wide_tiles.0.as_ref().expect("planned above").0;
+        let narrow_tiles = &narrow_tiles.0.as_ref().expect("planned above").0;
+        let indirect = &indirect.0.as_ref().expect("planned above").0;
         let packed = self.scratch(packed, padded * cols * 2);
         let sorted = self.scratch(sorted, pairs * rows * 4);
         out.touch();
@@ -810,18 +908,19 @@ impl Metal {
             (padded * cols / 4).div_ceil(THREADS),
             THREADS,
         );
-        let params = ExpertTileParams {
-            rows: rows as u32,
-            cols: cols as u32,
-            padded: padded as u32,
-        };
-        let scales = w.scales.as_ref().expect("quantized weights have scales");
-        self.dispatch_grid(
-            kernel,
-            &[sorted, &w.buf, scales, packed, tiles, &scale.buf],
-            &params,
-            (rows.div_ceil(TILE_ROWS), *count),
-            MATRIX_THREADS,
+        self.dispatch_expert_mma(
+            kernels,
+            sorted,
+            w,
+            scale,
+            packed,
+            wide_tiles,
+            narrow_tiles,
+            indirect,
+            0,
+            rows,
+            cols,
+            padded,
         );
         let scatter = ExpertScatterParams {
             pairs: pairs as u32,
@@ -1164,11 +1263,30 @@ struct RowsParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ExpertPlanParams {
+    pairs: u32,
+    experts: u32,
+    grid_x_0: u32,
+    grid_x_1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ExpertPackParams {
     pairs: u32,
     cols: u32,
     padded: u32,
     share: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExpertSituPackParams {
+    pairs: u32,
+    width: u32,
+    padded: u32,
+    beta: f32,
+    linear_beta: f32,
 }
 
 #[repr(C)]
@@ -1983,6 +2101,7 @@ impl Device for Metal {
         // accelerators, where the matrices are whole steps of the tiles.
         if let Some(tiled) = &self.kernels.expert_matmul_mma
             && pairs >= EXPERT_TOKENS * k
+            && scale.len <= EXPERT_MAX
             && cols.is_multiple_of(128)
             && rows.is_multiple_of(4)
         {
@@ -2005,6 +2124,174 @@ impl Device for Metal {
             &[&out.buf, &w.buf, scales, &x.buf, &ids.buf, &scale.buf],
             &params,
             (rows.div_ceil(self.matmul_rows * per_simd), pairs),
+            THREADS,
+        );
+    }
+
+    fn expert_ffn(
+        &self,
+        out: &mut Buffer,
+        gate_up: &Weight,
+        gate_up_scale: &Buffer,
+        down: &Weight,
+        down_scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Buffer,
+        act: &mut Buffer,
+    ) {
+        let experts = gate_up_scale.len;
+        let rows = down.shape[0] / experts;
+        let cols = gate_up.shape[1];
+        let pairs = ids.len;
+        let which = |w: &Weight| match w.format {
+            Format::Nvfp4 => Some(0usize),
+            Format::Q8_0 => Some(1usize),
+            Format::Bf16 | Format::Q4_0 => None,
+        };
+        let (Some(tiled), Some(w_gu), Some(w_down)) = (
+            &self.kernels.expert_matmul_mma,
+            which(gate_up),
+            which(down),
+        ) else {
+            return gpu::expert_ffn(
+                self,
+                out,
+                gate_up,
+                gate_up_scale,
+                down,
+                down_scale,
+                x,
+                ids,
+                k,
+                width,
+                beta,
+                linear_beta,
+                scratch,
+                act,
+            );
+        };
+        if pairs < EXPERT_TOKENS * k
+            || experts > EXPERT_MAX
+            || !cols.is_multiple_of(128)
+            || !width.is_multiple_of(128)
+            || !rows.is_multiple_of(4)
+        {
+            return gpu::expert_ffn(
+                self,
+                out,
+                gate_up,
+                gate_up_scale,
+                down,
+                down_scale,
+                x,
+                ids,
+                k,
+                width,
+                beta,
+                linear_beta,
+                scratch,
+                act,
+            );
+        }
+        assert!(gate_up.shape[0] == experts * 2 * width && down_scale.len == experts);
+        assert_eq!(down.shape[1], width);
+        assert!(x.len == pairs / k * cols && act.len == pairs * width);
+        assert_eq!(out.len, pairs * rows);
+
+        // Plan tiles once on the GPU for both gate_up and down, keep gate_up's
+        // output in expert-sorted order, apply SiTU directly into the packed
+        // half4 input buffer for down, and scatter only the final output.
+        let grid_x_gu = (2 * width).div_ceil(TILE_ROWS);
+        let grid_x_down = rows.div_ceil(TILE_ROWS);
+        let mut exp = self.experts.borrow_mut();
+        self.plan_experts(&mut exp, ids, experts, grid_x_gu, grid_x_down);
+        let padded = pairs + EXPERT_TILE_WIDE;
+        let Experts {
+            order,
+            wide_tiles,
+            narrow_tiles,
+            indirect,
+            packed,
+            sorted,
+            ..
+        } = &mut *exp;
+        let order = &order.0.as_ref().expect("planned above").0;
+        let wide_tiles = &wide_tiles.0.as_ref().expect("planned above").0;
+        let narrow_tiles = &narrow_tiles.0.as_ref().expect("planned above").0;
+        let indirect = &indirect.0.as_ref().expect("planned above").0;
+        let packed = self.scratch(packed, padded * cols.max(width) * 2);
+        let sorted = self.scratch(sorted, pairs * rows.max(2 * width) * 4);
+        out.touch();
+
+        let pack = ExpertPackParams {
+            pairs: pairs as u32,
+            cols: cols as u32,
+            padded: padded as u32,
+            share: k as u32,
+        };
+        self.dispatch(
+            &self.kernels.expert_pack,
+            &[packed, &x.buf, order],
+            &pack,
+            (padded * cols / 4).div_ceil(THREADS),
+            THREADS,
+        );
+        self.dispatch_expert_mma(
+            &tiled[w_gu],
+            sorted,
+            gate_up,
+            gate_up_scale,
+            packed,
+            wide_tiles,
+            narrow_tiles,
+            indirect,
+            0,
+            2 * width,
+            cols,
+            padded,
+        );
+        let situ_pack = ExpertSituPackParams {
+            pairs: pairs as u32,
+            width: width as u32,
+            padded: padded as u32,
+            beta,
+            linear_beta,
+        };
+        self.dispatch(
+            &self.kernels.expert_situ_pack,
+            &[packed, sorted],
+            &situ_pack,
+            (padded * width / 4).div_ceil(THREADS),
+            THREADS,
+        );
+        self.dispatch_expert_mma(
+            &tiled[w_down],
+            sorted,
+            down,
+            down_scale,
+            packed,
+            wide_tiles,
+            narrow_tiles,
+            indirect,
+            24,
+            rows,
+            width,
+            padded,
+        );
+        let scatter = ExpertScatterParams {
+            pairs: pairs as u32,
+            rows: rows as u32,
+        };
+        self.dispatch(
+            &self.kernels.expert_scatter,
+            &[&out.buf, sorted, order],
+            &scatter,
+            (pairs * rows / 4).div_ceil(THREADS),
             THREADS,
         );
     }
@@ -2685,7 +2972,7 @@ impl Device for Metal {
 
 #[cfg(test)]
 mod tests {
-    use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
+    use objc2_metal::{MTLBuffer, MTLCompileOptions, MTLLanguageVersion};
 
     use crate::gpu::Device;
     check_against_cpu!(super::Metal::new());
@@ -2883,6 +3170,103 @@ mod tests {
             eprintln!("{what}:");
             crate::gpu::tests::attention_speed(&gpu, 64);
         }
+    }
+
+    /// Checks the GPU expert tile planner (wide and narrow tile splits,
+    /// pair permutation, and indirect dispatch arguments) and the fused
+    /// SiTU-to-half packing kernel on any Metal GPU.
+    #[test]
+    fn expert_plan_and_situ_pack_match_cpu() {
+        let gpu = match super::Metal::new() {
+            Ok(gpu) => gpu,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let experts = 128usize;
+        // Counts spanning every boundary: 0, 1, 16, 17, 32, 33, 48, 49, 64, 65.
+        let counts: [usize; 10] = [0, 1, 16, 17, 32, 33, 48, 49, 64, 65];
+        let mut picks = Vec::new();
+        for (e, &c) in counts.iter().enumerate() {
+            for _ in 0..c {
+                picks.push((e * 11) as f32);
+            }
+        }
+        let pairs = picks.len();
+        let mut ids = gpu.alloc(pairs);
+        gpu.write(&mut ids, &picks);
+        {
+            let mut scratch = gpu.experts.borrow_mut();
+            gpu.plan_experts(&mut scratch, &ids, experts, 36, 18);
+        }
+        gpu.flush();
+        let scratch = gpu.experts.borrow();
+        let read_u32 = |s: &super::Scratch, n: usize| -> Vec<u32> {
+            let buf = &s.0.as_ref().unwrap().0;
+            unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u32>(), n).to_vec() }
+        };
+        let indirect = read_u32(&scratch.indirect, 12);
+        let wide_count = indirect[1] as usize;
+        let narrow_count = indirect[4] as usize;
+        // Expected: e=1(1->n), e=2(16->n), e=3(17->w), e=4(32->w), e=5(33->w+n),
+        // e=6(48->w+n), e=7(49->2w), e=8(64->2w), e=9(65->2w+n) => 10 wide, 5 narrow.
+        assert_eq!(indirect, [36, 10, 1, 36, 5, 1, 18, 10, 1, 18, 5, 1]);
+        let order = read_u32(&scratch.order, pairs);
+        let wide = read_u32(&scratch.wide_tiles, wide_count * 3);
+        let narrow = read_u32(&scratch.narrow_tiles, narrow_count * 3);
+        // Every pair appears once, and every tile covers only pairs of its expert.
+        let mut seen = vec![false; pairs];
+        for &p in &order {
+            assert!(!seen[p as usize]);
+            seen[p as usize] = true;
+        }
+        let mut covered = vec![false; pairs];
+        for (tiles, max_of) in [(&wide, 32u32), (&narrow, 16u32)] {
+            for tile in tiles.chunks_exact(3) {
+                let (e, t0, of) = (tile[0], tile[1], tile[2]);
+                assert!(of > 0 && of <= max_of);
+                for slot in t0..t0 + of {
+                    assert!(!covered[slot as usize]);
+                    covered[slot as usize] = true;
+                    assert_eq!(picks[order[slot as usize] as usize] as u32, e);
+                }
+            }
+        }
+        assert!(covered.into_iter().all(|c| c));
+        drop(scratch);
+
+        // Check expert_situ_pack matches Cpu::situ rounded to f16, with zero padding.
+        let (width, padded) = (128usize, pairs + super::EXPERT_TILE_WIDE);
+        let gate_up: Vec<f32> = (0..pairs * 2 * width)
+            .map(|i| ((i * 37) % 101) as f32 * 0.1 - 5.0)
+            .collect();
+        let mut want = vec![0.0f32; pairs * width];
+        crate::gpu::Cpu.situ(&mut want, &gate_up, width, 4.0, 25.0);
+        let mut src = gpu.alloc(gate_up.len());
+        gpu.write(&mut src, &gate_up);
+        let out_buf = gpu.buffer(padded * width * 2);
+        let params = super::ExpertSituPackParams {
+            pairs: pairs as u32,
+            width: width as u32,
+            padded: padded as u32,
+            beta: 4.0,
+            linear_beta: 25.0,
+        };
+        gpu.dispatch(
+            &gpu.kernels.expert_situ_pack,
+            &[&out_buf, &src.buf],
+            &params,
+            (padded * width / 4).div_ceil(super::THREADS),
+            super::THREADS,
+        );
+        gpu.flush();
+        let got: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(out_buf.contents().as_ptr().cast::<u16>(), padded * width)
+                .to_vec()
+        };
+        for (i, (&bits, &w)) in got[..pairs * width].iter().zip(&want).enumerate() {
+            let g = crate::gpu::float::from_f16(bits);
+            assert!((g - w).abs() <= 5e-3, "element {i}: {g} vs {w}");
+        }
+        assert!(got[pairs * width..].iter().all(|&b| b == 0));
     }
 
     /// Times the cost of a dispatch; run with `--ignored --nocapture`.
