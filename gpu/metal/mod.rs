@@ -70,6 +70,13 @@ const SUBMIT_EVERY: usize = 128;
 /// attention's.
 const THREADS: usize = 256;
 
+/// Threads in a single SIMD group, for kernels dispatched one SIMD group
+/// per unit of work.
+const SIMD_THREADS: usize = 32;
+
+/// Most clips dispatched in one grid.
+const CLIP_JOBS: usize = 4;
+
 /// Threads in a threadgroup of the kernels on the matrix units: the tile
 /// kernels and flash attention, four SIMD groups.
 const MATRIX_THREADS: usize = 128;
@@ -513,7 +520,7 @@ impl Metal {
             silu_mul: msl!("silu_mul", THREADS),
             sigmoid_mul: msl!("sigmoid_mul", THREADS),
             copy: msl!("copy", THREADS),
-            store_q8: msl!("store_q8", THREADS),
+            store_q8: msl!("store_q8", SIMD_THREADS),
             conv: msl!("conv", THREADS),
             delta_net: msl!("delta_net", THREADS),
             expert_matmul: [
@@ -528,12 +535,12 @@ impl Metal {
             gate: msl!("gate", THREADS),
             short_conv: msl!("short_conv", THREADS),
             short_conv_state: msl!("short_conv_state", THREADS),
-            clip: msl!("clip", THREADS),
+            clip: msl!("clip", SIMD_THREADS),
             scale_rows: msl!("scale_rows", THREADS),
             attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
             attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
             attention_rel_mma,
-            route: msl!("route", THREADS),
+            route: msl!("route", SIMD_THREADS),
             situ: msl!("situ", THREADS),
             weighted_sum: msl!("weighted_sum", THREADS),
             copy_words: [
@@ -991,10 +998,10 @@ struct ShortConvParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ClipParams {
-    heads: u32,
-    width: u32,
-    dim: u32,
-    threshold: f32,
+    first: [u32; CLIP_JOBS],
+    width: [u32; CLIP_JOBS],
+    dim: [u32; CLIP_JOBS],
+    threshold: [f32; CLIP_JOBS],
 }
 
 #[repr(C)]
@@ -1261,13 +1268,12 @@ impl Device for Metal {
             offset: offset as u32,
             len: src.len as u32,
         };
-        let groups = (src.len / CACHE_BLOCK).div_ceil(THREADS);
         self.dispatch(
             &self.kernels.store_q8,
             &[&cache.quants, &cache.scales, &src.buf],
             &params,
-            groups,
-            THREADS,
+            src.len / CACHE_BLOCK,
+            SIMD_THREADS,
         );
     }
 
@@ -1932,22 +1938,42 @@ impl Device for Metal {
     }
 
     fn clip(&self, x: &mut Buffer, scale: &Buffer, dim: usize, threshold: f32) {
-        assert!(x.len.is_multiple_of(scale.len) && scale.len.is_multiple_of(dim));
-        x.touch();
-        let heads = x.len / dim;
-        let params = ClipParams {
-            heads: heads as u32,
-            width: scale.len as u32,
-            dim: dim as u32,
-            threshold,
+        self.clips(&mut [(x, scale, dim, threshold)]);
+    }
+
+    fn clips(&self, jobs: &mut [(&mut Buffer, &Buffer, usize, f32)]) {
+        if jobs.is_empty() {
+            return;
+        }
+        if jobs.len() > CLIP_JOBS {
+            let (first, rest) = jobs.split_at_mut(CLIP_JOBS);
+            self.clips(first);
+            return self.clips(rest);
+        }
+        let mut params = ClipParams {
+            first: [u32::MAX; CLIP_JOBS],
+            width: [0; CLIP_JOBS],
+            dim: [0; CLIP_JOBS],
+            threshold: [0.0; CLIP_JOBS],
         };
-        self.dispatch(
-            &self.kernels.clip,
-            &[&x.buf, &scale.buf],
-            &params,
-            heads.div_ceil(THREADS),
-            THREADS,
-        );
+        let mut heads = 0usize;
+        for (j, (x, scale, dim, threshold)) in jobs.iter_mut().enumerate() {
+            assert!(x.len.is_multiple_of(scale.len) && scale.len.is_multiple_of(*dim));
+            x.touch();
+            params.first[j] = heads as u32;
+            params.width[j] = scale.len as u32;
+            params.dim[j] = *dim as u32;
+            params.threshold[j] = *threshold;
+            heads += x.len / *dim;
+        }
+        if heads == 0 {
+            return;
+        }
+        let x = |j: usize| &*jobs[j.min(jobs.len() - 1)].0.buf;
+        let s = |j: usize| &*jobs[j.min(jobs.len() - 1)].1.buf;
+        let buffers: [&ProtocolObject<dyn MTLBuffer>; 2 * CLIP_JOBS] =
+            [x(0), x(1), x(2), x(3), s(0), s(1), s(2), s(3)];
+        self.dispatch(&self.kernels.clip, &buffers, &params, heads, SIMD_THREADS);
     }
 
     fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
@@ -2158,8 +2184,8 @@ impl Device for Metal {
             &self.kernels.route,
             &[&ids.buf, &weights.buf, &logits.buf, &bias.buf],
             &params,
-            n.div_ceil(THREADS),
-            THREADS,
+            n,
+            SIMD_THREADS,
         );
     }
 
