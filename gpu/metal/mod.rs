@@ -74,11 +74,12 @@ const THREADS: usize = 256;
 /// per unit of work.
 const SIMD_THREADS: usize = 32;
 
-/// Most clips or normalizations dispatched in one grid, most depth mixes
-/// computed in one pass over the states, and tokens and gates a block of
-/// the gate kernels takes at once.
+/// Most clips, normalizations, or Q8_0 decode matmuls dispatched in one grid,
+/// most depth mixes computed in one pass over the states, and tokens and
+/// gates a block of the gate kernels takes at once.
 const CLIP_JOBS: usize = 4;
 const NORM_JOBS: usize = 4;
+const MATMUL_JOBS: usize = 6;
 const MIXES: usize = 4;
 const GATE_TOKENS: usize = 8;
 const GATES: usize = 4;
@@ -205,6 +206,8 @@ struct Kernels {
     matmul_quant: [Object<dyn MTLComputePipelineState>; 2],
     /// Single-token Q8_0 matmul without multi-token register arrays.
     matmul_q8_0_vec: Object<dyn MTLComputePipelineState>,
+    /// Multi-job Q8_0 decode matmul: single-token and small batch (up to 4).
+    matmul_q8_0_multi: [Object<dyn MTLComputePipelineState>; 2],
     matmul_quant_mma: Option<[[Object<dyn MTLComputePipelineState>; 3]; 2]>,
     matmul_quant_tile: [[Object<dyn MTLComputePipelineState>; 3]; 2],
     add: Object<dyn MTLComputePipelineState>,
@@ -487,6 +490,10 @@ impl Metal {
             attention_mma,
             matmul_quant: [msl!("matmul_q4_0", THREADS), msl!("matmul_q8_0", THREADS)],
             matmul_q8_0_vec: msl!("matmul_q8_0", THREADS, "VEC" = 1),
+            matmul_q8_0_multi: [
+                msl!("matmul_q8_0_multi", THREADS, "VEC" = 1),
+                msl!("matmul_q8_0_multi", THREADS, "VEC" = 0),
+            ],
             matmul_quant_mma,
             matmul_quant_tile: [
                 [
@@ -1037,6 +1044,15 @@ struct MatmulParams {
     n: u32,
     /// Splits of the columns, for the kernels that take them.
     splits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MatmulMultiParams {
+    first: [u32; MATMUL_JOBS],
+    rows: [u32; MATMUL_JOBS],
+    cols: [u32; MATMUL_JOBS],
+    n: [u32; MATMUL_JOBS],
 }
 
 #[repr(C)]
@@ -1648,10 +1664,101 @@ impl Device for Metal {
     }
 
     fn matmuls(&self, jobs: &mut [(&mut Buffer, &Weight, &Buffer)]) {
-        // Group jobs that share an input buffer so the single-entry
+        let mut done = vec![false; jobs.len()];
+        // Merge independent Q8_0 decode projections (n == 1, or 2..=QUANT_TOKENS)
+        // into one grid per batch-size class so Inkling's five attention
+        // projections (Q, gate, K, V, rel) run in a single dispatch.
+        for single in [true, false] {
+            let matching: Vec<usize> = jobs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, w, x))| {
+                    if done[i] || w.format != Format::Q8_0 {
+                        return None;
+                    }
+                    let n = x.len / w.shape[1];
+                    let ok = if single {
+                        n == 1
+                    } else {
+                        (2..=QUANT_TOKENS).contains(&n)
+                    };
+                    ok.then_some(i)
+                })
+                .collect();
+            if matching.len() < 2 {
+                continue;
+            }
+            let kernel = &self.kernels.matmul_q8_0_multi[usize::from(!single)];
+            for chunk in matching.chunks(MATMUL_JOBS) {
+                if chunk.len() == 1 {
+                    continue;
+                }
+                let mut params = MatmulMultiParams {
+                    first: [u32::MAX; MATMUL_JOBS],
+                    rows: [0; MATMUL_JOBS],
+                    cols: [0; MATMUL_JOBS],
+                    n: [0; MATMUL_JOBS],
+                };
+                let mut groups = 0usize;
+                for (slot, &idx) in chunk.iter().enumerate() {
+                    let (out, w, x) = &mut jobs[idx];
+                    let (rows, cols) = (w.shape[0], w.shape[1]);
+                    let n = x.len / cols;
+                    assert_eq!(x.len, n * cols);
+                    assert_eq!(out.len, n * rows);
+                    assert!(cols % 32 == 0);
+                    out.touch();
+                    params.first[slot] = groups as u32;
+                    params.rows[slot] = rows as u32;
+                    params.cols[slot] = cols as u32;
+                    params.n[slot] = n as u32;
+                    groups += rows.div_ceil(self.matmul_rows);
+                    done[idx] = true;
+                }
+                let last = chunk.len() - 1;
+                let pick = |s: usize| chunk[s.min(last)];
+                let o = |s: usize| &*jobs[pick(s)].0.buf;
+                let w = |s: usize| &*jobs[pick(s)].1.buf;
+                let sc = |s: usize| {
+                    &**jobs[pick(s)]
+                        .1
+                        .scales
+                        .as_ref()
+                        .expect("Q8_0 weights have scales")
+                };
+                let x = |s: usize| &*jobs[pick(s)].2.buf;
+                let buffers: [&ProtocolObject<dyn MTLBuffer>; 4 * MATMUL_JOBS] = [
+                    o(0),
+                    o(1),
+                    o(2),
+                    o(3),
+                    o(4),
+                    o(5),
+                    w(0),
+                    w(1),
+                    w(2),
+                    w(3),
+                    w(4),
+                    w(5),
+                    sc(0),
+                    sc(1),
+                    sc(2),
+                    sc(3),
+                    sc(4),
+                    sc(5),
+                    x(0),
+                    x(1),
+                    x(2),
+                    x(3),
+                    x(4),
+                    x(5),
+                ];
+                self.dispatch(kernel, &buffers, &params, groups, THREADS);
+            }
+        }
+        // Group remaining jobs that share an input buffer so the single-entry
         // `pack_halves` cache is not evicted between projections of the
         // same input (e.g. Q, gate, and rel across K and V).
-        let mut done = vec![false; jobs.len()];
         for i in 0..jobs.len() {
             if done[i] {
                 continue;
