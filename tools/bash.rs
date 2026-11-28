@@ -54,7 +54,7 @@ use serde_json::Value;
 
 use crate::{
     sys,
-    tools::{Parameter, Signature, Tool, Tools, optional_number, plural, required, string},
+    tools::{Parameter, Signature, Tool, Tools, Verb, optional_number, plural, required, string},
 };
 
 pub const NAME: &str = "bash";
@@ -78,6 +78,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: true,
+    verb: Some(Verb::Ran),
     describe,
     run,
 };

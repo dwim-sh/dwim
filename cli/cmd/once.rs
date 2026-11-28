@@ -108,7 +108,7 @@ impl Printer {
             }
             // The output follows in full once the command ends.
             Event::Progress(_) => {}
-            Event::Output(output) => eprintln!("{output}"),
+            Event::Output { text, .. } => eprintln!("{text}"),
             Event::Plan(plan) => {
                 // Not for what is known of a step alone: the calls that
                 // add to it are printed as they are.

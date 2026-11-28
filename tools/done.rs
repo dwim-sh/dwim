@@ -14,6 +14,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: false,
+    verb: None,
     describe,
     run: |tools, arguments| {
         let result = required(arguments, NAME, "result")?;

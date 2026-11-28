@@ -24,6 +24,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: false,
+    verb: None,
     describe,
     run: |tools, arguments| run(&mut tools.plan, arguments),
 };

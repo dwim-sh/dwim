@@ -214,8 +214,8 @@ time and rate of each; the tools run; and what a provider charged, where
 the model runs at one.
 .TP
 .B \-\-thinking
-Show the model's thinking, and the files it reads, in the shell from the
-start, as
+Show the model's thinking, and each tool call with all it returned, in
+the shell from the start, as
 .B Ctrl\-O
 does.
 .TP
@@ -393,8 +393,15 @@ The model thinks before it replies, and the shell hides the thought unless
 .B Ctrl\-O
 shows it: pressed while the model thinks, it prints the thought so far and
 what follows, and pressed again it hides the rest.
-The same key shows the files the model reads, of which the shell otherwise
-prints only the line that says what was read.
+The shell also says what each tool call did in a line, not what it
+returned: the programs a command ran and how it exited, the file an edit
+changed with the lines it added and removed, the matches a search found.
+Calls made one after another, with no reply between them, are one entry
+under a heading such as
+.IR "Edited files, ran commands" ,
+marked \[u2713] when the commands succeed and \[u2717] when a call fails, with the
+first line of what went wrong.
+The same key shows each call as it was made, with all it returned.
 .B Ctrl\-C
 or
 .B Esc

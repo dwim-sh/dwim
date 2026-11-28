@@ -8,7 +8,10 @@ use dwim::{
     model::{Device, Model, OnDisk, Size},
     providers::{Kind, hosted::Host},
     sys,
-    tools::plan::{Plan, Step},
+    tools::{
+        Summary, Verb,
+        plan::{Plan, Step},
+    },
 };
 
 use crate::{
@@ -30,7 +33,8 @@ pub fn help(columns: usize) -> Vec<Line> {
         .map(|(name, what)| format!("{name:<width$}{what}"))
         .collect();
     lines.push("enter while it works changes its course · esc interrupts".to_string());
-    lines.push("ctrl+o shows or hides the thought · ctrl+d quits".to_string());
+    lines
+        .push("ctrl+o shows or hides the thought and the calls' output · ctrl+d quits".to_string());
     report(vec![span("● "), span("Commands").bold()], lines, columns)
 }
 
@@ -536,6 +540,161 @@ pub fn reply_line(segment: Segment, (i, text): (usize, &str)) -> Line {
             let bullet = if i == 0 { span("● ") } else { span("  ") };
             vec![bullet, span(text)]
         }
+    }
+}
+
+/// A call as it was made: the tool, and its arguments as it describes
+/// them.
+pub fn call(name: &str, detail: &str) -> Line {
+    vec![
+        span("● "),
+        span(name).bold(),
+        span(format!("({detail})")).dark_grey(),
+    ]
+}
+
+/// The calls the model made one after another, said as one entry: what
+/// one call did, on a line, or for several, a heading of what they did,
+/// such as "Edited files, ran commands", over a line for each thing done.
+/// Calls of the same verb in a row share a line, unless one went wrong,
+/// which has its own, saying why. The heading is marked `✗` if a call
+/// went wrong, and `✓` if none did and a command ran: an edit or a read
+/// that went through needs no mark.
+pub fn calls(summaries: &[Summary], columns: usize) -> Vec<Line> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for summary in summaries {
+        match entries.last_mut() {
+            Some(entry)
+                if entry.verb == summary.verb
+                    && entry.failed.is_none()
+                    && summary.failed.is_none() =>
+            {
+                entry.add(summary)
+            }
+            _ => entries.push(Entry::of(summary)),
+        }
+    }
+    let mark = if summaries.iter().any(|summary| summary.failed.is_some()) {
+        Some(span(" ✗").red())
+    } else if summaries.iter().any(|summary| summary.verb == Verb::Ran) {
+        Some(span(" ✓").green())
+    } else {
+        None
+    };
+    let mut lines = Vec::new();
+    if let [entry] = entries.as_slice() {
+        let mut line = vec![span("● ")];
+        line.extend(entry.line(true));
+        line.extend(mark);
+        lines.push(tui::truncate(&line, columns));
+        return lines;
+    }
+    let mut verbs: Vec<Verb> = Vec::new();
+    for summary in summaries {
+        if !verbs.contains(&summary.verb) {
+            verbs.push(summary.verb);
+        }
+    }
+    let heading = verbs
+        .iter()
+        .map(|&verb| {
+            let mut objects: Vec<&str> = summaries
+                .iter()
+                .filter(|summary| summary.verb == verb)
+                .map(|summary| summary.object.as_str())
+                .collect();
+            objects.dedup();
+            verb.phrase(objects.len() > 1)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut heading = heading.chars();
+    let heading: String = heading
+        .next()
+        .map(|first| first.to_uppercase().chain(heading).collect())
+        .unwrap_or_default();
+    let mut line = vec![span("● "), span(heading).bold()];
+    line.extend(mark);
+    lines.push(tui::truncate(&line, columns));
+    for (i, entry) in entries.iter().enumerate() {
+        let branch = if i + 1 == entries.len() {
+            "└ "
+        } else {
+            "├ "
+        };
+        let mut line = vec![span(branch).dark_grey()];
+        line.extend(entry.line(false));
+        lines.push(tui::truncate(&line, columns));
+    }
+    lines
+}
+
+/// Calls of one verb in a row, as one line says them.
+struct Entry {
+    verb: Verb,
+    /// What they were done to, each once, in order.
+    objects: Vec<String>,
+    /// The lines they added and removed, if they changed files.
+    lines: Option<(usize, usize)>,
+    /// How many calls there were.
+    calls: usize,
+    note: Option<String>,
+    failed: Option<String>,
+}
+
+impl Entry {
+    fn of(summary: &Summary) -> Self {
+        Self {
+            verb: summary.verb,
+            objects: vec![summary.object.clone()],
+            lines: summary.lines,
+            calls: 1,
+            note: summary.note.clone(),
+            failed: summary.failed.clone(),
+        }
+    }
+
+    /// Adds another call of the verb, after which a note of one call no
+    /// longer says how they went.
+    fn add(&mut self, summary: &Summary) {
+        if !self.objects.contains(&summary.object) {
+            self.objects.push(summary.object.clone());
+        }
+        self.lines = match (self.lines, summary.lines) {
+            (Some((a, r)), Some((more, fewer))) => Some((a + more, r + fewer)),
+            (lines, None) | (None, lines) => lines,
+        };
+        self.calls += 1;
+        self.note = None;
+    }
+
+    /// The line, its verb bold if it is the heading: the verb, what was
+    /// done, the lines changed, and a note, or how many calls made it
+    /// where that is more than the things they were done to.
+    fn line(&self, heading: bool) -> Line {
+        let verb = match &self.failed {
+            Some(failed) => span(failed.clone()).red(),
+            None => span(self.verb.word()),
+        };
+        let mut line = vec![if heading { verb.bold() } else { verb }];
+        line.push(span(format!(" {}", self.objects.join(", "))));
+        if let Some((added, removed)) = self.lines {
+            line.push(span(format!(" +{added}")).green());
+            if removed > 0 {
+                line.push(span(format!("/-{removed}")).red());
+            }
+        }
+        let note = match &self.note {
+            Some(note) => Some(note.clone()),
+            None if self.calls > self.objects.len() => {
+                Some(format!("{} {}", self.calls, self.verb.calls()))
+            }
+            None => None,
+        };
+        if let Some(note) = note {
+            line.push(span(format!(" · {note}")).dark_grey());
+        }
+        line
     }
 }
 

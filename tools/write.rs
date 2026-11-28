@@ -14,7 +14,7 @@ use std::{fs, path::Path};
 
 use serde_json::Value;
 
-use crate::tools::{Parameter, Signature, Tool, plural, required, string};
+use crate::tools::{Parameter, Signature, Tool, Verb, plural, required, string};
 
 const NAME: &str = "write";
 
@@ -22,6 +22,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: true,
+    verb: Some(Verb::Wrote),
     describe,
     run: |tools, arguments| run(&tools.dir, arguments),
 };

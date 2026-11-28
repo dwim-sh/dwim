@@ -42,7 +42,7 @@ use std::{borrow::Cow, collections::HashMap, fs, path::Path};
 use serde_json::Value;
 
 use crate::tools::{
-    Parameter, Signature, Tool, number, optional_number, plural, read, required, string,
+    Parameter, Signature, Tool, Verb, number, optional_number, plural, read, required, string,
     without_ending,
 };
 
@@ -52,6 +52,7 @@ pub const TOOL: Tool = Tool {
     name: NAME,
     signature,
     changes: true,
+    verb: Some(Verb::Edited),
     describe,
     run: |tools, arguments| run(&tools.dir, arguments),
 };
