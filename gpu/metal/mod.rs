@@ -28,7 +28,7 @@ use objc2_metal::{
 };
 
 use crate::{
-    gpu::{CACHE_BLOCK, CONV_KERNEL, Device, Tensor, quant},
+    gpu::{self, CACHE_BLOCK, CONV_KERNEL, Device, Kept, Tensor, quant},
     sys::memory,
 };
 
@@ -243,7 +243,9 @@ struct Kernels {
     gate_up: Object<dyn MTLComputePipelineState>,
     short_conv: Object<dyn MTLComputePipelineState>,
     short_conv_state: Object<dyn MTLComputePipelineState>,
+    short_conv_store: Object<dyn MTLComputePipelineState>,
     clip: Object<dyn MTLComputePipelineState>,
+    softcap: Object<dyn MTLComputePipelineState>,
     scale_rows: Object<dyn MTLComputePipelineState>,
     /// Attention with a bias by distance and a sink: a token at a time,
     /// the merging of its chunks, and for heads of 128 the kernel on the
@@ -563,7 +565,9 @@ impl Metal {
             gate_up: msl!("gate_up", THREADS),
             short_conv: msl!("short_conv", THREADS),
             short_conv_state: msl!("short_conv_state", THREADS),
+            short_conv_store: msl!("short_conv_store", THREADS),
             clip: msl!("clip", SIMD_THREADS),
+            softcap: msl!("softcap", THREADS),
             scale_rows: msl!("scale_rows", THREADS),
             attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
             attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
@@ -814,6 +818,58 @@ impl Metal {
         );
     }
 
+    /// Runs `short_conv`, writing into or adding to `out`, and moves the
+    /// convolution state on past a batch.
+    fn run_short_conv(
+        &self,
+        out: &mut Buffer,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+        add: bool,
+    ) {
+        let channels = weight.len - state.len;
+        let taps = weight.len / channels;
+        let n = x.len / channels;
+        assert!(x.len == n * channels && out.len == x.len);
+        assert_eq!(state.len, (taps - 1) * channels);
+        assert!(taps <= 9, "the kernel keeps up to eight tokens of state");
+        if let Some((dynamic, heads)) = dynamic {
+            assert!(dynamic.len == n * heads * taps && channels.is_multiple_of(heads));
+        }
+        out.touch();
+        state.touch();
+        let params = ShortConvParams {
+            n: n as u32,
+            channels: channels as u32,
+            taps: taps as u32,
+            heads: dynamic.map_or(0, |(_, heads)| heads) as u32,
+            add: add as u32,
+        };
+        // Without taps of the heads' own, the kernel is bound the weight
+        // in their place, which it does not read.
+        let dynamic_buf = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
+        self.dispatch(
+            &self.kernels.short_conv,
+            &[&out.buf, &x.buf, &state.buf, &weight.buf, dynamic_buf],
+            &params,
+            (n * channels).div_ceil(THREADS),
+            THREADS,
+        );
+        // A token alone has its state moved on by the threads that
+        // convolve it, a thread a channel.
+        if n > 1 && taps > 1 {
+            self.dispatch(
+                &self.kernels.short_conv_state,
+                &[&state.buf, &x.buf],
+                &params,
+                channels.div_ceil(THREADS),
+                THREADS,
+            );
+        }
+    }
+
     /// Opens a command buffer to encode into. Its compute encoder runs each
     /// kernel only once the kernels before it are done.
     fn begin(&self) -> Pending {
@@ -1026,6 +1082,29 @@ struct ShortConvParams {
     channels: u32,
     taps: u32,
     heads: u32,
+    add: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShortConvStoreParams {
+    n: u32,
+    channels: u32,
+    taps: u32,
+    heads: u32,
+    dim: u32,
+    width: u32,
+    kept: u32,
+    pos: u32,
+    rows: u32,
+    value: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SoftcapParams {
+    len: u32,
+    cap: f32,
 }
 
 #[repr(C)]
@@ -1253,6 +1332,22 @@ impl Device for Metal {
         unsafe {
             slice::from_raw_parts(buf.buf.contents().as_ptr().cast::<f32>(), buf.len).to_vec()
         }
+    }
+
+    fn read_capped(&self, buf: &mut Buffer, cap: f32) -> Vec<f32> {
+        buf.touch();
+        let params = SoftcapParams {
+            len: buf.len as u32,
+            cap,
+        };
+        self.dispatch(
+            &self.kernels.softcap,
+            &[&buf.buf],
+            &params,
+            buf.len.div_ceil(THREADS),
+            THREADS,
+        );
+        self.read(buf)
     }
 
     fn write(&self, buf: &mut Buffer, data: &[f32]) {
@@ -2148,40 +2243,100 @@ impl Device for Metal {
         weight: &Buffer,
         dynamic: Option<(&Buffer, usize)>,
     ) {
-        let channels = weight.len - state.len;
+        self.run_short_conv(out, x, state, weight, dynamic, false);
+    }
+
+    fn short_conv_add(
+        &self,
+        x: &mut Buffer,
+        input: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        _scratch: &mut Buffer,
+    ) {
+        self.run_short_conv(x, input, state, weight, None, true);
+    }
+
+    fn short_conv_store(
+        &self,
+        cache: &mut Cache,
+        pos: usize,
+        rows: usize,
+        n: usize,
+        channels: usize,
+        x: &Buffer,
+        state: &mut Buffer,
+        weight: &Buffer,
+        dynamic: Option<(&Buffer, usize)>,
+        scale: &Buffer,
+        kept: Kept,
+        scratch: &mut Buffer,
+        wrapped: &mut Buffer,
+    ) {
+        let (dim, kind, value) = match kept {
+            Kept::Clipped { dim, threshold } => (dim, 0u32, threshold),
+            Kept::Normed { eps } => (scale.len, 1u32, eps),
+        };
+        let max_threads = self.kernels.short_conv_store.maxTotalThreadsPerThreadgroup();
+        if !dim.is_multiple_of(CACHE_BLOCK)
+            || dim > max_threads
+            || !channels.is_multiple_of(dim)
+        {
+            return gpu::short_conv_store(
+                self, cache, pos, rows, n, channels, x, state, weight, dynamic, scale, kept,
+                scratch, wrapped,
+            );
+        }
         let taps = weight.len / channels;
-        let n = x.len / channels;
-        assert!(x.len == n * channels && out.len == x.len);
+        assert!(x.len == n * channels && weight.len == taps * channels);
         assert_eq!(state.len, (taps - 1) * channels);
         assert!(taps <= 9, "the kernel keeps up to eight tokens of state");
+        assert!(n <= rows && rows * channels <= cache.len);
+        assert!(scale.len.is_multiple_of(dim) && channels.is_multiple_of(scale.len));
         if let Some((dynamic, heads)) = dynamic {
             assert!(dynamic.len == n * heads * taps && channels.is_multiple_of(heads));
         }
-        out.touch();
         state.touch();
-        let params = ShortConvParams {
+        let params = ShortConvStoreParams {
             n: n as u32,
             channels: channels as u32,
             taps: taps as u32,
             heads: dynamic.map_or(0, |(_, heads)| heads) as u32,
+            dim: dim as u32,
+            width: scale.len as u32,
+            kept: kind,
+            pos: (pos % rows) as u32,
+            rows: rows as u32,
+            value,
         };
-        // Without taps of the heads' own, the kernel is bound the weight
-        // in their place, which it does not read.
-        let taps = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
+        let dynamic_buf = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
         self.dispatch(
-            &self.kernels.short_conv,
-            &[&out.buf, &x.buf, &state.buf, &weight.buf, taps],
+            &self.kernels.short_conv_store,
+            &[
+                &cache.quants,
+                &cache.scales,
+                &x.buf,
+                &state.buf,
+                &weight.buf,
+                dynamic_buf,
+                &scale.buf,
+            ],
             &params,
-            (n * channels).div_ceil(THREADS),
-            THREADS,
+            n * (channels / dim),
+            dim,
         );
-        // A token alone has its state moved on by the threads that
-        // convolve it, a thread a channel.
-        if n > 1 {
+        if n > 1 && taps > 1 {
+            let state_params = ShortConvParams {
+                n: n as u32,
+                channels: channels as u32,
+                taps: taps as u32,
+                heads: params.heads,
+                add: 0,
+            };
             self.dispatch(
                 &self.kernels.short_conv_state,
                 &[&state.buf, &x.buf],
-                &params,
+                &state_params,
                 channels.div_ceil(THREADS),
                 THREADS,
             );

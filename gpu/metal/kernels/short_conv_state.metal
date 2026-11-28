@@ -11,6 +11,7 @@ struct Params {
     uint channels;
     uint taps;
     uint heads;
+    uint add;
 };
 
 // Most taps a convolution has, less one.
