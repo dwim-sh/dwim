@@ -1529,6 +1529,26 @@ impl Device for Metal {
         );
     }
 
+    fn matmuls(&self, jobs: &mut [(&mut Buffer, &Weight, &Buffer)]) {
+        // Group jobs that share an input buffer so the single-entry
+        // `pack_halves` cache is not evicted between projections of the
+        // same input (e.g. Q, gate, and rel across K and V).
+        let mut done = vec![false; jobs.len()];
+        for i in 0..jobs.len() {
+            if done[i] {
+                continue;
+            }
+            let key = (jobs[i].2.id, jobs[i].2.version);
+            for j in i..jobs.len() {
+                if !done[j] && (jobs[j].2.id, jobs[j].2.version) == key {
+                    let (out, w, x) = &mut jobs[j];
+                    self.matmul(out, w, x);
+                    done[j] = true;
+                }
+            }
+        }
+    }
+
     fn add(&self, x: &mut Buffer, y: &Buffer) {
         assert_eq!(x.len, y.len);
         x.touch();
@@ -2624,11 +2644,16 @@ impl Device for Metal {
             beta,
             linear_beta,
         };
+        let items = if width.is_multiple_of(4) {
+            out.len / 4
+        } else {
+            out.len
+        };
         self.dispatch(
             &self.kernels.situ,
             &[&out.buf, &gate_up.buf],
             &params,
-            out.len.div_ceil(THREADS),
+            items.div_ceil(THREADS),
             THREADS,
         );
     }
@@ -2643,11 +2668,16 @@ impl Device for Metal {
             width: width as u32,
             k: k as u32,
         };
+        let items = if width.is_multiple_of(4) {
+            out.len / 4
+        } else {
+            out.len
+        };
         self.dispatch(
             &self.kernels.weighted_sum,
             &[&out.buf, &y.buf, &weights.buf],
             &params,
-            out.len.div_ceil(THREADS),
+            items.div_ceil(THREADS),
             THREADS,
         );
     }
