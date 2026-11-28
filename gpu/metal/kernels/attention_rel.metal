@@ -30,16 +30,18 @@ struct Params {
     uint extent;
     uint base;
     uint batched;
+    uint bidir;
 };
 
 #ifndef CHUNK
 #define CHUNK 128
 #endif
+#ifndef ROUNDS
+#define ROUNDS 2
+#endif
 constant uint THREADS = 256;
-// Most query heads to a key/value head, and rounds of four elements to a
-// lane the widest head takes.
+// Most query heads to a key/value head.
 constant uint GROUP = 8;
-constant uint ROUNDS = 2;
 
 kernel void attention_rel(
     device float* out [[buffer(0)]],
@@ -59,16 +61,17 @@ kernel void attention_rel(
     uint nsg [[simdgroups_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float partial[THREADS / 8][GROUP];
+    threadgroup float partial_m[THREADS / 8][GROUP];
+    threadgroup float partial_s[THREADS / 8][GROUP];
     threadgroup float scores[GROUP][CHUNK];
 
     uint c = wg % p.chunks;
     uint tk = wg / p.chunks;
     uint t = p.first + tk / p.n_kv_heads;
     uint kvh = tk % p.n_kv_heads;
-    // The token's own position, the first it attends over, and how many
-    // it does.
-    uint at = p.pos + t;
+    // The token's own position (or shared block end when bidirectional), the
+    // first it attends over, and how many it does.
+    uint at = p.bidir != 0 ? p.pos : p.pos + t;
     uint lo = at + 1 > p.window ? at + 1 - p.window : 0;
     uint len = at + 1 - lo;
     if (c * CHUNK >= len) {
@@ -85,38 +88,53 @@ kernel void attention_rel(
 
     // Each lane of a SIMD group takes four elements of a key in each round
     // of as many as the SIMD group takes at once, the lanes side by side,
-    // and keeps the queries' matching elements, the heads past the group
-    // zero. It sums its products for every head before the lanes add them
-    // up, which takes halves of the heads' sums between lanes 16, 8 and 4
-    // apart, each lane keeping the half its bit says and adding the other
-    // lane's, and then adds the one head's sum it is left with across the
-    // last four lanes.
+    // and keeps the queries' matching elements.
     float4 query[GROUP][ROUNDS];
-    for (uint g = 0; g < GROUP; g++) {
+    for (uint g = 0; g < group; g++) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < ROUNDS; r++) {
             uint d = r * 32 + lane;
-            query[g][r] = g < group && d < quads ? q[qbase + g * quads + d] * scale : float4(0.0f);
+            query[g][r] = d < quads ? q[qbase + g * quads + d] * scale : float4(0.0f);
         }
     }
+
+    // Preload this lane's head projection for the relative-position bias once
+    // before walking the chunk's keys.
     uint head = (lane & 16 ? 4 : 0) + (lane & 8 ? 2 : 0) + (lane & 4 ? 1 : 0);
+    bool vec_rel = (p.n_rel & 3u) == 0 && p.n_rel <= 16;
+    uint rel_quads = p.n_rel / 4;
+    float4 rel_v[4] = {};
+    const device float* rel_head = rel + (t * p.n_heads + kvh * group + head) * p.n_rel;
+    if (p.extent != 0 && (lane & 3) == 0 && head < group && vec_rel) {
+        const device float4* r4 = (const device float4*)rel_head;
+        for (uint j = 0; j < rel_quads; j++) {
+            rel_v[j] = r4[j];
+        }
+    }
+
+    uint ring_row = (start + sid) % p.ring;
+    uint ring_step = nsg % p.ring;
     for (uint i = sid; i < count; i += nsg) {
         float v[GROUP] = {};
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < ROUNDS; r++) {
             uint d = r * 32 + lane;
             if (d < quads) {
-                uint e = ((start + i) % p.ring) * kv_dim + kv + 4 * d;
+                uint e = ring_row * kv_dim + kv + 4 * d;
                 float4 key = float4(k_quants[e / 4]) * float(k_scales[e / 32]);
-                for (uint g = 0; g < GROUP; g++) {
+                for (uint g = 0; g < group; g++) {
                     v[g] += dot(query[g][r], key);
                 }
             }
         }
         float a[4];
+        #pragma clang loop unroll(full)
         for (uint k = 0; k < 4; k++) {
             bool hi = lane & 16;
             a[k] = (hi ? v[k + 4] : v[k]) + simd_shuffle_xor(hi ? v[k] : v[k + 4], 16);
         }
         float b[2];
+        #pragma clang loop unroll(full)
         for (uint k = 0; k < 2; k++) {
             bool hi = lane & 8;
             b[k] = (hi ? a[k + 2] : a[k]) + simd_shuffle_xor(hi ? a[k] : a[k + 2], 8);
@@ -126,86 +144,95 @@ kernel void attention_rel(
         sum += simd_shuffle_xor(sum, 2);
         sum += simd_shuffle_xor(sum, 1);
         if ((lane & 3) == 0 && head < group) {
-            // The bias for how far back the key is.
             uint distance = at - (start + i);
             if (distance < p.extent) {
-                const device float* r = rel + (t * p.n_heads + kvh * group + head) * p.n_rel;
-                const device float* b = bias + distance * p.n_rel;
-                for (uint j = 0; j < p.n_rel; j++) {
-                    sum += r[j] * b[j];
+                if (vec_rel) {
+                    const device float4* b4 = (const device float4*)(bias + distance * p.n_rel);
+                    for (uint j = 0; j < rel_quads; j++) {
+                        sum += dot(rel_v[j], b4[j]);
+                    }
+                } else {
+                    const device float* bp = bias + distance * p.n_rel;
+                    for (uint j = 0; j < p.n_rel; j++) {
+                        sum += rel_head[j] * bp[j];
+                    }
                 }
             }
             scores[head][i] = sum;
+        }
+        ring_row += ring_step;
+        if (ring_row >= p.ring) {
+            ring_row -= p.ring;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each head's maximum over the chunk, for a stable softmax, and the
-    // sum of its exponentials.
+    // sum of its exponentials. Separate max/sum partial tables save a barrier.
+    uint active_sg = min(nsg, (count + 31) / 32);
     float m[GROUP];
     float total[GROUP];
-    for (uint g = 0; g < group; g++) {
-        float s = lid < count ? scores[g][lid] : -1e30f;
-        float sm = simd_max(s);
-        if (lane == 0) {
-            partial[sid][g] = sm;
+    if (sid < active_sg) {
+        for (uint g = 0; g < group; g++) {
+            float s = lid < count ? scores[g][lid] : -1e30f;
+            float sm = simd_max(s);
+            if (lane == 0) {
+                partial_m[sid][g] = sm;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float e[GROUP];
+    if (sid < active_sg) {
+        for (uint g = 0; g < group; g++) {
+            m[g] = -1e30f;
+            for (uint i = 0; i < active_sg; i++) {
+                m[g] = max(m[g], partial_m[i][g]);
+            }
+            float e = lid < count ? exp(scores[g][lid] - m[g]) : 0.0f;
+            if (lid < CHUNK) {
+                scores[g][lid] = e;
+            }
+            float sum = simd_sum(e);
+            if (lane == 0) {
+                partial_s[sid][g] = sum;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint g = 0; g < group; g++) {
         m[g] = -1e30f;
-        for (uint i = 0; i < nsg; i++) {
-            m[g] = max(m[g], partial[i][g]);
-        }
-        e[g] = lid < count ? exp(scores[g][lid] - m[g]) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // The rows past the group zero, so that the values' sums can take all
-    // of them.
-    for (uint g = 0; g < GROUP; g++) {
-        if (g >= group) {
-            e[g] = 0.0f;
-        }
-        if (lid < CHUNK) {
-            scores[g][lid] = e[g];
-        }
-        float sum = simd_sum(e[g]);
-        if (lane == 0) {
-            partial[sid][g] = sum;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint g = 0; g < group; g++) {
         total[g] = 0.0f;
-        for (uint i = 0; i < nsg; i++) {
-            total[g] += partial[i][g];
+        for (uint i = 0; i < active_sg; i++) {
+            m[g] = max(m[g], partial_m[i][g]);
+            total[g] += partial_s[i][g];
         }
     }
 
     // Each thread takes four elements of the head at every position of its
-    // lane, the lanes striding through the positions together, so that a
-    // position's values are read in runs and weighed for every head. A SIMD
-    // group's lanes take a power of two of positions at once, the lanes of
-    // one position side by side, so that each element's sums over the
-    // positions are added up across the SIMD group.
+    // lane, the lanes striding through the positions together.
     uint lanes = min(32u, 1u << (31 - clz(THREADS / quads)));
     uint d = lid / lanes;
     uint vlane = lid % lanes;
     float4 acc[GROUP];
-    for (uint g = 0; g < GROUP; g++) {
+    for (uint g = 0; g < group; g++) {
         acc[g] = 0.0f;
     }
     if (d < quads) {
+        uint v_ring = (start + vlane) % p.ring;
+        uint v_step = lanes % p.ring;
         for (uint i = vlane; i < count; i += lanes) {
-            uint e = ((start + i) % p.ring) * kv_dim + kv + 4 * d;
+            uint e = v_ring * kv_dim + kv + 4 * d;
             float4 v = float4(v_quants[e / 4]) * float(v_scales[e / 32]);
-            for (uint g = 0; g < GROUP; g++) {
+            for (uint g = 0; g < group; g++) {
                 acc[g] += scores[g][i] * v;
+            }
+            v_ring += v_step;
+            if (v_ring >= p.ring) {
+                v_ring -= p.ring;
             }
         }
     }
-    for (uint g = 0; g < GROUP; g++) {
+    for (uint g = 0; g < group; g++) {
         for (ushort s = 1; s < lanes; s <<= 1) {
             acc[g] += simd_shuffle_xor(acc[g], s);
         }
@@ -216,13 +243,15 @@ kernel void attention_rel(
     for (uint g = 0; g < group; g++) {
         uint h = kvh * group + g;
         if (p.chunks == 1) {
-            // The sink is one more to the softmax: the sums are rescaled
-            // to whichever is greater, the keys' maximum or the sink.
-            float sink = sinks[t * p.n_heads + h];
-            float most = max(m[g], sink);
-            float keys = exp(m[g] - most);
             device float4* dst = (device float4*)(out + (t * p.n_heads + h) * p.head_dim);
-            dst[d] = acc[g] * keys / (total[g] * keys + exp(sink - most));
+            if (p.bidir != 0) {
+                dst[d] = acc[g] / total[g];
+            } else {
+                float sink = sinks[t * p.n_heads + h];
+                float most = max(m[g], sink);
+                float keys = exp(m[g] - most);
+                dst[d] = acc[g] * keys / (total[g] * keys + exp(sink - most));
+            }
         } else {
             uint base = (((t - p.first) * p.n_heads + h) * p.chunks + c) * (p.head_dim + 2);
             if (d == 0) {

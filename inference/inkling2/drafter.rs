@@ -635,7 +635,7 @@ impl<D: Device> Drafter<D> {
     ) -> Result<Vec<u32>> {
         let c = &self.config;
         let s = &mut self.s;
-        let (hidden, block, kv_dim, q_dim) = (c.hidden, c.block, c.kv_dim(), c.q_dim());
+        let (hidden, block, kv_dim) = (c.hidden, c.block, c.kv_dim());
         let k = k.min(block - 1);
         // The token's row, and the mask's for the rest.
         let mut rows = anchor.to_vec();
@@ -685,25 +685,24 @@ impl<D: Device> Drafter<D> {
                 true => c.window + block,
                 false => usize::MAX,
             };
-            for row in 0..block {
-                d.copy(&mut s.q_row, 0, &s.q, row * q_dim, q_dim);
-                d.attention_rel(
-                    &mut s.att_row,
-                    &s.q_row,
-                    &context.k[i],
-                    &context.v[i],
-                    &s.rel,
-                    &s.bias,
-                    &s.sinks,
-                    pos + block - 1,
-                    c.heads,
-                    c.head_dim,
-                    c.kv_heads,
-                    window,
-                    cache_rows,
-                );
-                d.copy(&mut s.att, row * q_dim, &s.att_row, 0, q_dim);
-            }
+            d.attention_block(
+                &mut s.att,
+                &s.q,
+                &context.k[i],
+                &context.v[i],
+                pos + block - 1,
+                block,
+                c.heads,
+                c.head_dim,
+                c.kv_heads,
+                window,
+                cache_rows,
+                &mut s.q_row,
+                &mut s.att_row,
+                &s.rel,
+                &s.bias,
+                &s.sinks,
+            );
             d.matmul_add(&mut s.x, &layer.o, &s.att, &mut s.out);
             d.normalize(&mut s.xn, &s.x, &layer.ffn_norm, block * hidden, c.eps);
             d.swiglu(&mut s.h, &layer.gate, &layer.up, &s.xn, &mut s.h_scratch);

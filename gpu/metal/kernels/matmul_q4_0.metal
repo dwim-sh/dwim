@@ -12,6 +12,7 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
+    uint add;
 };
 
 // Tokens taken at once.
@@ -69,7 +70,8 @@ kernel void matmul_q4_0(
         for (uint k = 0; k < TOKENS; k++) {
             float total = simd_sum(acc[k]);
             if (lane == 0 && t0 + k < p.n) {
-                out[(t0 + k) * p.rows + r] = total;
+                uint at = (t0 + k) * p.rows + r;
+                out[at] = p.add != 0 ? out[at] + total : total;
             }
         }
     }

@@ -988,22 +988,23 @@ impl<D: Device> Pass<'_, D> {
             k,
             c.expert_scale,
         );
-        d.expert_ffn(
-            &mut s.down,
+        d.expert_ffn_sum(
+            &mut s.out,
             &layer.gate_up,
             &layer.gate_up_scale,
             &layer.down,
             &layer.down_scale,
             &s.ffn_normed,
             &s.ids,
+            &s.shares,
             k,
             c.expert_width,
             c.situ_beta,
             c.situ_linear_beta,
             &mut s.gate_up,
             &mut s.act,
+            &mut s.down,
         );
-        d.weighted_sum(&mut s.out, &s.down, &s.shares);
         if self.verify {
             let at = slot * CONVS + 3;
             let (kept, states) = (&mut s.verify_inputs[at], &mut s.verify_states[at]);

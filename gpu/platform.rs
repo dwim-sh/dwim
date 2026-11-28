@@ -703,6 +703,48 @@ impl Device for Gpu {
         )
     }
 
+    fn attention_block(
+        &self,
+        out: &mut Buffer,
+        q: &Buffer,
+        k_cache: &Cache,
+        v_cache: &Cache,
+        pos: usize,
+        block: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        window: usize,
+        rows: usize,
+        q_row: &mut Buffer,
+        att_row: &mut Buffer,
+        rel: &Buffer,
+        bias: &Buffer,
+        sinks: &Buffer,
+    ) {
+        dispatch!(
+            self,
+            attention_block(
+                [out],
+                [q],
+                (k_cache),
+                (v_cache),
+                pos,
+                block,
+                n_heads,
+                head_dim,
+                n_kv_heads,
+                window,
+                rows,
+                [q_row],
+                [att_row],
+                [rel],
+                [bias],
+                [sinks]
+            )
+        )
+    }
+
     fn route(
         &self,
         ids: &mut Buffer,
@@ -759,6 +801,46 @@ impl Device for Gpu {
                 linear_beta,
                 [scratch],
                 [act]
+            )
+        )
+    }
+
+    fn expert_ffn_sum(
+        &self,
+        out: &mut Buffer,
+        gate_up: &Weight,
+        gate_up_scale: &Buffer,
+        down: &Weight,
+        down_scale: &Buffer,
+        x: &Buffer,
+        ids: &Buffer,
+        shares: &Buffer,
+        k: usize,
+        width: usize,
+        beta: f32,
+        linear_beta: f32,
+        scratch: &mut Buffer,
+        act: &mut Buffer,
+        down_scratch: &mut Buffer,
+    ) {
+        dispatch!(
+            self,
+            expert_ffn_sum(
+                [out],
+                { gate_up },
+                [gate_up_scale],
+                { down },
+                [down_scale],
+                [x],
+                [ids],
+                [shares],
+                k,
+                width,
+                beta,
+                linear_beta,
+                [scratch],
+                [act],
+                [down_scratch]
             )
         )
     }

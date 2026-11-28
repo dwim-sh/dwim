@@ -11,6 +11,7 @@ struct Params {
     uint rows;
     uint cols;
     uint n;
+    uint add;
 };
 
 // Tokens a SIMD group takes at once.
@@ -55,7 +56,8 @@ kernel void matmul_bf16(
     for (uint t = 0; t < count; t++) {
         float total = simd_sum(acc[t]);
         if (lane == 0) {
-            out[(t0 + t) * p.rows + r] = total;
+            uint at = (t0 + t) * p.rows + r;
+            out[at] = p.add != 0 ? out[at] + total : total;
         }
     }
 }

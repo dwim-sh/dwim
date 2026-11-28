@@ -45,6 +45,7 @@ struct Params {
     uint extent;
     uint base;
     uint batched;
+    uint bidir;
 };
 
 #ifndef DIM
@@ -87,15 +88,30 @@ struct Fetched {
 
 // Fetches the thread's quads of the round's positions from `start`, the
 // positions past `len` clamped to the last, which only masked scores meet,
-// each from its row of the ring.
+// each from its row of the ring. When `ring >= ROUND`, row wrapping uses a
+// compare-and-subtract from `ring_r` instead of integer modulo.
 static Fetched fetch(const device char4* quants, const device half* scales, uint start, uint len,
-                     uint kv_dim, uint base, uint lid, uint ring) {
+                     uint kv_dim, uint base, uint lid, uint ring, uint ring_r, uint ring_last) {
     Fetched f;
+    bool simple = ring >= ROUND;
     for (uint k = 0; k < FETCHED; k++) {
         uint i = lid + k * THREADS;
         uint p = i / QUADS;
         uint d = (i % QUADS) * 4;
-        uint e = (min(start + p, len - 1) % ring) * kv_dim + base + d;
+        uint row;
+        if (simple) {
+            if (start + p < len) {
+                row = ring_r + p;
+                if (row >= ring) {
+                    row -= ring;
+                }
+            } else {
+                row = ring_last;
+            }
+        } else {
+            row = min(start + p, len - 1) % ring;
+        }
+        uint e = row * kv_dim + base + d;
         f.quads[k] = quants[e / 4];
         f.scales[k] = scales[e / 32];
     }
@@ -108,7 +124,7 @@ static void put(threadgroup half* kv, thread const Fetched& f, uint lid) {
         uint i = lid + k * THREADS;
         uint p = i / QUADS;
         uint d = (i % QUADS) * 4;
-        *(threadgroup half4*)(kv + p * STRIDE + d) = half4(float4(f.quads[k]) * float(f.scales[k]));
+        *(threadgroup half4*)(kv + p * STRIDE + d) = half4(f.quads[k]) * f.scales[k];
     }
 }
 
@@ -147,9 +163,9 @@ kernel void attention_rel_mma(
     uint r0 = wg.x * ROWS;
     // The positions any row of the threadgroup attends to in the chunk.
     uint last_row = min(r0 + ROWS, rows) - 1;
-    uint tg_len = p.pos + p.first + last_row / group + 1;
+    uint tg_len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + last_row / group + 1;
     // The first position its first row does.
-    uint first_len = p.pos + p.first + r0 / group + 1;
+    uint first_len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + r0 / group + 1;
     uint tg_lo = first_len > p.window ? first_len - p.window : 0;
     uint start = p.base + c * p.chunk;
     if (start >= tg_len || start + p.chunk <= tg_lo) {
@@ -162,14 +178,14 @@ kernel void attention_rel_mma(
     uint my = lid / PER_ROW;
     uint c0 = (lid % PER_ROW) * (ROUND / PER_ROW);
     uint mine_row = min(r0 + my, rows - 1);
-    uint len = p.pos + p.first + mine_row / group + 1;
+    uint len = p.bidir != 0 ? p.pos + 1 : p.pos + p.first + mine_row / group + 1;
     uint lo = len > p.window ? len - p.window : 0;
     // The row's projection for the bias, up to sixteen wide.
     uint quads = p.n_rel / 4;
     uint head = (p.first + mine_row / group) * p.n_heads + kvh * group + mine_row % group;
     float4 projected[4];
     for (uint j = 0; j < 4; j++) {
-        projected[j] = j < quads ? rel[head * quads + j] : float4(0.0f);
+        projected[j] = p.extent != 0 && j < quads ? rel[head * quads + j] : float4(0.0f);
     }
     float m = -1e30f;
     float l = 0.0f;
@@ -207,13 +223,15 @@ kernel void attention_rel_mma(
 
     // The round's keys are fetched during the round before, and its values
     // during its scores.
-    Fetched keys = fetch(k_quants, k_scales, start, tg_len, kv_dim, base, lid, p.ring);
+    uint ring_r = start % p.ring;
+    uint ring_last = (tg_len - 1) % p.ring;
+    Fetched keys = fetch(k_quants, k_scales, start, tg_len, kv_dim, base, lid, p.ring, ring_r, ring_last);
     for (uint r = start; r < end; r += ROUND) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 1)
         put(kv, keys, lid);
 #endif
-        Fetched values = fetch(v_quants, v_scales, r, tg_len, kv_dim, base, lid, p.ring);
+        Fetched values = fetch(v_quants, v_scales, r, tg_len, kv_dim, base, lid, p.ring, ring_r, ring_last);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 2)
         qk.run(qs, ks, st);
@@ -273,9 +291,18 @@ kernel void attention_rel_mma(
 #if !(ABLATE & 1)
         put(kv, values, lid);
 #endif
-        if (r + ROUND < end) {
-            keys = fetch(k_quants, k_scales, r + ROUND, tg_len, kv_dim, base, lid, p.ring);
+        uint next_ring_r = ring_r + ROUND;
+        if (p.ring >= ROUND) {
+            if (next_ring_r >= p.ring) {
+                next_ring_r -= p.ring;
+            }
+        } else {
+            next_ring_r = (r + ROUND) % p.ring;
         }
+        if (r + ROUND < end) {
+            keys = fetch(k_quants, k_scales, r + ROUND, tg_len, kv_dim, base, lid, p.ring, next_ring_r, ring_last);
+        }
+        ring_r = next_ring_r;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 2)
         pv.run(ps, vs, ot);
@@ -284,12 +311,16 @@ kernel void attention_rel_mma(
     if (lid % PER_ROW == 0) {
         row_l[my] = l;
         row_f[my] = m;
-        // The sink is one more to the softmax: the sums are rescaled to
-        // whichever is greater, the keys' maximum or the sink.
-        float sink = sinks[head];
-        float most = max(m, sink);
-        float keys_scale = exp(m - most);
-        row_o[my] = keys_scale / (l * keys_scale + exp(sink - most));
+        if (p.bidir != 0) {
+            row_o[my] = 1.0f / l;
+        } else {
+            // The sink is one more to the softmax: the sums are rescaled to
+            // whichever is greater, the keys' maximum or the sink.
+            float sink = sinks[head];
+            float most = max(m, sink);
+            float keys_scale = exp(m - most);
+            row_o[my] = keys_scale / (l * keys_scale + exp(sink - most));
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

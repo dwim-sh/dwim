@@ -48,25 +48,27 @@ constant uint UNIT = COLS / PER_ROW;
 #if BITS == 4
 
 // What a weight's four bits stand for, doubled: the scale is halved.
-constant half VALUES[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+static half fp4(uint n) {
+    half v = half((0xc8643210u >> ((n & 7u) * 4u)) & 0xfu);
+    return (n & 8u) != 0 ? -v : v;
+}
 
 static half4 low(uint word) {
-    return half4(VALUES[word & 0xfu], VALUES[(word >> 8) & 0xfu], VALUES[(word >> 16) & 0xfu], VALUES[(word >> 24) & 0xfu]);
+    return half4(fp4(word), fp4(word >> 8), fp4(word >> 16), fp4(word >> 24));
 }
 
 static half4 high(uint word) {
-    return half4(VALUES[(word >> 4) & 0xfu], VALUES[(word >> 12) & 0xfu], VALUES[(word >> 20) & 0xfu], VALUES[word >> 28]);
+    return half4(fp4(word >> 4), fp4(word >> 12), fp4(word >> 20), fp4(word >> 28));
 }
 
-// A block's scale from its bits, halved. Zero and the bits of a NaN scale
-// the block to nothing.
+// A block's scale from its bits, halved: branchless E4M3-to-f32 decode.
+// Zero and the bits of a NaN scale the block to nothing.
 static float scale_of(uint bits) {
-    if (bits == 0 || bits == 0x7f) {
-        return 0.0f;
-    }
-    int e = int((bits >> 3) & 0xf);
-    float m = float(bits & 7);
-    return e == 0 ? m * (0.5f / 512.0f) : ldexp(0.5f + m / 16.0f, e - 7);
+    uint e = (bits >> 3) & 0xfu;
+    uint m = bits & 7u;
+    float raw = e != 0 ? as_type<float>(((e + 119u) << 23) | (m << 20))
+                       : float(m) * (1.0f / 1024.0f);
+    return (bits == 0 || bits == 0x7fu) ? 0.0f : raw;
 }
 
 #define SCALES uint

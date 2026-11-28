@@ -25,6 +25,7 @@ struct Params {
     // For a batch, whose chunks are the dispatch's: its first position.
     uint base;
     uint batched;
+    uint bidir;
 };
 
 kernel void attention_rel_combine(
@@ -43,7 +44,7 @@ kernel void attention_rel_combine(
     // The chunks the token attends over: its own, counted from the first
     // position it attends over, or for a batch those of the dispatch's
     // that its positions are in.
-    uint at = p.pos + t;
+    uint at = p.bidir != 0 ? p.pos : p.pos + t;
     uint len = at + 1 > p.window ? p.window : at + 1;
     uint from = 0;
     uint chunks = (len + p.chunk - 1) / p.chunk;
@@ -53,12 +54,12 @@ kernel void attention_rel_combine(
     }
     uint stride = p.head_dim + 2;
     const device float* base = partials + ((t - p.first) * p.n_heads + h) * p.chunks * stride;
-    float sink = sinks[t * p.n_heads + h];
+    float sink = p.bidir != 0 ? -1e30f : sinks[t * p.n_heads + h];
     float m = sink;
     for (uint c = from; c < chunks; c++) {
         m = max(m, base[c * stride]);
     }
-    float total = exp(sink - m);
+    float total = p.bidir != 0 ? 0.0f : exp(sink - m);
     float o = 0.0f;
     for (uint c = from; c < chunks; c++) {
         float scale = exp(base[c * stride] - m);

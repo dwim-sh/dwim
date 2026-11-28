@@ -1263,14 +1263,22 @@ pub fn expert_ffn_matches_cpu<D: Device>(gpu: &D) {
                 let mut out = gpu.alloc(n * k * rows);
                 let (mut scratch, mut act) =
                     (gpu.alloc(n * k * 2 * width), gpu.alloc(n * k * width));
+                let (gate_up_gpu, scale_gpu, down_gpu, down_scale_gpu, x_gpu, ids_gpu) = (
+                    gpu.upload(clone(&gate_up)),
+                    buffer(gpu, &scale),
+                    gpu.upload(clone(&down)),
+                    buffer(gpu, &down_scale),
+                    buffer(gpu, &x),
+                    buffer(gpu, &ids),
+                );
                 gpu.expert_ffn(
                     &mut out,
-                    &gpu.upload(gate_up),
-                    &buffer(gpu, &scale),
-                    &gpu.upload(down),
-                    &buffer(gpu, &down_scale),
-                    &buffer(gpu, &x),
-                    &buffer(gpu, &ids),
+                    &gate_up_gpu,
+                    &scale_gpu,
+                    &down_gpu,
+                    &down_scale_gpu,
+                    &x_gpu,
+                    &ids_gpu,
                     k,
                     width,
                     2.0,
@@ -1280,6 +1288,29 @@ pub fn expert_ffn_matches_cpu<D: Device>(gpu: &D) {
                 );
                 let what = format!("{width} {rows}x{cols} n={n} nvfp4={nvfp4}");
                 close_batch(&gpu.read(&out), &want, &what);
+
+                let shares = rng.floats(n * k);
+                let mut want_sum = vec![0.0; n * rows];
+                Cpu.weighted_sum(&mut want_sum, &want, &shares);
+                let mut got_sum = gpu.alloc(n * rows);
+                gpu.expert_ffn_sum(
+                    &mut got_sum,
+                    &gate_up_gpu,
+                    &scale_gpu,
+                    &down_gpu,
+                    &down_scale_gpu,
+                    &x_gpu,
+                    &ids_gpu,
+                    &buffer(gpu, &shares),
+                    k,
+                    width,
+                    2.0,
+                    3.0,
+                    &mut scratch,
+                    &mut act,
+                    &mut out,
+                );
+                close_batch(&gpu.read(&got_sum), &want_sum, &format!("{what} sum"));
             }
         }
     }
@@ -1606,6 +1637,64 @@ pub fn attention_rel_matches_cpu<D: Device>(gpu: &D) {
         } else {
             close(&gpu.read(&out), &want, 1e-4);
         }
+    }
+
+    // Bidirectional block attention (as the drafter runs it): every row of the
+    // block attends to the same window ending at pos, with no bias or sink.
+    for (n_heads, head_dim, n_kv_heads, block, pos, window, rows) in [
+        (24, 128, 8, 8, 300, usize::MAX, 301),
+        (24, 128, 8, 8, 2500, 1032, 1096),
+        (24, 128, 8, 8, 12, 16, 24),
+    ] {
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        let q = rng.floats(block * q_dim);
+        let held = (pos + 1).min(rows);
+        let (k_cache, v_cache) = (rng.floats(held * kv_dim), rng.floats(held * kv_dim));
+        let rel = vec![0.0; n_heads * 16];
+        let bias = vec![0.0; 16];
+        let sinks = vec![-1e9; n_heads];
+        let mut want = vec![0.0; block * q_dim];
+        let (mut q_row_cpu, mut att_row_cpu) = (vec![0.0; q_dim], vec![0.0; q_dim]);
+        Cpu.attention_block(
+            &mut want,
+            &q,
+            &cache(&Cpu, &k_cache, 0),
+            &cache(&Cpu, &v_cache, 0),
+            pos,
+            block,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+            &mut q_row_cpu,
+            &mut att_row_cpu,
+            &rel,
+            &bias,
+            &sinks,
+        );
+        let mut out = gpu.alloc(want.len());
+        let (mut q_row, mut att_row) = (gpu.alloc(q_dim), gpu.alloc(q_dim));
+        gpu.attention_block(
+            &mut out,
+            &buffer(gpu, &q),
+            &cache(gpu, &k_cache, 0),
+            &cache(gpu, &v_cache, 0),
+            pos,
+            block,
+            n_heads,
+            head_dim,
+            n_kv_heads,
+            window,
+            rows,
+            &mut q_row,
+            &mut att_row,
+            &buffer(gpu, &rel),
+            &buffer(gpu, &bias),
+            &buffer(gpu, &sinks),
+        );
+        close_batch(&gpu.read(&out), &want, &format!("block {block} at {pos}"));
     }
 }
 
