@@ -87,15 +87,30 @@ struct Fetched {
 
 // Fetches the thread's quads of the round's positions from `start`, the
 // positions past `len` clamped to the last, which only masked scores meet,
-// each from its row of the ring.
+// each from its row of the ring. When `ring >= ROUND`, row wrapping uses a
+// compare-and-subtract from `ring_r` instead of integer modulo.
 static Fetched fetch(const device char4* quants, const device half* scales, uint start, uint len,
-                     uint kv_dim, uint base, uint lid, uint ring) {
+                     uint kv_dim, uint base, uint lid, uint ring, uint ring_r, uint ring_last) {
     Fetched f;
+    bool simple = ring >= ROUND;
     for (uint k = 0; k < FETCHED; k++) {
         uint i = lid + k * THREADS;
         uint p = i / QUADS;
         uint d = (i % QUADS) * 4;
-        uint e = (min(start + p, len - 1) % ring) * kv_dim + base + d;
+        uint row;
+        if (simple) {
+            if (start + p < len) {
+                row = ring_r + p;
+                if (row >= ring) {
+                    row -= ring;
+                }
+            } else {
+                row = ring_last;
+            }
+        } else {
+            row = min(start + p, len - 1) % ring;
+        }
+        uint e = row * kv_dim + base + d;
         f.quads[k] = quants[e / 4];
         f.scales[k] = scales[e / 32];
     }
@@ -108,7 +123,7 @@ static void put(threadgroup half* kv, thread const Fetched& f, uint lid) {
         uint i = lid + k * THREADS;
         uint p = i / QUADS;
         uint d = (i % QUADS) * 4;
-        *(threadgroup half4*)(kv + p * STRIDE + d) = half4(float4(f.quads[k]) * float(f.scales[k]));
+        *(threadgroup half4*)(kv + p * STRIDE + d) = half4(f.quads[k]) * f.scales[k];
     }
 }
 
@@ -207,13 +222,15 @@ kernel void attention_rel_mma(
 
     // The round's keys are fetched during the round before, and its values
     // during its scores.
-    Fetched keys = fetch(k_quants, k_scales, start, tg_len, kv_dim, base, lid, p.ring);
+    uint ring_r = start % p.ring;
+    uint ring_last = (tg_len - 1) % p.ring;
+    Fetched keys = fetch(k_quants, k_scales, start, tg_len, kv_dim, base, lid, p.ring, ring_r, ring_last);
     for (uint r = start; r < end; r += ROUND) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 1)
         put(kv, keys, lid);
 #endif
-        Fetched values = fetch(v_quants, v_scales, r, tg_len, kv_dim, base, lid, p.ring);
+        Fetched values = fetch(v_quants, v_scales, r, tg_len, kv_dim, base, lid, p.ring, ring_r, ring_last);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 2)
         qk.run(qs, ks, st);
@@ -273,9 +290,18 @@ kernel void attention_rel_mma(
 #if !(ABLATE & 1)
         put(kv, values, lid);
 #endif
-        if (r + ROUND < end) {
-            keys = fetch(k_quants, k_scales, r + ROUND, tg_len, kv_dim, base, lid, p.ring);
+        uint next_ring_r = ring_r + ROUND;
+        if (p.ring >= ROUND) {
+            if (next_ring_r >= p.ring) {
+                next_ring_r -= p.ring;
+            }
+        } else {
+            next_ring_r = (r + ROUND) % p.ring;
         }
+        if (r + ROUND < end) {
+            keys = fetch(k_quants, k_scales, r + ROUND, tg_len, kv_dim, base, lid, p.ring, next_ring_r, ring_last);
+        }
+        ring_r = next_ring_r;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #if !(ABLATE & 2)
         pv.run(ps, vs, ot);

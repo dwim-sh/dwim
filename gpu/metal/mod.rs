@@ -247,12 +247,12 @@ struct Kernels {
     clip: Object<dyn MTLComputePipelineState>,
     softcap: Object<dyn MTLComputePipelineState>,
     scale_rows: Object<dyn MTLComputePipelineState>,
-    /// Attention with a bias by distance and a sink: a token at a time,
-    /// the merging of its chunks, and for heads of 128 the kernel on the
-    /// matrix accelerators, where the GPU has them, in tiles of
-    /// [`MMA_ROWS`] rows for a batch and of [`DECODE_ROWS`] for a token
-    /// deep into a context.
-    attention_rel: Object<dyn MTLComputePipelineState>,
+    /// Attention with a bias by distance and a sink: a token at a time (one
+    /// round for heads up to 128 and two for wider heads), the merging of its
+    /// chunks, and for heads of 128 the kernel on the matrix accelerators,
+    /// where the GPU has them, in tiles of [`MMA_ROWS`] rows for a batch and
+    /// of [`DECODE_ROWS`] for a token deep into a context.
+    attention_rel: [Object<dyn MTLComputePipelineState>; 2],
     attention_rel_combine: Object<dyn MTLComputePipelineState>,
     attention_rel_mma: Option<[Object<dyn MTLComputePipelineState>; 2]>,
     route: Object<dyn MTLComputePipelineState>,
@@ -451,19 +451,24 @@ impl Metal {
         let attention_rel_mma = if matmul_quant_mma.is_some() {
             let metal4 = MTLCompileOptions::new();
             metal4.setLanguageVersion(MTLLanguageVersion::Version4_0);
-            let mma = |rows, threads| {
+            let mma = |rows, threads, round| {
                 compile(
                     &device,
                     "attention_rel_mma",
                     threads,
-                    &[("DIM", 128), ("ROWS", rows), ("THREADS", threads)],
+                    &[
+                        ("DIM", 128),
+                        ("ROWS", rows),
+                        ("THREADS", threads),
+                        ("ROUND", round),
+                    ],
                     &[source!("attention_rel_mma")],
                     Some(&metal4),
                 )
             };
             Some([
-                mma(MMA_ROWS, MMA_THREADS)?,
-                mma(DECODE_ROWS, DECODE_THREADS)?,
+                mma(MMA_ROWS, MMA_THREADS, 16)?,
+                mma(DECODE_ROWS, DECODE_THREADS, 32)?,
             ])
         } else {
             None
@@ -569,7 +574,20 @@ impl Metal {
             clip: msl!("clip", SIMD_THREADS),
             softcap: msl!("softcap", THREADS),
             scale_rows: msl!("scale_rows", THREADS),
-            attention_rel: msl!("attention_rel", ATTENTION_THREADS, "CHUNK" = CHUNK),
+            attention_rel: [
+                msl!(
+                    "attention_rel",
+                    ATTENTION_THREADS,
+                    "CHUNK" = CHUNK,
+                    "ROUNDS" = 1
+                ),
+                msl!(
+                    "attention_rel",
+                    ATTENTION_THREADS,
+                    "CHUNK" = CHUNK,
+                    "ROUNDS" = 2
+                ),
+            ],
             attention_rel_combine: msl!("attention_rel_combine", ATTENTION_THREADS),
             attention_rel_mma,
             route: msl!("route", SIMD_THREADS),
@@ -2524,7 +2542,7 @@ impl Device for Metal {
                         &[&out.buf, &self.partials, &sinks.buf],
                         &params,
                         tokens * n_heads,
-                        ATTENTION_THREADS,
+                        head_dim.next_multiple_of(SIMD_THREADS),
                     );
                 }
             }
@@ -2540,11 +2558,13 @@ impl Device for Metal {
             pos + n
         );
         let per_dispatch = PARTIALS / per_token;
+        let attention_rel = &self.kernels.attention_rel[usize::from(head_dim > 128)];
+        let combine_threads = head_dim.next_multiple_of(SIMD_THREADS);
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
             let params = params(first, tokens, chunks, CHUNK);
             self.dispatch(
-                &self.kernels.attention_rel,
+                attention_rel,
                 &buffers,
                 &params,
                 tokens * n_kv_heads * chunks,
@@ -2556,7 +2576,7 @@ impl Device for Metal {
                     &[&out.buf, &self.partials, &sinks.buf],
                     &params,
                     tokens * n_heads,
-                    ATTENTION_THREADS,
+                    combine_threads,
                 );
             }
         }
