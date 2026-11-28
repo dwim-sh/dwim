@@ -1746,12 +1746,17 @@ impl Device for Metal {
             dim: dim as u32,
             eps,
         };
+        let threads = if dim.is_multiple_of(4) && dim <= 256 {
+            SIMD_THREADS
+        } else {
+            THREADS
+        };
         self.dispatch(
             &self.kernels.rmsnorm,
             &[&x.buf, &weight.buf],
             &params,
             x.len / dim,
-            THREADS,
+            threads,
         );
     }
 

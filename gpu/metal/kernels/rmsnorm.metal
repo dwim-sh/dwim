@@ -1,7 +1,8 @@
 // Normalizes each row of x by its root mean square and scales it by the
-// weight: one threadgroup per row. Rows of up to 4096 elements in fours
-// are read once as float4 vectors into registers; other rows fall back to
-// a two-pass loop.
+// weight: one threadgroup per row. Rows up to 256 elements in fours run in
+// a single SIMD group (up to two float4s per lane, no barrier); rows up to
+// 4096 in fours cache float4 vectors in registers; other rows use a
+// two-pass loop.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -23,6 +24,23 @@ kernel void rmsnorm(
     uint nsg [[simdgroups_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    if ((p.dim & 3u) == 0 && p.dim <= 256) {
+        uint vectors = p.dim / 4;
+        device float4* v = (device float4*)x + row * vectors;
+        const device float4* w = (const device float4*)weight;
+        float4 a0 = lane < vectors ? v[lane] : float4(0.0f);
+        float4 a1 = lane + 32 < vectors ? v[lane + 32] : float4(0.0f);
+        float total = simd_sum(dot(a0, a0) + dot(a1, a1));
+        float scale = rsqrt(total / float(p.dim) + p.eps);
+        if (lane < vectors) {
+            v[lane] = a0 * (scale * w[lane]);
+        }
+        if (lane + 32 < vectors) {
+            v[lane + 32] = a1 * (scale * w[lane + 32]);
+        }
+        return;
+    }
+
     threadgroup float partial[32];
     if ((p.dim & 3u) == 0 && p.dim <= 4096) {
         uint vectors = p.dim / 4;
