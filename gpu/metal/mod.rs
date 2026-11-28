@@ -22,9 +22,10 @@ use objc2::{
 };
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLGPUFamily, MTLLanguageVersion,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::{
@@ -273,12 +274,70 @@ struct Kernels {
     copy_words: [Object<dyn MTLComputePipelineState>; 2],
 }
 
-/// A command buffer with commands encoded but not yet committed.
+/// A command buffer with commands encoded into a concurrent compute encoder
+/// and the buffer pointers read or written since the last memory barrier.
 struct Pending {
     cmd: Object<dyn MTLCommandBuffer>,
     encoder: Object<dyn MTLComputeCommandEncoder>,
     /// Kernels encoded into it.
     dispatched: usize,
+    /// Raw `MTLBuffer` pointers written since the last `MTLBarrierScope::Buffers`
+    /// barrier.
+    written: Vec<usize>,
+    /// Raw `MTLBuffer` pointers read since the last barrier.
+    read: Vec<usize>,
+}
+
+impl Pending {
+    /// Inserts a buffer memory barrier if any buffer in `buffers` (or
+    /// `indirect`) conflicts with dispatches since the last barrier, then
+    /// records the buffers read and written by this dispatch.
+    fn sync(
+        &mut self,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        writes: u32,
+        indirect: Option<&ProtocolObject<dyn MTLBuffer>>,
+        allow_waw: bool,
+    ) {
+        let id = |b: &ProtocolObject<dyn MTLBuffer>| b as *const ProtocolObject<dyn MTLBuffer> as usize;
+        let mut hazard = indirect.is_some_and(|b| self.written.contains(&id(b)));
+        if !hazard {
+            for (i, &buf) in buffers.iter().enumerate() {
+                let ptr = id(buf);
+                let is_write = (writes & (1u32 << i)) != 0;
+                if is_write {
+                    if self.read.contains(&ptr) || (!allow_waw && self.written.contains(&ptr)) {
+                        hazard = true;
+                        break;
+                    }
+                } else if self.written.contains(&ptr) {
+                    hazard = true;
+                    break;
+                }
+            }
+        }
+        if hazard {
+            self.encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            self.written.clear();
+            self.read.clear();
+        }
+        if let Some(buf) = indirect {
+            let ptr = id(buf);
+            if !self.read.contains(&ptr) {
+                self.read.push(ptr);
+            }
+        }
+        for (i, &buf) in buffers.iter().enumerate() {
+            let ptr = id(buf);
+            if (writes & (1u32 << i)) != 0 {
+                if !self.written.contains(&ptr) {
+                    self.written.push(ptr);
+                }
+            } else if !self.read.contains(&ptr) {
+                self.read.push(ptr);
+            }
+        }
+    }
 }
 
 pub struct Metal {
@@ -649,7 +708,8 @@ impl Metal {
     }
 
     /// Encodes a kernel over `groups` threadgroups of `threads` threads,
-    /// bound to `buffers` in order, with `params` in the slot after them.
+    /// bound to `buffers` in order, with `params` in the slot after them,
+    /// assuming only buffer 0 is written.
     fn dispatch<P: Copy>(
         &self,
         kernel: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -658,11 +718,24 @@ impl Metal {
         groups: usize,
         threads: usize,
     ) {
-        self.dispatch_grid(kernel, buffers, params, (groups, 1), threads);
+        self.dispatch_grid_writes(kernel, buffers, 1, params, (groups, 1), threads);
+    }
+
+    /// Like [`Self::dispatch`], with an explicit bitmask of written buffer slots.
+    fn dispatch_writes<P: Copy>(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        writes: u32,
+        params: &P,
+        groups: usize,
+        threads: usize,
+    ) {
+        self.dispatch_grid_writes(kernel, buffers, writes, params, (groups, 1), threads);
     }
 
     /// Encodes a kernel as `dispatch` does, over a grid of threadgroups
-    /// two deep.
+    /// two deep, assuming only buffer 0 is written.
     fn dispatch_grid<P: Copy>(
         &self,
         kernel: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -671,8 +744,23 @@ impl Metal {
         groups: (usize, usize),
         threads: usize,
     ) {
+        self.dispatch_grid_writes(kernel, buffers, 1, params, groups, threads);
+    }
+
+    /// Encodes a kernel over a 2D grid with an explicit bitmask of written
+    /// buffer slots, inserting a buffer barrier only on true data hazards.
+    fn dispatch_grid_writes<P: Copy>(
+        &self,
+        kernel: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        writes: u32,
+        params: &P,
+        groups: (usize, usize),
+        threads: usize,
+    ) {
         let mut pending = self.pending.borrow_mut();
         let current = pending.get_or_insert_with(|| self.begin());
+        current.sync(buffers, writes, None, false);
         let encoder = &current.encoder;
         encoder.setComputePipelineState(kernel);
         unsafe {
@@ -702,18 +790,23 @@ impl Metal {
     }
 
     /// Encodes a kernel whose threadgroup grid comes from `indirect` at byte
-    /// offset `offset`.
+    /// offset `offset`. When `allow_waw` is true, disjoint writes to an
+    /// already-written output buffer overlap without a barrier.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_indirect<P: Copy>(
         &self,
         kernel: &ProtocolObject<dyn MTLComputePipelineState>,
         buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        writes: u32,
         params: &P,
         indirect: &ProtocolObject<dyn MTLBuffer>,
         offset: usize,
         threads: usize,
+        allow_waw: bool,
     ) {
         let mut pending = self.pending.borrow_mut();
         let current = pending.get_or_insert_with(|| self.begin());
+        current.sync(buffers, writes, Some(indirect), allow_waw);
         let encoder = &current.encoder;
         encoder.setComputePipelineState(kernel);
         unsafe {
@@ -811,9 +904,10 @@ impl Metal {
             grid_x_0: grid_x_0 as u32,
             grid_x_1: grid_x_1 as u32,
         };
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.expert_plan,
             &[order, wide_tiles, narrow_tiles, indirect, &ids.buf],
+            0b1111,
             &params,
             1,
             THREADS,
@@ -848,18 +942,24 @@ impl Metal {
         self.dispatch_indirect(
             &kernels[1],
             &[sorted, &w.buf, scales, packed, wide_tiles, &scale.buf],
+            1,
             &params,
             indirect,
             slot_offset,
             MATRIX_THREADS,
+            false,
         );
+        // Wide and narrow tiles write disjoint rows of `sorted`, so they can
+        // run concurrently on the GPU without a barrier between them.
         self.dispatch_indirect(
             &kernels[0],
             &[sorted, &w.buf, scales, packed, narrow_tiles, &scale.buf],
+            1,
             &params,
             indirect,
             slot_offset + 12,
             MATRIX_THREADS,
+            true,
         );
     }
 
@@ -974,9 +1074,11 @@ impl Metal {
         // Without taps of the heads' own, the kernel is bound the weight
         // in their place, which it does not read.
         let dynamic_buf = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
-        self.dispatch(
+        let writes = if n == 1 { (1 << 0) | (1 << 2) } else { 1 << 0 };
+        self.dispatch_writes(
             &self.kernels.short_conv,
             &[&out.buf, &x.buf, &state.buf, &weight.buf, dynamic_buf],
+            writes,
             &params,
             (n * channels).div_ceil(THREADS),
             THREADS,
@@ -994,20 +1096,22 @@ impl Metal {
         }
     }
 
-    /// Opens a command buffer to encode into. Its compute encoder runs each
-    /// kernel only once the kernels before it are done.
+    /// Opens a command buffer with a concurrent compute encoder so independent
+    /// kernels overlap on GPU cores between explicit buffer barriers.
     fn begin(&self) -> Pending {
         // Both come back autoreleased: the pool lets go of them now rather
         // than when the thread exits.
         autoreleasepool(|_| {
             let cmd = self.queue.commandBuffer().expect("no Metal command buffer");
             let encoder = cmd
-                .computeCommandEncoder()
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
                 .expect("no Metal compute encoder");
             Pending {
                 cmd,
                 encoder,
                 dispatched: 0,
+                written: Vec::new(),
+                read: Vec::new(),
             }
         })
     }
@@ -1548,9 +1652,10 @@ impl Device for Metal {
             offset: offset as u32,
             len: src.len as u32,
         };
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.store_q8,
             &[&cache.quants, &cache.scales, &src.buf],
+            0b11,
             &params,
             src.len / CACHE_BLOCK,
             SIMD_THREADS,
@@ -1753,7 +1858,14 @@ impl Device for Metal {
                     x(4),
                     x(5),
                 ];
-                self.dispatch(kernel, &buffers, &params, groups, THREADS);
+                self.dispatch_writes(
+                    kernel,
+                    &buffers,
+                    (1u32 << MATMUL_JOBS) - 1,
+                    &params,
+                    groups,
+                    THREADS,
+                );
             }
         }
         // Group remaining jobs that share an input buffer so the single-entry
@@ -1836,9 +1948,10 @@ impl Device for Metal {
             w(2),
             w(3),
         ];
-        self.dispatch_grid(
+        self.dispatch_grid_writes(
             &self.kernels.normalize,
             &buffers,
+            (1u32 << NORM_JOBS) - 1,
             &params,
             (len / dim, outs.len()),
             THREADS,
@@ -2045,19 +2158,22 @@ impl Device for Metal {
                 &v_cache.scales,
                 &self.partials,
             ];
+            let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
             if let Some(b) = &batched {
                 let rows = tokens * group;
-                self.dispatch_grid(
+                self.dispatch_grid_writes(
                     b.kernel,
                     &buffers,
+                    writes,
                     &params,
                     (rows.div_ceil(b.rows), n_kv_heads * chunks),
                     b.threads,
                 );
             } else {
-                self.dispatch(
+                self.dispatch_writes(
                     &self.kernels.attention,
                     &buffers,
+                    writes,
                     &params,
                     tokens * n_kv_heads * chunks,
                     ATTENTION_THREADS,
@@ -2139,9 +2255,10 @@ impl Device for Metal {
             &state.buf,
             &weight.buf,
         ];
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.conv,
             &buffers,
+            0b1111,
             &params,
             (n * channels).div_ceil(THREADS),
             THREADS,
@@ -2178,9 +2295,10 @@ impl Device for Metal {
         let buffers: [&ProtocolObject<dyn MTLBuffer>; 7] = [
             &out.buf, &q.buf, &k.buf, &v.buf, &gates.buf, &decay.buf, &state.buf,
         ];
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.delta_net,
             &buffers,
+            (1 << 0) | (1 << 6),
             &params,
             n_v_heads,
             THREADS,
@@ -2519,9 +2637,10 @@ impl Device for Metal {
             2 | 3 => 1,
             _ => 2,
         };
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.mix[kernel],
             &buffers,
+            (1u32 << MIXES) - 1,
             &params,
             len / dim,
             THREADS,
@@ -2663,9 +2782,10 @@ impl Device for Metal {
             w(2, 3),
             w(3, 3),
         ];
-        self.dispatch_grid(
+        self.dispatch_grid_writes(
             &self.kernels.gate_up,
             &up_buffers,
+            ((1u32 << GATES) - 1) << 1,
             &params,
             (dim.div_ceil(THREADS) * xs.len(), groups),
             THREADS,
@@ -2747,7 +2867,8 @@ impl Device for Metal {
             value,
         };
         let dynamic_buf = dynamic.map_or(&weight.buf, |(dynamic, _)| &dynamic.buf);
-        self.dispatch(
+        let writes = (1 << 0) | (1 << 1) | if n == 1 { 1 << 3 } else { 0 };
+        self.dispatch_writes(
             &self.kernels.short_conv_store,
             &[
                 &cache.quants,
@@ -2758,6 +2879,7 @@ impl Device for Metal {
                 dynamic_buf,
                 &scale.buf,
             ],
+            writes,
             &params,
             n * (channels / dim),
             dim,
@@ -2816,7 +2938,14 @@ impl Device for Metal {
         let s = |j: usize| &*jobs[j.min(jobs.len() - 1)].1.buf;
         let buffers: [&ProtocolObject<dyn MTLBuffer>; 2 * CLIP_JOBS] =
             [x(0), x(1), x(2), x(3), s(0), s(1), s(2), s(3)];
-        self.dispatch(&self.kernels.clip, &buffers, &params, heads, SIMD_THREADS);
+        self.dispatch_writes(
+            &self.kernels.clip,
+            &buffers,
+            (1u32 << CLIP_JOBS) - 1,
+            &params,
+            heads,
+            SIMD_THREADS,
+        );
     }
 
     fn scale_rows(&self, x: &mut Buffer, factors: &Buffer) {
@@ -2948,9 +3077,11 @@ impl Device for Metal {
                 };
                 let mut packed = buffers;
                 packed[1] = &self.packed;
-                self.dispatch_grid(
+                let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
+                self.dispatch_grid_writes(
                     kernel,
                     &packed,
+                    writes,
                     &params,
                     ((tokens * group).div_ceil(tile_rows), n_kv_heads * chunks),
                     threads,
@@ -2979,12 +3110,14 @@ impl Device for Metal {
         let per_dispatch = PARTIALS / per_token;
         let attention_rel = &self.kernels.attention_rel[usize::from(head_dim > 128)];
         let combine_threads = head_dim.next_multiple_of(SIMD_THREADS);
+        let writes = if chunks > 1 { (1 << 0) | (1 << 6) } else { 1 };
         for first in (0..n).step_by(per_dispatch) {
             let tokens = per_dispatch.min(n - first);
             let params = params(first, tokens, chunks, CHUNK);
-            self.dispatch(
+            self.dispatch_writes(
                 attention_rel,
                 &buffers,
+                writes,
                 &params,
                 tokens * n_kv_heads * chunks,
                 ATTENTION_THREADS,
@@ -3025,9 +3158,10 @@ impl Device for Metal {
             k: k as u32,
             scale,
         };
-        self.dispatch(
+        self.dispatch_writes(
             &self.kernels.route,
             &[&ids.buf, &weights.buf, &logits.buf, &bias.buf],
+            0b11,
             &params,
             n,
             SIMD_THREADS,
